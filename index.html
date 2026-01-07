@@ -41,9 +41,12 @@
             margin: 0 5px;
             font-weight: bold;
             cursor: pointer;
+            transition: all 0.3s ease;
         }
         .mock-mode { background: #f59e0b; color: #fff; }
         .real-mode { background: #10b981; color: #fff; }
+        .mode-btn.active { box-shadow: 0 0 10px #38bdf8; }
+        .mode-btn:disabled { background: #64748b; cursor: not-allowed; }
         .mode-tips { font-size: 12px; margin-top: 8px; color: #94a3b8; }
         /* 使用指南模块 */
         .guide-module {
@@ -112,14 +115,15 @@
             color: #ef4444;
             display: block;
         }
-        /* 跨域提示 */
+        /* 跨域检测提示 */
         .cors-tips {
-            font-size: 11px;
+            font-size: 12px;
             color: #f59e0b;
-            margin-top: 5px;
-            padding: 5px;
-            background: #1e293b;
+            padding: 8px;
             border-radius: 4px;
+            background: #f59e0b33;
+            margin-bottom: 8px;
+            display: none;
         }
         /* 状态栏-颜色分级预警 */
         .status-bar {
@@ -350,7 +354,7 @@
             <div class="guide-step-title">✅ 步骤1：选择使用模式</div>
             <div class="guide-step-content">
                 1. 点击 <span class="guide-highlight">模拟行情模式</span>：无需API，直接用！默认加载BTC/ETH等模拟价格，适合新手练手。<br>
-                2. 点击 <span class="guide-highlight">实盘API模式</span>：需填欧易API Key/Secret/Passphrase，适合老手对接真实行情。
+                2. 点击 <span class="guide-highlight">实盘API模式</span>：需填欧易API Key，适合老手对接真实行情。
             </div>
         </div>
         <div class="guide-step">
@@ -358,7 +362,7 @@
             <div class="guide-step-content">
                 点击 <span class="guide-highlight">启动行情监控</span> 按钮：<br>
                 - 模拟模式：每5秒自动波动价格，像真实市场一样！<br>
-                - 实盘模式：每5秒更新欧易真实价格（需先解决跨域）。
+                - 实盘模式：每5秒更新欧易真实价格。
             </div>
         </div>
         <div class="guide-step">
@@ -391,36 +395,34 @@
             </div>
         </div>
         <div class="guide-step">
-            <div class="guide-step-title">⚠️ 重要提示（实盘必看）</div>
+            <div class="guide-step-title">⚠️ 实盘必看：跨域解决</div>
             <div class="guide-step-content">
-                实盘API需解决<span class="guide-highlight">跨域限制</span>：<br>
-                1. 安装Chrome跨域插件（如Allow CORS）；<br>
-                2. 或部署到服务器（如GitHub Pages）；<br>
-                3. 确保API的IP白名单、权限配置正确。
+                1. 安装Chrome插件 <span class="guide-highlight">Allow CORS: Access-Control-Allow-Origin</span>；<br>
+                2. 确保API的IP白名单、权限、Passphrase配置正确；<br>
+                3. 若实盘模式点击无反应，刷新页面后重试。
             </div>
         </div>
     </div>
 
     <!-- 模式切换区 -->
     <div class="mode-switch">
-        <button class="mode-btn mock-mode active" onclick="switchMode('mock')">模拟行情模式</button>
-        <button class="mode-btn real-mode" onclick="switchMode('real')">实盘API模式</button>
+        <button class="mode-btn mock-mode active" id="mockBtn">模拟行情模式</button>
+        <button class="mode-btn real-mode" id="realBtn">实盘API模式</button>
         <div class="mode-tips" id="mode-tips">当前：模拟行情模式（无需API，直接使用所有功能）</div>
     </div>
 
-    <!-- API配置区（新增Passphrase） -->
+    <!-- API配置区 -->
     <div class="api-config" id="api-config">
-        <div class="api-pre-fill-tips">✅ 请填写完整的欧易API信息（Key/Secret/Passphrase）</div>
+        <div class="cors-tips" id="cors-tips">⚠️ 检测到跨域限制未解除，请安装Allow CORS插件后再测试API！</div>
+        <div class="api-pre-fill-tips">✅ 已自动填充你提供的API信息</div>
         <div class="area-title">🔑 欧易API配置</div>
         API Key：<input type="text" class="calc-input" id="api-key" placeholder="输入欧易API Key" value="02b337eb-2fee-4f21-88bb-3568e3e781a5">
         Secret Key：<input type="text" class="calc-input" id="secret-key" placeholder="输入欧易Secret Key" value="E5DD942D5204DD8D9CDC1B488927BCA5">
-        Passphrase：<input type="text" class="calc-input" id="api-passphrase" placeholder="输入欧易API密码短语（创建时设置）" value="">
+        Passphrase：<input type="text" class="calc-input" id="api-pass" placeholder="输入API密码短语（创建时设置）" value="">
         <button class="big-btn primary-btn" onclick="testApi()">测试API连接</button>
         <div class="calc-result" id="api-test-result">👉 点击测试按钮，验证API是否有效</div>
         <!-- 排查结果显示区 -->
         <div class="api-check-result" id="api-check-result"></div>
-        <!-- 跨域提示 -->
-        <div class="cors-tips">💡 提示：若测试失败，先安装Chrome跨域插件（Allow CORS），或部署到服务器后再试</div>
     </div>
 
     <!-- 状态栏 -->
@@ -438,254 +440,4 @@
         <div class="dashboard-title">📈 全币种行情监控</div>
         <div class="coin-card active" onclick="switchCoin('BTC')">
             <div class="coin-name">BTC</div>
-            <div class="coin-price" id="btc-price">$61937.00</div>
-            <div class="coin-change rise" id="btc-change">+0.8%</div>
-        </div>
-        <div class="coin-card" onclick="switchCoin('ETH')">
-            <div class="coin-name">ETH</div>
-            <div class="coin-price" id="eth-price">$3215.00</div>
-            <div class="coin-change rise" id="eth-change">+1.2%</div>
-        </div>
-        <div class="coin-card" onclick="switchCoin('SOL')">
-            <div class="coin-name">SOL</div>
-            <div class="coin-price" id="sol-price">$124.50</div>
-            <div class="coin-change fall" id="sol-change">-2.1%</div>
-        </div>
-        <div class="coin-card" onclick="switchCoin('ADA')">
-            <div class="coin-name">ADA</div>
-            <div class="coin-price" id="ada-price">$0.58</div>
-            <div class="coin-change" id="ada-change">0%</div>
-        </div>
-    </div>
-
-    <!-- 核心功能区 -->
-    <div class="func-area">
-        <div class="area-title">🎯 核心操作</div>
-        <div class="btn-group">
-            <button class="big-btn primary-btn" onclick="jumpToOKX()">一键跳欧易</button>
-            <button class="big-btn normal-btn" onclick="showReview()">查看复盘</button>
-        </div>
-        <div class="btn-group">
-            <button class="big-btn normal-btn" onclick="startMonitor()">启动行情监控</button>
-            <button class="big-btn risk-btn" onclick="lockTrade()">锁定仓位</button>
-        </div>
-
-        <!-- 风控计算器 -->
-        <div class="risk-calc">
-            <div class="area-title">🛡️ 自动风控计算</div>
-            总资金(USDT)：<input type="number" class="calc-input" id="total-fund" placeholder="输入总资金" value="10000">
-            止损点数(USDT)：<input type="number" class="calc-input" id="stop-loss-point" placeholder="止损点数" value="500">
-            <button class="big-btn normal-btn" onclick="calcRisk()">计算爆仓价/仓位</button>
-            <div class="calc-result" id="risk-result">点击计算，自动生成安全开仓建议</div>
-        </div>
-
-        <!-- 自动委托模块 -->
-        <div class="auto-order">
-            <div class="area-title">🚀 止盈止损自动委托</div>
-            止盈价格(USDT)：<input type="number" class="calc-input" id="take-profit-price" placeholder="输入止盈价" value="62500">
-            止损价格(USDT)：<input type="number" class="calc-input" id="stop-loss-price" placeholder="输入止损价" value="61500">
-            开仓方向：
-            <select class="calc-input" id="order-direction" style="margin-top:5px;">
-                <option value="long">开多</option>
-                <option value="short">开空</option>
-            </select>
-            <div class="btn-group" style="margin-top:10px;">
-                <button class="big-btn primary-btn" onclick="startAutoOrder()">启动自动委托</button>
-                <button class="big-btn risk-btn" onclick="stopAutoOrder()">停止自动委托</button>
-            </div>
-            <div class="order-status" id="auto-order-status">👉 启动后价格触达自动触发平仓，无需手动操作</div>
-        </div>
-
-        <!-- 策略回测模块 -->
-        <div class="strategy-backtest">
-            <div class="area-title">📊 策略历史回测（近7天数据）</div>
-            选择策略：
-            <select class="calc-input" id="backtest-strategy" style="margin-top:5px;">
-                <option value="shock">震荡策略（低杠杆+窄止损）</option>
-                <option value="trend">趋势策略（中杠杆+宽止损）</option>
-                <option value="extreme">极端策略（1倍杠杆+观望）</option>
-            </select>
-            <button class="big-btn normal-btn" onclick="startBacktest()" style="margin-top:10px;">一键启动回测</button>
-            <div class="backtest-result" id="backtest-result">
-                👉 回测结果将显示在这里：胜率、盈亏比、最大回撤
-            </div>
-        </div>
-
-        <!-- 策略模板 -->
-        <div class="strategy-template">
-            <div class="area-title">📋 策略模板一键选</div>
-            <button class="template-btn template-shock" onclick="loadTemplate('shock')">震荡行情：低杠杆+窄止损</button>
-            <button class="template-btn template-trend" onclick="loadTemplate('trend')">趋势行情：中杠杆+移动止盈</button>
-            <button class="template-btn template-extreme" onclick="loadTemplate('extreme')">极端行情：1倍杠杆+观望</button>
-        </div>
-
-        <!-- 交易日志模块 -->
-        <div class="trade-log">
-            <div class="area-title">📝 交易日志记录</div>
-            <button class="big-btn normal-btn" onclick="clearTradeLog()" style="margin-bottom:8px;">清空交易日志</button>
-            <div class="log-content" id="log-content">
-                <div class="log-empty">暂无交易记录</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- 预警弹窗 -->
-    <div class="alert-box alert-danger hide" id="liquidation-alert">
-        <div class="alert-title" style="color: #ef4444;">⚠️ 爆仓预警</div>
-        <div class="alert-content" id="liquidation-content">当前价格接近爆仓价，请立即减仓/补保证金！</div>
-        <button class="alert-btn" onclick="closeAlert('liquidation-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-warning hide" id="loss-alert">
-        <div class="alert-title" style="color: #f59e0b;">⚠️ 亏损警告</div>
-        <div class="alert-content" id="loss-content">当日亏损已达80%，即将触发锁定！</div>
-        <button class="alert-btn" onclick="closeAlert('loss-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-info hide" id="price-alert">
-        <div class="alert-title" style="color: #38bdf8;">📢 价格/委托提醒</div>
-        <div class="alert-content" id="price-content">BTC已触达止损价$61500！</div>
-        <button class="alert-btn" onclick="closeAlert('price-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-info hide" id="review-alert">
-        <div class="alert-title" style="color: #38bdf8;">⏰ 每小时复盘</div>
-        <div class="alert-content" id="review-content">...</div>
-        <button class="alert-btn" onclick="closeAlert('review-alert')">知道了</button>
-    </div>
-
-    <script>
-        // 全局变量
-        let currentCoin = 'BTC';
-        let isTradeLocked = false;
-        let currentLeverage = 10;
-        let isAutoOrderRunning = false;
-        let autoOrderTimer = null;
-        let isPriceMonitorRunning = false;
-        let priceMonitorTimer = null;
-        let currentMode = 'mock';
-        const maxDailyLoss = 1000;
-        const coinLeverageLimit = { BTC: 20, ETH: 15, SOL: 10, ADA: 10 };
-        const coinSymbolMap = { BTC: 'BTC-USDT', ETH: 'ETH-USDT', SOL: 'SOL-USDT', ADA: 'ADA-USDT' };
-        let apiKey = '';
-        let secretKey = '';
-        let apiPassphrase = '';
-        // 欧易API最新端点（主站）
-        const okxApiBaseUrl = 'https://www.okx.com/api/v5';
-        // 模拟行情数据
-        let currentPriceData = { 
-            BTC: 61937, 
-            ETH: 3215, 
-            SOL: 124.5, 
-            ADA: 0.58 
-        };
-        // 模拟历史数据
-        const mockHistoryData = {
-            BTC: [61200, 61500, 61800, 62000, 61700, 62100, 62300, 61900, 62200, 62500],
-            ETH: [3180, 3200, 3220, 3190, 3230, 3250, 3210, 3240, 3260, 3280],
-            SOL: [122, 124, 126, 123, 125, 121, 119, 122, 124, 127],
-            ADA: [0.56, 0.57, 0.58, 0.57, 0.59, 0.58, 0.57, 0.59, 0.60, 0.61]
-        };
-
-        // 模式切换函数
-        function switchMode(mode) {
-            currentMode = mode;
-            document.querySelectorAll('.mode-btn').forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
-            const apiConfig = document.getElementById('api-config');
-            const priceStatus = document.getElementById('price-status');
-            const modeTips = document.getElementById('mode-tips');
-            const checkResult = document.getElementById('api-check-result');
-            checkResult.className = 'api-check-result';
-            checkResult.textContent = '';
-            if (mode === 'mock') {
-                apiConfig.style.display = 'none';
-                priceStatus.innerText = '行情状态：模拟行情';
-                priceStatus.className = 'status-item status-warning';
-                modeTips.innerText = '当前：模拟行情模式（无需API，直接使用所有功能）';
-                resetMockPrice();
-            } else {
-                apiConfig.style.display = 'block';
-                priceStatus.innerText = '行情状态：未连接API';
-                priceStatus.className = 'status-item status-neutral';
-                modeTips.innerText = '当前：实盘API模式（请填写完整API信息，先解决跨域再测试）';
-            }
-        }
-
-        // 重置模拟行情数据
-        function resetMockPrice() {
-            currentPriceData = { BTC: 61937, ETH: 3215, SOL: 124.5, ADA: 0.58 };
-            updateCoinCards();
-        }
-
-        // 更新币种卡片显示
-        function updateCoinCards() {
-            for (const coin in currentPriceData) {
-                const price = currentPriceData[coin];
-                document.getElementById(`${coin.toLowerCase()}-price`).innerText = `$${price.toFixed(2)}`;
-                const change = (Math.random() - 0.5) * 2;
-                document.getElementById(`${coin.toLowerCase()}-change`).innerText = `${change.toFixed(2)}%`;
-                document.getElementById(`${coin.toLowerCase()}-change`).className = `coin-change ${change >= 0 ? 'rise' : 'fall'}`;
-            }
-        }
-
-        // 生成欧易API签名（适配最新规范）
-        function generateOkxSign(timestamp, method, requestPath, body = '') {
-            if (!window.CryptoJS || !secretKey) return '';
-            const preHash = timestamp + method + requestPath + (body ? JSON.stringify(body) : '');
-            return CryptoJS.HmacSHA256(preHash, secretKey).toString(CryptoJS.enc.Base64);
-        }
-
-        // API错误排查函数
-        function analyzeApiError(errorMsg) {
-            const checkResult = document.getElementById('api-check-result');
-            checkResult.className = 'api-check-result check-error';
-            if (errorMsg.includes('Invalid API key') || errorMsg.includes('Invalid sign')) {
-                return '❌ 排查结果：密钥无效！请检查API Key/Secret/Passphrase是否填写正确，确认没有多余空格。';
-            } else if (errorMsg.includes('Permission denied') || errorMsg.includes('No permission')) {
-                return '❌ 排查结果：权限不足！请确认API已开启「行情读取」和「交易」权限。';
-            } else if (errorMsg.includes('IP not in whitelist') || errorMsg.includes('Invalid IP')) {
-                return '❌ 排查结果：IP未白名单！请将当前设备IP添加到欧易API的IP白名单中。';
-            } else if (errorMsg.includes('Load failed') || errorMsg.includes('CORS')) {
-                return '❌ 排查结果：跨域限制！请安装Chrome跨域插件（Allow CORS），或部署到服务器后再试。';
-            } else if (errorMsg.includes('timeout')) {
-                return '❌ 排查结果：网络超时！请检查网络是否能访问欧易官网（https://www.okx.com）。';
-            } else {
-                return `❌ 排查结果：未知错误！错误信息：${errorMsg}，请联系欧易客服查询。`;
-            }
-        }
-
-        // 获取实盘价格（适配欧易最新API）
-        async function getRealTimePrice(symbol) {
-            try {
-                const timestamp = new Date().toISOString(); // 欧易要求的ISO时间戳
-                const requestPath = '/market/ticker';
-                const method = 'GET';
-                const queryParams = `?symbol=${symbol}`;
-                // 生成签名
-                const sign = generateOkxSign(timestamp, method, requestPath + queryParams);
-                if (!sign) throw new Error('签名生成失败');
-                // 构造请求头
-                const headers = {
-                    'OK-ACCESS-KEY': apiKey,
-                    'OK-ACCESS-SIGN': sign,
-                    'OK-ACCESS-TIMESTAMP': timestamp,
-                    'OK-ACCESS-PASSPHRASE': apiPassphrase,
-                    'Content-Type': 'application/json'
-                };
-                // 发送请求（添加超时）
-                const response = await Promise.race([
-                    fetch(`${okxApiBaseUrl}${requestPath}${queryParams}`, { headers, method }),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
-                ]);
-                if (!response.ok) throw new Error(`HTTP错误：${response.status} ${response.statusText}`);
-                const data = await response.json();
-                if (data.code !== '0') throw new Error(`API错误：${data.msg}（代码${data.code}）`);
-                return parseFloat(data.data[0].last);
-            } catch (error) {
-                throw new Error(error.message);
-            }
-        }
-
-        // 执行API测试
-        async function executeApiTest() {
-            const testResult = document.getElementById('api-test-result');
-            const checkResult = document.getElementById('api-check-result');
-            try {...
+            <div class="coin-price" id="btc-price">$61...

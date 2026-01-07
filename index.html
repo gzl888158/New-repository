@@ -45,6 +45,40 @@
         .mock-mode { background: #f59e0b; color: #fff; }
         .real-mode { background: #10b981; color: #fff; }
         .mode-tips { font-size: 12px; margin-top: 8px; color: #94a3b8; }
+        /* 新增：使用指南模块 */
+        .guide-module {
+            background: #1e293b;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border: 2px solid #38bdf8;
+        }
+        .guide-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #38bdf8;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        .guide-step {
+            background: #27374d;
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 8px;
+        }
+        .guide-step-title {
+            font-weight: bold;
+            color: #f59e0b;
+            margin-bottom: 5px;
+        }
+        .guide-step-content {
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .guide-highlight {
+            color: #10b981;
+            font-weight: bold;
+        }
         /* API配置区 */
         .api-config {
             background: #1e293b;
@@ -256,7 +290,58 @@
 <body>
     <div class="header">💰 傻瓜式欧易合约交易助手 | 模拟/实盘双模式</div>
 
-    <!-- 新增：模式切换区 -->
+    <!-- 新增：使用指南模块 -->
+    <div class="guide-module">
+        <div class="guide-title">📖 傻瓜式使用指南（新手必看）</div>
+        <div class="guide-step">
+            <div class="guide-step-title">✅ 步骤1：选择使用模式</div>
+            <div class="guide-step-content">
+                1. 点击 <span class="guide-highlight">模拟行情模式</span>：无需API，直接用！默认加载BTC/ETH等模拟价格，适合新手练手。<br>
+                2. 点击 <span class="guide-highlight">实盘API模式</span>：需填欧易API Key，适合老手对接真实行情。
+            </div>
+        </div>
+        <div class="guide-step">
+            <div class="guide-step-title">🚀 步骤2：启动行情监控</div>
+            <div class="guide-step-content">
+                点击 <span class="guide-highlight">启动行情监控</span> 按钮：<br>
+                - 模拟模式：每5秒自动波动价格，像真实市场一样！<br>
+                - 实盘模式：每5秒更新欧易真实价格。
+            </div>
+        </div>
+        <div class="guide-step">
+            <div class="guide-step-title">🎯 步骤3：设置自动交易</div>
+            <div class="guide-step-content">
+                1. 填 <span class="guide-highlight">止盈价/止损价</span>，选 <span class="guide-highlight">开多/开空</span>；<br>
+                2. 点击 <span class="guide-highlight">启动自动委托</span>：价格触达自动平仓，不用盯盘！
+            </div>
+        </div>
+        <div class="guide-step">
+            <div class="guide-step-title">📊 步骤4：策略回测（关键！）</div>
+            <div class="guide-step-content">
+                1. 选 <span class="guide-highlight">震荡/趋势/极端</span> 策略；<br>
+                2. 点击 <span class="guide-highlight">一键启动回测</span>，看胜率、盈亏比；<br>
+                3. 胜率＞50%再用，胜率低就换策略！
+            </div>
+        </div>
+        <div class="guide-step">
+            <div class="guide-step-title">🛡️ 步骤5：风控保命（必做！）</div>
+            <div class="guide-step-content">
+                1. 填 <span class="guide-highlight">总资金/止损点数</span>，点击 <span class="guide-highlight">计算爆仓价</span>；<br>
+                2. 价格接近爆仓价会弹窗预警！<br>
+                3. 危险时点击 <span class="guide-highlight">锁定仓位</span>，禁止一切操作！
+            </div>
+        </div>
+        <div class="guide-step">
+            <div class="guide-step-title">💡 新手小贴士</div>
+            <div class="guide-step-content">
+                - 先在 <span class="guide-highlight">模拟模式</span> 练熟，再碰实盘！<br>
+                - 策略回测是核心，别凭感觉交易！<br>
+                - 锁定仓位是救命按钮，亏太多时果断点！
+            </div>
+        </div>
+    </div>
+
+    <!-- 模式切换区 -->
     <div class="mode-switch">
         <button class="mode-btn mock-mode active" onclick="switchMode('mock')">模拟行情模式</button>
         <button class="mode-btn real-mode" onclick="switchMode('real')">实盘API模式</button>
@@ -731,7 +816,7 @@
                 document.getElementById('take-profit-price').value = (currentPrice * (1 + tpRate)).toFixed(2);
                 document.getElementById('stop-loss-price').value = (currentPrice * (1 - slRate)).toFixed(2);
             }
-            alert(`✅ 已加载【${type === 'sh【${type === 'shock' ? '震荡' : type === 'trend' ? '趋势' : '极端'}】策略\n${tip}`);
+            alert(`✅ 已加载【${type === 'shock' ? '震荡' : type === 'trend' ? '趋势' : '极端'}】策略\n${tip}`);
         }
 
         function lockTrade() {

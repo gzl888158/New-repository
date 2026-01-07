@@ -28,6 +28,27 @@
             margin-bottom: 10px;
             color: #ff9800;
         }
+        .coin-tab {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 15px;
+            overflow-x: auto;
+            padding-bottom: 5px;
+        }
+        .coin-tab button {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 5px;
+            background: #333;
+            color: #fff;
+            font-size: 14px;
+            cursor: pointer;
+            white-space: nowrap;
+            touch-action: manipulation;
+        }
+        .coin-tab button.active {
+            background: #4CAF50;
+        }
         .analysis {
             background: #1e1e1e;
             padding: 10px;
@@ -63,7 +84,7 @@
             font-size: 14px;
             cursor: pointer;
             min-width: 80px;
-            touch-action: manipulation; /* 修复移动端点击延迟 */
+            touch-action: manipulation;
         }
         .confirm-btn {
             background: #2196F3;
@@ -108,7 +129,16 @@
 <body>
     <div class="header">豆包搭档·欧易专属交易辅助工具</div>
     <div class="status">欧易已连接 | 保证金使用率: 35% | 多空比: 2:1</div>
-    <div class="analysis">
+    
+    <!-- 币种切换标签 -->
+    <div class="coin-tab">
+        <button class="active" onclick="switchCoin('BTC')">BTC</button>
+        <button onclick="switchCoin('ETH')">ETH</button>
+        <button onclick="switchCoin('SOL')">SOL</button>
+        <button onclick="switchCoin('ADA')">ADA</button>
+    </div>
+
+    <div class="analysis" id="coinAnalysis">
         <div>豆包半小时行情解读 | 下次解读: 15:30</div>
         <br>
         <div>15:00 最新解读</div>
@@ -133,25 +163,82 @@
     <div class="alert-box" id="alertBox">
         <span class="close-btn" onclick="closeAlert()">&times;</span>
         <div class="alert-title">价格预警</div>
-        <div>BTC已跌破止损价$61500，建议立即平仓！</div>
+        <div id="alertContent">BTC已跌破止损价$61500，建议立即平仓！</div>
         <br>
-        <button class="alert-btn confirm-btn" onclick="jumpToOKX()">跳转欧易平仓</button>
+        <button class="alert-btn confirm-btn" id="jumpBtn" onclick="jumpToOKX('BTC')">跳转欧易平仓</button>
         <button class="alert-btn ignore-btn" onclick="closeAlert()">忽略</button>
     </div>
 
     <script>
-        // 修复移动端按钮点击事件
-        function jumpToOKX() {
-            window.open('https://www.okx.com/trade/spot/btc-usdt', '_blank');
+        let currentCoin = 'BTC';
+        // 币种行情数据（可根据实际更新）
+        const coinData = {
+            BTC: {
+                price: '$61937',
+                analysis: 'BTC当前价格$61937，15m K线形成双底形态，MACD金叉，RSI50（中性），多空比2:1。建议：继续持有多单，止盈位$62500，止损位$61500；若跌破$61500，立即平仓反手做空。',
+                stopLoss: '$61500'
+            },
+            ETH: {
+                price: '$3215',
+                analysis: 'ETH当前价格$3215，1h K线呈上升趋势，MACD红柱放大，RSI60（偏多），多空比1.8:1。建议：开多单，止盈位$3300，止损位$3180。',
+                stopLoss: '$3180'
+            },
+            SOL: {
+                price: '$124.5',
+                analysis: 'SOL当前价格$124.5，4h K线顶背离，MACD死叉，RSI70（超买），多空比1.2:1。建议：平仓多单，反手开空，止盈位$118，止损位$126。',
+                stopLoss: '$126'
+            },
+            ADA: {
+                price: '$0.58',
+                analysis: 'ADA当前价格$0.58，日线K线横盘整理，MACD走平，RSI45（中性），多空比1:1。建议：观望，突破$0.6开多，跌破$0.55开空。',
+                stopLoss: '$0.55'
+            }
+        };
+
+        // 切换币种
+        function switchCoin(coin) {
+            currentCoin = coin;
+            // 更新标签样式
+            document.querySelectorAll('.coin-tab button').forEach(btn => {
+                btn.classList.remove('active');
+                if (btn.innerText === coin) btn.classList.add('active');
+            });
+            // 更新行情分析
+            const analysisEl = document.getElementById('coinAnalysis');
+            analysisEl.innerHTML = `
+                <div>豆包半小时行情解读 | 下次解读: 15:30</div>
+                <br>
+                <div>15:00 最新解读</div>
+                <div>${coinData[coin].analysis}</div>
+            `;
+            // 更新预警内容（若弹窗显示）
+            document.getElementById('alertContent').innerText = `${coin}已跌破止损价${coinData[coin].stopLoss}，建议立即平仓！`;
+            document.getElementById('jumpBtn').setAttribute('onclick', `jumpToOKX('${coin}')`);
+        }
+
+        // 跳转欧易APP/网页
+        function jumpToOKX(coin) {
+            // 欧易APP协议链接 + 币种合约路径
+            const okxAppUrl = `okex://trade/${coin.toLowerCase()}-usdt/contract`; 
+            // 欧易网页端合约链接
+            const okxWebUrl = `https://www.okx.com/trade/contract/${coin.toLowerCase()}-usdt`;
+
+            // 优先唤起APP
+            window.location.href = okxAppUrl;
+            // 唤起失败则跳转到网页端
+            setTimeout(() => {
+                window.open(okxWebUrl, '_blank');
+            }, 2000);
             closeAlert();
         }
 
+        // 关闭预警弹窗
         function closeAlert() {
             document.getElementById('alertBox').style.display = 'none';
         }
 
         // 移动端触摸事件适配
-        document.querySelectorAll('.alert-btn').forEach(btn => {
+        document.querySelectorAll('.alert-btn, .coin-tab button').forEach(btn => {
             btn.addEventListener('touchstart', function(e) {
                 e.preventDefault();
                 this.click();

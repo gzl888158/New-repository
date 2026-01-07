@@ -128,11 +128,18 @@
         .danger-alert {
             border-color: #f44336;
         }
+        .review-alert {
+            border-color: #4CAF50;
+            z-index: 10000;
+        }
         .alert-title {
             font-size: 16px;
             font-weight: bold;
             margin-bottom: 15px;
             color: #f44336;
+        }
+        .review-title {
+            color: #4CAF50;
         }
         .alert-btn {
             padding: 8px 16px;
@@ -181,6 +188,12 @@
         }
         .lock-tips {
             background: #f44336;
+        }
+        .review-content {
+            text-align: left;
+            margin-bottom: 15px;
+            font-size: 14px;
+            line-height: 1.6;
         }
     </style>
 </head>
@@ -271,6 +284,14 @@
         <button class="alert-btn ignore-btn" onclick="closeLossAlert()">继续交易</button>
     </div>
 
+    <!-- 每小时复盘弹窗 -->
+    <div class="alert-box review-alert" id="reviewAlertBox" style="display:none;">
+        <span class="close-btn" onclick="closeReviewAlert()">&times;</span>
+        <div class="alert-title review-title">⏰ 每小时行情复盘报告</div>
+        <div class="review-content" id="reviewContent"></div>
+        <button class="alert-btn confirm-btn" onclick="closeReviewAlert()">确认</button>
+    </div>
+
     <!-- 提示弹窗 -->
     <div class="tips-box" id="tipsBox"></div>
 
@@ -283,22 +304,30 @@
             BTC: {
                 price: 61937,
                 analysis: 'BTC当前价格$61937，15m K线形成双底形态，MACD金叉，RSI50（中性），多空比2:1。建议：继续持有多单，止盈位$62500，止损位$61500；若跌破$61500，立即平仓反手做空。',
-                stopLoss: 61500
+                stopLoss: 61500,
+                fundingRate: 0.015, // 资金费率
+                volume: 12000 // 成交量
             },
             ETH: {
                 price: 3215,
                 analysis: 'ETH当前价格$3215，1h K线呈上升趋势，MACD红柱放大，RSI60（偏多），多空比1.8:1。建议：开多单，止盈位$3300，止损位$3180。',
-                stopLoss: 3180
+                stopLoss: 3180,
+                fundingRate: 0.012,
+                volume: 8000
             },
             SOL: {
                 price: 124.5,
                 analysis: 'SOL当前价格$124.5，4h K线顶背离，MACD死叉，RSI70（超买），多空比1.2:1。建议：平仓多单，反手开空，止盈位$118，止损位$126。',
-                stopLoss: 126
+                stopLoss: 126,
+                fundingRate: 0.025,
+                volume: 15000
             },
             ADA: {
                 price: 0.58,
                 analysis: 'ADA当前价格$0.58，日线K线横盘整理，MACD走平，RSI45（中性），多空比1:1。建议：观望，突破$0.6开多，跌破$0.55开空。',
-                stopLoss: 0.55
+                stopLoss: 0.55,
+                fundingRate: 0.008,
+                volume: 5000
             }
         };
 
@@ -326,9 +355,9 @@
             });
             const analysisEl = document.getElementById('coinAnalysis');
             analysisEl.innerHTML = `
-                <div>豆包半小时行情解读 | 下次解读: 15:30</div>
+                <div>豆包半小时行情解读 | 下次解读: ${getNextHourTime()}</div>
                 <br>
-                <div>15:00 最新解读</div>
+                <div>${new Date().getHours()}:00 最新解读</div>
                 <div>${coinData[coin].analysis}</div>
             `;
             document.getElementById('alertContent').innerText = `${coin}已跌破止损价$${coinData[coin].stopLoss}，建议立即平仓！`;
@@ -473,6 +502,79 @@
         function closeLossAlert() {
             document.getElementById('lossAlertBox').style.display = 'none';
         }
+        function closeReviewAlert() {
+            document.getElementById('reviewAlertBox').style.display = 'none';
+        }
+
+        // ========== 核心新增：每小时自动复盘功能 ==========
+        // 获取下一个整点时间
+        function getNextHourTime() {
+            const now = new Date();
+            const nextHour = now.getHours() + 1;
+            return `${nextHour < 10 ? '0' + nextHour : nextHour}:00`;
+        }
+
+        // 生成复盘报告
+        function generateReviewReport() {
+            const now = new Date();
+            const hour = now.getHours();
+            const coin = currentCoin;
+            const data = coinData[coin];
+            
+            // 趋势判断（基于K线周期和指标）
+            let trend = '震荡';
+            if (klineCycle === '1h' && data.price > data.stopLoss * 1.01) trend = '上升';
+            if (klineCycle === '1h' && data.price < data.stopLoss * 0.99) trend = '下降';
+
+            // 资金费率判断情绪
+            let sentiment = '中性';
+            if (data.fundingRate > 0.02) sentiment = '多头狂热（警惕回调）';
+            if (data.fundingRate < -0.01) sentiment = '空头主导（谨慎抄底）';
+
+            // 成交量判断活跃度
+            let activity = '一般';
+            if (data.volume > 10000) activity = '高（资金活跃）';
+            if (data.volume < 5000) activity = '低（观望为主）';
+
+            // 生成结构化报告
+            const report = `
+【时间】${hour}:00
+【币种】${coin}
+【当前价格】$${data.price}
+【趋势判断】${trend}
+【资金费率】${data.fundingRate}% → ${sentiment}
+【成交量】${data.volume} → ${activity}
+【操作建议】${data.analysis.split('建议：')[1]}
+【风控提醒】当前杠杆${document.getElementById('leverage').value}倍，单次亏损控制在${document.getElementById('riskRate').value}%以内
+            `;
+            return report;
+        }
+
+        // 定时触发复盘（每小时整点）
+        function startReviewTimer() {
+            // 立即生成一次当前时间的报告
+            document.getElementById('reviewContent').innerText = generateReviewReport();
+            
+            // 计算距离下一个整点的时间差（毫秒）
+            const now = new Date();
+            const nextHour = new Date(now);
+            nextHour.setHours(now.getHours() + 1);
+            nextHour.setMinutes(0);
+            nextHour.setSeconds(0);
+            nextHour.setMilliseconds(0);
+            const timeDiff = nextHour - now;
+
+            // 定时器：每小时触发一次
+            setTimeout(() => {
+                document.getElementById('reviewContent').innerText = generateReviewReport();
+                document.getElementById('reviewAlertBox').style.display = 'block';
+                // 循环触发
+                setInterval(() => {
+                    document.getElementById('reviewContent').innerText = generateReviewReport();
+                    document.getElementById('reviewAlertBox').style.display = 'block';
+                }, 3600000); // 3600000ms = 1小时
+            }, timeDiff);
+        }
 
         // 移动端触摸适配
         document.querySelectorAll('.alert-btn, .coin-tab button, .func-btn').forEach(btn => {
@@ -482,9 +584,11 @@
             }, { passive: false });
         });
 
-        // 初始弹窗
+        // 初始加载
         window.onload = function() {
             document.getElementById('alertBox').style.display = 'block';
+            // 启动每小时复盘定时器
+            startReviewTimer();
         };
     </script>
 </body>

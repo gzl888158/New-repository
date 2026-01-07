@@ -415,10 +415,10 @@
         </div>
     </div>
 
-    <!-- 模式切换区（修复点击无反应） -->
+    <!-- 🔥 核心修改：实盘按钮在前，模拟按钮在后 -->
     <div class="mode-switch">
-        <button class="mode-btn mock-mode active" onclick="switchMode('mock')">模拟行情模式</button>
         <button class="mode-btn real-mode" onclick="switchMode('real')">实盘API模式</button>
+        <button class="mode-btn mock-mode active" onclick="switchMode('mock')">模拟行情模式</button>
         <div class="mode-tips" id="mode-tips">当前：模拟行情模式（无需API，直接使用所有功能）</div>
     </div>
 
@@ -622,8 +622,8 @@
 
         // 页面加载完成后绑定事件（修复实盘模式点击无反应）
         window.onload = function() {
-            document.querySelector('.mock-mode').onclick = () => switchMode('mock');
             document.querySelector('.real-mode').onclick = () => switchMode('real');
+            document.querySelector('.mock-mode').onclick = () => switchMode('mock');
             // 初始化模拟模式
             switchMode('mock');
             // 自动检测TV信号服务
@@ -986,4 +986,5 @@
             let orderType = '';
 
             if (direction === 'long' && currentPrice >= takeProfitPrice) {
-               
+                orderType = '止盈';
+                record

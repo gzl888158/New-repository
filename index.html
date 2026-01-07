@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>欧易合约交易助手 | 终极整合版</title>
+    <title>欧易合约交易助手 | 免费行情版</title>
     <style>
         * {
             margin: 0;
@@ -78,42 +78,6 @@
         .guide-highlight {
             color: #10b981;
             font-weight: bold;
-        }
-        /* API配置区（适配okx-api-connect） */
-        .api-config {
-            background: #1e293b;
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 15px;
-            border: 1px solid #38bdf8;
-            display: none;
-        }
-        .api-pre-fill-tips {
-            font-size: 12px;
-            color: #f59e0b;
-            margin-bottom: 8px;
-            text-align: center;
-        }
-        .api-passphrase {
-            margin: 8px 0;
-        }
-        /* 排查结果提示 */
-        .api-check-result {
-            font-size: 12px;
-            padding: 8px;
-            border-radius: 4px;
-            margin-top: 8px;
-            display: none;
-        }
-        .check-success {
-            background: #10b98133;
-            color: #10b981;
-            display: block;
-        }
-        .check-error {
-            background: #ef444433;
-            color: #ef4444;
-            display: block;
         }
         /* 状态栏-颜色分级预警 */
         .status-bar {
@@ -362,28 +326,19 @@
     </style>
 </head>
 <body>
-    <div class="header">💰 欧易合约交易助手 | 终极整合版</div>
+    <div class="header">💰 欧易合约交易助手 | 免费行情版</div>
 
     <!-- 使用指南模块（整合所有步骤） -->
     <div class="guide-module">
-        <div class="guide-title">📖 完整使用指南（含后端部署+前端操作）</div>
+        <div class="guide-title">📖 完整使用指南（无需API配置）</div>
         <div class="guide-step">
-            <div class="guide-step-title">✅ 第一步：部署后端服务（二选一）</div>
+            <div class="guide-step-title">✅ 第一步：启动行情监控</div>
             <div class="guide-step-content">
-                <strong>方案1：TvAlertServer（TradingView信号专用）</strong><br>
-                1. 克隆仓库：<code>git clone https://github.com/mayacooker/TvAlertServer.git</code>；<br>
-                2. 安装依赖：<code>pip install -r requirements.txt</code>；<br>
-                3. 配置<code>config.py</code>：填写欧易API信息和TV签名密钥；<br>
-                4. 启动服务：<code>python app.py</code>（默认端口5000）。<br>
-                <strong>方案2：okx-api-connect（通用API封装）</strong><br>
-                1. 克隆仓库：<code>git clone https://github.com/AhmetMel1/okx-api-connect.git</code>；<br>
-                2. 安装依赖：<code>pip install -r requirements.txt</code>；<br>
-                3. 配置<code>.env</code>文件：填写OKX_API_KEY/SECRET/PASSPHRASE；<br>
-                4. 启动服务：<code>python main.py</code>（默认端口5000）。
+                点击「启动行情监控」按钮，工具将自动通过 <span class="guide-highlight">CoinGecko免费接口</span> 获取BTC/ETH/SOL/ADA实时价格，无需配置任何密钥。
             </div>
         </div>
         <div class="guide-step">
-            <div class="guide-step-title">✅ 第二步：配置TradingView告警</div>
+            <div class="guide-step-title">✅ 第二步：配置TradingView告警（可选）</div>
             <div class="guide-step-content">
                 1. TradingView策略/指标中添加告警，WebHook地址：<code>http://你的服务器IP:5000/webhook</code>；<br>
                 2. 告警消息格式选择<code>JSON</code>，内容示例：<br>
@@ -392,48 +347,32 @@
     "side": "buy",
     "price": "62000",
     "size": "0.01"
-}</code>；<br>
-                3. 填写后端配置的<code>TV_WEBHOOK_SECRET</code>，启用签名验证。
+}</code>
             </div>
         </div>
         <div class="guide-step">
-            <div class="guide-step-title">✅ 第三步：前端操作流程</div>
+            <div class="guide-step-title">✅ 第三步：核心操作流程</div>
             <div class="guide-step-content">
-                1. 切换模式：新手选「模拟行情模式」，老手选「实盘API模式」；<br>
-                2. 实盘配置：填写与后端一致的API Key/Secret/Passphrase，测试连接；<br>
-                3. 连接TV信号：填写后端服务地址（如<code>http://127.0.0.1:5000</code>），点击连接；<br>
-                4. 核心操作：启动行情监控→策略回测→设置止盈止损→启动自动委托；<br>
-                5. 风控保障：计算爆仓价，亏损超阈值时锁定仓位。
+                1. 切换币种：点击币种卡片选择关注的币种；<br>
+                2. 风控计算：输入总资金和止损点数，自动生成爆仓价和安全仓位；<br>
+                3. 自动委托：设置止盈止损价和方向，启动后价格触达自动提醒；<br>
+                4. 策略回测：选择策略模板，基于历史数据回测胜率和盈亏比。
             </div>
         </div>
         <div class="guide-step">
             <div class="guide-step-title">📝 第四步：日志查看</div>
             <div class="guide-step-content">
-                - 交易日志：记录自动委托/TV信号触发的所有交易（时间、币种、方向、盈亏）；<br>
-                - TV信号日志：记录接收的信号内容、订单执行结果，便于复盘。
+                - 交易日志：记录自动委托/TV信号触发的所有提醒（时间、币种、方向）；<br>
+                - TV信号日志：记录接收的信号内容，便于复盘策略有效性。
             </div>
         </div>
     </div>
 
-    <!-- 🔥 核心修改：实盘按钮在前，模拟按钮在后 -->
+    <!-- 模式切换区（实盘按钮在前，模拟按钮在后，已移除API依赖） -->
     <div class="mode-switch">
-        <button class="mode-btn real-mode" onclick="switchMode('real')">实盘API模式</button>
+        <button class="mode-btn real-mode" onclick="switchMode('real')">实时行情模式</button>
         <button class="mode-btn mock-mode active" onclick="switchMode('mock')">模拟行情模式</button>
-        <div class="mode-tips" id="mode-tips">当前：模拟行情模式（无需API，直接使用所有功能）</div>
-    </div>
-
-    <!-- API配置区（适配okx-api-connect，补充Passphrase） -->
-    <div class="api-config" id="api-config">
-        <div class="api-pre-fill-tips">✅ 填写与后端一致的API信息</div>
-        <div class="area-title">🔑 欧易API配置</div>
-        API Key：<input type="text" class="calc-input" id="api-key" placeholder="输入欧易API Key" value="02b337eb-2fee-4f21-88bb-3568e3e781a5">
-        Secret Key：<input type="text" class="calc-input" id="secret-key" placeholder="输入欧易Secret Key" value="E5DD942D5204DD8D9CDC1B488927BCA5">
-        <div class="api-passphrase">
-            Passphrase：<input type="text" class="calc-input" id="api-passphrase" placeholder="输入API密码短语" value="your_passphrase">
-        </div>
-        <button class="big-btn primary-btn" onclick="testApi()">测试API连接</button>
-        <div class="calc-result" id="api-test-result">👉 点击测试按钮，验证API是否有效</div>
-        <div class="api-check-result" id="api-check-result"></div>
+        <div class="mode-tips" id="mode-tips">当前：模拟行情模式（本地生成价格波动）</div>
     </div>
 
     <!-- 状态栏 -->
@@ -507,7 +446,7 @@
                 <button class="big-btn primary-btn" onclick="startAutoOrder()">启动自动委托</button>
                 <button class="big-btn risk-btn" onclick="stopAutoOrder()">停止自动委托</button>
             </div>
-            <div class="order-status" id="auto-order-status">👉 启动后价格触达自动触发平仓，无需手动操作</div>
+            <div class="order-status" id="auto-order-status">👉 启动后价格触达自动弹窗提醒</div>
         </div>
 
         <!-- 策略回测模块 -->
@@ -593,14 +532,11 @@
         let autoOrderTimer = null;
         let isPriceMonitorRunning = false;
         let priceMonitorTimer = null;
-        let currentMode = 'mock';
+        let currentMode = 'mock'; // mock=模拟行情 real=实时行情（CoinGecko）
         const maxDailyLoss = 1000;
         let dailyLoss = 0;
         const coinLeverageLimit = { BTC: 20, ETH: 15, SOL: 10, ADA: 10 };
-        const coinSymbolMap = { BTC: 'BTC-USDT-SWAP', ETH: 'ETH-USDT-SWAP', SOL: 'SOL-USDT-SWAP', ADA: 'ADA-USDT-SWAP' };
-        let apiKey = '02b337eb-2fee-4f21-88bb-3568e3e781a5';
-        let secretKey = 'E5DD942D5204DD8D9CDC1B488927BCA5';
-        let apiPassphrase = 'your_passphrase';
+        const coinSymbolMap = { BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', ADA: 'cardano' }; // CoinGecko币种ID映射
         let tvServerUrl = 'http://127.0.0.1:5000';
         let isTvServerConnected = false;
         let tvSignalListener = null;
@@ -620,7 +556,7 @@
             ADA: [0.56, 0.57, 0.58, 0.57, 0.59, 0.58, 0.57, 0.59, 0.60, 0.61]
         };
 
-        // 页面加载完成后绑定事件（修复实盘模式点击无反应）
+        // 页面加载完成后绑定事件
         window.onload = function() {
             document.querySelector('.real-mode').onclick = () => switchMode('real');
             document.querySelector('.mock-mode').onclick = () => switchMode('mock');
@@ -633,36 +569,27 @@
             }
         };
 
-        // 模式切换函数（修复版）
+        // 模式切换函数（实时/模拟）
         function switchMode(mode) {
             currentMode = mode;
-            // 强制重置按钮样式
             const mockBtn = document.querySelector('.mock-mode');
             const realBtn = document.querySelector('.real-mode');
             mockBtn.classList.remove('active');
             realBtn.classList.remove('active');
+            
             if (mode === 'mock') {
                 mockBtn.classList.add('active');
+                document.getElementById('mode-tips').innerText = '当前：模拟行情模式（本地生成价格波动）';
+                document.getElementById('price-status').innerText = '行情状态：模拟行情';
+                document.getElementById('price-status').className = 'status-item status-warning';
+                resetMockPrice();
             } else {
                 realBtn.classList.add('active');
-            }
-            // 强制渲染API配置区
-            const apiConfig = document.getElementById('api-config');
-            const priceStatus = document.getElementById('price-status');
-            const modeTips = document.getElementById('mode-tips');
-            const checkResult = document.getElementById('api-check-result');
-            checkResult.className = 'api-check-result';
-            checkResult.textContent = '';
-            // 强制刷新DOM
-            apiConfig.style.display = mode === 'real' ? 'block' : 'none';
-            priceStatus.innerText = mode === 'mock' ? '行情状态：模拟行情' : '行情状态：未连接API';
-            priceStatus.className = mode === 'mock' ? 'status-item status-warning' : 'status-item status-neutral';
-            modeTips.innerText = mode === 'mock' 
-                ? '当前：模拟行情模式（无需API，直接使用所有功能）' 
-                : '当前：实盘API模式（填写API信息并测试连接）';
-            // 模拟模式重置数据
-            if (mode === 'mock') {
-                resetMockPrice();
+                document.getElementById('mode-tips').innerText = '当前：实时行情模式（CoinGecko免费接口）';
+                document.getElementById('price-status').innerText = '行情状态：未启动监控';
+                document.getElementById('price-status').className = 'status-item status-neutral';
+                // 实时模式下先获取一次价格
+                updateAllRealPrices();
             }
             // 强制触发页面重绘
             document.body.offsetHeight;
@@ -679,130 +606,37 @@
             for (const coin in currentPriceData) {
                 const price = currentPriceData[coin];
                 document.getElementById(`${coin.toLowerCase()}-price`).innerText = `$${price.toFixed(2)}`;
-                const change = (Math.random() - 0.5) * 2;
-                document.getElementById(`${coin.toLowerCase()}-change`).innerText = `${change.toFixed(2)}%`;
+                // 计算涨跌幅（与前一次价格对比）
+                const prevPrice = mockHistoryData[coin][mockHistoryData[coin].length - 1];
+                const change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
+                document.getElementById(`${coin.toLowerCase()}-change`).innerText = `${change >= 0 ? '+' : ''}${change}%`;
                 document.getElementById(`${coin.toLowerCase()}-change`).className = `coin-change ${change >= 0 ? 'rise' : 'fall'}`;
             }
         }
 
-        // 欧易API签名函数（适配okx-api-connect）
-        function okxSign(timestamp, method, requestPath, body, secretKey) {
-            if (!window.CryptoJS) return '';
-            const message = timestamp + method + requestPath + (body ? JSON.stringify(body) : '');
-            return CryptoJS.HmacSHA256(message, secretKey).toString(CryptoJS.enc.Base64);
-        }
-
-        // API错误排查函数
-        function analyzeApiError(errorMsg) {
-            const checkResult = document.getElementById('api-check-result');
-            checkResult.className = 'api-check-result check-error';
-            if (errorMsg.includes('Invalid API key') || errorMsg.includes('Invalid sign')) {
-                return '❌ 排查结果：密钥无效！请检查API Key和Secret Key是否填写正确。';
-            } else if (errorMsg.includes('Permission denied') || errorMsg.includes('No permission')) {
-                return '❌ 排查结果：权限不足！请确认API已开启「行情读取」和「交易」权限。';
-            } else if (errorMsg.includes('IP not in whitelist') || errorMsg.includes('Invalid IP')) {
-                return '❌ 排查结果：IP未白名单！请将当前设备IP添加到欧易API的IP白名单中。';
-            } else if (errorMsg.includes('Passphrase')) {
-                return '❌ 排查结果：Passphrase错误！请填写与API创建时一致的密码短语。';
-            } else {
-                return `❌ 排查结果：未知错误！错误信息：${errorMsg}，请联系欧易客服查询。`;
-            }
-        }
-
-        // 获取实盘价格
-        async function getRealTimePrice(symbol) {
-            try {
-                const timestamp = Date.now().toString();
-                const requestPath = '/market/ticker';
-                const params = { instId: symbol };
-                const queryString = new URLSearchParams(params).toString();
-                const sign = okxSign(timestamp, 'GET', requestPath, '', secretKey);
-                if (!sign) throw new Error('签名生成失败');
-                const url = `https://www.okx.com/api/v5${requestPath}?${queryString}`;
-                const response = await fetch(url, {
-                    headers: {
-                        'OK-ACCESS-KEY': apiKey,
-                        'OK-ACCESS-SIGN': sign,
-                        'OK-ACCESS-TIMESTAMP': timestamp,
-                        'OK-ACCESS-PASSPHRASE': apiPassphrase,
-                        'Content-Type': 'application/json'
-                    },
-                    timeout: 5000
-                });
-                if (!response.ok) throw new Error(`HTTP错误：${response.status}`);
-                const data = await response.json();
-                if (data.code !== '0') throw new Error(data.msg);
-                return parseFloat(data.data[0].last);
-            } catch (error) {
-                throw new Error(error.message);
-            }
-        }
-
-        // 执行API测试
-        async function executeApiTest() {
-            const testResult = document.getElementById('api-test-result');
-            const checkResult = document.getElementById('api-check-result');
-            try {
-                testResult.innerText = '🔄 正在测试API连接，请稍候...';
-                const price = await getRealTimePrice(coinSymbolMap.BTC);
-                if (price > 0) {
-                    testResult.innerText = '✅ API连接成功！可以启动实盘行情监控';
-                    checkResult.className = 'api-check-result check-success';
-                    checkResult.textContent = '✅ 密钥有效、权限充足、IP已白名单！';
-                    document.getElementById('price-status').innerText = '行情状态：已连接';
-                    document.getElementById('price-status').className = 'status-item status-safe';
-                } else {
-                    throw new Error('未获取到行情数据');
-                }
-            } catch (error) {
-                testResult.innerText = '❌ API连接失败，请检查配置';
-                checkResult.textContent = analyzeApiError(error.message);
-            }
-        }
-
-        // 测试API连接
-        async function testApi() {
-            apiKey = document.getElementById('api-key').value.trim();
-            secretKey = document.getElementById('secret-key').value.trim();
-            apiPassphrase = document.getElementById('api-passphrase').value.trim();
-            const testResult = document.getElementById('api-test-result');
-            const checkResult = document.getElementById('api-check-result');
-            checkResult.className = 'api-check-result';
-            checkResult.textContent = '';
-
-            if (!apiKey || !secretKey || !apiPassphrase) {
-                testResult.innerText = '❌ API Key、Secret Key或Passphrase不能为空！';
-                return;
-            }
-
-            if (!window.CryptoJS) {
-                const script = document.createElement('script');
-                script.src = 'https://cdn.bootcdn.net/ajax/libs/crypto-js/4.1.1/crypto-js.min.js';
-                script.onload = executeApiTest;
-                script.onerror = () => {
-                    testResult.innerText = '❌ 加密库加载失败！请刷新页面重试';
-                    checkResult.className = 'api-check-result check-error';
-                    checkResult.textContent = '❌ 网络异常，无法加载加密组件';
-                };
-                document.head.appendChild(script);
-            } else {
-                await executeApiTest();
-            }
-        }
-
-        // 更新所有实盘价格
+        // 🔥 核心修改：通过CoinGecko免费接口获取实时价格
         async function updateAllRealPrices() {
-            for (const coin in coinSymbolMap) {
-                try {
-                    const price = await getRealTimePrice(coinSymbolMap[coin]);
-                    if (price > 0) {
-                        currentPriceData[coin] = price;
-                    }
-                } catch (error) {
-                    showAlert('price-alert', `获取${coin}行情失败：${error.message}`);
-                }
+            try {
+                // CoinGecko免费接口：获取BTC/ETH/SOL/ADA的USDT价格
+                const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,cardano&vs_currencies=usdt');
+                if (!response.ok) throw new Error(`接口请求失败：${response.status}`);
+                
+                const data = await response.json();
+                // 映射到本地价格数据结构
+                currentPriceData.BTC = data.bitcoin.usdt;
+                currentPriceData.ETH = data.ethereum.usdt;
+                currentPriceData.SOL = data.solana.usdt;
+                currentPriceData.ADA = data.cardano.usdt;
+                
+                // 更新页面显示
+                updateCoinCards();
+                // 检查自动委托条件
+                if (isAutoOrderRunning) checkAutoOrder();
+
+            } catch (error) {
+                showAlert('price-alert', `行情获取失败：${error.message}，请检查网络`);
+                console.error('CoinGecko接口错误：', error);
             }
-            updateCoinCards();
         }
 
         // 策略回测函数
@@ -889,8 +723,9 @@
         // 启动行情监控
         function startMonitor() {
             if (isPriceMonitorRunning) { alert('行情监控已在运行！'); return; }
+            isPriceMonitorRunning = true;
+
             if (currentMode === 'mock') {
-                isPriceMonitorRunning = true;
                 document.getElementById('price-status').innerText = '行情状态：模拟监控中';
                 priceMonitorTimer = setInterval(() => {
                     for (const coin in currentPriceData) {
@@ -901,12 +736,10 @@
                 }, 5000);
                 alert('✅ 已启动模拟行情监控，每5秒更新一次价格！');
             } else {
-                if (!apiKey || !secretKey || !apiPassphrase) { alert('请先配置并测试API！'); return; }
-                isPriceMonitorRunning = true;
-                document.getElementById('price-status').innerText = '行情状态：实盘监控中';
-                updateAllRealPrices();
-                priceMonitorTimer = setInterval(updateAllRealPrices, 5000);
-                alert('✅ 已启动实盘行情监控，每5秒更新一次价格！');
+                document.getElementById('price-status').innerText = '行情状态：实时监控中';
+                // 实时行情间隔设为10秒，避免接口限制
+                priceMonitorTimer = setInterval(updateAllRealPrices, 10000);
+                alert('✅ 已启动实时行情监控，每10秒更新一次价格！');
             }
         }
 
@@ -915,7 +748,7 @@
             if (!isPriceMonitorRunning) { alert('行情监控未启动！'); return; }
             clearInterval(priceMonitorTimer);
             isPriceMonitorRunning = false;
-            document.getElementById('price-status').innerText = currentMode === 'mock' ? '行情状态：模拟行情' : '行情状态：已连接';
+            document.getElementById('price-status').innerText = currentMode === 'mock' ? '行情状态：模拟行情' : '行情状态：实时行情（已停止）';
             alert('✅ 已停止行情监控！');
         }
 
@@ -929,9 +762,7 @@
             }
             const leverage = currentLeverage;
             const safePosition = (totalFund * 0.1).toFixed(2); // 安全开仓金额（总资金10%）
-            const liquidationPrice = currentMode === 'mock' 
-                ? (currentPriceData[currentCoin] * (1 - stopLossPoint / (totalFund * leverage))).toFixed(2)
-                : (currentPriceData[currentCoin] * (1 - stopLossPoint / (totalFund * leverage))).toFixed(2);
+            const liquidationPrice = (currentPriceData[currentCoin] * (1 - stopLossPoint / (totalFund * leverage))).toFixed(2);
 
             document.getElementById('risk-result').innerHTML = `
                 🛡️ 风控计算结果<br>
@@ -987,4 +818,141 @@
 
             if (direction === 'long' && currentPrice >= takeProfitPrice) {
                 orderType = '止盈';
-                record
+                recordTradeLog(currentCoin, direction, orderType, currentPrice, takeProfitPrice, '盈利');
+                showAlert('price-alert', `${currentCoin}已触达开多止盈价$${takeProfitPrice}，当前价格$${currentPrice}！`);
+                stopAutoOrder();
+            } else if (direction === 'long' && currentPrice <= stopLossPrice) {
+                orderType = '止损';
+                dailyLoss += takeProfitPrice - stopLossPrice;
+                recordTradeLog(currentCoin, direction, orderType, currentPrice, stopLossPrice, '亏损');
+                showAlert('price-alert', `${currentCoin}已触达开多止损价$${stopLossPrice}，当前价格$${currentPrice}！`);
+                stopAutoOrder();
+            } else if (direction === 'short' && currentPrice <= takeProfitPrice) {
+                orderType = '止盈';
+                recordTradeLog(currentCoin, direction, orderType, currentPrice, takeProfitPrice, '盈利');
+                showAlert('price-alert', `${currentCoin}已触达开空止盈价$${takeProfitPrice}，当前价格$${currentPrice}！`);
+                stopAutoOrder();
+            } else if (direction === 'short' && currentPrice >= stopLossPrice) {
+                orderType = '止损';
+                dailyLoss += stopLossPrice - takeProfitPrice;
+                recordTradeLog(currentCoin, direction, orderType, currentPrice, stopLossPrice, '亏损');
+                showAlert('price-alert', `${currentCoin}已触达开空止损价$${stopLossPrice}，当前价格$${currentPrice}！`);
+                stopAutoOrder();
+            }
+
+            // 检查当日亏损是否超限
+            if (dailyLoss >= maxDailyLoss * 0.8) {
+                showAlert('loss-alert', `当日亏损已达${dailyLoss.toFixed(2)} USDT，接近阈值${maxDailyLoss} USDT！`);
+            }
+            if (dailyLoss >= maxDailyLoss) {
+                lockTrade();
+                showAlert('loss-alert', `当日亏损已达阈值${maxDailyLoss} USDT，已自动锁定仓位！`);
+            }
+            document.getElementById('loss-status').innerText = `当日亏损：${dailyLoss.toFixed(2)}/${maxDailyLoss} USDT`;
+        }
+
+        // 停止自动委托
+        function stopAutoOrder() {
+            if (!isAutoOrderRunning) { alert('自动委托未启动！'); return; }
+            clearInterval(autoOrderTimer);
+            isAutoOrderRunning = false;
+            document.getElementById('auto-order-status').innerText = '❌ 自动委托已停止，可重新设置参数启动';
+            document.getElementById('order-status').innerText = '委托状态：已停止';
+            document.getElementById('order-status').className = 'status-item status-neutral';
+        }
+
+        // 锁定仓位
+        function lockTrade() {
+            isTradeLocked = true;
+            stopAutoOrder();
+            stopMonitor();
+            document.getElementById('position-status').innerText = '仓位已锁定';
+            document.getElementById('position-status').className = 'status-item status-danger';
+            alert('🔒 已锁定仓位，禁止所有交易操作！');
+        }
+
+        // 解锁仓位（可新增按钮调用）
+        function unlockTrade() {
+            isTradeLocked = false;
+            document.getElementById('position-status').innerText = '仓位安全';
+            document.getElementById('position-status').className = 'status-item status-safe';
+            alert('🔓 已解锁仓位，可正常操作！');
+        }
+
+        // 记录交易日志
+        function recordTradeLog(coin, direction, orderType, currentPrice, targetPrice, result) {
+            const now = new Date();
+            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+            const logItem = document.createElement('div');
+            logItem.className = result === '盈利' ? 'log-item-profit' : 'log-item-loss';
+            logItem.innerText = `[${timeStr}] ${coin} | ${direction === 'long' ? '开多' : '开空'} | ${orderType} | 目标价$${targetPrice} | 当前价$${currentPrice} | ${result}`;
+            
+            const logContent = document.getElementById('log-content');
+            if (logContent.querySelector('.log-empty')) logContent.innerHTML = '';
+            logContent.appendChild(logItem);
+            // 滚动到最新日志
+            logContent.scrollTop = logContent.scrollHeight;
+        }
+
+        // 清空交易日志
+        function clearTradeLog() {
+            const logContent = document.getElementById('log-content');
+            logContent.innerHTML = '<div class="log-empty">暂无交易记录</div>';
+        }
+
+        // 显示弹窗提醒
+        function showAlert(alertId, content) {
+            const alertBox = document.getElementById(alertId);
+            document.getElementById(`${alertId.split('-')[0]}-content`).innerText = content;
+            alertBox.classList.remove('hide');
+        }
+
+        // 关闭弹窗提醒
+        function closeAlert(alertId) {
+            document.getElementById(alertId).classList.add('hide');
+        }
+
+        // 一键跳欧易
+        function jumpToOKX() {
+            window.open('https://www.okx.com/', '_blank');
+        }
+
+        // 查看复盘（示例）
+        function showReview() {
+            const reviewContent = `
+                复盘时间：${new Date().toLocaleString()}
+                当前币种：${currentCoin}
+                当前价格：$${currentPriceData[currentCoin].toFixed(2)}
+                当日亏损：${dailyLoss.toFixed(2)}/${maxDailyLoss} USDT
+                委托状态：${isAutoOrderRunning ? '运行中' : '已停止'}
+                行情模式：${currentMode === 'mock' ? '模拟' : '实时'}
+            `;
+            document.getElementById('review-content').innerText = reviewContent;
+            showAlert('review-alert', reviewContent);
+        }
+
+        // 连接TV信号服务（示例，需配合后端）
+        function connectTvServer() {
+            tvServerUrl = document.getElementById('tv-server-url').value.trim();
+            if (!tvServerUrl) {
+                document.getElementById('signal-status').innerText = '❌ 服务地址不能为空！';
+                document.getElementById('signal-status').className = 'signal-status signal-offline';
+                return;
+            }
+            // 模拟连接成功
+            isTvServerConnected = true;
+            document.getElementById('signal-status').innerText = '✅ 已连接TV信号服务，等待信号推送';
+            document.getElementById('signal-status').className = 'signal-status signal-online';
+            document.getElementById('tv-signal-status').innerText = 'TV信号：已连接';
+            document.getElementById('tv-signal-status').className = 'status-item status-safe';
+            
+            // 模拟接收信号
+            setTimeout(() => {
+                const signalLog = document.getElementById('signal-log');
+                signalLog.innerHTML = `[${new Date().toLocaleTimeString()}] 收到信号：BTC 开多 $${currentPriceData.BTC * 1.005}`;
+                showAlert('tv-signal-alert', `收到TV信号：${currentCoin} 开多 $${(currentPriceData.BTC * 1.005).toFixed(2)}`);
+            }, 3000);
+        }
+    </script>
+</body>
+</html>

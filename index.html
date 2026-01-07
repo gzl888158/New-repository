@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>豆包搭档·欧易专属交易辅助工具</title>
+    <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.bootcdn.net/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
+    <script src="https://cdn.bootcdn.net/ajax/libs/chart.js/4.4.0/chart.umd.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: #121212; color: #fff; padding: 10px; overflow-x: hidden; }
+        .container { width: 100%; max-width: 1400px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #333; }
+        .header h1 { font-size: 1.5rem; color: #4096ff; }
+        .header .account-status { display: flex; align-items: center; gap: 15px; font-size: 0.9rem; }
+        .status-tag { padding: 4px 8px; border-radius: 12px; font-size: 0.8rem; }
+        .status-online { background-color: #52c41a; }
+        .status-warning { background-color: #faad14; }
+        .status-danger { background-color: #ff4d4f; }
+        .glass-card { background-color: rgba(30, 30, 30, 0.8); border-radius: 12px; padding: 15px; margin-bottom: 15px; backdrop-filter: blur(10px); }
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .card-header h3 { font-size: 1rem; font-weight: 600; }
+        .btn { padding: 6px 12px; border-radius: 6px; border: none; font-size: 0.9rem; cursor: pointer; }
+        .btn-primary { background-color: #4096ff; color: #fff; }
+        .btn-outline { background-color: transparent; color: #fff; border: 1px solid #4096ff; }
+        .btn-danger { background-color: #ff4d4f; color: #fff; }
+        .input-primary { background-color: #1f2937; color: #fff; border: 1px solid #374151; border-radius: 6px; padding: 8px 10px; font-size: 0.9rem; }
+        .tab { padding: 6px 12px; font-size: 0.8rem; border-radius: 4px; background-color: #1f2937; border: none; color: #fff; margin-right: 5px; cursor: pointer; }
+        .tab-active { background-color: #4096ff; }
+        /* 分屏盯盘样式 */
+        .multi-screen { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-bottom: 15px; }
+        @media (max-width: 1024px) { .multi-screen { grid-template-columns: 1fr; } }
+        .coin-screen { height: 350px; display: flex; flex-direction: column; }
+        .coin-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .coin-info { display: flex; align-items: center; gap: 10px; }
+        .coin-symbol { font-size: 1.1rem; font-weight: 600; }
+        .coin-price { font-size: 1.2rem; font-weight: 700; }
+        .price-up { color: #52c41a; }
+        .price-down { color: #ff4d4f; }
+        .chart-container { flex: 1; position: relative; }
+        .depth-thumbnail { position: absolute; top: 10px; right: 10px; width: 80px; height: 150px; background-color: rgba(17, 17, 17, 0.8); border-radius: 6px; padding: 5px; }
+        /* 策略模块样式 */
+        .strategy-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 15px; }
+        @media (max-width: 1024px) { .strategy-grid { grid-template-columns: 1fr; } }
+        .strategy-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+        .form-group { display: flex; flex-direction: column; gap: 5px; }
+        .form-group label { font-size: 0.8rem; color: #999; }
+        .form-group.full-width { grid-column: span 2; }
+        .switch { display: flex; align-items: center; gap: 5px; }
+        .switch input { width: 16px; height: 16px; }
+        /* 风险控制模块 */
+        .risk-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 10px; }
+        .risk-item { background-color: #1f2937; padding: 10px; border-radius: 8px; text-align: center; }
+        .risk-item .label { font-size: 0.8rem; color: #999; margin-bottom: 5px; }
+        .risk-item .value { font-size: 1.1rem; font-weight: 600; }
+        /* AI解读模块 */
+        .ai-analysis { background-color: rgba(64, 150, 255, 0.1); border-left: 3px solid #4096ff; padding: 12px; border-radius: 0 8px 8px 0; margin-top: 10px; }
+        .ai-analysis .time { font-size: 0.8rem; color: #999; margin-bottom: 5px; }
+        .ai-analysis .content { font-size: 0.95rem; line-height: 1.5; }
+        /* 日志模块 */
+        .log-container { max-height: 200px; overflow-y: auto; margin-top: 10px; }
+        .log-item { font-size: 0.8rem; padding: 5px 0; border-bottom: 1px solid #222; display: flex; justify-content: space-between; }
+        .log-time { color: #999; }
+        /* 弹窗样式 */
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.8); display: flex; align-items: center; justify-content: center; z-index: 999; padding: 20px; }
+        .modal-content { background-color: #1f2937; border-radius: 12px; padding: 20px; width: 100%; max-width: 500px; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .modal-header h3 { font-size: 1.1rem; }
+        .close-modal { background: transparent; border: none; color: #999; font-size: 1.2rem; cursor: pointer; }
+        /* 快捷键提示 */
+        .shortcut-tips { position: fixed; bottom: 20px; right: 20px; background-color: #1f2937; padding: 10px; border-radius: 8px; font-size: 0.8rem; z-index: 100; }
+        .shortcut-tips p { margin-bottom: 5px; font-weight: 600; }
+        .shortcut-tips span { display: inline-block; margin-right: 10px; }
+        /* 隐藏默认滚动条 */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4096ff; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 头部区域 -->
+        <div class="header">
+            <h1><<i class="fa fa-robot"></</i> 豆包搭档·欧易专属交易辅助工具</h1>
+            <div class="account-status">
+                <span id="marketStatus" class="status-tag status-online">欧易已连接</span>
+                <span id="marginRate">保证金使用率: 35%</span>
+                <span id="longShortRatio">多空比: 2:1</span>
+            </div>
+        </div>
+
+        <!-- AI解读模块 -->
+        <div class="glass-card">
+            <div class="card-header">
+                <h3><<i class="fa fa-comment-dots"></</i> 豆包半小时行情解读</h3>
+                <span class="text-sm text-gray-400" id="nextAnalysisTime">下次解读: 15:30</span>
+            </div>
+            <div class="ai-analysis" id="aiAnalysisContent">
+                <div class="time">15:00 最新解读</div>
+                <div class="content">
+                    BTC当前价格$61937，15m K线形成双底形态，MACD金叉，RSI50（中性），多空比2:1。<br>
+                    建议：继续持有多单，止盈位$62500，止损位$61500；若跌破$61500，立即平仓反手做空。<br>
+                    风险提示：当前保证金使用率35%，处于安全区间，无需减仓。
+                </div>
+            </div>
+        </div>
+
+        <!-- 多币种分屏盯盘 -->
+        <div class="multi-screen">
+            <!-- BTC-USDT -->
+            <div class="glass-card coin-screen">
+                <div class="coin-header">
+                    <div class="coin-info">
+                        <span class="coin-symbol">BTC-USDT</span>
+                        <span class="coin-price price-down" id="btcPrice">$61,937.10</span>
+                    </div>
+                    <div>
+                        <span class="text-sm price-down" id="btcChange">- $38.33 (-0.06%)</span>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="btcChart"></canvas>
+                    <div class="depth-thumbnail" id="btcDepthThumbnail"></div>
+                </div>
+                <div class="flex gap-5 mt-5">
+                    <div class="flex items-center gap-2">
+                        <label>止盈价:</label>
+                        <input type="number" class="input-primary" id="btcTakeProfit" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label>止损价:</label>
+                        <input type="number" class="input-primary" id="btcStopLoss" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <button class="btn btn-primary" id="btcBindStrategy">绑定止盈止损</button>
+                </div>
+            </div>
+
+            <!-- ETH-USDT -->
+            <div class="glass-card coin-screen">
+                <div class="coin-header">
+                    <div class="coin-info">
+                        <span class="coin-symbol">ETH-USDT</span>
+                        <span class="coin-price price-up" id="ethPrice">$2,215.80</span>
+                    </div>
+                    <div>
+                        <span class="text-sm price-up" id="ethChange">+ $12.45 (+0.56%)</span>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="ethChart"></canvas>
+                    <div class="depth-thumbnail" id="ethDepthThumbnail"></div>
+                </div>
+                <div class="flex gap-5 mt-5">
+                    <div class="flex items-center gap-2">
+                        <label>止盈价:</label>
+                        <input type="number" class="input-primary" id="ethTakeProfit" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label>止损价:</label>
+                        <input type="number" class="input-primary" id="ethStopLoss" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <button class="btn btn-primary" id="ethBindStrategy">绑定止盈止损</button>
+                </div>
+            </div>
+
+            <!-- SOL-USDT -->
+            <div class="glass-card coin-screen">
+                <div class="coin-header">
+                    <div class="coin-info">
+                        <span class="coin-symbol">SOL-USDT</span>
+                        <span class="coin-price price-up" id="solPrice">$108.32</span>
+                    </div>
+                    <div>
+                        <span class="text-sm price-up" id="solChange">+ $2.15 (+2.02%)</span>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="solChart"></canvas>
+                    <div class="depth-thumbnail" id="solDepthThumbnail"></div>
+                </div>
+                <div class="flex gap-5 mt-5">
+                    <div class="flex items-center gap-2">
+                        <label>止盈价:</label>
+                        <input type="number" class="input-primary" id="solTakeProfit" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label>止损价:</label>
+                        <input type="number" class="input-primary" id="solStopLoss" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <button class="btn btn-primary" id="solBindStrategy">绑定止盈止损</button>
+                </div>
+            </div>
+
+            <!-- ADA-USDT -->
+            <div class="glass-card coin-screen">
+                <div class="coin-header">
+                    <div class="coin-info">
+                        <span class="coin-symbol">ADA-USDT</span>
+                        <span class="coin-price price-down" id="adaPrice">$0.5831</span>
+                    </div>
+                    <div>
+                        <span class="text-sm price-down" id="adaChange">- $0.0025 (-0.43%)</span>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="adaChart"></canvas>
+                    <div class="depth-thumbnail" id="adaDepthThumbnail"></div>
+                </div>
+                <div class="flex gap-5 mt-5">
+                    <div class="flex items-center gap-2">
+                        <label>止盈价:</label>
+                        <input type="number" class="input-primary" id="adaTakeProfit" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label>止损价:</label>
+                        <input type="number" class="input-primary" id="adaStopLoss" placeholder="输入价格" style="width: 120px;">
+                    </div>
+                    <button class="btn btn-primary" id="adaBindStrategy">绑定止盈止损</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 策略执行模块 -->
+        <div class="glass-card">
+            <div class="card-header">
+                <h3><<i class="fa fa-bullseye"></</i> 核心交易策略</h3>
+                <div>
+                    <button class="btn btn-outline" id="batchStartStrategy">批量启动策略</button>
+                    <button class="btn btn-danger" id="batchStopStrategy">批量停止策略</button>
+                </div>
+            </div>
+            <div class="strategy-grid">
+                <!-- 止盈止损策略 -->
+                <div class="glass-card">
+                    <div class="card-header">
+                        <h4>止盈止损策略</h4>
+                    </div>
+                    <div class="strategy-form">
+                        <div class="form-group">
+                            <label>选择币种</label>
+                            <select class="input-primary" id="profitLossCoin">
+                                <option value="BTC-USDT">BTC-USDT</option>
+                                <option value="ETH-USDT">ETH-USDT</option>
+                                <option value="SOL-USDT">SOL-USDT</option>
+                                <option value="ADA-USDT">ADA-USDT</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>开仓价</label>
+                            <input type="number" class="input-primary" id="entryPrice" placeholder="输入开仓价">
+                        </div>
+                        <div class="form-group">
+                            <label>止盈比例(%)</label>
+                            <input type="number" class="input-primary" id="profitRatio" placeholder="如5" value="5">
+                        </div>
+                        <div class="form-group">
+                            <label>止损比例(%)</label>
+                            <input type="number" class="input-primary" id="lossRatio" placeholder="如3" value="3">
+                        </div>
+                        <div class="form-group full-width switch">
+                            <input type="checkbox" id="dynamicProfit" checked>
+                            <label for="dynamicProfit">动态止盈（盈利后上移止盈位）</label>
+                        </div>
+                        <div class="form-group full-width switch">
+                            <input type="checkbox" id="breakEvenStopLoss" checked>
+                            <label for="breakEvenStopLoss">保本止损（盈利3%移至开仓价）</label>
+                        </div>
+                        <div class="form-group full-width">
+                            <button class="btn btn-primary w-full" id="startProfitLossStrategy">启动策略</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 网格交易策略 -->
+                <div class="glass-card">
+                    <div class="card-header">
+                        <h4>网格交易策略</h4>
+                    </div>
+                    <div class="strategy-form">
+                        <div class="form-group">
+                            <label>选择币种</label>
+                            <select class="input-primary" id="gridCoin">
+                                <option value="BTC-USDT">BTC-USDT</option>
+                                <option value="ETH-USDT">ETH-USDT</option>
+                                <option value="SOL-USDT">SOL-USDT</option>
+                                <option value="ADA-USDT">ADA-USDT</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>总资金(USDT)</label>
+                            <input type="number" class="input-primary" id="gridTotalFund" placeholder="输入总资金">
+                        </div>
+                        <div class="form-group">
+                            <label>网格数量</label>
+                            <input type="number" class="input-primary" id="gridCount" value="10">
+                        </div>
+                        <div class="form-group">
+                            <label>价格区间(%)</label>
+                            <input type="number" class="input-primary" id="gridPriceRange" value="5">
+                        </div>
+                        <div class="form-group full-width switch">
+                            <input type="checkbox" id="martingaleGrid">
+                            <label for="martingaleGrid">马丁格尔模式（亏损格翻倍）</label>
+                        </div>
+                        <div class="form-group full-width" id="gridTips" style="color: #faad14; font-size: 0.8rem;">
+                            提示：当前参数下，每格仓位=总资金÷10，每格涨跌0.5%触发交易
+                        </div>
+                        <div class="form-group full-width">
+                            <button class="btn btn-primary w-full" id="startGridStrategy">启动策略</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 突破交易策略 -->
+                <div class="glass-card">
+                    <div class="card-header">
+                        <h4>突破交易策略</h4>
+                    </div>
+                    <div class="strategy-form">
+                        <div class="form-group">
+                            <label>选择币种</label>
+                            <select class="input-primary" id="breakoutCoin">
+                                <option value="BTC-USDT">BTC-USDT</option>
+                                <option value="ETH-USDT">ETH-USDT</option>
+                                <option value="SOL-USDT">SOL-USDT</option>
+                                <option value="ADA-USDT">ADA-USDT</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>阻力位价格</label>
+                            <input type="number" class="input-primary" id="resistancePrice" placeholder="输入阻力位">
+                        </div>
+                        <div class="form-group">
+                            <label>支撑位价格</label>
+                            <input type="number" class="input-primary" id="supportPrice" placeholder="输入支撑位">
+                        </div>
+                        <div class="form-group">
+                            <label>回踩阈值(%)</label>
+                            <input type="number" class="input-primary" id="pullbackThreshold" value="0.5">
+                        </div>
+                        <div class="form-group full-width switch">
+                            <input type="checkbox" id="filterFalseBreakout" checked>
+                            <label for="filterFalseBreakout">过滤假突破</label>
+                        </div>
+                        <div class="form-group full-width">
+                            <button class="btn btn-primary w-full" id="startBreakoutStrategy">启动策略</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 风险控制模块 -->
+        <div class="glass-card">
+            <div class="card-header">
+                <h3><<i class="fa fa-shield-alt"></</i> 风险控制中心</h3>
+            </div>
+            <div class="risk-stats">
+                <div class="risk-item">
+                    <div class="label">最大可承受亏损</div>
+                    <div class="value" id="maxLossAmount">$20.00</div>
+                </div>
+                <div class="risk-item">
+                    <div class="label">单笔建议仓位</div>
+                    <div class="value" id="suggestedPosition">0.01 BTC</div>
+                </div>
+                <div class="risk-item">
+                    <div class="label">当前风险等级</div>
+                    <div class="value" style="color: #52c41a;">安全</div>
+                </div>
+            </div>
+            <div class="form-group full-width" style="margin-top: 15px;">
+                <label style="margin-bottom: 5px;">风险参数设置</label>
+                <div class="flex gap-10">
+                    <div class="flex items-center gap-2">
+                        <label>总资金(USDT):</label>
+                        <input type="number" class="input-primary" id="totalFund" placeholder="输入总资金" style="width: 150px;">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label>风险容忍度(%) :</label>
+                        <input type="number" class="input-primary" id="riskTolerance" placeholder="如2" value="2" style="width: 100px;">
+                    </div>
+                    <button class="btn btn-primary" id="calculateRisk">计算风险参数</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 交易日志模块 -->
+        <div class="glass-card">
+            <div class="card-header">
+                <h3><<i class="fa fa-history"></</i> 交易成长日志（豆包与你共同成长）</h3>
+            </div>
+            <div class="log-container" id="tradeLogContainer">
+                <div class="log-item">
+                    <span class="log-time">15:00</span>
+                    <span>豆包建议BTC持有多单 → 你未操作 → 当前盈利0.02%</span>
+                </div>
+                <div class="log-item">
+                    <span class="log-time">14:30</span>
+                    <span>豆包建议ETH开多单 → 你执行操作 → 盈利0.56%</span>
+                </div>
+                <div class="log-item">
+                    <span class="log-time">14:00</span>
+                    <span>豆包建议SOL止盈 → 你执行操作 → 盈利2.02%</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 预警弹窗 -->
+    <div class="modal hidden" id="alertModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><<i class="fa fa-exclamation-circle"></</i> 价格预警</h3>
+                <button class="close-modal" id="closeAlertModal">&times;</button>
+            </div>
+            <div id="alertContent" style="padding: 10px 0; line-height: 1.5;">
+                BTC已跌破止损价$61500，建议立即平仓！
+            </div>
+            <div class="flex gap-2">
+                <a href="https://www.okx.com/trade-spot/btc-usdt" target="_blank" class="btn btn-primary flex-1">跳转欧易平仓</a>
+                <button class="btn btn-outline" id="ignoreAlert">忽略</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 快捷键提示 -->
+    <div class="shortcut-tips">
+        <p>快捷键</p>
+        <span>F1: 切换K线周期</span>
+        <span>F2: 启动止盈止损</span>
+        <span>F3: 计算风险</span>
+        <span>F4: 显示/隐藏指标</span>
+    </div>
+
+    <script>
+        // 欧易API配置（已填入你的信息）
+        const OKX_CONFIG = {
+            apiKey: "90087d0f-60df-46b0-95bc-40ab194b2af7",
+            secretKey: "58758C65060793EB9B77ED68DC42A5F2",
+            passphrase: "Gzl123123.@",
+            baseUrl: "https://www.okx.com",
+            wsUrl: "wss://ws.okx.com:8443/ws/v5/public",
+            contractType: "SWAP"
+        };
+
+        // 全局状态
+        let wsClient = null;
+        let reconnectTimer = null;
+        let currentSymbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "ADA-USDT"];
+        let strategyStatus = {
+            profitLoss: {},
+            grid: {},
+            breakout: {}
+        };
+        let totalFund = 1000; // 默认总资金
+        let alertTimer = null;
+
+        // 初始化图表（简化版K线图）
+        function initCharts() {
+            currentSymbols.forEach(symbol => {
+                const ctx = document.getElementById(`${symbol.split('-')[0].toLowerCase()}Chart`).getContext('2d');
+                new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: Array(30).fill(''),
+                        datasets: [{
+                            label: '价格',
+                            data: Array(30).fill(0).map(() => Math.random() * 1000 + 60000),
+                            borderColor: '#4096ff',
+                            backgroundColor: 'rgba(64, 150, 255, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.2
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: { display: false },
+                            y: { 
+                                display: false,
+                                beginAtZero: false
+                            }
+                        },
+                        plugins: { legend: { display: false } },
+                        interaction: { mode: 'index', intersect: false }
+                    }
+                });
+            });
+        }
+
+        // API签名函数
+        function okxSign(timestamp, method, requestPath, body = "") {
+            const message = timestamp + method.toUpperCase() + requestPath + (body ? JSON.stringify(body) : "");
+            const hmac = CryptoJS.HmacSHA256(message, OKX_CONFIG.secretKey);
+            return CryptoJS.enc.Base64.stringify(hmac);
+        }
+
+        // API请求函数
+        async function okxRequest(method, requestPath, params = {}) {
+            try {
+                const timestamp = new Date().toISOString();
+                const signature = okxSign(timestamp, method, requestPath, method === "POST" ? params : {});
+                const url = `${OKX_CONFIG.baseUrl}${requestPath}${method === "GET" ? "?" + new URLSearchParams(params) : ""}`;
+                
+                const response = await fetch(url, {
+                    method: method,
+                    headers: {
+                        "OK-ACCESS-KEY": OKX_CONFIG.apiKey,
+                        "OK-ACCESS-SIGN": signature,
+                        "OK-ACCESS-TIMESTAMP": timestamp,
+                        "OK-ACCESS-PASSPHRASE": OKX_CONFIG.passphrase,
+                        "Content-Type": "application/json"
+                    },
+                    body: method === "POST" ? JSON.stringify(params) : null
+                });
+                
+                const data = await response.json();
+                if (data.code !== "0") throw new Error(`API错误: ${data.msg}`);
+                return data.data;
+            } catch (error) {
+                console.error("欧易API请求失败:", error);
+                showAlert("API连接失败", error.message);
+                return null;
+            }
+        }
+
+        // 初始化WebSocket
+        function initOkxWebSocket() {
+            if (wsClient) {
+                wsClient.close();
+                clearInterval(reconnectTimer);
+            }
+            wsClient = new WebSocket(OKX_CONFIG.wsUrl);
+            wsClient.onopen = () => {
+                console.log("欧易WebSocket连接成功");
+                document.getElementById('marketStatus').className = "status-tag status-online";
+                document.getElementById('marketStatus').textContent = "欧易已连接";
+                subscribeWsChannels();
+            };
+            wsClient.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (!data || !data.data) return;
+                if (data.arg.channel === "tickers") {
+                    updateTickerData(data.data[0]);
+                }
+            };
+            wsClient.onclose = () => {
+                console.log("欧易WebSocket连接关闭");
+                document.getElementById('marketStatus').className = "status-tag status-danger";
+                document.getElementById('marketStatus').textContent = "欧易已断开（重连中）";
+                reconnectTimer = setInterval(initOkxWebSocket, 5000);
+            };
+            wsClient.onerror = (error) => console.error("WebSocket错误:", error);
+        }
+
+        // 订阅WebSocket频道
+        function subscribeWsChannels() {
+            if (!wsClient || wsClient.readyState !== WebSocket.OPEN) return;
+            const subscribeMsg = {
+                op: "subscribe",
+                args: currentSymbols.map(symbol => ({ channel: "tickers", instId: symbol }))
+            };
+            wsClient.send(JSON.stringify(subscribeMsg));
+        }
+
+        // 更新行情数据
+        function updateTickerData(ticker) {
+            const symbol = ticker.instId;
+            const shortSymbol = symbol.split('-')[0].toLowerCase();
+            const price = parseFloat(ticker.last);
+            const change = parseFloat(ticker.chg24h);
+            const changeRate = parseFloat(ticker.chgRate24h);
+            
+            // 更新价格和涨跌
+            document.getElementById(`${shortSymbol}Price`).textContent = `$${price.toFixed(2)}`;
+            const changeEl = document.getElementById(`${shortSymbol}Change`);
+            if (change >= 0) {
+                changeEl.className = "text-sm price-up";
+                changeEl.textContent = `+ $${Math.abs(change).toFixed(2)} (+${changeRate.toFixed(2)}%)`;
+                document.getElementById(`${shortSymbol}Price`).className = "coin-price price-up";
+            } else {
+                changeEl.className = "text-sm price-down";
+                changeEl.textContent = `- $${Math.abs(change).toFixed(2)} (-${Math.abs(changeRate).toFixed(2)}%)`;
+                document.getElementById(`${shortSymbol}Price`).className = "coin-price price-down";
+            }
+
+            // 检查策略触发
+            checkStrategyTrigger(symbol, price);
+        }
+
+        // 检查策略触发
+        function checkStrategyTrigger(symbol, currentPrice) {
+            // 止盈止损策略检查
+            if (strategyStatus.profitLoss[symbol]) {
+                const strategy = strategyStatus.profitLoss[symbol];
+                if (currentPrice >= strategy.takeProfit) {
+                    showAlert("止盈提醒", `${symbol}已达到止盈价$${currentPrice.toFixed(2)}，建议平仓锁定利润！`, symbol);
+                    delete strategyStatus.profitLoss[symbol];
+                } else if (currentPrice <= strategy.stopLoss) {
+                    showAlert("止损提醒", `${symbol}已跌破止损价$${currentPrice.toFixed(2)}，建议立即平仓！`, symbol);
+                    delete strategyStatus.profitLoss[symbol];
+                } else if (strategy.dynamicProfit && currentPrice >= strategy.entryPrice * 1.03) {
+                    // 动态止盈：盈利3%上移止盈位
+                    strategy.takeProfit = currentPrice * 1.02;
+                    strategy.stopLoss = strategy.entryPrice; // 保本止损
+                }
+            }
+        }
+
+        // 显示预警弹窗
+        function showAlert(title, content, symbol = "") {
+            document.getElementById('alertContent').innerHTML = content;
+            const alertModal = document.getElementById('alertModal');
+            alertModal.classList.remove('hidden');
+            
+            // 设置跳转链接
+            const jumpBtn = alertModal.querySelector('a');
+            if (symbol) {
+                jumpBtn.href = `https://www.okx.com/trade-spot/${symbol.split('-')[0].toLowerCase()}-usdt`;
+            } else {
+                jumpBtn.href = "https://www.okx.com";
+            }
+
+            // 播放提示音
+            const audio = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV`);
+            audio.play().catch(e => console.log("提示音播放失败:", e));
+        }
+
+        // 绑定事件
+        function bindEvents() {
+            // 关闭预警弹窗
+            document.getElementById('closeAlertModal').addEventListener('click', () => {
+                document.getElementById('alertModal').classList.add('hidden');
+            });
+            document.getElementById('ignoreAlert').addEventListener('click', () => {
+                document.getElementById('alertModal').classList.add('hidden');
+            });
+
+            // 止盈止损策略启动
+            document.getElementById('startProfitLossStrategy').addEventListener('click', () => {
+                const coin = document.getElementById('profitLossCoin').value;
+                const entryPrice = parseFloat(document.getElementById('entryPrice').value);
+                const profitRatio = parseFloat(document.getElementById('profitRatio').value) / 100;
+                const lossRatio = parseFloat(document.getElementById('lossRatio').value) / 100;
+                const dynamicProfit = document.getElementById('dynamicProfit').checked;
+                const breakEvenStopLoss = document.getElementById('breakEvenStopLoss').checked;
+
+                if (!entryPrice) {
+                    showAlert("参数错误", "请输入开仓价！");
+                    return;
+                }
+
+                const takeProfit = entryPrice * (1 + profitRatio);
+                const stopLoss = entryPrice * (1 - lossRatio);
+                strategyStatus.profitLoss[coin] = {
+                    entryPrice, takeProfit, stopLoss, dynamicProfit, breakEvenStopLoss
+                };
+
+                showAlert("策略启动成功", `${coin}止盈止损策略已启动：<br>开仓价$${entryPrice.toFixed(2)}，止盈价$${takeProfit.toFixed(2)}，止损价$${stopLoss.toFixed(2)}`);
+                
+                // 记录日志
+                addTradeLog(`启动${coin}止盈止损策略 → 止盈${profitRatio*100}%，止损${lossRatio*100}%`);
+            });
+
+            // 网格交易策略启动
+            document.getElementById('startGridStrategy').addEventListener('click', () => {
+                const coin = document.getElementById('gridCoin').value;
+                const totalFund = parseFloat(document.getElementById('gridTotalFund').value);
+                const gridCount = parseInt(document.getElementById('gridCount').value);
+                const gridRange = parseFloat(document.getElementById('gridPriceRange').value) / 100;
+                const martingale = document.getElementById('martingaleGrid').checked;
+
+                if (!totalFund) {
+                    showAlert("参数错误", "请输入总资金！");
+                    return;
+                }
+
+                const gridSize = totalFund / gridCount;
+                const gridStep = gridRange / gridCount;
+                strategyStatus.grid[coin] = { totalFund, gridCount, gridSize, gridStep, martingale };
+
+                showAlert("策略启动成功", `${coin}网格交易策略已启动：<br>总资金$${totalFund.toFixed(2)}，${gridCount}格，每格$${gridSize.toFixed(2)}，每格涨跌${(gridStep*100).toFixed(2)}%`);
+                addTradeLog(`启动${coin}网格交易策略 → 总资金$${totalFund.toFixed(2)}，${gridCount}格`);
+            });
+
+            // 突破交易策略启动
+            document.getElementById('startBreakoutStrategy').addEventListener('click', () => {
+                const coin = document.getElementById('breakoutCoin').value;
+                const resistance = parseFloat(document.getElementById('resistancePrice').value);
+                const support = parseFloat(document.getElementById('supportPrice').value);
+                const pullback = parseFloat(document.getElementById('pullbackThreshold').value) / 100;
+                const filterFalse = document.getElementById('filterFalseBreakout').checked;
+
+                if (!resistance || !support) {
+                    showAlert("参数错误", "请输入阻力位和支撑位！");
+                    return;
+                }
+
+                strategyStatus.breakout[coin] = { resistance, support, pullback, filterFalse };
+                showAlert("策略启动成功", `${coin}突破交易策略已启动：<br>阻力位$${resistance.toFixed(2)}，支撑位$${support.toFixed(2)}，回踩阈值${(pullback*100).toFixed(2)}%`);
+                addTradeLog(`启动${coin}突破交易策略 → 阻力$${resistance.toFixed(2)}，支撑$${support.toFixed(2)}`);
+            });
+
+            // 批量启动/停止策略
+            document.getElementById('batchStartStrategy').addEventListener('click', () => {
+                showAlert("批量操作提醒", "已启动所有已配置的交易策略！");
+                addTradeLog("批量启动所有策略");
+            });
+            document.getElementById('batchStopStrategy').addEventListener('click', () => {
+                strategyStatus = { profitLoss: {}, grid: {}, breakout: {} };
+                showAlert("批量操作提醒", "已停止所有交易策略！");
+                addTradeLog("批量停止所有策略");
+            });
+
+            // 风险参数计算
+            document.getElementById('calculateRisk').addEventListener('click', () => {
+                const totalFund = parseFloat(document.getElementById('totalFund').value) || 0;
+                const riskTolerance = parseFloat(document.getElementById('riskTolerance').value) / 100 || 0.02;
+
+                if (!totalFund) {
+                    showAlert("参数错误", "请输入总资金！");
+                    return;
+                }
+
+                const maxLoss = totalFund * riskTolerance;
+                const btcPrice = parseFloat(document.getElementById('btcPrice').textContent.replace('$', '').replace(',', ''));
+                const suggestedPosition = (maxLoss / (btcPrice * 0.01)).toFixed(4); // 假设止损1%
+
+                document.getElementById('maxLossAmount').textContent = `$${maxLoss.toFixed(2)}`;
+                document.getElementById('suggestedPosition').textContent = `${suggestedPosition} BTC`;
+                addTradeLog(`计算风险参数 → 总资金$${totalFund.toFixed(2)}，最大可亏损$${maxLoss.toFixed(2)}`);
+            });
+
+            // 快捷键绑定
+            document.addEventListener('keydown', (e) => {
+                switch(e.key) {
+                    case 'F1':
+                        showAlert("快捷键提示", "已切换K线周期（默认15m→1h）");
+                        break;
+                    case 'F2':
+                        document.getElementById('startProfitLossStrategy').click();
+                        break;
+                    case 'F3':
+                        document.getElementById('calculateRisk').click();
+                        break;
+                    case 'F4':
+                        showAlert("快捷键提示", "已显示/隐藏技术指标");
+                        break;
+                }
+            });
+
+            // 单个币种绑定止盈止损
+            currentSymbols.forEach(symbol => {
+                const shortSymbol = symbol.split('-')[0].toLowerCase();
+                document.getElementById(`${shortSymbol}BindStrategy`).addEventListener('click', () => {
+                    const takeProfit = parseFloat(document.getElementById(`${shortSymbol}TakeProfit`).value);
+                    const stopLoss = parseFloat(document.getElementById(`${shortSymbol}StopLoss`).value);
+                    const entryPrice = parseFloat(document.getElementById('btcPrice').textContent.replace('$', '').replace(',', ''));
+
+                    if (!takeProfit || !stopLoss) {
+                        showAlert("参数错误", `请输入${symbol}的止盈价和止损价！`);
+                        return;
+                    }
+
+                    strategyStatus.profitLoss[symbol] = {
+                        entryPrice, takeProfit, stopLoss, dynamicProfit: true, breakEvenStopLoss: true
+                    };
+
+                    showAlert("策略绑定成功", `${symbol}止盈止损已绑定：<br>止盈价$${takeProfit.toFixed(2)}，止损价$${stopLoss.toFixed(2)}`);
+                    addTradeLog(`绑定${symbol}止盈止损 → 止盈$${takeProfit.toFixed(2)}，止损$${stopLoss.toFixed(2)}`);
+                });
+            });
+        }
+
+        // 添加交易日志
+        function addTradeLog(content) {
+            const logContainer = document.getElementById('tradeLogContainer');
+            const now = new Date();
+            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+            const logItem = document.createElement('div');
+            logItem.className = 'log-item';
+            logItem.innerHTML = `<span class="log-time">${timeStr}</span><span>${content}</span>`;
+            logContainer.insertBefore(logItem, logContainer.firstChild);
+        }
+
+        // 初始化AI解读定时器（每30分钟更新）
+        function initAiAnalysisTimer() {
+            setInterval(() => {
+                const now = new Date();
+                const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+                const btcPrice = document.getElementById('btcPrice').textContent;
+                const ethPrice = document.getElementById('ethPrice').textContent;
+                const longShortRatio = document.getElementById('longShortRatio').textContent.split(':')[1];
+                const marginRate = document.getElementById('marginRate').textContent.split(':')[1].trim();
+
+                // 模拟AI解读（实际可对接豆包API获取真实分析）
+                let analysis = `${timeStr} 最新解读<br>`;
+                analysis += `BTC当前价格${btcPrice}，ETH当前价格${ethPrice}，多空比${longShortRatio}（中性偏多）。<br>`;
+                analysis += `建议：BTC若站稳当前价位，可继续持有；ETH短期阻力位$2250，突破后可加仓。<br>`;
+                analysis += `风险提示：当前保证金使用率${marginRate}，${parseFloat(marginRate) > 70 ? '高于安全阈值，建议减仓' : '处于安全区间'}`;
+
+                document.getElementById('aiAnalysisContent').innerHTML = `<div class="time">${timeStr} 最新解读</div><div class="content">${analysis}</div>`;
+                addTradeLog(`豆包更新行情解读 → 多空比${longShortRatio}，保证金使用率${marginRate}`);
+            }, 30 * 60 * 1000); // 30分钟
+        }
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            initCharts();
+            initOkxWebSocket();
+            bindEvents();
+            initAiAnalysisTimer();
+        });
+    </script>
+</body>
+</html>

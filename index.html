@@ -94,6 +94,24 @@
             margin-bottom: 8px;
             text-align: center;
         }
+        /* 新增：排查结果提示 */
+        .api-check-result {
+            font-size: 12px;
+            padding: 8px;
+            border-radius: 4px;
+            margin-top: 8px;
+            display: none;
+        }
+        .check-success {
+            background: #10b98133;
+            color: #10b981;
+            display: block;
+        }
+        .check-error {
+            background: #ef444433;
+            color: #ef4444;
+            display: block;
+        }
         /* 状态栏-颜色分级预警 */
         .status-bar {
             background: #1e293b;
@@ -303,7 +321,7 @@
             <div class="guide-step-title">✅ 步骤1：选择使用模式</div>
             <div class="guide-step-content">
                 1. 点击 <span class="guide-highlight">模拟行情模式</span>：无需API，直接用！默认加载BTC/ETH等模拟价格，适合新手练手。<br>
-                2. 点击 <span class="guide-highlight">实盘API模式</span>：自动填充你提供的API信息，一键测试连接。
+                2. 点击 <span class="guide-highlight">实盘API模式</span>：需填欧易API Key，适合老手对接真实行情。
             </div>
         </div>
         <div class="guide-step">
@@ -362,6 +380,8 @@
         Secret Key：<input type="text" class="calc-input" id="secret-key" placeholder="输入欧易Secret Key" value="E5DD942D5204DD8D9CDC1B488927BCA5">
         <button class="big-btn primary-btn" onclick="testApi()">测试API连接</button>
         <div class="calc-result" id="api-test-result">👉 点击测试按钮，验证API是否有效</div>
+        <!-- 新增：排查结果显示区 -->
+        <div class="api-check-result" id="api-check-result"></div>
     </div>
 
     <!-- 状态栏 -->
@@ -521,6 +541,9 @@
             const apiConfig = document.getElementById('api-config');
             const priceStatus = document.getElementById('price-status');
             const modeTips = document.getElementById('mode-tips');
+            const checkResult = document.getElementById('api-check-result');
+            checkResult.className = 'api-check-result';
+            checkResult.textContent = '';
             if (mode === 'mock') {
                 apiConfig.style.display = 'none';
                 priceStatus.innerText = '行情状态：模拟行情';
@@ -561,6 +584,21 @@
             return CryptoJS.HmacSHA256(queryString, secret).toString(CryptoJS.enc.Base64);
         }
 
+        // 新增：API错误排查函数
+        function analyzeApiError(errorMsg) {
+            const checkResult = document.getElementById('api-check-result');
+            checkResult.className = 'api-check-result check-error';
+            if (errorMsg.includes('Invalid API key') || errorMsg.includes('Invalid sign')) {
+                return '❌ 排查结果：密钥无效！请检查API Key和Secret Key是否填写正确，确认没有多余空格。';
+            } else if (errorMsg.includes('Permission denied') || errorMsg.includes('No permission')) {
+                return '❌ 排查结果：权限不足！请确认API已开启「行情读取」和「交易」权限。';
+            } else if (errorMsg.includes('IP not in whitelist') || errorMsg.includes('Invalid IP')) {
+                return '❌ 排查结果：IP未白名单！请将当前设备IP添加到欧易API的IP白名单中。';
+            } else {
+                return `❌ 排查结果：未知错误！错误信息：${errorMsg}，请联系欧易客服查询。`;
+            }
+        }
+
         // 获取实盘价格
         async function getRealTimePrice(symbol) {
             try {
@@ -575,11 +613,10 @@
                 if (data.code === '0') {
                     return parseFloat(data.data[0].last);
                 } else {
-                    throw new Error(`API错误：${data.msg}`);
+                    throw new Error(data.msg);
                 }
             } catch (error) {
-                showAlert('price-alert', `行情获取失败：${error.message}`);
-                return 0;
+                throw new Error(error.message);
             }
         }
 
@@ -587,33 +624,47 @@
         async function testApi() {
             apiKey = document.getElementById('api-key').value.trim();
             secretKey = document.getElementById('secret-key').value.trim();
+            const testResult = document.getElementById('api-test-result');
+            const checkResult = document.getElementById('api-check-result');
+            checkResult.className = 'api-check-result';
+            checkResult.textContent = '';
+
             if (!apiKey || !secretKey) {
-                document.getElementById('api-test-result').innerText = '❌ 请输入完整的API Key和Secret Key';
+                testResult.innerText = '❌ API Key或Secret Key不能为空！';
                 return;
             }
+
+            testResult.innerText = '🔄 正在测试API连接，请稍候...';
+
             // 引入CryptoJS加密库
             if (!window.CryptoJS) {
                 const script = document.createElement('script');
                 script.src = 'https://cdn.bootcdn.net/ajax/libs/crypto-js/4.1.1/crypto-js.min.js';
                 script.onload = async () => {
-                    const price = await getRealTimePrice(coinSymbolMap.BTC);
-                    if (price > 0) {
-                        document.getElementById('api-test-result').innerText = '✅ API连接成功！可以启动实盘行情监控';
-                        document.getElementById('price-status').innerText = '行情状态：已连接';
-                        document.getElementById('price-status').className = 'status-item status-safe';
-                    } else {
-                        document.getElementById('api-test-result').innerText = '❌ API连接失败，请检查Key、权限或IP白名单';
-                    }
+                    await executeApiTest();
                 };
                 document.head.appendChild(script);
             } else {
-                const price = await getRealTimePrice(coinSymbolMap.BTC);
-                if (price > 0) {
-                    document.getElementById('api-test-result').innerText = '✅ API连接成功！可以启动实盘行情监控';
-                    document.getElementById('price-status').innerText = '行情状态：已连接';
-                    document.getElementById('price-status').className = 'status-item status-safe';
-                } else {
-                    document.getElementById('api-test-result').innerText = '❌ API连接失败，请检查Key、权限或IP白名单';
+                await executeApiTest();
+            }
+
+            // 执行测试逻辑
+            async function executeApiTest() {
+                try {
+                    const price = await getRealTimePrice(coinSymbolMap.BTC);
+                    if (price > 0) {
+                        testResult.innerText = '✅ API连接成功！可以启动实盘行情监控';
+                        checkResult.className = 'api-check-result check-success';
+                        checkResult.textContent = '✅ 密钥有效、权限充足、IP已白名单！';
+                        document.getElementById('price-status').innerText = '行情状态：已连接';
+                        document.getElementById('price-status').className = 'status-item status-safe';
+                    } else {
+                        testResult.innerText = '❌ API连接失败，未获取到行情数据';
+                    }
+                } catch (error) {
+                    testResult.innerText = '❌ API连接失败，请检查配置';
+                    const errorInfo = analyzeApiError(error.message);
+                    checkResult.textContent = errorInfo;
                 }
             }
         }
@@ -621,10 +672,14 @@
         // 更新所有实盘价格
         async function updateAllRealPrices() {
             for (const coin in coinSymbolMap) {
-                const price = await getRealTimePrice(coinSymbolMap[coin]);
-                if (price > 0) {
-                    currentPriceData[coin] = price;
-                    updateCoinCards();
+                try {
+                    const price = await getRealTimePrice(coinSymbolMap[coin]);
+                    if (price > 0) {
+                        currentPriceData[coin] = price;
+                        updateCoinCards();
+                    }
+                } catch (error) {
+                    showAlert('price-alert', `获取${coin}行情失败：${error.message}`);
                 }
             }
         }
@@ -725,6 +780,7 @@
                 alert('✅ 已启动模拟行情监控，每5秒更新一次价格！');
             } else {
                 if (!apiKey || !secretKey) { alert('请先配置并测试API！'); return; }
+！'); return; }
                 isPriceMonitorRunning = true;
                 document.getElementById('price-status').innerText = '行情状态：实盘监控中';
                 updateAllRealPrices();

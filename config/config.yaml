@@ -1,29 +1,21 @@
-# 欧易接口配置
-okx:
-  market_url: "https://www.okx.com/api/v5/market"
-  trade_url: "https://www.okx.com/api/v5/trade"
-  account_url: "https://www.okx.com/api/v5/account"
-
 # 策略参数
 strategy:
-  inst_ids: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-  timeframes: ["15m", "1h", "4h"]  # 多周期共振
   kline_limit: 100
   atr_period: 14
-  atr_tp_multiplier: 1.5  # 止盈ATR倍数
-  atr_sl_multiplier: 1.0  # 止损ATR倍数
+  atr_tp_multiplier: 2.0
+  atr_sl_multiplier: 1.0
 
 # 风控参数
 risk:
-  max_daily_loss: 0.05  # 单日最大亏损5%
-  max_consecutive_loss: 2  # 连续亏损2次熔断
-  daily_trade_limit: 10  # 单日最多交易10次
-  risk_ratio: 0.02  # 单笔风险2%
-  leverage: 10
-  min_order_volume: 0.001
+  leverage: 5
+  risk_ratio: 0.02  # 单次风险占账户2%
+  max_daily_loss: 0.1  # 单日最大亏损10%
+  max_consecutive_loss: 3  # 最大连续亏损次数
+  daily_trade_limit: 20  # 单日最大交易次数
+  min_order_volume: 0.001  # 最小下单量
 
-# 运行配置
-run:
-  interval: 1800  # 30分钟运行一次
-  backtest_days: 30  # 回测30天数据
-  init_capital: 1000  # 回测初始资金1000USDT
+# 欧易API配置
+okx:
+  real_base_url: "https://www.okx.com"
+  sim_base_url: "https://www.okx.com/testnet"
+  timeout: 10

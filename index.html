@@ -83,3 +83,11 @@
     </script>
 </body>
 </html>
+ws.onerror = (error) => {
+    console.error("WebSocket连接错误：", error);
+    alert("行情数据连接失败，请检查网络或刷新页面");
+};
+ws.onclose = () => {
+    alert("WebSocket连接断开，正在重连...");
+    setTimeout(() => window.location.reload(), 3000); // 自动重连
+};

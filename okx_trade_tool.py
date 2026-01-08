@@ -1,124 +1,170 @@
-import os
 import time
-import csv
-import pandas as pd
-from okx import OKXClient
-from datetime import datetime
+import json
+import requests
+import numpy as np
+from datetime import datetime, timedelta
 
-# ========== 从环境变量读取 API 密钥（安全无泄露） ==========
-API_KEY = os.getenv("OKX_API_KEY")
-SECRET_KEY = os.getenv("OKX_SECRET_KEY")
-PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-FLAG = os.getenv("OKX_FLAG", "0")  # 默认实盘
+# ==================== 配置参数 ====================
+OKX_API_KEY = ""          # 替换为你的欧易API Key
+OKX_SECRET_KEY = ""       # 替换为你的欧易Secret Key
+OKX_PASSPHRASE = ""       # 替换为你的欧易Passphrase
+INST_ID = "BTC-USDT-SWAP" # 分析的合约品种
+BAR = "15m"               # K线周期
+LIMIT = 20                # 拉取最近20根K线
+LOG_FILE = "ai_analysis_log.json" # 输出日志文件
 
-# ========== 初始化欧易客户端 ==========
-client = OKXClient(
-    api_key=API_KEY,
-    secret_key=SECRET_KEY,
-    passphrase=PASSPHRASE,
-    flag=FLAG
-)
+# ==================== 欧易 API 接口 ====================
+OKX_BASE_URL = "https://www.okx.com"
+OKX_CANDLES_URL = f"{OKX_BASE_URL}/api/v5/market/candles"
+OKX_TICKER_URL = f"{OKX_BASE_URL}/api/v5/market/ticker"
 
-# ========== 交易日志保存（自动写入 CSV） ==========
-def init_trade_log():
-    if not os.path.exists("trade_history.csv"):
-        with open("trade_history.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["时间", "币种", "方向", "仓位", "止盈价", "止损价", "保证金使用率", "AI建议"])
-
-def write_trade_log(inst_id, side, sz, tp_price, sl_price, mgn_ratio, ai_tip):
-    init_trade_log()
-    with open("trade_history.csv", "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            inst_id,
-            side,
-            sz,
-            tp_price,
-            sl_price,
-            mgn_ratio,
-            ai_tip
-        ])
-
-# ========== 核心策略：止盈止损 + AI 分析 + 风险控制 ==========
-class OKXTradeBot:
-    def __init__(self, inst_id="BTC-USDT-SWAP", leverage=10):
-        self.inst_id = inst_id
-        self.leverage = leverage
-        self.set_leverage()
-
-    # 设置杠杆
-    def set_leverage(self):
-        res = client.trade.set_leverage(
-            instId=self.inst_id,
-            lever=self.leverage,
-            mgnMode="cross"
-        )
-        if res["code"] == "0":
-            print(f"✅ {self.inst_id} 杠杆设置为 {self.leverage} 倍")
+# ==================== 工具函数 ====================
+def get_okx_candles(inst_id, bar, limit):
+    """拉取欧易K线数据"""
+    params = {
+        "instId": inst_id,
+        "bar": bar,
+        "limit": limit
+    }
+    try:
+        response = requests.get(OKX_CANDLES_URL, params=params, timeout=10)
+        data = response.json()
+        if data["code"] == "0" and len(data["data"]) > 0:
+            # 格式化K线数据：时间戳、开、高、低、收、成交量
+            candles = []
+            for item in data["data"]:
+                candles.append({
+                    "ts": int(item[0]),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "vol": float(item[5])
+                })
+            return sorted(candles, key=lambda x: x["ts"]) # 按时间正序排列
         else:
-            print(f"❌ 杠杆设置失败：{res['msg']}")
+            print(f"拉取K线失败: {data['msg']}")
+            return []
+    except Exception as e:
+        print(f"拉取K线异常: {str(e)}")
+        return []
 
-    # 获取保证金使用率（风险预警）
-    def get_margin_ratio(self):
-        res = client.account.get_account()
-        mgn_ratio = float(res["data"][0]["mgnRatio"]) * 100
-        if mgn_ratio >= 80:
-            print("🚨 保证金≥80%：强制限制开仓！")
-        elif mgn_ratio >= 70:
-            print("⚠️ 保证金≥70%：建议减仓！")
-        elif mgn_ratio >= 50:
-            print("ℹ️ 保证金≥50%：仓位偏重！")
-        return f"{mgn_ratio:.2f}%"
+def calculate_macd(close_prices, fastperiod=12, slowperiod=26, signalperiod=9):
+    """计算MACD指标"""
+    ema_fast = np.convolve(close_prices, np.ones(fastperiod)/fastperiod, mode='valid')
+    ema_slow = np.convolve(close_prices, np.ones(slowperiod)/slowperiod, mode='valid')
+    macd_line = ema_fast - ema_slow[-len(ema_fast):]
+    signal_line = np.convolve(macd_line, np.ones(signalperiod)/signalperiod, mode='valid')
+    histogram = macd_line[-len(signal_line):] - signal_line
+    return macd_line, signal_line, histogram
 
-    # 30分钟 AI 行情解读（专业指标+小白话术）
-    def ai_market_analysis(self):
-        # 获取 15m K线 + 多空比
-        candles = client.market.get_candlesticks(instId=self.inst_id, bar="15m", limit=20)
-        last_close = float(candles["data"][0][4])
-        prev_close = float(candles["data"][1][4])
-        long_short = client.market.get_long_short_ratio(instId=self.inst_id, period="15m")
-        ratio = float(long_short["data"][0]["longShortRatio"])
+def analyze_trend(candles):
+    """趋势分析：多头/空头/震荡"""
+    if len(candles) < 5:
+        return "震荡", "K线数据不足"
+    
+    recent_close = [c["close"] for c in candles[-5:]]
+    # 计算涨幅
+    max_price = max(recent_close)
+    min_price = min(recent_close)
+    change_rate = (max_price - min_price) / min_price * 100
 
-        # 趋势判断
-        trend = "上涨" if last_close > prev_close else "下跌"
-        ratio_tip = "多头占优" if ratio > 1.2 else "空头占优" if ratio < 0.8 else "多空平衡"
-        ai_tip = f"{self.inst_id} 当前价 {last_close:.2f} USDT，15m {trend}，多空比 {ratio:.2f}（{ratio_tip}）→ 建议：{'持有多单' if trend == '上涨' and ratio>1.2 else '持有空单' if trend == '下跌' and ratio<0.8 else '观望'}"
-        print(f"📊 AI 解读：{ai_tip}")
-        return ai_tip
+    if recent_close[-1] > recent_close[0] and change_rate > 1:
+        return "多头", f"近5根K线上涨{change_rate:.2f}%"
+    elif recent_close[-1] < recent_close[0] and change_rate > 1:
+        return "空头", f"近5根K线下跌{change_rate:.2f}%"
+    else:
+        return "震荡", f"近5根K线振幅{change_rate:.2f}%"
 
-    # 止盈止损开仓
-    def place_tp_sl_order(self, side="buy", sz="0.01", tp_pct=5, sl_pct=2):
-        ticker = client.market.get_ticker(instId=self.inst_id)
-        last_price = float(ticker["data"][0]["last"])
-        tp_price = last_price * (1 + tp_pct/100) if side == "buy" else last_price * (1 - tp_pct/100)
-        sl_price = last_price * (1 - sl_pct/100) if side == "buy" else last_price * (1 + sl_pct/100)
+def analyze_volume(candles):
+    """成交量异动检测"""
+    if len(candles) < 10:
+        return "正常", "成交量数据不足"
+    
+    recent_vol = [c["vol"] for c in candles[-5:]]
+    history_vol = [c["vol"] for c in candles[:-5]]
+    avg_recent = np.mean(recent_vol)
+    avg_history = np.mean(history_vol)
 
-        res = client.trade.place_order(
-            instId=self.inst_id,
-            tdMode="cross",
-            side=side,
-            ordType="market",
-            sz=sz,
-            tpTriggerPx=str(tp_price),
-            tpOrdPx=str(tp_price),
-            slTriggerPx=str(sl_price),
-            slOrdPx=str(sl_price)
-        )
+    if avg_recent > avg_history * 1.5:
+        return "放量", f"近5根K线成交量放大{((avg_recent/avg_history)-1)*100:.2f}%"
+    elif avg_recent < avg_history * 0.5:
+        return "缩量", f"近5根K线成交量缩小{((1-avg_recent/avg_history))*100:.2f}%"
+    else:
+        return "正常", "成交量无明显异动"
 
-        if res["code"] == "0":
-            mgn_ratio = self.get_margin_ratio()
-            ai_tip = self.ai_market_analysis()
-            print(f"✅ {side} 单开仓成功！止盈 {tp_price:.2f} | 止损 {sl_price:.2f}")
-            write_trade_log(self.inst_id, side, sz, tp_price, sl_price, mgn_ratio, ai_tip)
+def generate_trade_signal(trend, macd_signal, volume_status):
+    """生成交易信号：buy/sell/hold"""
+    # 多头+MACD金叉+放量 → 买入
+    if trend == "多头" and macd_signal == "金叉" and volume_status == "放量":
+        return "buy"
+    # 空头+MACD死叉+放量 → 卖出
+    elif trend == "空头" and macd_signal == "死叉" and volume_status == "放量":
+        return "sell"
+    # 其他情况 → 持有
+    else:
+        return "hold"
+
+# ==================== 主分析函数 ====================
+def main():
+    print(f"开始AI分析 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # 1. 拉取K线数据
+    candles = get_okx_candles(INST_ID, BAR, LIMIT)
+    if not candles:
+        return
+    
+    # 2. 提取收盘价和成交量
+    close_prices = np.array([c["close"] for c in candles])
+    vol_data = [c["vol"] for c in candles]
+
+    # 3. 趋势分析
+    trend, trend_desc = analyze_trend(candles)
+
+    # 4. MACD分析
+    macd_line, signal_line, histogram = calculate_macd(close_prices)
+    if len(macd_line) < 2 or len(signal_line) < 2:
+        macd_desc = "MACD数据不足"
+        macd_signal = "无"
+    else:
+        # 判断金叉/死叉
+        if macd_line[-1] > signal_line[-1] and macd_line[-2] < signal_line[-2]:
+            macd_signal = "金叉"
+            macd_desc = "MACD金叉形成，短期看涨"
+        elif macd_line[-1] < signal_line[-1] and macd_line[-2] > signal_line[-2]:
+            macd_signal = "死叉"
+            macd_desc = "MACD死叉形成，短期看跌"
         else:
-            print(f"❌ 开仓失败：{res['msg']}")
+            macd_signal = "无"
+            macd_desc = "MACD无明显交叉"
 
-# ========== 启动机器人 ==========
+    # 5. 成交量分析
+    volume_status, volume_desc = analyze_volume(candles)
+
+    # 6. 生成交易信号
+    trade_signal = generate_trade_signal(trend, macd_signal, volume_status)
+
+    # 7. 生成分析结论
+    analysis_conclusion = f"{trend_desc} | {macd_desc} | {volume_desc}"
+
+    # 8. 生成日志数据
+    log_data = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "instId": INST_ID,
+        "trend": trend,
+        "macdSignal": macd_signal,
+        "volumeStatus": volume_status,
+        "analysis": analysis_conclusion,
+        "signal": trade_signal,
+        "lastPrice": candles[-1]["close"],
+        "updateTime": int(time.time() * 1000)
+    }
+
+    # 9. 保存日志文件
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(log_data, f, ensure_ascii=False, indent=4)
+    
+    print(f"AI分析完成，信号: {trade_signal}")
+    print(f"日志已保存至: {LOG_FILE}")
+
 if __name__ == "__main__":
-    bot = OKXTradeBot(inst_id="BTC-USDT-SWAP", leverage=10)
-    bot.ai_market_analysis()  # 执行 AI 分析
-    bot.get_margin_ratio()    # 检查保证金风险
-    # 如需自动开仓，取消下面注释 ↓
-    # bot.place_tp_sl_order(side="buy", sz="0.01")
+    main()

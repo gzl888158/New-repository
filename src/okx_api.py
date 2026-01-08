@@ -1,141 +1,142 @@
-import os
 import json
+import time
 import requests
-import hmac
-import hashlib
+import numpy as np
+import yaml
+from datetime import datetime
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
 import base64
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
-from typing import Dict, List, Any
-from .utils import setup_logger
+import hmac
 
-# 加载环境变量
-load_dotenv()
-logger = setup_logger()
+# 加载配置
+with open("config/config.yaml", "r", encoding="utf-8") as f:
+    CONFIG = yaml.safe_load(f)
 
-# 欧易API配置
-OKX_API_KEY = os.getenv("OKX_API_KEY")
-OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-OKX_MARKET_URL = "https://www.okx.com/api/v5/market"
-OKX_TRADE_URL = "https://www.okx.com/api/v5/trade"
-OKX_ACCOUNT_URL = "https://www.okx.com/api/v5/account"
-
-def get_okx_signature(timestamp: str, method: str, request_path: str, body: str = "") -> str:
-    """生成欧易API签名"""
-    message = timestamp + method.upper() + request_path + body
-    mac = hmac.new(
-        bytes(OKX_SECRET_KEY, encoding="utf8"),
-        bytes(message, encoding="utf8"),
-        hashlib.sha256
-    )
-    return base64.b64encode(mac.digest()).decode("utf-8")
-
-def get_okx_headers(request_path: str, body: str = "", method: str = "GET") -> Dict[str, str]:
-    """生成欧易API请求头"""
-    timestamp = datetime.utcnow().isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def get_okx_headers(method: str, path: str, body: str, api_key: str, api_secret: str, passphrase: str, env: str) -> dict:
+    """生成欧易API请求头（含签名）"""
+    timestamp = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
+    message = f"{timestamp}{method}{path}{body}"
+    signature = base64.b64encode(hmac.new(api_secret.encode(), message.encode(), SHA256).digest()).decode()
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
     return {
-        "OK-ACCESS-KEY": OKX_API_KEY,
-        "OK-ACCESS-SIGN": get_okx_signature(timestamp, method, request_path, body),
+        "OK-ACCESS-KEY": api_key,
+        "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
-        "Content-Type": "application/json"
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "Content-Type": "application/json",
+        "x-simulated-trading": "1" if env == "sim" else "0"
     }
 
-def fetch_candles(inst_id: str, bar: str, limit: int = 100, end_ts: int = None) -> List[Dict[str, Any]]:
-    """拉取欧易K线数据"""
-    url = f"{OKX_MARKET_URL}/candles"
-    params = {"instId": inst_id, "bar": bar, "limit": limit}
-    if end_ts:
-        params["after"] = end_ts
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
+def verify_api(api_key: str, api_secret: str, passphrase: str, inst_id: str, env: str) -> str:
+    """验证API有效性"""
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
+    path = "/api/v5/account/account"
+    headers = get_okx_headers("GET", path, "", api_key, api_secret, passphrase, env)
+    resp = requests.get(f"{base_url}{path}", headers=headers, timeout=CONFIG["okx"]["timeout"])
+    data = resp.json()
+    if data["code"] != "0":
+        raise Exception(f"API错误：{data['msg']}")
+    return data["data"][0]["uid"]
+
+def fetch_ticker(inst_id: str, env: str) -> dict:
+    """获取实时行情"""
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
+    resp = requests.get(f"{base_url}/api/v5/market/ticker?instId={inst_id}", timeout=CONFIG["okx"]["timeout"])
+    data = resp.json()["data"][0]
+    return {
+        "instId": data["instId"],
+        "last": data["last"],
+        "change": f"{float(data['sodUtc0']) * 100:.2f}"
+    }
+
+def fetch_candles(inst_id: str, bar: str, limit: int, env: str) -> list:
+    """获取K线数据"""
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
+    resp = requests.get(
+        f"{base_url}/api/v5/market/history-candles?instId={inst_id}&bar={bar}&limit={limit}",
+        timeout=CONFIG["okx"]["timeout"]
+    )
+    data = resp.json()["data"]
+    return [
+        {
+            "high": float(c[2]), "low": float(c[3]),
+            "close": float(c[4]), "volume": float(c[5])
+        } for c in reversed(data)
+    ]
+
+def calculate_atr(candles: list, period: int) -> float:
+    """计算ATR指标"""
+    if len(candles) < period + 1:
+        return 0.0
+    tr_list = []
+    for i in range(1, len(candles)):
+        tr = max(
+            candles[i]["high"] - candles[i]["low"],
+            abs(candles[i]["high"] - candles[i-1]["close"]),
+            abs(candles[i]["low"] - candles[i-1]["close"])
+        )
+        tr_list.append(tr)
+    return round(np.mean(tr_list[-period:]), 4)
+
+def place_grid_orders(inst_id: str, buy_levels: list, sell_levels: list, volume: float, api_key: str, api_secret: str, passphrase: str, env: str) -> dict:
+    """挂网格买单和卖单"""
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
+    path = "/api/v5/trade/order"
+    headers = get_okx_headers("POST", path, "", api_key, api_secret, passphrase, env)
+    orders = []
+    # 挂买单
+    for price in buy_levels:
+        body = json.dumps({
+            "instId": inst_id,
+            "tdMode": "isolated",
+            "side": "buy",
+            "posSide": "long",
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(round(volume / len(buy_levels), 4))
+        })
+        resp = requests.post(f"{base_url}{path}", headers=headers, data=body, timeout=CONFIG["okx"]["timeout"])
+        data = resp.json()
         if data["code"] != "0":
-            logger.error(f"拉取K线失败: {data.get('msg')}")
-            return []
-        candles = []
-        for item in data["data"]:
-            candles.append({
-                "ts": int(item[0]),
-                "open": float(item[1]),
-                "high": float(item[2]),
-                "low": float(item[3]),
-                "close": float(item[4]),
-                "vol": float(item[5])
-            })
-        return sorted(candles, key=lambda x: x["ts"])
-    except Exception as e:
-        logger.error(f"拉取K线异常: {str(e)}")
-        return []
+            raise Exception(f"挂单失败：{data['msg']}")
+        orders.append({"side": "buy", "price": price, "ordId": data["data"][0]["ordId"]})
+    # 挂卖单
+    for price in sell_levels:
+        body = json.dumps({
+            "instId": inst_id,
+            "tdMode": "isolated",
+            "side": "sell",
+            "posSide": "long",
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(round(volume / len(sell_levels), 4))
+        })
+        resp = requests.post(f"{base_url}{path}", headers=headers, data=body, timeout=CONFIG["okx"]["timeout"])
+        data = resp.json()
+        if data["code"] != "0":
+            raise Exception(f"挂单失败：{data['msg']}")
+        orders.append({"side": "sell", "price": price, "ordId": data["data"][0]["ordId"]})
+    return {"status": "success", "orders": orders}
 
-def get_account_balance(ccy: str = "USDT") -> float:
-    """获取账户可用余额"""
-    url = f"{OKX_ACCOUNT_URL}/balance"
-    params = {"ccy": ccy}
-    headers = get_okx_headers("/api/v5/account/balance")
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        data = response.json()
-        if data["code"] == "0" and len(data["data"]) > 0:
-            for detail in data["data"][0]["details"]:
-                if detail["ccy"] == ccy:
-                    return float(detail["availBal"])
-        logger.error(f"获取余额失败: {data.get('msg')}")
-        return 0.0
-    except Exception as e:
-        logger.error(f"获取余额异常: {str(e)}")
-        return 0.0
+def cancel_all_orders(inst_id: str, api_key: str, api_secret: str, passphrase: str, env: str) -> dict:
+    """取消所有挂单"""
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
+    path = "/api/v5/trade/cancel-batch-orders"
+    body = json.dumps({"instId": inst_id})
+    headers = get_okx_headers("POST", path, body, api_key, api_secret, passphrase, env)
+    resp = requests.post(f"{base_url}{path}", headers=headers, data=body, timeout=CONFIG["okx"]["timeout"])
+    data = resp.json()
+    if data["code"] != "0":
+        raise Exception(f"撤单失败：{data['msg']}")
+    return {"status": "success"}
 
-def get_position(inst_id: str) -> Dict[str, Any]:
-    """获取指定合约持仓"""
-    url = f"{OKX_ACCOUNT_URL}/positions"
-    params = {"instId": inst_id}
-    headers = get_okx_headers("/api/v5/account/positions")
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        data = response.json()
-        if data["code"] == "0" and len(data["data"]) > 0:
-            pos = data["data"][0]
-            return {
-                "instId": pos["instId"],
-                "posSide": pos["posSide"],
-                "posAmt": float(pos["posAmt"]),
-                "avgPx": float(pos["avgPx"]),
-                "upl": float(pos["upl"]),
-                "liqPx": float(pos["liqPx"])
-            }
-        return {"instId": inst_id, "posSide": "net", "posAmt": 0.0}
-    except Exception as e:
-        logger.error(f"获取持仓异常: {str(e)}")
-        return {"instId": inst_id, "posSide": "net", "posAmt": 0.0}
-
-def place_order(inst_id: str, pos_side: str, vol: float, tp_price: float, sl_price: float) -> Dict[str, Any]:
-    """下单（市价单+止盈止损）"""
-    url = f"{OKX_TRADE_URL}/order"
-    method = "POST"
-    side = "buy" if pos_side == "long" else "sell"
-    body = json.dumps({
-        "instId": inst_id,
-        "tdMode": "isolated",
-        "side": side,
-        "posSide": pos_side,
-        "ordType": "market",
-        "sz": str(round(vol, 4)),
-        "tpTriggerPx": str(tp_price),
-        "tpOrdPx": str(tp_price),
-        "slTriggerPx": str(sl_price),
-        "slOrdPx": str(sl_price)
-    })
-    headers = get_okx_headers("/api/v5/trade/order", body, method)
-    try:
-        response = requests.post(url, headers=headers, data=body, timeout=10)
-        data = response.json()
-        if data["code"] == "0":
-            logger.info(f"下单成功: {inst_id} {pos_side} | 订单号: {data['data'][0]['ordId']}")
-            return {"status": "success", "ordId": data["data"][0]["ordId"]}
-        logger.error(f"下单失败: {data.get('msg')}")
-        return {"status": "failed", "msg": data.get("msg")}
-    except Exception as e:
-        logger.error(f"下单异常: {str(e)}")
-        return {"status": "failed", "msg": str(e)}
+def get_account_info(api_key: str, api_secret: str, passphrase: str, env: str) -> dict:
+    """获取账户信息"""
+    base_url = CONFIG["okx"]["real_base_url"] if env == "real" else CONFIG["okx"]["sim_base_url"]
+    path = "/api/v5/account/balance"
+    headers = get_okx_headers("GET", path, "", api_key, api_secret, passphrase, env)
+    resp = requests.get(f"{base_url}{path}", headers=headers, timeout=CONFIG["okx"]["timeout"])
+    data = resp.json()["data"][0]["details"][0]
+    return {"available": data["availBal"], "balance": data["bal"]}

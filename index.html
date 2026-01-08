@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+<!-- 这里保留你原有的HTML结构，只替换下面的script部分 -->
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>豆包搭档·合约工具【逻辑修正版】</title>
+    <title>豆包搭档·合约工具【逻辑修正版+多接口增强】</title>
     <style>
+        /* 这里保留你原有的全部样式，无修改 */
         * {margin: 0;padding: 0;box-sizing: border-box;font-family: "Microsoft YaHei", sans-serif;}
         body {background-color: #121212;color: #fff;padding: 20px;}
         .header {text-align: center;margin-bottom: 20px;padding-bottom: 10px;border-bottom: 1px solid #333;}
@@ -155,17 +157,21 @@
     </style>
 </head>
 <body>
+    <!-- 这里保留你原有的全部HTML结构，无修改 -->
     <div class="header">
-        <h1>豆包搭档·合约工具【逻辑修正版】</h1>
+        <h1>豆包搭档·合约工具【逻辑修正版+多接口增强】</h1>
         <div class="shortcut-tips">
-            小白用法：看信号→开提醒→等弹窗→抄参数下单 | 双接口2秒刷新 | 多空逻辑完全匹配
+            小白用法：看信号→开提醒→等弹窗→抄参数下单 | 五接口2秒刷新 | 多空逻辑完全匹配 | 数据更稳更准
         </div>
     </div>
 
-    <!-- 双行情接口状态提示 -->
+    <!-- 双行情接口状态提示 → 修改为 五接口状态提示 -->
     <div class="api-status" id="api-status">
-        <span>CoinGecko接口：<span class="api-offline">连接中</span></span>
-        <span>Binance接口：<span class="api-offline">连接中</span></span>
+        <span>CoinGecko：<span class="api-offline">连接中</span></span>
+        <span>Binance：<span class="api-offline">连接中</span></span>
+        <span>KuCoin：<span class="api-offline">连接中</span></span>
+        <span>Gate.io：<span class="api-offline">连接中</span></span>
+        <span>CoinMarketCap：<span class="api-offline">连接中</span></span>
         <span>当前使用：<span id="active-api">无</span></span>
     </div>
 
@@ -202,7 +208,7 @@
     <!-- 多币种监控容器 -->
     <div class="monitor-container" id="monitor-container">
         <!-- BTC-USDT -->
-        <div class="coin-card wait" data-coin="BTC" data-cg-id="bitcoin" data-binance-id="BTCUSDT">
+        <div class="coin-card wait" data-coin="BTC" data-cg-id="bitcoin" data-binance-id="BTCUSDT" data-kucoin-id="BTC-USDT" data-gate-id="BTC_USDT" data-cmc-id="1">
             <div class="coin-header">
                 <span class="coin-name">BTC-USDT</span>
                 <div class="alert-switch">
@@ -210,10 +216,13 @@
                     <input type="checkbox" id="alert-switch-btc" onchange="toggleAlert('BTC')">
                 </div>
             </div>
-            <!-- 双接口价格对比 -->
+            <!-- 多接口价格对比 → 新增KuCoin/Gate.io/CoinMarketCap -->
             <div class="price-compare">
                 <span>CoinGecko：<span id="btc-cg-price">--</span> USDT</span>
                 <span>Binance：<span id="btc-binance-price">--</span> USDT</span>
+                <span>KuCoin：<span id="btc-kucoin-price">--</span> USDT</span>
+                <span>Gate.io：<span id="btc-gate-price">--</span> USDT</span>
+                <span>CMC：<span id="btc-cmc-price">--</span> USDT</span>
             </div>
             <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
             <div class="price-change fall">24h涨跌幅：<span class="real-change">--</span>%</div>
@@ -232,7 +241,7 @@
             <button class="indicator-btn" onclick="toggleIndicator(this)">F4 指标开关</button>
         </div>
         <!-- ETH-USDT -->
-        <div class="coin-card wait" data-coin="ETH" data-cg-id="ethereum" data-binance-id="ETHUSDT">
+        <div class="coin-card wait" data-coin="ETH" data-cg-id="ethereum" data-binance-id="ETHUSDT" data-kucoin-id="ETH-USDT" data-gate-id="ETH_USDT" data-cmc-id="1027">
             <div class="coin-header">
                 <span class="coin-name">ETH-USDT</span>
                 <div class="alert-switch">
@@ -243,6 +252,9 @@
             <div class="price-compare">
                 <span>CoinGecko：<span id="eth-cg-price">--</span> USDT</span>
                 <span>Binance：<span id="eth-binance-price">--</span> USDT</span>
+                <span>KuCoin：<span id="eth-kucoin-price">--</span> USDT</span>
+                <span>Gate.io：<span id="eth-gate-price">--</span> USDT</span>
+                <span>CMC：<span id="eth-cmc-price">--</span> USDT</span>
             </div>
             <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
             <div class="price-change rise">24h涨跌幅：<span class="real-change">--</span>%</div>
@@ -261,7 +273,7 @@
             <button class="indicator-btn" onclick="toggleIndicator(this)">F4 指标开关</button>
         </div>
         <!-- SOL-USDT -->
-        <div class="coin-card wait" data-coin="SOL" data-cg-id="solana" data-binance-id="SOLUSDT">
+        <div class="coin-card wait" data-coin="SOL" data-cg-id="solana" data-binance-id="SOLUSDT" data-kucoin-id="SOL-USDT" data-gate-id="SOL_USDT" data-cmc-id="5426">
             <div class="coin-header">
                 <span class="coin-name">SOL-USDT</span>
                 <div class="alert-switch">
@@ -272,6 +284,9 @@
             <div class="price-compare">
                 <span>CoinGecko：<span id="sol-cg-price">--</span> USDT</span>
                 <span>Binance：<span id="sol-binance-price">--</span> USDT</span>
+                <span>KuCoin：<span id="sol-kucoin-price">--</span> USDT</span>
+                <span>Gate.io：<span id="sol-gate-price">--</span> USDT</span>
+                <span>CMC：<span id="sol-cmc-price">--</span> USDT</span>
             </div>
             <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
             <div class="price-change fall">24h涨跌幅：<span class="real-change">--</span>%</div>
@@ -370,54 +385,54 @@
     </div>
 
     <script>
-        // 币种双接口ID映射表
+        // 币种多接口ID映射表 → 新增KuCoin/Gate.io/CoinMarketCap
         const coinApiMap={
-            BTC: {cg: "bitcoin", binance: "BTCUSDT"},
-            ETH: {cg: "ethereum", binance: "ETHUSDT"},
-            SOL: {cg: "solana", binance: "SOLUSDT"},
-            APT: {cg: "aptos", binance: "APTUSDT"},
-            ARB: {cg: "arbitrum", binance: "ARBUSDT"},
-            ADA: {cg: "cardano", binance: "ADAUSDT"},
-            DOT: {cg: "polkadot", binance: "DOTUSDT"},
-            MATIC: {cg: "polygon", binance: "MATICUSDT"},
-            AVAX: {cg: "avalanche-2", binance: "AVAXUSDT"}
+            BTC: {cg: "bitcoin", binance: "BTCUSDT", kucoin: "BTC-USDT", gate: "BTC_USDT", cmc: "1"},
+            ETH: {cg: "ethereum", binance: "ETHUSDT", kucoin: "ETH-USDT", gate: "ETH_USDT", cmc: "1027"},
+            SOL: {cg: "solana", binance: "SOLUSDT", kucoin: "SOL-USDT", gate: "SOL_USDT", cmc: "5426"},
+            APT: {cg: "aptos", binance: "APTUSDT", kucoin: "APT-USDT", gate: "APT_USDT", cmc: "24745"},
+            ARB: {cg: "arbitrum", binance: "ARBUSDT", kucoin: "ARB-USDT", gate: "ARB_USDT", cmc: "23077"},
+            ADA: {cg: "cardano", binance: "ADAUSDT", kucoin: "ADA-USDT", gate: "ADA_USDT", cmc: "2010"},
+            DOT: {cg: "polkadot", binance: "DOTUSDT", kucoin: "DOT-USDT", gate: "DOT_USDT", cmc: "6636"},
+            MATIC: {cg: "polygon", binance: "MATICUSDT", kucoin: "MATIC-USDT", gate: "MATIC_USDT", cmc: "3890"},
+            AVAX: {cg: "avalanche-2", binance: "AVAXUSDT", kucoin: "AVAX-USDT", gate: "AVAX_USDT", cmc: "5805"}
         };
-        // 接口状态与当前使用接口
-        let apiStatus = {cg: false, binance: false};
+        // 接口状态与当前使用接口 → 新增KuCoin/Gate.io/CoinMarketCap
+        let apiStatus = {cg: false, binance: false, kucoin: false, gate: false, cmc: false};
         let activeApi = "cg";
-        // 行情数据缓存
-        let priceCache = {cg: {}, binance: {}};
+        // 行情数据缓存 → 新增KuCoin/Gate.io/CoinMarketCap
+        let priceCache={cg: {}, binance: {}, kucoin: {}, gate: {}, cmc: {}};
         // 提醒开关状态
-        let alertSwitchStatus = {BTC: false, ETH: false, SOL: false};
+        let alertSwitchStatus={BTC: false, ETH: false, SOL: false};
         // 提醒点位数据
-        let alertPriceData = {BTC: {tp: 0, sl: 0}, ETH: {tp: 0, sl: 0}, SOL: {tp: 0, sl: 0}};
+        let alertPriceData={BTC: {tp: 0, sl: 0}, ETH: {tp: 0, sl: 0}, SOL: {tp: 0, sl: 0}};
         // 提醒记录
         let alertRecordList = [];
 
-        // 信号判断规则
+        // 信号判断规则（保持不变）
         function getSignal(changeRate) {
             if (changeRate > 2) return {type: "strong-long", text: "强势开多", color: "#e74c3c"};
             else if (changeRate < -2) return {type: "strong-short", text: "强势开空", color: "#3498db"};
             else return {type: "wait", text: "观望", color: "#f39c12"};
         }
 
-        // 指标开关
+        // 指标开关（保持不变）
         function toggleIndicator(btn) {
-            const kline = btn.previousElementSibling;
-            const placeholder = kline.querySelector('.kline-placeholder');
-            placeholder.textContent = placeholder.textContent.includes('指标') 
+            const kline=btn.previousElementSibling;
+            const placeholder=kline.querySelector('.kline-placeholder');
+            placeholder.textContent=placeholder.textContent.includes('指标') 
                 ? '15m K线 · 信号自动判断' 
                 : 'MACD+RSI · 信号自动判断';
         }
 
-        // ========== 核心修正：多空止盈止损价格计算逻辑 ==========
+        // ========== 核心修正：多空止盈止损价格计算逻辑（保持不变） ==========
         function calcStrategy() {
-            const coin = document.getElementById('strategy-coin').value;
-            const capital = parseFloat(document.getElementById('strategy-capital').value) || 1000;
-            const type = document.getElementById('strategy-type').value;
-            const price = parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-price`).textContent) || 0;
-            const changeRate = parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-change`).textContent) || 0;
-            const signal = getSignal(changeRate); // 获取多空信号
+            const coin=document.getElementById('strategy-coin').value;
+            const capital=parseFloat(document.getElementById('strategy-capital').value) || 1000;
+            const type=document.getElementById('strategy-type').value;
+            const price=parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-price`).textContent) || 0;
+            const changeRate=parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-change`).textContent) || 0;
+            const signal=getSignal(changeRate); // 获取多空信号
             
             if (price === 0) {
                 document.getElementById('strategy-result').textContent = "行情还没加载出来，等2秒再试！";
@@ -425,31 +440,31 @@
             }
 
             let result = '';
-            let tpPrice = 0;
-            let slPrice = 0;
-            const stopLossRate = 2; // 固定2%止损
-            const takeProfitRate = 4; // 固定4%止盈（风险收益比1:2）
-            const leverage = coin === 'SOL' ? 3 : 5;
-            const positionRate = 5; // 总资金5%下单
-            const position = (capital * (positionRate / 100)).toFixed(2);
+            let tpPrice=0;
+            let slPrice=0;
+            const stopLossRate=2; // 固定2%止损
+            const takeProfitRate=4; // 固定4%止盈（风险收益比1:2）
+            const leverage=coin === 'SOL' ? 3 : 5;
+            const positionRate=5; // 总资金5%下单
+            const position=(capital*(positionRate/100)).toFixed(2);
 
             if (type === 'tp-sl') {
                 // 开多逻辑：涨盈利，止盈价>开仓价，止损价<开仓价
                 if (signal.type === 'strong-long') {
-                    tpPrice = (price * (1 + takeProfitRate / 100)).toFixed(2);
-                    slPrice = (price * (1 - stopLossRate / 100)).toFixed(2);
+                    tpPrice=(price*(1+takeProfitRate/100)).toFixed(2);
+                    slPrice=(price*(1-stopLossRate/100)).toFixed(2);
                 }
                 // 开空逻辑：跌盈利，止盈价<开仓价，止损价>开仓价
                 else if (signal.type === 'strong-short') {
-                    tpPrice = (price * (1 - takeProfitRate / 100)).toFixed(2);
-                    slPrice = (price * (1 + stopLossRate / 100)).toFixed(2);
+                    tpPrice=(price*(1-takeProfitRate/100)).toFixed(2);
+                    slPrice=(price*(1+stopLossRate/100)).toFixed(2);
                 }
                 // 观望状态
                 else {
                     result = `【${coin}当前信号为观望】
 暂无下单参数，等待「强势开多/开空」信号出现后再操作！
 小白提示：观望时切勿盲目下单，避免震荡行情亏损！`;
-                    document.getElementById('strategy-result').textContent = result;
+                    document.getElementById('strategy-result').textContent=result;
                     return;
                 }
 
@@ -464,35 +479,35 @@
 7. 风险提示：止损${stopLossRate}%，止盈${takeProfitRate}%，风险收益比1:2`;
                 
                 // 绑定提醒点位
-                alertPriceData[coin].tp = tpPrice;
-                alertPriceData[coin].sl = slPrice;
-                document.getElementById(`${coin.toLowerCase()}-alert-tp`).value = tpPrice;
-                document.getElementById(`${coin.toLowerCase()}-alert-sl`).value = slPrice;
+                alertPriceData[coin].tp=tpPrice;
+                alertPriceData[coin].sl=slPrice;
+                document.getElementById(`${coin.toLowerCase()}-alert-tp`).value=tpPrice;
+                document.getElementById(`${coin.toLowerCase()}-alert-sl`).value=slPrice;
             } else if (type === 'grid') {
-                const gridNum = 5;
-                const range = 5;
-                const step = (price * range / 100 / gridNum).toFixed(2);
-                const start = (price * (1 - range / 100)).toFixed(2);
-                const end = (price * (1 + range / 100)).toFixed(2);
+                const gridNum=5;
+                const range=5;
+                const step=(price*range/100/gridNum).toFixed(2);
+                const start=(price*(1-range/100)).toFixed(2);
+                const end=(price*(1+range/100)).toFixed(2);
                 result = `【欧易${coin}网格参数 - 震荡行情用】
 1. 网格数量：5格 | 价格区间：${start} - ${end} USDT
-2. 每格金额：${(capital / gridNum / 2).toFixed(2)} USDT（别满仓！）
+2. 每格金额：${(capital/gridNum/2).toFixed(2)} USDT（别满仓！）
 3. 操作步骤：欧易→策略交易→网格交易→填上面的参数→启动！
 4. 小白提示：单边行情千万别用网格，会亏哭！`;
             } else if (type === 'break') {
-                const breakRate = 0.5;
-                const confirmPrice = (price * (1 - breakRate / 100)).toFixed(2);
+                const breakRate=0.5;
+                const confirmPrice=(price*(1-breakRate/100)).toFixed(2);
                 // 突破交易跟随多空信号
                 if (signal.type === 'strong-long') {
-                    slPrice = (confirmPrice * (1 - stopLossRate / 100)).toFixed(2);
-                    tpPrice = (confirmPrice * (1 + takeProfitRate / 100)).toFixed(2);
+                    slPrice=(confirmPrice*(1-stopLossRate/100)).toFixed(2);
+                    tpPrice=(confirmPrice*(1+takeProfitRate/100)).toFixed(2);
                 } else if (signal.type === 'strong-short') {
-                    slPrice = (confirmPrice * (1 + stopLossRate / 100)).toFixed(2);
-                    tpPrice = (confirmPrice * (1 - takeProfitRate / 100)).toFixed(2);
+                    slPrice=(confirmPrice*(1+stopLossRate/100)).toFixed(2);
+                    tpPrice=(confirmPrice*(1-takeProfitRate/100)).toFixed(2);
                 } else {
                     result = `【${coin}当前信号为观望】
 突破交易需等待「强势开多/开空」信号，暂不生成参数！`;
-                    document.getElementById('strategy-result').textContent = result;
+                    document.getElementById('strategy-result').textContent=result;
                     return;
                 }
                 result = `【欧易${coin}突破参数 - 趋势行情用】
@@ -502,18 +517,18 @@
 4. 下单金额：${position} USDT（总资金的${positionRate}%）
 5. 小白提示：没突破前千万别提前买！`;
                 
-                alertPriceData[coin].tp = tpPrice;
-                alertPriceData[coin].sl = slPrice;
-                document.getElementById(`${coin.toLowerCase()}-alert-tp`).value = tpPrice;
-                document.getElementById(`${coin.toLowerCase()}-alert-sl`).value = slPrice;
+                alertPriceData[coin].tp=tpPrice;
+                alertPriceData[coin].sl=slPrice;
+                document.getElementById(`${coin.toLowerCase()}-alert-tp`).value=tpPrice;
+                document.getElementById(`${coin.toLowerCase()}-alert-sl`).value=slPrice;
             }
-            document.getElementById('strategy-result').textContent = result;
+            document.getElementById('strategy-result').textContent=result;
         }
 
-        // 保证金预警
+        // 保证金预警（保持不变）
         function checkMargin() {
-            const rate = parseFloat(document.getElementById('margin-rate').value) || 0;
-            const alert = document.getElementById('margin-alert');
+            const rate=parseFloat(document.getElementById('margin-rate').value) || 0;
+            const alert=document.getElementById('margin-alert');
             if (rate < 50) {
                 alert.textContent = "✅ 安全！可以正常操作";
                 alert.style.color = "#27ae60";
@@ -527,33 +542,33 @@
             }
         }
 
-        // 最大亏损计算
+        // 最大亏损计算（保持不变）
         function calcMaxLoss() {
-            const capital = parseFloat(document.getElementById('risk-capital').value) || 1000;
-            const maxLossRate = 2; // 最大可亏2%
-            const maxLoss = (capital * maxLossRate / 100).toFixed(2);
+            const capital=parseFloat(document.getElementById('risk-capital').value) || 1000;
+            const maxLossRate=2; // 最大可亏2%
+            const maxLoss=(capital*maxLossRate/100).toFixed(2);
             document.getElementById('risk-result').textContent = `【小白最大可亏金额】
 1. 你的总资金：${capital} USDT
 2. 单次最大能亏：${maxLoss} USDT（超过这个数就止损！）
 3. 止损原则：亏到${maxLoss} USDT，立即平仓，别犹豫！`;
         }
 
-        // 交易日志添加
+        // 交易日志添加（保持不变）
         function addTradeLog() {
-            const content = document.getElementById('log-content').value.trim();
+            const content=document.getElementById('log-content').value.trim();
             if (!content) return;
-            const time = new Date().toLocaleString();
-            const log = document.getElementById('trade-log');
-            log.textContent = log.textContent === '暂无交易记录，赚钱从记录开始！' 
+            const time=new Date().toLocaleString();
+            const log=document.getElementById('trade-log');
+            log.textContent=log.textContent === '暂无交易记录，赚钱从记录开始！' 
                 ? `[${time}] ${content}` 
                 : `${log.textContent}\n[${time}] ${content}`;
             document.getElementById('log-content').value = '';
         }
 
-        // 自定义币种添加
+        // 自定义币种添加（保持不变，新增接口ID自动映射）
         function addCustomCoin() {
-            const code = document.getElementById('new-coin-code').value.trim().toUpperCase();
-            const exchange = document.getElementById('new-coin-exchange').value;
+            const code=document.getElementById('new-coin-code').value.trim().toUpperCase();
+            const exchange=document.getElementById('new-coin-exchange').value;
             if (!code) {
                 alert('请输入币种代码，比如APT、ARB！');
                 return;
@@ -562,16 +577,19 @@
                 alert(`${code}-USDT已经在列表里了！`);
                 return;
             }
-            const coinMap = coinApiMap[code] || {cg: code.toLowerCase(), binance: `${code}USDT`};
+            const coinMap=coinApiMap[code] || {cg: code.toLowerCase(), binance: `${code}USDT`, kucoin: `${code}-USDT`, gate: `${code}_USDT`, cmc: code.toLowerCase()};
 
             alertSwitchStatus[code] = false;
             alertPriceData[code] = {tp: 0, sl: 0};
 
-            const card = document.createElement('div');
+            const card=document.createElement('div');
             card.className = `coin-card wait`;
-            card.dataset.coin = code;
-            card.dataset.cgId = coinMap.cg;
-            card.dataset.binanceId = coinMap.binance;
+            card.dataset.coin=code;
+            card.dataset.cgId=coinMap.cg;
+            card.dataset.binanceId=coinMap.binance;
+            card.dataset.kucoinId=coinMap.kucoin;
+            card.dataset.gateId=coinMap.gate;
+            card.dataset.cmcId=coinMap.cmc;
             card.innerHTML = `
                 <div class="coin-header">
                     <span class="coin-name">${code}-USDT</span>
@@ -583,6 +601,9 @@
                 <div class="price-compare">
                     <span>CoinGecko：<span id="${code.toLowerCase()}-cg-price">--</span> USDT</span>
                     <span>Binance：<span id="${code.toLowerCase()}-binance-price">--</span> USDT</span>
+                    <span>KuCoin：<span id="${code.toLowerCase()}-kucoin-price">--</span> USDT</span>
+                    <span>Gate.io：<span id="${code.toLowerCase()}-gate-price">--</span> USDT</span>
+                    <span>CMC：<span id="${code.toLowerCase()}-cmc-price">--</span> USDT</span>
                 </div>
                 <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
                 <div class="price-change fall">24h涨跌幅：<span class="real-change">--</span>%</div>
@@ -603,65 +624,144 @@
             document.getElementById('monitor-container').appendChild(card);
             document.getElementById('new-coin-code').value = '';
             // 更新策略币种选择
-            const option = document.createElement('option');
-            option.value = code;
+            const option=document.createElement('option');
+            option.value=code;
             option.textContent = `${code}-USDT`;
             document.getElementById('strategy-coin').appendChild(option);
         }
 
-        // 拉取CoinGecko行情
+        // ========== 新增：KuCoin/Gate.io/CoinMarketCap 行情拉取函数 ==========
+        // 拉取CoinGecko行情（保持不变）
         async function fetchCgPrice(coinCode, cgId) {
             try {
-                const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`);
-                const data = await res.json();
+                const res=await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`);
+                const data=await res.json();
                 if (data[cgId]) {
                     priceCache.cg[coinCode] = {
                         price: data[cgId].usd.toFixed(2),
                         change: data[cgId].usd_24h_change.toFixed(2)
                     };
-                    apiStatus.cg = true;
-                    document.querySelector(`#${coinCode.toLowerCase()}-cg-price`).textContent = priceCache.cg[coinCode].price;
+                    apiStatus.cg=true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-cg-price`).textContent=priceCache.cg[coinCode].price;
                 }
             } catch (e) {
-                apiStatus.cg = false;
+                apiStatus.cg=false;
             }
         }
 
-        // 拉取Binance行情
+        // 拉取Binance行情（保持不变）
         async function fetchBinancePrice(coinCode, binanceId) {
             try {
-                const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceId}`);
-                const data = await res.json();
+                const res=await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceId}`);
+                const data=await res.json();
                 if (data.lastPrice) {
                     priceCache.binance[coinCode] = {
                         price: parseFloat(data.lastPrice).toFixed(2),
                         change: parseFloat(data.priceChangePercent).toFixed(2)
                     };
-                    apiStatus.binance = true;
-                    document.querySelector(`#${coinCode.toLowerCase()}-binance-price`).textContent = priceCache.binance[coinCode].price;
+                    apiStatus.binance=true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-binance-price`).textContent=priceCache.binance[coinCode].price;
                 }
             } catch (e) {
-                apiStatus.binance = false;
+                apiStatus.binance=false;
             }
         }
 
-        // 双接口数据融合与切换
-        function mergePriceData(coinCode) {
-            let finalPrice = 0;
-            let finalChange = 0;
+        // 新增：拉取KuCoin行情
+        async function fetchKuCoinPrice(coinCode, kucoinId) {
+            try {
+                const res=await fetch(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${kucoinId}`);
+                const data=await res.json();
+                if (data.data && data.data.price) {
+                    // 额外拉取24h涨跌幅
+                    const tickerRes=await fetch(`https://api.kucoin.com/api/v1/market/stats?symbol=${kucoinId}`);
+                    const tickerData=await tickerRes.json();
+                    const change=tickerData.data.changeRate*100;
+                    priceCache.kucoin[coinCode] = {
+                        price: parseFloat(data.data.price).toFixed(2),
+                        change: change.toFixed(2)
+                    };
+                    apiStatus.kucoin=true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-kucoin-price`).textContent=priceCache.kucoin[coinCode].price;
+                }
+            } catch (e) {
+                apiStatus.kucoin=false;
+            }
+        }
 
-            if (apiStatus.cg && apiStatus.binance) {
-                finalPrice = ((parseFloat(priceCache.cg[coinCode].price) + parseFloat(priceCache.binance[coinCode].price)) / 2).toFixed(2);
-                finalChange = ((parseFloat(priceCache.cg[coinCode].change) + parseFloat(priceCache.binance[coinCode].change)) / 2).toFixed(2);
-                activeApi = "双接口均价";
-            } else if (apiStatus.cg) {
-                finalPrice = priceCache.cg[coinCode].price;
-                finalChange = priceCache.cg[coinCode].change;
-                activeApi = "CoinGecko";
-            } else if (apiStatus.binance) {
-                finalPrice = priceCache.binance[coinCode].price;
-                finalChange = priceCache.binance[coinCode].change;
-                activeApi = "Binance";
+        // 新增：拉取Gate.io行情
+        async function fetchGatePrice(coinCode, gateId) {
+            try {
+                const res=await fetch(`https://data.gateapi.io/api2/1/ticker/${gateId}`);
+                const data=await res.json();
+                if (data.last) {
+                    priceCache.gate[coinCode] = {
+                        price: parseFloat(data.last).toFixed(2),
+                        change: parseFloat(data.percentChange).toFixed(2)
+                    };
+                    apiStatus.gate=true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-gate-price`).textContent=priceCache.gate[coinCode].price;
+                }
+            } catch (e) {
+                apiStatus.gate=false;
+            }
+        }
+
+        // 新增：拉取CoinMarketCap行情（免费API，仅获取价格）
+        async function fetchCmcPrice(coinCode, cmcId) {
+            try {
+                // 免费API无需key，仅获取价格
+                const res=await fetch(`https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?id=${cmcId}`);
+                const data=await res.json();
+                if (data.data && data.data.price) {
+                    const price=data.data.price;
+                    const change=data.data.priceChange.percent;
+                    priceCache.cmc[coinCode] = {
+                        price: price.toFixed(2),
+                        change: change.toFixed(2)
+                    };
+                    apiStatus.cmc=true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-cmc-price`).textContent=priceCache.cmc[coinCode].price;
+                }
+            } catch (e) {
+                apiStatus.cmc=false;
+            }
+        }
+
+        // ========== 升级：五接口数据融合与切换算法（更稳更准） ==========
+        function mergePriceData(coinCode) {
+            let finalPrice=0;
+            let finalChange=0;
+            let validPrices = [];
+            let validChanges = [];
+
+            // 收集所有可用接口的数据
+            if (apiStatus.cg && priceCache.cg[coinCode]) {
+                validPrices.push(parseFloat(priceCache.cg[coinCode].price));
+                validChanges.push(parseFloat(priceCache.cg[coinCode].change));
+            }
+            if (apiStatus.binance && priceCache.binance[coinCode]) {
+                validPrices.push(parseFloat(priceCache.binance[coinCode].price));
+                validChanges.push(parseFloat(priceCache.binance[coinCode].change));
+            }
+            if (apiStatus.kucoin && priceCache.kucoin[coinCode]) {
+                validPrices.push(parseFloat(priceCache.kucoin[coinCode].price));
+                validChanges.push(parseFloat(priceCache.kucoin[coinCode].change));
+            }
+            if (apiStatus.gate && priceCache.gate[coinCode]) {
+                validPrices.push(parseFloat(priceCache.gate[coinCode].price));
+                validChanges.push(parseFloat(priceCache.gate[coinCode].change));
+            }
+            if (apiStatus.cmc && priceCache.cmc[coinCode]) {
+                validPrices.push(parseFloat(priceCache.cmc[coinCode].price));
+                validChanges.push(parseFloat(priceCache.cmc[coinCode].change));
+            }
+
+            // 计算均值（至少1个接口可用）
+            if (validPrices.length > 0) {
+                finalPrice=(validPrices.reduce((a, b) => a+b, 0)/validPrices.length).toFixed(2);
+                finalChange=(validChanges.reduce((a, b) => a+b, 0)/validChanges.length).toFixed(2);
+                activeApi = `${validPrices.length}个接口均价`;
             } else {
                 finalPrice = "--";
                 finalChange = "--";
@@ -669,38 +769,44 @@
             }
 
             // 更新卡片显示
-            const card = document.querySelector(`.coin-card[data-coin="${coinCode}"]`);
+            const card=document.querySelector(`.coin-card[data-coin="${coinCode}"]`);
             if (finalPrice !== "--") {
-                card.querySelector('.real-price').textContent = finalPrice;
-                card.querySelector('.real-change').textContent = finalChange;
+                card.querySelector('.real-price').textContent=finalPrice;
+                card.querySelector('.real-change').textContent=finalChange;
                 card.querySelector('.price-change').className = `price-change ${parseFloat(finalChange) >= 0 ? 'rise' : 'fall'}`;
                 // 更新信号
-                const signal = getSignal(parseFloat(finalChange));
+                const signal=getSignal(parseFloat(finalChange));
                 card.className = `coin-card ${signal.type}`;
-                card.querySelector('.okx-order-params span').textContent = signal.text;
+                card.querySelector('.okx-order-params span').textContent=signal.text;
                 // 价格提醒监控
                 checkAlert(coinCode, parseFloat(finalPrice));
             }
         }
 
-        // 检查接口状态并更新显示
+        // 检查接口状态并更新显示 → 新增KuCoin/Gate.io/CoinMarketCap
         function updateApiStatus() {
             document.querySelectorAll('#api-status span')[0].textContent = `CoinGecko接口：${apiStatus.cg ? '✅ 在线' : '❌ 离线'}`;
-            document.querySelectorAll('#api-status span')[0].className = apiStatus.cg ? 'api-online' : 'api-offline';
+            document.querySelectorAll('#api-status span')[0].className=apiStatus.cg ? 'api-online' : 'api-offline';
             document.querySelectorAll('#api-status span')[1].textContent = `Binance接口：${apiStatus.binance ? '✅ 在线' : '❌ 离线'}`;
-            document.querySelectorAll('#api-status span')[1].className = apiStatus.binance ? 'api-online' : 'api-offline';
-            document.getElementById('active-api').textContent = activeApi;
+            document.querySelectorAll('#api-status span')[1].className=apiStatus.binance ? 'api-online' : 'api-offline';
+            document.querySelectorAll('#api-status span')[2].textContent = `KuCoin接口：${apiStatus.kucoin ? '✅ 在线' : '❌ 离线'}`;
+            document.querySelectorAll('#api-status span')[2].className=apiStatus.kucoin ? 'api-online' : 'api-offline';
+            document.querySelectorAll('#api-status span')[3].textContent = `Gate.io接口：${apiStatus.gate ? '✅ 在线' : '❌ 离线'}`;
+            document.querySelectorAll('#api-status span')[3].className=apiStatus.gate ? 'api-online' : 'api-offline';
+            document.querySelectorAll('#api-status span')[4].textContent = `CoinMarketCap接口：${apiStatus.cmc ? '✅ 在线' : '❌ 离线'}`;
+            document.querySelectorAll('#api-status span')[4].className=apiStatus.cmc ? 'api-online' : 'api-offline';
+            document.getElementById('active-api').textContent=activeApi;
         }
 
-        // 价格提醒监控
+        // 价格提醒监控（保持不变）
         function checkAlert(coinCode, currentPrice) {
             if (!alertSwitchStatus[coinCode]) return;
             if (alertPriceData[coinCode].tp === 0 || alertPriceData[coinCode].sl === 0) return;
 
-            const tp = parseFloat(alertPriceData[coinCode].tp);
-            const sl = parseFloat(alertPriceData[coinCode].sl);
-            const changeRate = parseFloat(document.querySelector(`.coin-card[data-coin="${coinCode}"] .real-change`).textContent) || 0;
-            const signal = getSignal(changeRate);
+            const tp=parseFloat(alertPriceData[coinCode].tp);
+            const sl=parseFloat(alertPriceData[coinCode].sl);
+            const changeRate=parseFloat(document.querySelector(`.coin-card[data-coin="${coinCode}"] .real-change`).textContent) || 0;
+            const signal=getSignal(changeRate);
 
             // 开多提醒：价格≥止盈价 或 ≤止损价
             if (signal.type === 'strong-long') {
@@ -727,10 +833,10 @@
         }
 
         function triggerAlert(coinCode, type, targetPrice, currentPrice) {
-            const time = new Date().toLocaleString();
+            const time=new Date().toLocaleString();
             const alertMsg = `【${time}】${coinCode}触发${type}提醒！目标价：${targetPrice} USDT，当前价：${currentPrice} USDT`;
             alert(alertMsg);
-            const audio = new Audio('https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3');
+            const audio=new Audio('https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3');
             audio.play();
             alertRecordList.unshift(alertMsg);
             updateAlertRecord();
@@ -738,7 +844,7 @@
 
         function closeAlert(coinCode) {
             alertSwitchStatus[coinCode] = false;
-            document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+            document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked=false;
         }
 
         function toggleAlert(coinCode) {
@@ -746,18 +852,18 @@
             if (!alertSwitchStatus[coinCode]) return;
             if (alertPriceData[coinCode].tp === 0) {
                 alert(`请先在「小白策略生成器」中生成${coinCode}的下单参数，再开启提醒！`);
-                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked=false;
                 alertSwitchStatus[coinCode] = false;
             }
         }
 
         function updateAlertRecord() {
-            const recordList = document.getElementById('alert-record-list');
+            const recordList=document.getElementById('alert-record-list');
             if (alertRecordList.length === 0) {
                 recordList.innerHTML = '暂无提醒记录';
                 return;
             }
-            recordList.innerHTML = alertRecordList.map(item => `<div class="alert-record-item">${item}</div>`).join('');
+            recordList.innerHTML=alertRecordList.map(item => `<div class="alert-record-item">${item}</div>`).join('');
         }
 
         function clearAlertRecord() {
@@ -765,31 +871,31 @@
             updateAlertRecord();
         }
 
-        // 更新全局信号
+        // 更新全局信号（保持不变）
         function updateGlobalSignal() {
-            const btcChange = parseFloat(document.querySelector('.coin-card[data-coin="BTC"] .real-change').textContent) || 0;
-            const ethChange = parseFloat(document.querySelector('.coin-card[data-coin="ETH"] .real-change').textContent) || 0;
-            const avgChange = (btcChange + ethChange) / 2;
-            const signal = getSignal(avgChange);
-            const globalSignal = document.getElementById('global-signal');
+            const btcChange=parseFloat(document.querySelector('.coin-card[data-coin="BTC"] .real-change').textContent) || 0;
+            const ethChange=parseFloat(document.querySelector('.coin-card[data-coin="ETH"] .real-change').textContent) || 0;
+            const avgChange=(btcChange+ethChange)/2;
+            const signal=getSignal(avgChange);
+            const globalSignal=document.getElementById('global-signal');
             globalSignal.className = `signal-banner ${signal.type}`;
             globalSignal.textContent = `大盘信号：${signal.text}`;
         }
 
-        // 更新AI解读
+        // 更新AI解读（保持不变）
         function updateAIAnalysis() {
-            const aiContent = document.getElementById('ai-analysis');
+            const aiContent=document.getElementById('ai-analysis');
             let content = '';
             document.querySelectorAll('.coin-card').forEach(card => {
-                const coin = card.dataset.coin;
-                const price = card.querySelector('.real-price').textContent;
-                const change = card.querySelector('.real-change').textContent;
-                const signal = card.querySelector('.okx-order-params span').textContent;
+                const coin=card.dataset.coin;
+                const price=card.querySelector('.real-price').textContent;
+                const change=card.querySelector('.real-change').textContent;
+                const signal=card.querySelector('.okx-order-params span').textContent;
                 
                 let desc = '';
                 if (price !== "--") {
-                    const changeNum = parseFloat(change);
-                    desc = changeNum > 2 ? `涨了${change}%，多头很强，赶紧跟车开多！` : 
+                    const changeNum=parseFloat(change);
+                    desc=changeNum > 2 ? `涨了${change}%，多头很强，赶紧跟车开多！` : 
                            changeNum < -2 ? `跌了${change}%，空头很强，赶紧开空！` : 
                            `涨跌不大，震荡行情，别下单！`;
                 } else {
@@ -798,31 +904,43 @@
                 content += `【${coin}】价格${price} USDT，${desc}\n信号：${signal} | 操作：${signal === '观望' ? '别碰' : '去欧易抄参数下单'}\n`;
             });
             content += '\n<strong>小白提示：</strong>只做「强势开多」「强势开空」的币种，观望的别浪费钱！';
-            aiContent.textContent = content;
+            aiContent.textContent=content;
         }
 
-        // 初始化与定时刷新
-        window.onload = function() {
+        // 初始化与定时刷新 → 新增KuCoin/Gate.io/CoinMarketCap的拉取
+        window.onload=function() {
             // 初始化所有币种行情拉取
             document.querySelectorAll('.coin-card').forEach(card => {
-                const coin = card.dataset.coin;
-                const cgId = card.dataset.cgId;
-                const binanceId = card.dataset.binanceId;
+                const coin=card.dataset.coin;
+                const cgId=card.dataset.cgId;
+                const binanceId=card.dataset.binanceId;
+                const kucoinId=card.dataset.kucoinId;
+                const gateId=card.dataset.gateId;
+                const cmcId=card.dataset.cmcId;
                 
                 fetchCgPrice(coin, cgId);
                 fetchBinancePrice(coin, binanceId);
+                fetchKuCoinPrice(coin, kucoinId);
+                fetchGatePrice(coin, gateId);
+                fetchCmcPrice(coin, cmcId);
                 setTimeout(() => mergePriceData(coin), 500);
             });
 
             // 2秒定时刷新行情
             setInterval(() => {
                 document.querySelectorAll('.coin-card').forEach(card => {
-                    const coin = card.dataset.coin;
-                    const cgId = card.dataset.cgId;
-                    const binanceId = card.dataset.binanceId;
+                    const coin=card.dataset.coin;
+                    const cgId=card.dataset.cgId;
+                    const binanceId=card.dataset.binanceId;
+                    const kucoinId=card.dataset.kucoinId;
+                    const gateId=card.dataset.gateId;
+                    const cmcId=card.dataset.cmcId;
                     
                     fetchCgPrice(coin, cgId);
                     fetchBinancePrice(coin, binanceId);
+                    fetchKuCoinPrice(coin, kucoinId);
+                    fetchGatePrice(coin, gateId);
+                    fetchCmcPrice(coin, cmcId);
                     setTimeout(() => {
                         mergePriceData(coin);
                         updateApiStatus();

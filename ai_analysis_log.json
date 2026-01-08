@@ -1,0 +1,15 @@
+// 前端新增函数，拉取AI分析结果
+function fetchAIAnalysis() {
+    $.get("https://gzl888158.github.io/okx-trade-bot/ai_analysis_log.json", (data) => {
+        $("#aiAnalysis").html(`
+            <p>AI分析时间：${data.time}</p>
+            <p>分析币种：${data.instId}</p>
+            <p>分析结论：${data.analysis}</p>
+            <p>交易信号：<span class="signal-${data.signal}">${data.signal === "buy" ? "买入" : "卖出"}</span></p>
+        `);
+    }).fail(() => {
+        $("#aiAnalysis").html("AI分析结果暂未更新");
+    });
+}
+// 每30分钟拉取一次
+setInterval(fetchAIAnalysis, 1800000);

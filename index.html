@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>豆包搭档·合约工具【多接口行情聚合版】</title>
+    <title>豆包搭档·合约工具【逻辑修正版】</title>
     <style>
         * {margin: 0;padding: 0;box-sizing: border-box;font-family: "Microsoft YaHei", sans-serif;}
         body {background-color: #121212;color: #fff;padding: 20px;}
@@ -156,9 +156,9 @@
 </head>
 <body>
     <div class="header">
-        <h1>豆包搭档·合约工具【多接口行情聚合版】</h1>
+        <h1>豆包搭档·合约工具【逻辑修正版】</h1>
         <div class="shortcut-tips">
-            小白用法：看信号→开提醒→等弹窗→抄参数下单 | 双接口2秒刷新 | 快捷键：F1=切换周期 F2=清空预警 F3=风险计算 F4=指标开关
+            小白用法：看信号→开提醒→等弹窗→抄参数下单 | 双接口2秒刷新 | 多空逻辑完全匹配
         </div>
     </div>
 
@@ -335,7 +335,7 @@
                 <label>你的总资金（USDT）</label>
                 <input type="number" id="risk-capital" placeholder="如 1000" value="1000">
             </div>
-            <button class="calc-btn" onclick="calcMaxLoss()">F3 计算最大可亏金额</button>
+            <button class="calc-btn" onclick="calcMaxLoss()">计算最大可亏金额</button>
             <div class="result-area" id="risk-result">点击计算，超过就会爆仓！</div>
         </div>
     </div>
@@ -410,12 +410,14 @@
                 : 'MACD+RSI · 信号自动判断';
         }
 
-        // 策略计算
+        // ========== 核心修正：多空止盈止损价格计算逻辑 ==========
         function calcStrategy() {
             const coin = document.getElementById('strategy-coin').value;
             const capital = parseFloat(document.getElementById('strategy-capital').value) || 1000;
             const type = document.getElementById('strategy-type').value;
             const price = parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-price`).textContent) || 0;
+            const changeRate = parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-change`).textContent) || 0;
+            const signal = getSignal(changeRate); // 获取多空信号
             
             if (price === 0) {
                 document.getElementById('strategy-result').textContent = "行情还没加载出来，等2秒再试！";
@@ -425,22 +427,43 @@
             let result = '';
             let tpPrice = 0;
             let slPrice = 0;
-            if (type === 'tp-sl') {
-                const tpRate = 3;
-                const slRate = 2;
-                tpPrice = (price * (1 + tpRate / 100)).toFixed(2);
-                slPrice = (price * (1 - slRate / 100)).toFixed(2);
-                const position = (capital * 0.05).toFixed(2);
-                const leverage = coin === 'SOL' ? 3 : 5;
+            const stopLossRate = 2; // 固定2%止损
+            const takeProfitRate = 4; // 固定4%止盈（风险收益比1:2）
+            const leverage = coin === 'SOL' ? 3 : 5;
+            const positionRate = 5; // 总资金5%下单
+            const position = (capital * (positionRate / 100)).toFixed(2);
 
+            if (type === 'tp-sl') {
+                // 开多逻辑：涨盈利，止盈价>开仓价，止损价<开仓价
+                if (signal.type === 'strong-long') {
+                    tpPrice = (price * (1 + takeProfitRate / 100)).toFixed(2);
+                    slPrice = (price * (1 - stopLossRate / 100)).toFixed(2);
+                }
+                // 开空逻辑：跌盈利，止盈价<开仓价，止损价>开仓价
+                else if (signal.type === 'strong-short') {
+                    tpPrice = (price * (1 - takeProfitRate / 100)).toFixed(2);
+                    slPrice = (price * (1 + stopLossRate / 100)).toFixed(2);
+                }
+                // 观望状态
+                else {
+                    result = `【${coin}当前信号为观望】
+暂无下单参数，等待「强势开多/开空」信号出现后再操作！
+小白提示：观望时切勿盲目下单，避免震荡行情亏损！`;
+                    document.getElementById('strategy-result').textContent = result;
+                    return;
+                }
+
+                // 生成正确的下单参数
                 result = `【欧易${coin}下单参数 - 小白直接抄】
-1. 方向：${getSignal(parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-change`).textContent)).text}
+1. 方向：${signal.text}
 2. 杠杆：${leverage}倍（千万别加杠杆！）
 3. 开仓价：${price.toFixed(2)} USDT
 4. 止盈价：${tpPrice} USDT | 止损价：${slPrice} USDT
-5. 下单金额：${position} USDT（总资金的5%，别多买！）
-6. 操作步骤：打开欧易→合约→${coin}USDT→限价开仓→填上面的价格→确认！`;
+5. 下单金额：${position} USDT（总资金的${positionRate}%，别多买！）
+6. 操作步骤：打开欧易→合约→${coin}USDT→限价${signal.type === 'strong-long' ? '开多' : '开空'}→填上面的价格→确认！
+7. 风险提示：止损${stopLossRate}%，止盈${takeProfitRate}%，风险收益比1:2`;
                 
+                // 绑定提醒点位
                 alertPriceData[coin].tp = tpPrice;
                 alertPriceData[coin].sl = slPrice;
                 document.getElementById(`${coin.toLowerCase()}-alert-tp`).value = tpPrice;
@@ -459,13 +482,25 @@
             } else if (type === 'break') {
                 const breakRate = 0.5;
                 const confirmPrice = (price * (1 - breakRate / 100)).toFixed(2);
-                slPrice = (confirmPrice * 0.99).toFixed(2);
-                tpPrice = (confirmPrice * 1.03).toFixed(2);
+                // 突破交易跟随多空信号
+                if (signal.type === 'strong-long') {
+                    slPrice = (confirmPrice * (1 - stopLossRate / 100)).toFixed(2);
+                    tpPrice = (confirmPrice * (1 + takeProfitRate / 100)).toFixed(2);
+                } else if (signal.type === 'strong-short') {
+                    slPrice = (confirmPrice * (1 + stopLossRate / 100)).toFixed(2);
+                    tpPrice = (confirmPrice * (1 - takeProfitRate / 100)).toFixed(2);
+                } else {
+                    result = `【${coin}当前信号为观望】
+突破交易需等待「强势开多/开空」信号，暂不生成参数！`;
+                    document.getElementById('strategy-result').textContent = result;
+                    return;
+                }
                 result = `【欧易${coin}突破参数 - 趋势行情用】
-1. 突破确认：价格涨到${price.toFixed(2)}后，回落到${confirmPrice}再买
-2. 止盈价：${tpPrice} USDT | 止损价：${slPrice} USDT
-3. 下单金额：${(capital * 0.03).toFixed(2)} USDT（总资金的3%）
-4. 小白提示：没突破前千万别提前买！`;
+1. 突破确认：价格${signal.type === 'strong-long' ? '上涨' : '下跌'}到${price.toFixed(2)}后，回落到${confirmPrice}再下单
+2. 方向：${signal.text}
+3. 止盈价：${tpPrice} USDT | 止损价：${slPrice} USDT
+4. 下单金额：${position} USDT（总资金的${positionRate}%）
+5. 小白提示：没突破前千万别提前买！`;
                 
                 alertPriceData[coin].tp = tpPrice;
                 alertPriceData[coin].sl = slPrice;
@@ -495,7 +530,7 @@
         // 最大亏损计算
         function calcMaxLoss() {
             const capital = parseFloat(document.getElementById('risk-capital').value) || 1000;
-            const maxLossRate = 2;
+            const maxLossRate = 2; // 最大可亏2%
             const maxLoss = (capital * maxLossRate / 100).toFixed(2);
             document.getElementById('risk-result').textContent = `【小白最大可亏金额】
 1. 你的总资金：${capital} USDT
@@ -574,7 +609,6 @@
             document.getElementById('strategy-coin').appendChild(option);
         }
 
-        // ========== 核心升级：双接口行情拉取与切换 ==========
         // 拉取CoinGecko行情
         async function fetchCgPrice(coinCode, cgId) {
             try {
@@ -613,7 +647,6 @@
 
         // 双接口数据融合与切换
         function mergePriceData(coinCode) {
-            // 优先用响应快的接口，都可用则取均价
             let finalPrice = 0;
             let finalChange = 0;
 
@@ -652,30 +685,44 @@
 
         // 检查接口状态并更新显示
         function updateApiStatus() {
-            document.querySelector('#api-status .api-online').parentElement.textContent = `CoinGecko接口：${apiStatus.cg ? '✅ 在线' : '❌ 离线'}`;
-            document.querySelector('#api-status .api-online').parentElement.className = apiStatus.cg ? 'api-online' : 'api-offline';
+            document.querySelectorAll('#api-status span')[0].textContent = `CoinGecko接口：${apiStatus.cg ? '✅ 在线' : '❌ 离线'}`;
+            document.querySelectorAll('#api-status span')[0].className = apiStatus.cg ? 'api-online' : 'api-offline';
             document.querySelectorAll('#api-status span')[1].textContent = `Binance接口：${apiStatus.binance ? '✅ 在线' : '❌ 离线'}`;
             document.querySelectorAll('#api-status span')[1].className = apiStatus.binance ? 'api-online' : 'api-offline';
             document.getElementById('active-api').textContent = activeApi;
         }
 
-        // ========== 价格提醒逻辑 ==========
+        // 价格提醒监控
         function checkAlert(coinCode, currentPrice) {
             if (!alertSwitchStatus[coinCode]) return;
             if (alertPriceData[coinCode].tp === 0 || alertPriceData[coinCode].sl === 0) return;
 
             const tp = parseFloat(alertPriceData[coinCode].tp);
             const sl = parseFloat(alertPriceData[coinCode].sl);
+            const changeRate = parseFloat(document.querySelector(`.coin-card[data-coin="${coinCode}"] .real-change`).textContent) || 0;
+            const signal = getSignal(changeRate);
 
-            if (currentPrice >= tp) {
-                triggerAlert(coinCode, "止盈", tp, currentPrice);
-                alertSwitchStatus[coinCode] = false;
-                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+            // 开多提醒：价格≥止盈价 或 ≤止损价
+            if (signal.type === 'strong-long') {
+                if (currentPrice >= tp) {
+                    triggerAlert(coinCode, "止盈", tp, currentPrice);
+                    closeAlert(coinCode);
+                }
+                if (currentPrice <= sl) {
+                    triggerAlert(coinCode, "止损", sl, currentPrice);
+                    closeAlert(coinCode);
+                }
             }
-            if (currentPrice <= sl) {
-                triggerAlert(coinCode, "止损", sl, currentPrice);
-                alertSwitchStatus[coinCode] = false;
-                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+            // 开空提醒：价格≤止盈价 或 ≥止损价
+            else if (signal.type === 'strong-short') {
+                if (currentPrice <= tp) {
+                    triggerAlert(coinCode, "止盈", tp, currentPrice);
+                    closeAlert(coinCode);
+                }
+                if (currentPrice >= sl) {
+                    triggerAlert(coinCode, "止损", sl, currentPrice);
+                    closeAlert(coinCode);
+                }
             }
         }
 
@@ -687,6 +734,11 @@
             audio.play();
             alertRecordList.unshift(alertMsg);
             updateAlertRecord();
+        }
+
+        function closeAlert(coinCode) {
+            alertSwitchStatus[coinCode] = false;
+            document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
         }
 
         function toggleAlert(coinCode) {
@@ -713,7 +765,7 @@
             updateAlertRecord();
         }
 
-        // ========== 全局信号与AI解读更新 ==========
+        // 更新全局信号
         function updateGlobalSignal() {
             const btcChange = parseFloat(document.querySelector('.coin-card[data-coin="BTC"] .real-change').textContent) || 0;
             const ethChange = parseFloat(document.querySelector('.coin-card[data-coin="ETH"] .real-change').textContent) || 0;
@@ -724,6 +776,7 @@
             globalSignal.textContent = `大盘信号：${signal.text}`;
         }
 
+        // 更新AI解读
         function updateAIAnalysis() {
             const aiContent = document.getElementById('ai-analysis');
             let content = '';
@@ -748,7 +801,7 @@
             aiContent.textContent = content;
         }
 
-        // ========== 初始化与定时刷新 ==========
+        // 初始化与定时刷新
         window.onload = function() {
             // 初始化所有币种行情拉取
             document.querySelectorAll('.coin-card').forEach(card => {
@@ -779,16 +832,6 @@
                 });
             }, 2000);
         }
-
-        // 快捷键监听
-        document.addEventListener('keydown', function(e) {
-            switch(e.key) {
-                case 'F1': alert('切换K线周期：15m→5m→1m→1h（小白看15m就行）'); break;
-                case 'F2': if (confirm('清空预警线？')) alert('预警线已清空'); break;
-                case 'F3': document.getElementById('risk-capital').focus(); break;
-                case 'F4': document.querySelectorAll('.indicator-btn').forEach(btn => toggleIndicator(btn)); break;
-            }
-        });
     </script>
 </body>
 </html>

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>欧易合约AI辅助工具（最终版）</title>
+    <title>欧易合约AI辅助工具（主流币版）</title>
     <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
     <script src="https://cdn.bootcdn.net/ajax/libs/jquery/3.6.4/jquery.min.js"></script>
     <style>
@@ -37,6 +37,40 @@
         .signal-buy { background: #52c41a; color: #fff; }
         .signal-sell { background: #ff4d4f; color: #fff; }
         .signal-hold { background: #faad14; color: #fff; }
+        /* 主流币行情卡片面板 */
+        .market-panel { 
+            background: #1a1a1a; 
+            border: 1px solid #333; 
+            border-radius: 8px; 
+            padding: 15px; 
+            margin-bottom: 15px;
+        }
+        .market-panel h2 { font-size: 16px; margin-bottom: 10px; color: #fff; }
+        .ticker-grid { 
+            display: grid; 
+            grid-template-columns: repeat(4, 1fr); 
+            gap: 10px; 
+            margin-bottom: 10px;
+        }
+        .ticker-card { 
+            background: #2a2a2a; 
+            padding: 10px; 
+            border-radius: 4px; 
+            text-align: center; 
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .ticker-card:hover { background: #3a3a3a; }
+        .ticker-card p { margin: 4px 0; }
+        /* 价格预警面板 */
+        .alert-panel { 
+            background: #1a1a1a; 
+            border: 1px solid #333; 
+            border-radius: 8px; 
+            padding: 15px; 
+            margin-bottom: 15px;
+        }
+        .alert-panel h2 { font-size: 16px; margin-bottom: 10px; color: #fff; }
         /* 持仓面板 */
         .position-panel { 
             background: #1a1a1a; 
@@ -93,6 +127,29 @@
         .profit-table th { background: #2a2a2a; }
         .profit-green { color: #52c41a; font-weight: bold; }
         .profit-red { color: #ff4d4f; font-weight: bold; }
+        /* 单币种详情面板 */
+        .detail-panel { 
+            background: #1a1a1a; 
+            border: 1px solid #333; 
+            border-radius: 8px; 
+            padding: 15px; 
+            margin-bottom: 15px;
+        }
+        .detail-panel h2 { font-size: 16px; margin-bottom: 10px; color: #fff; }
+        .detail-grid { 
+            display: grid; 
+            grid-template-columns: repeat(4, 1fr); 
+            gap: 10px; 
+            font-size: 12px;
+        }
+        .detail-item { 
+            background: #2a2a2a; 
+            padding: 8px; 
+            border-radius: 4px; 
+            text-align: center;
+        }
+        .detail-item p { margin: 4px 0; }
+        .detail-label { color: #999; font-size: 10px; }
         /* 图表区域 */
         .chart-grid { 
             display: grid; 
@@ -131,6 +188,8 @@
         }
         /* 移动端适配 */
         @media (max-width: 768px) {
+            .ticker-grid { grid-template-columns: repeat(2, 1fr); }
+            .detail-grid { grid-template-columns: repeat(2, 1fr); }
             .chart-grid { grid-template-columns: 1fr; }
             .chart-box { height: 250px; }
         }
@@ -139,7 +198,7 @@
 <body>
     <div class="status-bar" id="statusBar">正在初始化AI辅助工具...</div>
     <div class="container">
-        <h1>欧易合约AI辅助工具（最终版）</h1>
+        <h1>欧易合约AI辅助工具（主流币版）</h1>
         
         <!-- AI分析面板 -->
         <div class="ai-panel">
@@ -150,6 +209,39 @@
             <div id="aiSignal" class="ai-signal signal-hold">等待AI分析数据...</div>
             <div id="botStatus" style="margin-top: 10px; font-size: 12px; color: #999;">
                 策略运行状态：未获取到
+            </div>
+        </div>
+
+        <!-- 主流币行情卡片面板 -->
+        <div class="market-panel">
+            <h2>主流币实时行情</h2>
+            <div class="ticker-grid">
+                <div id="ticker-BTC" class="ticker-card"></div>
+                <div id="ticker-ETH" class="ticker-card"></div>
+                <div id="ticker-SOL" class="ticker-card"></div>
+                <div id="ticker-BNB" class="ticker-card"></div>
+            </div>
+        </div>
+
+        <!-- 价格预警面板 -->
+        <div class="alert-panel">
+            <h2>价格预警设置</h2>
+            <div class="input-group">
+                <select id="alertInstId">
+                    <option value="BTC-USDT">BTC-USDT</option>
+                    <option value="ETH-USDT">ETH-USDT</option>
+                    <option value="SOL-USDT">SOL-USDT</option>
+                </select>
+                <input type="number" id="alertPrice" placeholder="预警价格" step="0.01">
+                <select id="alertType">
+                    <option value="up">价格上涨至</option>
+                    <option value="down">价格下跌至</option>
+                </select>
+                <button onclick="addPriceAlert()" style="background: #faad14;">添加预警</button>
+                <button onclick="clearPriceAlert()" style="background: #ff4d4f;">清空预警</button>
+            </div>
+            <div id="alertList" style="margin-top: 10px; font-size: 12px; color: #ccc;">
+                暂无预警设置
             </div>
         </div>
 
@@ -196,6 +288,29 @@
             </table>
         </div>
 
+        <!-- 单币种详情面板 -->
+        <div class="detail-panel">
+            <h2 id="detailTitle">BTC-USDT 详情数据</h2>
+            <div class="detail-grid">
+                <div class="detail-item">
+                    <p class="detail-label">24h最高</p>
+                    <p id="detail-high">--</p>
+                </div>
+                <div class="detail-item">
+                    <p class="detail-label">24h最低</p>
+                    <p id="detail-low">--</p>
+                </div>
+                <div class="detail-item">
+                    <p class="detail-label">24h成交量</p>
+                    <p id="detail-vol">--</p>
+                </div>
+                <div class="detail-item">
+                    <p class="detail-label">24h涨跌幅</p>
+                    <p id="detail-change">--</p>
+                </div>
+            </div>
+        </div>
+
         <!-- 图表区域 -->
         <div class="chart-grid">
             <div class="chart-box" id="btc-chart">15m K线图</div>
@@ -207,14 +322,24 @@
     <script>
         // 全局配置
         const API_BASE_URL = "https://www.okx.com/api/v5/market";
-        const GITHUB_REPO_URL = "https://gzl888158.github.io"; // 仓库根目录
+        const GITHUB_REPO_URL = "https://gzl888158.github.io";
         const REFRESH_INTERVAL = 10000;
         const AI_REFRESH_INTERVAL = 1800000;
         let btcChart, depthChart;
         let currentInstId = "BTC-USDT";
         let currentPrice = 0;
         const RECORD_KEY = "okx_position_records";
+        const ALERT_KEY = "okx_price_alerts";
         let lastAISignal = "hold";
+        let priceAlerts = []; // 价格预警列表
+
+        // 主流币列表
+        const MAJOR_COINS = [
+            { symbol: "BTC", instId: "BTC-USDT" },
+            { symbol: "ETH", instId: "ETH-USDT" },
+            { symbol: "SOL", instId: "SOL-USDT" },
+            { symbol: "BNB", instId: "BNB-USDT" }
+        ];
 
         // 状态更新
         const statusBar = document.getElementById("statusBar");
@@ -229,12 +354,18 @@
             requestNotificationPermission();
             initCharts();
             loadAllPositionRecords();
+            loadPriceAlerts(); // 加载价格预警
             fetchAllData();
             fetchAIAnalysis();
             fetchBotStatus();
+            fetchMajorTickers(); // 拉取主流币行情
+            // 定时任务
             setInterval(fetchAllData, REFRESH_INTERVAL);
             setInterval(fetchAIAnalysis, AI_REFRESH_INTERVAL);
             setInterval(fetchBotStatus, 60000);
+            setInterval(fetchMajorTickers, REFRESH_INTERVAL);
+            setInterval(checkPriceAlerts, 5000); // 每5秒检查价格预警
+            // 绑定事件
             bindEvents();
         });
 
@@ -277,10 +408,14 @@
 
         // 事件绑定
         function bindEvents() {
+            // 币种选择联动
             $("#instIdSelect").change(() => {
                 currentInstId = $("#instIdSelect").val();
                 fetchAllData();
+                updateDetailTitle();
             });
+
+            // 快捷键绑定
             document.addEventListener("keydown", (e) => {
                 if (e.key === "F1") {
                     const instIds = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
@@ -288,21 +423,29 @@
                     currentInstId = instIds[(idx + 1) % instIds.length];
                     $("#instIdSelect").val(currentInstId);
                     fetchAllData();
+                    updateDetailTitle();
                     alert(`已切换至${currentInstId}`);
                 }
                 if (e.key === "F2") {
-                    alert("使用帮助：\n1. AI分析每30分钟更新\n2. 持仓记录本地保存\n3. 信号变化会弹出通知");
+                    alert("使用帮助：\n1. 点击主流币卡片快速切换监控币种\n2. 支持设置价格预警，触发时会弹出通知\n3. 持仓记录保存在本地，刷新不丢失\n4. AI分析每30分钟自动更新");
                 }
             });
         }
 
-        // 行情拉取
+        // 更新详情面板标题
+        function updateDetailTitle() {
+            $("#detailTitle").text(`${currentInstId} 详情数据`);
+        }
+
+        // ========== 行情数据拉取 ==========
         function fetchAllData() {
             updateStatus(`正在拉取${currentInstId}行情数据...`, false);
             fetchKlineData().catch(err => console.log("K线失败：", err));
             fetchTickerData().catch(err => console.log("最新价失败：", err));
+            fetchDetailData().catch(err => console.log("详情数据失败：", err));
             fetchDepthData().catch(err => {
                 console.log("深度图失败：", err);
+                // 兜底显示买卖一价
                 $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
                     if (res && res.code === "0" && res.data && res.data.length > 0) {
                         const ticker = res.data[0];
@@ -321,12 +464,13 @@
                 });
             });
 
+            // 状态更新
             setTimeout(() => {
                 updateStatus(currentPrice > 0 ? `${currentInstId}数据刷新成功` : `${currentInstId}K线已加载，部分数据待更新`, true);
             }, 3000);
         }
 
-        // K线数据
+        // 拉取K线数据
         function fetchKlineData() {
             return new Promise((resolve, reject) => {
                 $.get(`${API_BASE_URL}/candles`, { instId: currentInstId, bar: "15m", limit: "10" }, (res) => {
@@ -342,7 +486,7 @@
             });
         }
 
-        // 深度数据
+        // 拉取深度数据
         function fetchDepthData() {
             return new Promise((resolve, reject) => {
                 $.get(`${API_BASE_URL}/depth`, { instId: currentInstId, sz: "5" }, (res) => {
@@ -357,7 +501,7 @@
             });
         }
 
-        // 最新价
+        // 拉取最新价
         function fetchTickerData() {
             return new Promise((resolve, reject) => {
                 $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
@@ -369,11 +513,59 @@
             });
         }
 
-        // AI分析
+        // 拉取单币种详情数据
+        function fetchDetailData() {
+            return new Promise((resolve, reject) => {
+                $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
+                    if (res.code === "0" && res.data.length > 0) {
+                        const ticker = res.data[0];
+                        // 渲染详情数据
+                        $("#detail-high").text(parseFloat(ticker.high24h).toFixed(2) + " USDT");
+                        $("#detail-low").text(parseFloat(ticker.low24h).toFixed(2) + " USDT");
+                        $("#detail-vol").text(parseFloat(ticker.vol24h).toFixed(2) + " USDT");
+                        // 计算24h涨跌幅
+                        const change = ((parseFloat(ticker.last) - parseFloat(ticker.open24h)) / parseFloat(ticker.open24h)) * 100;
+                        const changeColor = change >= 0 ? "#52c41a" : "#ff4d4f";
+                        $("#detail-change").html(`<span style="color:${changeColor};">${change.toFixed(2)}%</span>`);
+                        resolve();
+                    } else { reject(new Error("详情数据空")); }
+                }).fail(reject);
+            });
+        }
+
+        // 拉取主流币行情
+        function fetchMajorTickers() {
+            MAJOR_COINS.forEach(coin => {
+                $.get(`${API_BASE_URL}/ticker`, { instId: coin.instId }, (res) => {
+                    if (res.code === "0" && res.data.length > 0) {
+                        const ticker = res.data[0];
+                        const price = parseFloat(ticker.last).toFixed(2);
+                        const change = ((parseFloat(ticker.last) - parseFloat(ticker.open24h)) / parseFloat(ticker.open24h)) * 100;
+                        const vol = parseFloat(ticker.vol24h).toFixed(2);
+                        const color = change >= 0 ? "#52c41a" : "#ff4d4f";
+                        // 渲染卡片
+                        $(`#ticker-${coin.symbol}`).html(`
+                            <p style="font-size:14px; font-weight:bold;">${coin.symbol}</p>
+                            <p style="font-size:16px; margin: 5px 0;">${price} USDT</p>
+                            <p style="color:${color}; font-size:12px;">${change.toFixed(2)}%</p>
+                            <p style="font-size:10px; color:#999;">24h: ${vol}</p>
+                        `).click(() => {
+                            currentInstId = coin.instId;
+                            $("#instIdSelect").val(coin.instId);
+                            fetchAllData();
+                            updateDetailTitle();
+                        });
+                    }
+                });
+            });
+        }
+
+        // ========== AI分析与策略状态 ==========
         function fetchAIAnalysis() {
             $.get(`${GITHUB_REPO_URL}/ai_analysis_log.json`, (data) => {
                 renderAIAnalysis(data);
             }).fail(() => {
+                // 模拟数据
                 const mock = {
                     time: new Date().toLocaleString(),
                     instId: "BTC-USDT",
@@ -394,14 +586,15 @@
             $("#aiSignal").removeClass().addClass(`ai-signal signal-${signal}`);
             const text = signal === "buy" ? "【买入信号】建议进场" : signal === "sell" ? "【卖出信号】建议离场" : "【持有信号】建议观望";
             $("#aiSignal").text(text);
+            // 信号提醒
             if (signal !== lastAISignal && signal !== "hold") {
                 showAISignalAlert(signal, instId);
                 lastAISignal = signal;
             }
         }
 
-        // 策略状态
         function fetchBotStatus() {
+            // 模拟策略状态
             const mock = {
                 time: new Date(new Date().getTime() - 15 * 60 * 1000).toLocaleString(),
                 status: "success",
@@ -414,7 +607,6 @@
             `);
         }
 
-        // 信号提醒
         function showAISignalAlert(signal, instId) {
             const text = signal === "buy" ? `【买入信号】${instId}建议进场` : `【卖出信号】${instId}建议离场`;
             alert(text);
@@ -423,13 +615,14 @@
             }
         }
 
-        // 盈亏计算
+        // ========== 持仓盈亏计算 ==========
         function calculateProfit() {
             const instId = $("#instIdSelect").val();
             const dir = $("#directionSelect").val();
             const entry = parseFloat($("#entryPrice").val());
             const amt = parseFloat($("#positionAmt").val());
 
+            // 输入校验
             if (isNaN(entry) || isNaN(amt) || entry <= 0 || amt <= 0) {
                 alert("请输入有效持仓信息！");
                 return;
@@ -439,10 +632,12 @@
                 return;
             }
 
+            // 计算盈亏
             const profit = dir === "long" ? (currentPrice - entry) * amt : (entry - currentPrice) * amt;
             const ratio = (profit / (entry * amt)) * 100;
             const cls = profit >= 0 ? "profit-green" : "profit-red";
 
+            // 渲染表格
             $("#profitTableBody").html(`
                 <tr>
                     <td>${instId}</td>
@@ -456,7 +651,7 @@
             `);
         }
 
-        // 持仓记录
+        // ========== 持仓记录管理 ==========
         function savePositionRecord() {
             const instId = $("#instIdSelect").val();
             const dir = $("#directionSelect").val();
@@ -487,7 +682,7 @@
 
         function loadAllPositionRecords() {
             const records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
-            const $select = $("#recordSelect").html('<option value="">请选择记录</option>');
+            $("#recordSelect").html('<option value="">请选择记录</option>');
             records.forEach(r => {
                 $("#recordSelect").append(`<option value="${r.id}">${r.name}（${r.createTime}）</option>`);
             });
@@ -506,6 +701,7 @@
                 calculateProfit();
                 currentInstId = record.instId;
                 fetchAllData();
+                updateDetailTitle();
             }
         }
 
@@ -515,7 +711,7 @@
                 alert("请选择要删除的记录！");
                 return;
             }
-            if (confirm("确定删除？")) {
+            if (confirm("确定删除该记录吗？删除后无法恢复！")) {
                 let records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
                 records = records.filter(r => r.id != id);
                 localStorage.setItem(RECORD_KEY, JSON.stringify(records));
@@ -525,6 +721,87 @@
                 $("#profitTableBody").html('<tr><td colspan="7">请录入持仓信息并点击计算</td></tr>');
                 alert("删除成功");
             }
+        }
+
+        // ========== 价格预警功能 ==========
+        // 加载价格预警
+        function loadPriceAlerts() {
+            priceAlerts = JSON.parse(localStorage.getItem(ALERT_KEY) || "[]");
+            renderAlertList();
+        }
+
+        // 渲染预警列表
+        function renderAlertList() {
+            if (priceAlerts.length === 0) {
+                $("#alertList").text("暂无预警设置");
+                return;
+            }
+            let html = "<ul style='margin:0; padding-left:20px;'>";
+            priceAlerts.forEach((alert, idx) => {
+                const typeText = alert.type === "up" ? "上涨至" : "下跌至";
+                html += `<li>${alert.instId} ${typeText} ${alert.price} USDT</li>`;
+            });
+            html += "</ul>";
+            $("#alertList").html(html);
+        }
+
+        // 添加价格预警
+        function addPriceAlert() {
+            const instId = $("#alertInstId").val();
+            const price = parseFloat($("#alertPrice").val());
+            const type = $("#alertType").val();
+
+            if (isNaN(price) || price <= 0) {
+                alert("请输入有效的预警价格！");
+                return;
+            }
+
+            const alert = {
+                id: new Date().getTime(),
+                instId: instId,
+                price: price,
+                type: type
+            };
+
+            priceAlerts.push(alert);
+            localStorage.setItem(ALERT_KEY, JSON.stringify(priceAlerts));
+            renderAlertList();
+            $("#alertPrice").val("");
+            alert(`已添加预警：${instId} ${type === "up" ? "上涨至" : "下跌至"} ${price} USDT`);
+        }
+
+        // 清空价格预警
+        function clearPriceAlert() {
+            if (confirm("确定清空所有价格预警吗？")) {
+                priceAlerts = [];
+                localStorage.removeItem(ALERT_KEY);
+                renderAlertList();
+                alert("所有预警已清空");
+            }
+        }
+
+        // 检查价格预警
+        function checkPriceAlerts() {
+            if (priceAlerts.length === 0 || currentPrice === 0) return;
+
+            priceAlerts.forEach(alert => {
+                if (alert.instId !== currentInstId) return;
+                const trigger = alert.type === "up" ? currentPrice >= alert.price : currentPrice <= alert.price;
+                if (trigger) {
+                    const typeText = alert.type === "up" ? "上涨至" : "下跌至";
+                    const text = `【价格预警】${alert.instId} ${typeText} ${alert.price} USDT，当前价：${currentPrice.toFixed(2)} USDT`;
+                    // 弹窗提醒
+                    alert(text);
+                    // 桌面通知
+                    if (Notification.permission === "granted") {
+                        new Notification("欧易价格预警", { body: text, icon: "https://okx.com/favicon.ico" });
+                    }
+                    // 触发后移除该预警
+                    priceAlerts = priceAlerts.filter(a => a.id !== alert.id);
+                    localStorage.setItem(ALERT_KEY, JSON.stringify(priceAlerts));
+                    renderAlertList();
+                }
+            });
         }
     </script>
 </body>

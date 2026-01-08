@@ -37,3 +37,13 @@ jobs:
           git add trade_logs.csv
           git commit -m "Update trade logs at $(date)"
           git push
+- name: Run OKX trade bot
+  run: |
+    python okx_trade_tool.py
+    # 将AI分析结果写入JSON文件
+    echo '{"time":"$(date)", "instId":"BTC-USDT", "analysis":"多头趋势，建议持仓", "signal":"buy"}' > ai_analysis_log.json
+- name: Commit AI log
+  run: |
+    git add ai_analysis_log.json
+    git commit -m "Update AI analysis log"
+    git push

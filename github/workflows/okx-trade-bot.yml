@@ -1,49 +1,40 @@
-name: OKX Contract Trade Bot (24/7)
+name: OKX Contract AI Analysis Bot
+
 on:
-  workflow_dispatch:  # 手动触发
   schedule:
-    - cron: '*/30 * * * *'  # 每30分钟执行一次（AI分析+风险监控）
+    - cron: "*/30 * * * *" # 每30分钟执行一次
+  workflow_dispatch: # 手动触发
 
 jobs:
-  run-trade-bot:
+  run-ai-analysis:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # 防止长时间占用资源
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'  # 兼容python-okx
+          python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests numpy
 
-      - name: Run OKX trade bot
+      - name: Run AI Analysis Script
         env:
-          API_KEY: ${{ secrets.OKX_API_KEY }}
-          SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
-          PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
-          GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
-        run: python okx_trade_tool.py
-
-      - name: Commit trade logs (optional)
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
         run: |
-          git config --global user.email "bot@example.com"
-          git config --global user.name "Trade Bot"
-          git add trade_logs.csv
-          git commit -m "Update trade logs at $(date)"
+          python okx_trade_tool.py
+
+      - name: Commit AI Analysis Log
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add ai_analysis_log.json
+          git commit -m "Update AI analysis log: $(date +'%Y-%m-%d %H:%M:%S')"
           git push
-- name: Run OKX trade bot
-  run: |
-    python okx_trade_tool.py
-    # 将AI分析结果写入JSON文件
-    echo '{"time":"$(date)", "instId":"BTC-USDT", "analysis":"多头趋势，建议持仓", "signal":"buy"}' > ai_analysis_log.json
-- name: Commit AI log
-  run: |
-    git add ai_analysis_log.json
-    git commit -m "Update AI analysis log"
-    git push
+        continue-on-error: true # 无更新时跳过

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>豆包搭档·合约工具【无API实时行情版】</title>
+    <title>豆包搭档·合约工具【多接口行情聚合版】</title>
     <style>
         * {margin: 0;padding: 0;box-sizing: border-box;font-family: "Microsoft YaHei", sans-serif;}
         body {background-color: #121212;color: #fff;padding: 20px;}
@@ -18,6 +18,14 @@
         }
         .signal-banner.strong-long {background: linear-gradient(90deg, #e74c3c, #c0392b);}
         .signal-banner.strong-short {background: linear-gradient(90deg, #3498db, #2980b9);}
+        /* 行情接口状态提示 */
+        .api-status {
+            text-align: center;margin-bottom: 15px;padding: 8px;border-radius: 4px;
+            font-size: 12px;background-color: #1e1e1e;
+        }
+        .api-status span {margin: 0 10px;}
+        .api-online {color: #27ae60;}
+        .api-offline {color: #e74c3c;}
         /* 提醒记录区 */
         .alert-record-container {
             background-color: #1e1e1e;border-radius: 8px;padding: 15px;margin-bottom: 20px;border: 1px solid #f39c12;
@@ -71,6 +79,11 @@
         .price-change {font-size: 16px;font-weight: bold;margin-bottom: 10px;}
         .rise {color: #e74c3c;}
         .fall {color: #27ae60;}
+        /* 双接口价格对比 */
+        .price-compare {
+            font-size: 12px;padding: 5px;background-color: #2c2c2c;border-radius: 4px;margin-bottom: 8px;
+            display: flex;justify-content: space-between;
+        }
         /* 下单参数区 */
         .okx-order-params {
             background-color: #2c2c2c;padding: 10px;border-radius: 4px;margin: 10px 0;font-size: 14px;line-height: 1.8;
@@ -143,10 +156,17 @@
 </head>
 <body>
     <div class="header">
-        <h1>豆包搭档·合约工具【无API实时行情版】</h1>
+        <h1>豆包搭档·合约工具【多接口行情聚合版】</h1>
         <div class="shortcut-tips">
-            小白用法：看信号→开提醒→等弹窗→抄参数下单 | 行情3秒自动更新 | 快捷键：F1=切换周期 F2=清空预警 F3=风险计算 F4=指标开关
+            小白用法：看信号→开提醒→等弹窗→抄参数下单 | 双接口2秒刷新 | 快捷键：F1=切换周期 F2=清空预警 F3=风险计算 F4=指标开关
         </div>
+    </div>
+
+    <!-- 双行情接口状态提示 -->
+    <div class="api-status" id="api-status">
+        <span>CoinGecko接口：<span class="api-offline">连接中</span></span>
+        <span>Binance接口：<span class="api-offline">连接中</span></span>
+        <span>当前使用：<span id="active-api">无</span></span>
     </div>
 
     <!-- 价格提醒历史记录 -->
@@ -167,10 +187,9 @@
 
     <!-- 自定义币种添加区 -->
     <div class="custom-coin-add">
-        <div class="add-coin-title">自定义币种添加（输入代码如 APT/ARB，小白不用管ID）</div>
+        <div class="add-coin-title">自定义币种添加（输入代码如 APT/ARB）</div>
         <div class="add-coin-form">
             <input type="text" id="new-coin-code" placeholder="币种代码（如 APT）" maxlength="5">
-            <input type="text" id="new-coin-id" placeholder="CoinGecko ID（留空自动补）" style="display:none">
             <select id="new-coin-exchange">
                 <option>欧易</option>
                 <option>币安</option>
@@ -183,7 +202,7 @@
     <!-- 多币种监控容器 -->
     <div class="monitor-container" id="monitor-container">
         <!-- BTC-USDT -->
-        <div class="coin-card wait" data-coin="BTC" data-id="bitcoin">
+        <div class="coin-card wait" data-coin="BTC" data-cg-id="bitcoin" data-binance-id="BTCUSDT">
             <div class="coin-header">
                 <span class="coin-name">BTC-USDT</span>
                 <div class="alert-switch">
@@ -191,7 +210,12 @@
                     <input type="checkbox" id="alert-switch-btc" onchange="toggleAlert('BTC')">
                 </div>
             </div>
-            <div class="coin-price">价格：<span class="real-price">--</span> USDT</div>
+            <!-- 双接口价格对比 -->
+            <div class="price-compare">
+                <span>CoinGecko：<span id="btc-cg-price">--</span> USDT</span>
+                <span>Binance：<span id="btc-binance-price">--</span> USDT</span>
+            </div>
+            <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
             <div class="price-change fall">24h涨跌幅：<span class="real-change">--</span>%</div>
             <div class="okx-order-params">
                 方向：<span id="btc-direction">观望</span> | 杠杆：<span>5倍（小白推荐）</span><br>
@@ -208,7 +232,7 @@
             <button class="indicator-btn" onclick="toggleIndicator(this)">F4 指标开关</button>
         </div>
         <!-- ETH-USDT -->
-        <div class="coin-card wait" data-coin="ETH" data-id="ethereum">
+        <div class="coin-card wait" data-coin="ETH" data-cg-id="ethereum" data-binance-id="ETHUSDT">
             <div class="coin-header">
                 <span class="coin-name">ETH-USDT</span>
                 <div class="alert-switch">
@@ -216,7 +240,11 @@
                     <input type="checkbox" id="alert-switch-eth" onchange="toggleAlert('ETH')">
                 </div>
             </div>
-            <div class="coin-price">价格：<span class="real-price">--</span> USDT</div>
+            <div class="price-compare">
+                <span>CoinGecko：<span id="eth-cg-price">--</span> USDT</span>
+                <span>Binance：<span id="eth-binance-price">--</span> USDT</span>
+            </div>
+            <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
             <div class="price-change rise">24h涨跌幅：<span class="real-change">--</span>%</div>
             <div class="okx-order-params">
                 方向：<span id="eth-direction">观望</span> | 杠杆：<span>5倍（小白推荐）</span><br>
@@ -233,7 +261,7 @@
             <button class="indicator-btn" onclick="toggleIndicator(this)">F4 指标开关</button>
         </div>
         <!-- SOL-USDT -->
-        <div class="coin-card wait" data-coin="SOL" data-id="solana">
+        <div class="coin-card wait" data-coin="SOL" data-cg-id="solana" data-binance-id="SOLUSDT">
             <div class="coin-header">
                 <span class="coin-name">SOL-USDT</span>
                 <div class="alert-switch">
@@ -241,7 +269,11 @@
                     <input type="checkbox" id="alert-switch-sol" onchange="toggleAlert('SOL')">
                 </div>
             </div>
-            <div class="coin-price">价格：<span class="real-price">--</span> USDT</div>
+            <div class="price-compare">
+                <span>CoinGecko：<span id="sol-cg-price">--</span> USDT</span>
+                <span>Binance：<span id="sol-binance-price">--</span> USDT</span>
+            </div>
+            <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
             <div class="price-change fall">24h涨跌幅：<span class="real-change">--</span>%</div>
             <div class="okx-order-params">
                 方向：<span id="sol-direction">观望</span> | 杠杆：<span>3倍（小白推荐）</span><br>
@@ -313,12 +345,12 @@
         <div class="ai-card">
             <div class="card-title">
                 <span>人话版行情解读（小白必看）</span>
-                <span style="font-size:12px;color:#999">3秒自动更新行情</span>
+                <span style="font-size:12px;color:#999">2秒自动更新行情</span>
             </div>
             <div class="ai-content" id="ai-analysis">
-                【BTC】价格加载中，稍等3秒！
-                【ETH】价格加载中，稍等3秒！
-                【SOL】价格加载中，稍等3秒！
+                【BTC】价格加载中，稍等2秒！
+                【ETH】价格加载中，稍等2秒！
+                【SOL】价格加载中，稍等2秒！
                 <br><br>
                 <strong>小白提示：</strong>只做「开多」「开空」信号的币种，观望的别碰！
             </div>
@@ -338,12 +370,23 @@
     </div>
 
     <script>
-        // 币种ID映射表
-        const coinIdMap={
-            BTC: "bitcoin",ETH: "ethereum",SOL: "solana",
-            APT: "aptos",ARB: "arbitrum",ADA: "cardano",
-            DOT: "polkadot",MATIC: "polygon",AVAX: "avalanche-2"
+        // 币种双接口ID映射表
+        const coinApiMap={
+            BTC: {cg: "bitcoin", binance: "BTCUSDT"},
+            ETH: {cg: "ethereum", binance: "ETHUSDT"},
+            SOL: {cg: "solana", binance: "SOLUSDT"},
+            APT: {cg: "aptos", binance: "APTUSDT"},
+            ARB: {cg: "arbitrum", binance: "ARBUSDT"},
+            ADA: {cg: "cardano", binance: "ADAUSDT"},
+            DOT: {cg: "polkadot", binance: "DOTUSDT"},
+            MATIC: {cg: "polygon", binance: "MATICUSDT"},
+            AVAX: {cg: "avalanche-2", binance: "AVAXUSDT"}
         };
+        // 接口状态与当前使用接口
+        let apiStatus = {cg: false, binance: false};
+        let activeApi = "cg";
+        // 行情数据缓存
+        let priceCache = {cg: {}, binance: {}};
         // 提醒开关状态
         let alertSwitchStatus = {BTC: false, ETH: false, SOL: false};
         // 提醒点位数据
@@ -375,7 +418,7 @@
             const price = parseFloat(document.querySelector(`.coin-card[data-coin="${coin}"] .real-price`).textContent) || 0;
             
             if (price === 0) {
-                document.getElementById('strategy-result').textContent = "行情还没加载出来，等3秒再试！";
+                document.getElementById('strategy-result').textContent = "行情还没加载出来，等2秒再试！";
                 return;
             }
 
@@ -484,8 +527,7 @@
                 alert(`${code}-USDT已经在列表里了！`);
                 return;
             }
-            const coinId = coinIdMap[code] || code.toLowerCase();
-            document.getElementById('new-coin-id').value = coinId;
+            const coinMap = coinApiMap[code] || {cg: code.toLowerCase(), binance: `${code}USDT`};
 
             alertSwitchStatus[code] = false;
             alertPriceData[code] = {tp: 0, sl: 0};
@@ -493,7 +535,8 @@
             const card = document.createElement('div');
             card.className = `coin-card wait`;
             card.dataset.coin = code;
-            card.dataset.id = coinId;
+            card.dataset.cgId = coinMap.cg;
+            card.dataset.binanceId = coinMap.binance;
             card.innerHTML = `
                 <div class="coin-header">
                     <span class="coin-name">${code}-USDT</span>
@@ -502,7 +545,11 @@
                         <input type="checkbox" id="alert-switch-${code.toLowerCase()}" onchange="toggleAlert('${code}')">
                     </div>
                 </div>
-                <div class="coin-price">价格：<span class="real-price">--</span> USDT</div>
+                <div class="price-compare">
+                    <span>CoinGecko：<span id="${code.toLowerCase()}-cg-price">--</span> USDT</span>
+                    <span>Binance：<span id="${code.toLowerCase()}-binance-price">--</span> USDT</span>
+                </div>
+                <div class="coin-price">最终价格：<span class="real-price">--</span> USDT</div>
                 <div class="price-change fall">24h涨跌幅：<span class="real-change">--</span>%</div>
                 <div class="okx-order-params">
                     方向：<span>观望</span> | 杠杆：<span>3倍（小白推荐）</span><br>
@@ -520,81 +567,153 @@
             `;
             document.getElementById('monitor-container').appendChild(card);
             document.getElementById('new-coin-code').value = '';
-            fetchCoinPrice(code, card);
+            // 更新策略币种选择
             const option = document.createElement('option');
             option.value = code;
             option.textContent = `${code}-USDT`;
             document.getElementById('strategy-coin').appendChild(option);
         }
 
-        // 实时行情拉取（3秒刷新）
-        async function fetchCoinPrice(coinCode, card) {
+        // ========== 核心升级：双接口行情拉取与切换 ==========
+        // 拉取CoinGecko行情
+        async function fetchCgPrice(coinCode, cgId) {
             try {
-                const coinId = card ? card.dataset.id : coinIdMap[coinCode];
-                const apiUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true`;
-                const response = await fetch(apiUrl);
-                const data = await response.json();
-                
-                if (data[coinId]) {
-                    const price = data[coinId].usd.toFixed(2);
-                    const change = data[coinId].usd_24h_change.toFixed(2);
-                    const signal = getSignal(parseFloat(change));
-
-                    if (card) {
-                        card.querySelector('.real-price').textContent = price;
-                        card.querySelector('.real-change').textContent = change;
-                        card.querySelector('.price-change').className = `price-change ${change >= 0 ? 'rise' : 'fall'}`;
-                        card.className = `coin-card ${signal.type}`;
-                        card.querySelector('.okx-order-params span').textContent = signal.text;
-                        if (alertPriceData[coinCode].tp > 0) {
-                            card.querySelector('.okx-order-params span:nth-child(3)').textContent = alertPriceData[coinCode].tp;
-                            card.querySelector('.okx-order-params span:nth-child(5)').textContent = alertPriceData[coinCode].sl;
-                        }
-                    } else {
-                        document.querySelectorAll(`.coin-card[data-coin="${coinCode}"]`).forEach(item => {
-                            item.querySelector('.real-price').textContent = price;
-                            item.querySelector('.real-change').textContent = change;
-                            item.querySelector('.price-change').className = `price-change ${change >= 0 ? 'rise' : 'fall'}`;
-                            item.className = `coin-card ${signal.type}`;
-                        });
-                    }
-
-                    // 价格提醒监控
-                    if (alertSwitchStatus[coinCode] && alertPriceData[coinCode].tp > 0 && alertPriceData[coinCode].sl > 0) {
-                        const currentPrice = parseFloat(price);
-                        const tpPrice = parseFloat(alertPriceData[coinCode].tp);
-                        const slPrice = parseFloat(alertPriceData[coinCode].sl);
-
-                        if (currentPrice >= tpPrice) {
-                            triggerAlert(coinCode, "止盈", tpPrice, currentPrice);
-                            alertSwitchStatus[coinCode] = false;
-                            document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
-                        }
-                        if (currentPrice <= slPrice) {
-                            triggerAlert(coinCode, "止损", slPrice, currentPrice);
-                            alertSwitchStatus[coinCode] = false;
-                            document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
-                        }
-                    }
-
-                    updateGlobalSignal();
-                    updateAIAnalysis(coinCode, price, change, signal.text);
+                const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`);
+                const data = await res.json();
+                if (data[cgId]) {
+                    priceCache.cg[coinCode] = {
+                        price: data[cgId].usd.toFixed(2),
+                        change: data[cgId].usd_24h_change.toFixed(2)
+                    };
+                    apiStatus.cg = true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-cg-price`).textContent = priceCache.cg[coinCode].price;
                 }
-            } catch (error) {
-                console.log(`获取${coinCode}行情失败，用模拟数据`, error);
-                const mockPrice = (Math.random() * 1000 + 100).toFixed(2);
-                const mockChange = (Math.random() * 4 - 2).toFixed(2);
-                const signal = getSignal(parseFloat(mockChange));
-                if (card) {
-                    card.querySelector('.real-price').textContent = mockPrice;
-                    card.querySelector('.real-change').textContent = mockChange;
-                    card.querySelector('.price-change').className = `price-change ${mockChange >= 0 ? 'rise' : 'fall'}`;
-                    card.className = `coin-card ${signal.type}`;
-                }
+            } catch (e) {
+                apiStatus.cg = false;
             }
         }
 
-        // 更新全局信号
+        // 拉取Binance行情
+        async function fetchBinancePrice(coinCode, binanceId) {
+            try {
+                const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceId}`);
+                const data = await res.json();
+                if (data.lastPrice) {
+                    priceCache.binance[coinCode] = {
+                        price: parseFloat(data.lastPrice).toFixed(2),
+                        change: parseFloat(data.priceChangePercent).toFixed(2)
+                    };
+                    apiStatus.binance = true;
+                    document.querySelector(`#${coinCode.toLowerCase()}-binance-price`).textContent = priceCache.binance[coinCode].price;
+                }
+            } catch (e) {
+                apiStatus.binance = false;
+            }
+        }
+
+        // 双接口数据融合与切换
+        function mergePriceData(coinCode) {
+            // 优先用响应快的接口，都可用则取均价
+            let finalPrice = 0;
+            let finalChange = 0;
+
+            if (apiStatus.cg && apiStatus.binance) {
+                finalPrice = ((parseFloat(priceCache.cg[coinCode].price) + parseFloat(priceCache.binance[coinCode].price)) / 2).toFixed(2);
+                finalChange = ((parseFloat(priceCache.cg[coinCode].change) + parseFloat(priceCache.binance[coinCode].change)) / 2).toFixed(2);
+                activeApi = "双接口均价";
+            } else if (apiStatus.cg) {
+                finalPrice = priceCache.cg[coinCode].price;
+                finalChange = priceCache.cg[coinCode].change;
+                activeApi = "CoinGecko";
+            } else if (apiStatus.binance) {
+                finalPrice = priceCache.binance[coinCode].price;
+                finalChange = priceCache.binance[coinCode].change;
+                activeApi = "Binance";
+            } else {
+                finalPrice = "--";
+                finalChange = "--";
+                activeApi = "无";
+            }
+
+            // 更新卡片显示
+            const card = document.querySelector(`.coin-card[data-coin="${coinCode}"]`);
+            if (finalPrice !== "--") {
+                card.querySelector('.real-price').textContent = finalPrice;
+                card.querySelector('.real-change').textContent = finalChange;
+                card.querySelector('.price-change').className = `price-change ${parseFloat(finalChange) >= 0 ? 'rise' : 'fall'}`;
+                // 更新信号
+                const signal = getSignal(parseFloat(finalChange));
+                card.className = `coin-card ${signal.type}`;
+                card.querySelector('.okx-order-params span').textContent = signal.text;
+                // 价格提醒监控
+                checkAlert(coinCode, parseFloat(finalPrice));
+            }
+        }
+
+        // 检查接口状态并更新显示
+        function updateApiStatus() {
+            document.querySelector('#api-status .api-online').parentElement.textContent = `CoinGecko接口：${apiStatus.cg ? '✅ 在线' : '❌ 离线'}`;
+            document.querySelector('#api-status .api-online').parentElement.className = apiStatus.cg ? 'api-online' : 'api-offline';
+            document.querySelectorAll('#api-status span')[1].textContent = `Binance接口：${apiStatus.binance ? '✅ 在线' : '❌ 离线'}`;
+            document.querySelectorAll('#api-status span')[1].className = apiStatus.binance ? 'api-online' : 'api-offline';
+            document.getElementById('active-api').textContent = activeApi;
+        }
+
+        // ========== 价格提醒逻辑 ==========
+        function checkAlert(coinCode, currentPrice) {
+            if (!alertSwitchStatus[coinCode]) return;
+            if (alertPriceData[coinCode].tp === 0 || alertPriceData[coinCode].sl === 0) return;
+
+            const tp = parseFloat(alertPriceData[coinCode].tp);
+            const sl = parseFloat(alertPriceData[coinCode].sl);
+
+            if (currentPrice >= tp) {
+                triggerAlert(coinCode, "止盈", tp, currentPrice);
+                alertSwitchStatus[coinCode] = false;
+                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+            }
+            if (currentPrice <= sl) {
+                triggerAlert(coinCode, "止损", sl, currentPrice);
+                alertSwitchStatus[coinCode] = false;
+                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+            }
+        }
+
+        function triggerAlert(coinCode, type, targetPrice, currentPrice) {
+            const time = new Date().toLocaleString();
+            const alertMsg = `【${time}】${coinCode}触发${type}提醒！目标价：${targetPrice} USDT，当前价：${currentPrice} USDT`;
+            alert(alertMsg);
+            const audio = new Audio('https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3');
+            audio.play();
+            alertRecordList.unshift(alertMsg);
+            updateAlertRecord();
+        }
+
+        function toggleAlert(coinCode) {
+            alertSwitchStatus[coinCode] = !alertSwitchStatus[coinCode];
+            if (!alertSwitchStatus[coinCode]) return;
+            if (alertPriceData[coinCode].tp === 0) {
+                alert(`请先在「小白策略生成器」中生成${coinCode}的下单参数，再开启提醒！`);
+                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
+                alertSwitchStatus[coinCode] = false;
+            }
+        }
+
+        function updateAlertRecord() {
+            const recordList = document.getElementById('alert-record-list');
+            if (alertRecordList.length === 0) {
+                recordList.innerHTML = '暂无提醒记录';
+                return;
+            }
+            recordList.innerHTML = alertRecordList.map(item => `<div class="alert-record-item">${item}</div>`).join('');
+        }
+
+        function clearAlertRecord() {
+            alertRecordList = [];
+            updateAlertRecord();
+        }
+
+        // ========== 全局信号与AI解读更新 ==========
         function updateGlobalSignal() {
             const btcChange = parseFloat(document.querySelector('.coin-card[data-coin="BTC"] .real-change').textContent) || 0;
             const ethChange = parseFloat(document.querySelector('.coin-card[data-coin="ETH"] .real-change').textContent) || 0;
@@ -605,78 +724,60 @@
             globalSignal.textContent = `大盘信号：${signal.text}`;
         }
 
-        // 更新AI解读
-        function updateAIAnalysis(coinCode, price, change, signal) {
+        function updateAIAnalysis() {
             const aiContent = document.getElementById('ai-analysis');
-            const changeNum = parseFloat(change);
-            let desc = '';
-            if (changeNum > 2) desc = `涨了${change}%，多头很强，赶紧跟车开多！`;
-            else if (changeNum < -2) desc = `跌了${change}%，空头很强，赶紧开空！`;
-            else desc = `涨跌不大，震荡行情，别下单！`;
-            
-            const existing = aiContent.textContent.includes(`【${coinCode}】`) 
-                ? aiContent.textContent.split(`【${coinCode}】`)[0] 
-                : aiContent.textContent.split('\n\n')[0] + '\n';
-            
-            aiContent.textContent = `${existing}【${coinCode}】价格${price} USDT，${desc}
-信号：${signal} | 操作：${signal === '观望' ? '别碰' : '去欧易抄参数下单'}
-\n<strong>小白提示：</strong>只做「强势开多」「强势开空」的币种，观望的别浪费钱！`;
-        }
-
-        // 触发价格提醒
-        function triggerAlert(coinCode, type, targetPrice, currentPrice) {
-            const time = new Date().toLocaleString();
-            const alertMsg = `【${time}】${coinCode}触发${type}提醒！目标价：${targetPrice} USDT，当前价：${currentPrice} USDT`;
-            // 弹窗提醒
-            alert(alertMsg);
-            // 声音提醒
-            const audio = new Audio('https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3');
-            audio.play();
-            // 记录提醒
-            alertRecordList.unshift(alertMsg);
-            updateAlertRecord();
-        }
-
-        // 切换提醒开关
-        function toggleAlert(coinCode) {
-            alertSwitchStatus[coinCode] = !alertSwitchStatus[coinCode];
-            if (!alertSwitchStatus[coinCode]) return;
-            // 若未生成提醒点位，提示先生成策略
-            if (alertPriceData[coinCode].tp === 0) {
-                alert(`请先在「小白策略生成器」中生成${coinCode}的下单参数，再开启提醒！`);
-                document.getElementById(`alert-switch-${coinCode.toLowerCase()}`).checked = false;
-                alertSwitchStatus[coinCode] = false;
-            }
-        }
-
-        // 更新提醒记录
-        function updateAlertRecord() {
-            const recordList = document.getElementById('alert-record-list');
-            if (alertRecordList.length === 0) {
-                recordList.innerHTML = '暂无提醒记录';
-                return;
-            }
-            recordList.innerHTML = alertRecordList.map(item => `<div class="alert-record-item">${item}</div>`).join('');
-        }
-
-        // 清空提醒记录
-        function clearAlertRecord() {
-            alertRecordList = [];
-            updateAlertRecord();
-        }
-
-        // 初始化：3秒自动刷新行情
-        window.onload = function() {
-            ['BTC', 'ETH', 'SOL'].forEach(coin => {
-                fetchCoinPrice(coin);
+            let content = '';
+            document.querySelectorAll('.coin-card').forEach(card => {
+                const coin = card.dataset.coin;
+                const price = card.querySelector('.real-price').textContent;
+                const change = card.querySelector('.real-change').textContent;
+                const signal = card.querySelector('.okx-order-params span').textContent;
+                
+                let desc = '';
+                if (price !== "--") {
+                    const changeNum = parseFloat(change);
+                    desc = changeNum > 2 ? `涨了${change}%，多头很强，赶紧跟车开多！` : 
+                           changeNum < -2 ? `跌了${change}%，空头很强，赶紧开空！` : 
+                           `涨跌不大，震荡行情，别下单！`;
+                } else {
+                    desc = "价格加载中，稍等2秒！";
+                }
+                content += `【${coin}】价格${price} USDT，${desc}\n信号：${signal} | 操作：${signal === '观望' ? '别碰' : '去欧易抄参数下单'}\n`;
             });
-            // 3秒刷新一次行情
+            content += '\n<strong>小白提示：</strong>只做「强势开多」「强势开空」的币种，观望的别浪费钱！';
+            aiContent.textContent = content;
+        }
+
+        // ========== 初始化与定时刷新 ==========
+        window.onload = function() {
+            // 初始化所有币种行情拉取
+            document.querySelectorAll('.coin-card').forEach(card => {
+                const coin = card.dataset.coin;
+                const cgId = card.dataset.cgId;
+                const binanceId = card.dataset.binanceId;
+                
+                fetchCgPrice(coin, cgId);
+                fetchBinancePrice(coin, binanceId);
+                setTimeout(() => mergePriceData(coin), 500);
+            });
+
+            // 2秒定时刷新行情
             setInterval(() => {
                 document.querySelectorAll('.coin-card').forEach(card => {
                     const coin = card.dataset.coin;
-                    fetchCoinPrice(coin, card);
+                    const cgId = card.dataset.cgId;
+                    const binanceId = card.dataset.binanceId;
+                    
+                    fetchCgPrice(coin, cgId);
+                    fetchBinancePrice(coin, binanceId);
+                    setTimeout(() => {
+                        mergePriceData(coin);
+                        updateApiStatus();
+                        updateGlobalSignal();
+                        updateAIAnalysis();
+                    }, 500);
                 });
-            }, 3000);
+            }, 2000);
         }
 
         // 快捷键监听

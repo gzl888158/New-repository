@@ -444,6 +444,18 @@
     </div>
 
     <script>
+        // 核心新增：币种ID映射表（适配CoinGecko API）
+        const coinIdMap={
+            BTC: "bitcoin",
+            ETH: "ethereum",
+            SOL: "solana",
+            APT: "aptos",
+            ARB: "arbitrum",
+            ADA: "cardano",
+            DOT: "polkadot",
+            MATIC: "polygon"
+        };
+
         // 策略类型切换逻辑
         document.getElementById('strategy-type').addEventListener('change', function() {
             const type = this.value;
@@ -571,7 +583,7 @@
             document.getElementById('log-content').value = '';
         }
 
-        // ===== 新增核心功能：1. 添加自定义币种 =====
+        // 新增核心功能：1. 添加自定义币种
         function addCustomCoin() {
             const code = document.getElementById('new-coin-code').value.trim().toUpperCase();
             const exchange = document.getElementById('new-coin-exchange').value;
@@ -611,72 +623,78 @@
             fetchCoinPrice(code, card);
         }
 
-        // ===== 新增核心功能：2. 获取真实行情数据 =====
-        // 非小号公开行情接口（免费无限制）
+        // 新增核心功能：2. 获取真实行情数据（整合CoinGecko API）
         async function fetchCoinPrice(coinCode, card) {
             try {
-                // 非小号API：替换为实际可用的公开行情接口（示例接口，可根据实际情况更换）
-                const apiUrl = `https://api.feixiaohao.com/api/v1/coin/price?symbol=${coinCode.toLowerCase()}_usdt`;
-                const response = await fetch(apiUrl);
-                const data = await response.json();
-                if (data.code === 200 && data.data) {
-                    const price = data.data.price.toFixed(2);
-                    const change = data.data.change_24h.toFixed(2);
+                // 从映射表获取CoinGecko的币种ID，无则用小写代码
+                const coinId=coinIdMap[coinCode] || coinCode.toLowerCase();
+                // CoinGecko公开API，含现价+24h涨跌幅
+                const apiUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true`;
+                
+                const response=await fetch(apiUrl);
+                const data=await response.json();
+                
+                // 解析CoinGecko返回数据
+                if (data[coinId]) {
+                    const price=data[coinId].usd.toFixed(2);
+                    const change=data[coinId].usd_24h_change.toFixed(2);
+                    
                     // 更新指定卡片的价格和涨跌幅
                     if (card) {
-                        card.querySelector('.real-price').textContent = price;
+                        card.querySelector('.real-price').textContent=price;
                         card.querySelector('.real-change').textContent = `${change}%`;
-                        // 涨跌幅颜色区分：涨红跌绿
                         card.querySelector('.price-change').className = `price-change ${change >= 0 ? 'rise' : 'fall'}`;
                     } else {
-                        // 更新默认币种的价格
+                        // 更新默认币种的所有卡片
                         document.querySelectorAll(`.coin-card[data-coin="${coinCode}"]`).forEach(item => {
-                            item.querySelector('.real-price').textContent = price;
+                            item.querySelector('.real-price').textContent=price;
                             item.querySelector('.real-change').textContent = `${change}%`;
                             item.querySelector('.price-change').className = `price-change ${change >= 0 ? 'rise' : 'fall'}`;
                         });
                     }
-                    // 更新AI解读
+                    // 更新AI解读内容
                     updateAIAnalysis(coinCode, price, change);
                 }
             } catch (error) {
                 console.log(`获取${coinCode}行情失败，使用模拟数据`, error);
-                // 备用：模拟行情数据
-                const mockPrice = (Math.random() * 1000 + 100).toFixed(2);
-                const mockChange = (Math.random() * 4 - 2).toFixed(2);
+                // 备用：模拟行情数据，保证工具可用
+                const mockPrice=(Math.random()*1000+100).toFixed(2);
+                const mockChange=(Math.random()*4-2).toFixed(2);
                 if (card) {
-                    card.querySelector('.real-price').textContent = mockPrice;
+                    card.querySelector('.real-price').textContent=mockPrice;
                     card.querySelector('.real-change').textContent = `${mockChange}%`;
                     card.querySelector('.price-change').className = `price-change ${mockChange >= 0 ? 'rise' : 'fall'}`;
                 }
             }
         }
 
-        // ===== 新增核心功能：3. 更新AI行情解读 =====
+        // 新增核心功能：3. 更新AI行情解读
         function updateAIAnalysis(coinCode, price, change) {
-            const aiContent = document.getElementById('ai-analysis');
-            const changeNum = parseFloat(change);
+            const aiContent=document.getElementById('ai-analysis');
+            const changeNum=parseFloat(change);
             let trendDesc = '';
+            
             if (changeNum > 2) trendDesc = '强势上涨，多头趋势明确';
             else if (changeNum < -2) trendDesc = '快速下跌，空头占据主导';
             else trendDesc = '震荡整理，等待方向选择';
             
+            // 拼接新的AI解读内容
             const newAnalysis = `${aiContent.textContent.split(`【${coinCode}`)[0]}【${coinCode}】当前价格${price} USDT，24h涨跌幅${change}%，${trendDesc}。
 建议：${changeNum >= 0 ? '轻仓开多，止损位设为当前价下方2%' : '轻仓开空，止损位设为当前价上方2%'}。
 ${aiContent.textContent.split(`【${coinCode}`)[1] ? aiContent.textContent.split(`【${coinCode}`)[1].split('\n\n')[1] : ''}`;
-            aiContent.textContent = newAnalysis;
+            aiContent.textContent=newAnalysis;
         }
 
-        // ===== 初始化：获取所有默认币种行情 =====
-        window.onload = function() {
+        // 初始化：获取所有默认币种行情，30秒自动刷新
+        window.onload=function() {
             // 获取默认币种BTC/ETH/SOL的行情
             ['BTC', 'ETH', 'SOL'].forEach(coin => {
                 fetchCoinPrice(coin);
             });
-            // 每30秒刷新一次行情
+            // 每30秒（30000ms）刷新一次行情，和原周期一致，避免API高频请求
             setInterval(() => {
                 document.querySelectorAll('.coin-card').forEach(card => {
-                    const coin = card.dataset.coin;
+                    const coin=card.dataset.coin;
                     fetchCoinPrice(coin, card);
                 });
             }, 30000);

@@ -2,1086 +2,608 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>欧易合约交易助手 | 免费行情版（修复版）</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>豆包搭档·多平台合约交易辅助工具</title>
     <style>
+        /* 欧易同源深色主题 */
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: "微软雅黑", Arial, sans-serif;
+            font-family: "Microsoft YaHei", sans-serif;
         }
         body {
-            background: #0f172a;
-            color: #f8fafc;
-            padding: 15px;
-            line-height: 1.6;
+            background-color: #121212;
+            color: #ffffff;
+            padding: 20px;
         }
         .header {
-            font-size: 20px;
-            font-weight: bold;
             text-align: center;
-            color: #38bdf8;
             margin-bottom: 20px;
-            text-shadow: 0 0 8px rgba(56, 189, 248, 0.5);
+            padding-bottom: 10px;
+            border-bottom: 1px solid #333333;
         }
-        /* 模式切换区 */
-        .mode-switch {
-            background: #1e293b;
-            border-radius: 10px;
-            padding: 10px;
-            margin-bottom: 15px;
-            text-align: center;
-            border: 2px solid #f59e0b;
+        .header h1 {
+            color: #27ae60;
+            font-size: 24px;
         }
-        .mode-btn {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 5px;
-            margin: 0 5px;
-            font-weight: bold;
-            cursor: pointer;
+        .shortcut-tips {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #999999;
         }
-        .mock-mode { background: #f59e0b; color: #fff; }
-        .real-mode { background: #10b981; color: #fff; }
-        .mode-tips { font-size: 12px; margin-top: 8px; color: #94a3b8; }
-        /* 使用指南模块 */
-        .guide-module {
-            background: #1e293b;
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 15px;
-            border: 2px solid #38bdf8;
-        }
-        .guide-title {
-            font-size: 16px;
-            font-weight: bold;
-            color: #38bdf8;
-            margin-bottom: 10px;
-            text-align: center;
-        }
-        .guide-step {
-            background: #27374d;
-            border-radius: 8px;
-            padding: 10px;
-            margin-bottom: 8px;
-        }
-        .guide-step-title {
-            font-weight: bold;
-            color: #f59e0b;
-            margin-bottom: 5px;
-        }
-        .guide-step-content {
-            font-size: 13px;
-            line-height: 1.5;
-        }
-        .guide-highlight {
-            color: #10b981;
-            font-weight: bold;
-        }
-        /* 状态栏-颜色分级预警 */
-        .status-bar {
-            background: #1e293b;
-            border-radius: 10px;
-            padding: 10px;
-            margin-bottom: 15px;
-            font-size: 13px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .status-item {
-            padding: 4px 8px;
-            border-radius: 4px;
-        }
-        .status-safe { background: #10b981; color: #fff; }
-        .status-warning { background: #f59e0b; color: #fff; }
-        .status-danger { background: #ef4444; color: #fff; }
-        .status-neutral { background: #64748b; color: #fff; }
-        /* 币种行情看板 */
-        .coin-dashboard {
-            background: #1e293b;
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 15px;
-            overflow-x: auto;
-        }
-        .dashboard-title {
-            font-size: 15px;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #94a3b8;
+        /* 分屏布局容器 */
+        .monitor-container {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
         }
         .coin-card {
-            display: inline-block;
-            width: 120px;
-            background: #27374d;
+            background-color: #1e1e1e;
             border-radius: 8px;
-            padding: 10px;
-            text-align: center;
-            margin-right: 10px;
-            cursor: pointer;
-        }
-        .coin-card.active {
-            border: 2px solid #38bdf8;
-            box-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
-        }
-        .coin-name { font-size: 16px; font-weight: bold; }
-        .coin-price { font-size: 14px; margin: 5px 0; }
-        .coin-change { font-size: 12px; }
-        .rise { color: #ef4444; }
-        .fall { color: #10b981; }
-        /* 核心功能区-傻瓜式按钮 */
-        .func-area {
-            background: #1e293b;
-            border-radius: 10px;
             padding: 15px;
-            margin-bottom: 15px;
+            border: 1px solid #333333;
         }
-        .area-title {
-            font-size: 15px;
-            font-weight: bold;
+        .coin-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 10px;
-            color: #94a3b8;
         }
-        .btn-group {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 10px;
-            margin-bottom: 15px;
-        }
-        .big-btn {
-            width: 100%;
-            padding: 12px;
-            border: none;
-            border-radius: 8px;
-            font-size: 13px;
+        .coin-name {
             font-weight: bold;
-            cursor: pointer;
-            touch-action: manipulation;
+            color: #27ae60;
         }
-        .primary-btn { background: #38bdf8; color: #fff; }
-        .risk-btn { background: #ef4444; color: #fff; }
-        .normal-btn { background: #64748b; color: #fff; }
-        /* 风控计算器-自动计算+防呆提示 */
-        .risk-calc {
-            background: #27374d;
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 15px;
-        }
-        .calc-input {
-            width: 100%;
-            padding: 8px;
-            margin: 5px 0;
-            border: 1px solid #475569;
+        .exchange-select {
+            background-color: #2c2c2c;
+            color: #ffffff;
+            border: 1px solid #444444;
             border-radius: 4px;
-            background: #1e293b;
-            color: #fff;
-            font-size: 13px;
-        }
-        .calc-result {
-            font-size: 13px;
-            margin-top: 10px;
-            padding: 8px;
-            border-radius: 4px;
-            background: #0f172a;
-        }
-        /* 自动委托模块-核心 */
-        .auto-order {
-            background: #27374d;
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 15px;
-        }
-        .order-status {
+            padding: 3px 8px;
             font-size: 12px;
-            padding: 4px;
-            border-radius: 4px;
-            background: #1e293b;
-            margin-top: 8px;
-            color: #38bdf8;
         }
-        /* 策略回测模块-核心 */
-        .strategy-backtest {
-            background: #27374d;
+        .coin-price {
+            font-size: 18px;
+            margin: 10px 0;
+        }
+        .price-change {
+            font-size: 14px;
+        }
+        .rise {
+            color: #e74c3c;
+        }
+        .fall {
+            color: #27ae60;
+        }
+        /* K线与指标区 */
+        .kline-area {
+            height: 150px;
+            background-color: #2c2c2c;
+            border-radius: 4px;
+            margin: 10px 0;
+            position: relative;
+            overflow: hidden;
+        }
+        .kline-placeholder {
+            text-align: center;
+            line-height: 150px;
+            color: #999999;
+            font-size: 12px;
+        }
+        .indicator-btn {
+            background-color: #27ae60;
+            color: #ffffff;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            margin-top: 5px;
+        }
+        /* 策略与风险区 */
+        .strategy-risk-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .strategy-card, .risk-card {
+            background-color: #1e1e1e;
             border-radius: 8px;
-            padding: 12px;
+            padding: 20px;
+            border: 1px solid #333333;
+        }
+        .card-title {
+            color: #27ae60;
             margin-bottom: 15px;
-            border: 1px solid #f59e0b;
+            font-size: 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
-        .backtest-result {
-            font-size: 13px;
-            margin-top: 10px;
-            padding: 10px;
-            border-radius: 4px;
-            background: #0f172a;
-            line-height: 1.8;
+        .form-group {
+            margin-bottom: 12px;
         }
-        .backtest-highlight {
-            color: #f59e0b;
-            font-weight: bold;
+        .form-group label {
+            display: block;
+            font-size: 14px;
+            margin-bottom: 5px;
+            color: #cccccc;
         }
-        /* 策略模板-一键加载 */
-        .strategy-template {
-            background: #27374d;
-            border-radius: 8px;
-            padding: 12px;
-        }
-        .template-btn {
+        .form-group input, .form-group select {
             width: 100%;
             padding: 8px;
-            margin: 5px 0;
-            border: none;
+            background-color: #2c2c2c;
+            color: #ffffff;
+            border: 1px solid #444444;
             border-radius: 4px;
-            font-size: 13px;
-            cursor: pointer;
         }
-        .template-shock { background: #f59e0b; color: #fff; }
-        .template-trend { background: #10b981; color: #fff; }
-        .template-extreme { background: #ef4444; color: #fff; }
-        /* 交易日志模块 */
-        .trade-log {
-            background: #27374d;
-            border-radius: 8px;
-            padding: 12px;
+        .calc-btn {
+            background-color: #27ae60;
+            color: #ffffff;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+        }
+        .result-area {
             margin-top: 15px;
+            padding: 10px;
+            background-color: #2c2c2c;
+            border-radius: 4px;
+            font-size: 14px;
+            white-space: pre-wrap;
+        }
+        /* AI解读与交易日志 */
+        .ai-log-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .ai-card, .log-card {
+            background-color: #1e1e1e;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #333333;
+        }
+        .ai-content {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #2c2c2c;
+            border-radius: 4px;
+            min-height: 100px;
+            font-size: 14px;
         }
         .log-content {
-            height: 150px;
-            overflow-y: auto;
-            background: #1e293b;
-            border-radius: 4px;
-            padding: 8px;
-            margin-top: 8px;
-            font-size: 12px;
-            line-height: 1.5;
-        }
-        .log-item-profit { color: #10b981; }
-        .log-item-loss { color: #ef4444; }
-        .log-empty { color: #94a3b8; font-style: italic; }
-        /* TradingView信号模块（完整集成） */
-        .tv-signal {
-            background: #27374d;
-            border-radius: 8px;
-            padding: 12px;
             margin-top: 15px;
-        }
-        .signal-config {
-            margin-bottom: 10px;
-        }
-        .signal-status {
-            font-size: 13px;
-            padding: 8px;
+            padding: 10px;
+            background-color: #2c2c2c;
             border-radius: 4px;
-            margin-bottom: 8px;
-        }
-        .signal-online { background: #10b98133; color: #10b981; }
-        .signal-offline { background: #ef444433; color: #ef4444; }
-        .signal-log {
-            height: 100px;
-            overflow-y: auto;
-            background: #1e293b;
-            border-radius: 4px;
-            padding: 8px;
+            min-height: 100px;
             font-size: 12px;
-            line-height: 1.5;
+            white-space: pre-wrap;
         }
-        /* 预警弹窗-优先级排序 */
-        .alert-box {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: #1e293b;
-            border: 3px solid;
-            border-radius: 10px;
-            padding: 20px;
-            width: 90%;
-            max-width: 350px;
-            z-index: 9999;
-            text-align: center;
-        }
-        .alert-danger { border-color: #ef4444; }
-        .alert-warning { border-color: #f59e0b; }
-        .alert-info { border-color: #38bdf8; }
-        .alert-title {
-            font-size: 16px;
-            font-weight: bold;
-            margin-bottom: 10px;
-        }
-        .alert-content {
-            font-size: 14px;
-            margin-bottom: 15px;
-            text-align: left;
-        }
-        .alert-btn {
-            padding: 8px 16px;
+        .add-log-btn {
+            background-color: #27ae60;
+            color: #ffffff;
             border: none;
-            border-radius: 5px;
-            margin: 0 5px;
+            padding: 5px 10px;
+            border-radius: 4px;
             cursor: pointer;
+            margin-top: 10px;
         }
-        .hide { display: none; }
+        /* 预警线样式 */
+        .alert-line {
+            position: absolute;
+            width: 100%;
+            height: 1px;
+            z-index: 10;
+        }
+        .profit-line {
+            background-color: #27ae60;
+        }
+        .stop-line {
+            background-color: #e74c3c;
+        }
+        .warn-line {
+            background-color: #f39c12;
+        }
+        .line-label {
+            position: absolute;
+            font-size: 10px;
+            color: inherit;
+        }
+        /* 响应式适配 */
+        @media (max-width: 1200px) {
+            .monitor-container {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        @media (max-width: 768px) {
+            .monitor-container, .strategy-risk-container, .ai-log-container {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="header">💰 欧易合约交易助手 | 免费行情版（修复版）</div>
-
-    <!-- 使用指南模块（整合所有步骤） -->
-    <div class="guide-module">
-        <div class="guide-title">📖 完整使用指南（无需API配置）</div>
-        <div class="guide-step">
-            <div class="guide-step-title">✅ 第一步：启动行情监控</div>
-            <div class="guide-step-content">
-                点击「启动行情监控」按钮，工具将自动通过 <span class="guide-highlight">CoinGecko/Binance免费接口</span> 获取BTC/ETH/SOL/ADA实时价格，无需配置任何密钥。
-            </div>
-        </div>
-        <div class="guide-step">
-            <div class="guide-step-title">✅ 第二步：配置TradingView告警（可选）</div>
-            <div class="guide-step-content">
-                1. TradingView策略/指标中添加告警，WebHook地址：<code>http://你的服务器IP:5000/webhook</code>；<br>
-                2. 告警消息格式选择<code>JSON</code>，内容示例：<br>
-                <code>{
-    "symbol": "BTC-USDT-SWAP",
-    "side": "buy",
-    "price": "62000",
-    "size": "0.01"
-}</code>
-            </div>
-        </div>
-        <div class="guide-step">
-            <div class="guide-step-title">✅ 第三步：核心操作流程</div>
-            <div class="guide-step-content">
-                1. 切换币种：点击币种卡片选择关注的币种；<br>
-                2. 风控计算：输入总资金和止损点数，自动生成爆仓价和安全仓位；<br>
-                3. 自动委托：设置止盈止损价和方向，启动后价格触达自动提醒；<br>
-                4. 策略回测：选择策略模板，基于历史数据回测胜率和盈亏比。
-            </div>
-        </div>
-        <div class="guide-step">
-            <div class="guide-step-title">📝 第四步：日志查看</div>
-            <div class="guide-step-content">
-                - 交易日志：记录自动委托/TV信号触发的所有提醒（时间、币种、方向）；<br>
-                - TV信号日志：记录接收的信号内容，便于复盘策略有效性。
-            </div>
+    <!-- 头部标题与快捷键提示 -->
+    <div class="header">
+        <h1>豆包搭档·多平台合约交易辅助工具</h1>
+        <div class="shortcut-tips">
+            快捷键：F1=切换K线周期 | F2=清空预警 | F3=打开亏损计算器 | F4=叠加/隐藏指标
         </div>
     </div>
 
-    <!-- 模式切换区（实盘按钮在前，模拟按钮在后，已移除API依赖） -->
-    <div class="mode-switch">
-        <button class="mode-btn real-mode" onclick="switchMode('real')">实时行情模式</button>
-        <button class="mode-btn mock-mode active" onclick="switchMode('mock')">模拟行情模式</button>
-        <div class="mode-tips" id="mode-tips">当前：模拟行情模式（本地生成价格波动）</div>
+    <!-- 多币种分屏监控区 -->
+    <div class="monitor-container">
+        <!-- BTC-USDT -->
+        <div class="coin-card">
+            <div class="coin-header">
+                <span class="coin-name">BTC-USDT</span>
+                <select class="exchange-select">
+                    <option>欧易</option>
+                    <option>币安</option>
+                    <option>火币</option>
+                </select>
+            </div>
+            <div class="coin-price">价格：<span id="btc-price">--</span> USDT</div>
+            <div class="price-change fall">24h涨跌幅：<span id="btc-change">--</span></div>
+            <div class="kline-area" id="btc-kline">
+                <div class="kline-placeholder">15m裸K · 双底形态标注</div>
+            </div>
+            <button class="indicator-btn" onclick="toggleIndicator('btc-kline')">F4 叠加指标</button>
+        </div>
+
+        <!-- ETH-USDT -->
+        <div class="coin-card">
+            <div class="coin-header">
+                <span class="coin-name">ETH-USDT</span>
+                <select class="exchange-select">
+                    <option>欧易</option>
+                    <option>币安</option>
+                    <option>火币</option>
+                </select>
+            </div>
+            <div class="coin-price">价格：<span id="eth-price">--</span> USDT</div>
+            <div class="price-change rise">24h涨跌幅：<span id="eth-change">--</span></div>
+            <div class="kline-area" id="eth-kline">
+                <div class="kline-placeholder">15m裸K · 三角收敛形态</div>
+            </div>
+            <button class="indicator-btn" onclick="toggleIndicator('eth-kline')">F4 叠加指标</button>
+        </div>
+
+        <!-- SOL-USDT 自定义币种1 -->
+        <div class="coin-card">
+            <div class="coin-header">
+                <span class="coin-name">SOL-USDT</span>
+                <select class="exchange-select">
+                    <option>欧易</option>
+                    <option>币安</option>
+                    <option>火币</option>
+                </select>
+            </div>
+            <div class="coin-price">价格：<span id="sol-price">--</span> USDT</div>
+            <div class="price-change fall">24h涨跌幅：<span id="sol-change">--</span></div>
+            <div class="kline-area" id="sol-kline">
+                <div class="kline-placeholder">15m裸K · 等待突破</div>
+            </div>
+            <button class="indicator-btn" onclick="toggleIndicator('sol-kline')">F4 叠加指标</button>
+        </div>
+
+        <!-- ADA-USDT 自定义币种2 -->
+        <div class="coin-card">
+            <div class="coin-header">
+                <span class="coin-name">ADA-USDT</span>
+                <select class="exchange-select">
+                    <option>欧易</option>
+                    <option>币安</option>
+                    <option>火币</option>
+                </select>
+            </div>
+            <div class="coin-price">价格：<span id="ada-price">--</span> USDT</div>
+            <div class="price-change rise">24h涨跌幅：<span id="ada-change">--</span></div>
+            <div class="kline-area" id="ada-kline">
+                <div class="kline-placeholder">15m裸K · 头肩顶形态</div>
+            </div>
+            <button class="indicator-btn" onclick="toggleIndicator('ada-kline')">F4 叠加指标</button>
+        </div>
     </div>
 
-    <!-- 状态栏 -->
-    <div class="status-bar">
-        <div class="status-item status-safe" id="position-status">仓位安全</div>
-        <div class="status-item status-neutral" id="coin-status">当前币种：BTC</div>
-        <div class="status-item status-neutral" id="leverage-status">杠杆：10倍</div>
-        <div class="status-item status-safe" id="loss-status">当日亏损：0/1000 USDT</div>
-        <div class="status-item status-neutral" id="order-status">委托状态：未启动</div>
-        <div class="status-item status-warning" id="price-status">行情状态：模拟行情</div>
-        <div class="status-item status-offline" id="tv-signal-status">TV信号：未连接</div>
-    </div>
-
-    <!-- 币种行情看板 -->
-    <div class="coin-dashboard">
-        <div class="dashboard-title">📈 全币种行情监控</div>
-        <div class="coin-card active" onclick="switchCoin('BTC')">
-            <div class="coin-name">BTC</div>
-            <div class="coin-price" id="btc-price">$61937.00</div>
-            <div class="coin-change rise" id="btc-change">+0.8%</div>
-        </div>
-        <div class="coin-card" onclick="switchCoin('ETH')">
-            <div class="coin-name">ETH</div>
-            <div class="coin-price" id="eth-price">$3215.00</div>
-            <div class="coin-change rise" id="eth-change">+1.2%</div>
-        </div>
-        <div class="coin-card" onclick="switchCoin('SOL')">
-            <div class="coin-name">SOL</div>
-            <div class="coin-price" id="sol-price">$124.50</div>
-            <div class="coin-change fall" id="sol-change">-2.1%</div>
-        </div>
-        <div class="coin-card" onclick="switchCoin('ADA')">
-            <div class="coin-name">ADA</div>
-            <div class="coin-price" id="ada-price">$0.58</div>
-            <div class="coin-change" id="ada-change">0%</div>
-        </div>
-    </div>
-
-    <!-- 核心功能区 -->
-    <div class="func-area">
-        <div class="area-title">🎯 核心操作</div>
-        <div class="btn-group">
-            <button class="big-btn primary-btn" onclick="jumpToOKX()">一键跳欧易</button>
-            <button class="big-btn normal-btn" onclick="showReview()">查看复盘</button>
-        </div>
-        <div class="btn-group">
-            <button class="big-btn normal-btn" onclick="startMonitor()">启动行情监控</button>
-            <button class="big-btn risk-btn" onclick="lockTrade()">锁定仓位</button>
-            <!-- 新增解锁仓位按钮 -->
-            <button class="big-btn normal-btn" onclick="unlockTrade()">解锁仓位</button>
-        </div>
-
-        <!-- 风控计算器 -->
-        <div class="risk-calc">
-            <div class="area-title">🛡️ 自动风控计算</div>
-            总资金(USDT)：<input type="number" class="calc-input" id="total-fund" placeholder="输入总资金" value="10000">
-            止损点数(USDT)：<input type="number" class="calc-input" id="stop-loss-point" placeholder="止损点数" value="500">
-            <button class="big-btn normal-btn" onclick="calcRisk()">计算爆仓价/仓位</button>
-            <div class="calc-result" id="risk-result">点击计算，自动生成安全开仓建议</div>
-        </div>
-
-        <!-- 自动委托模块 -->
-        <div class="auto-order">
-            <div class="area-title">🚀 止盈止损自动委托</div>
-            止盈价格(USDT)：<input type="number" class="calc-input" id="take-profit-price" placeholder="输入止盈价" value="62500">
-            止损价格(USDT)：<input type="number" class="calc-input" id="stop-loss-price" placeholder="输入止损价" value="61500">
-            开仓方向：
-            <select class="calc-input" id="order-direction" style="margin-top:5px;">
-                <option value="long">开多</option>
-                <option value="short">开空</option>
-            </select>
-            <div class="btn-group" style="margin-top:10px;">
-                <button class="big-btn primary-btn" onclick="startAutoOrder()">启动自动委托</button>
-                <button class="big-btn risk-btn" onclick="stopAutoOrder()">停止自动委托</button>
+    <!-- 策略与风险控制区 -->
+    <div class="strategy-risk-container">
+        <!-- 策略计算器 -->
+        <div class="strategy-card">
+            <div class="card-title">
+                <span>核心策略计算器</span>
+                <span style="font-size:12px;color:#999">支持止盈止损/网格/突破</span>
             </div>
-            <div class="order-status" id="auto-order-status">👉 启动后价格触达自动弹窗提醒</div>
-        </div>
-
-        <!-- 策略回测模块 -->
-        <div class="strategy-backtest">
-            <div class="area-title">📊 策略历史回测（近7天数据）</div>
-            选择策略：
-            <select class="calc-input" id="backtest-strategy" style="margin-top:5px;">
-                <option value="shock">震荡策略（低杠杆+窄止损）</option>
-                <option value="trend">趋势策略（中杠杆+宽止损）</option>
-                <option value="extreme">极端策略（1倍杠杆+观望）</option>
-            </select>
-            <button class="big-btn normal-btn" onclick="startBacktest()" style="margin-top:10px;">一键启动回测</button>
-            <div class="backtest-result" id="backtest-result">
-                👉 回测结果将显示在这里：胜率、盈亏比、最大回撤
+            <div class="form-group">
+                <label>选择策略类型</label>
+                <select id="strategy-type">
+                    <option value="tp-sl">止盈止损策略</option>
+                    <option value="grid">网格交易策略</option>
+                    <option value="break">突破交易策略</option>
+                </select>
             </div>
-        </div>
-
-        <!-- 策略模板 -->
-        <div class="strategy-template">
-            <div class="area-title">📋 策略模板一键选</div>
-            <button class="template-btn template-shock" onclick="loadTemplate('shock')">震荡行情：低杠杆+窄止损</button>
-            <button class="template-btn template-trend" onclick="loadTemplate('trend')">趋势行情：中杠杆+移动止盈</button>
-            <button class="template-btn template-extreme" onclick="loadTemplate('extreme')">极端行情：1倍杠杆+观望</button>
-        </div>
-
-        <!-- TradingView信号模块（完整集成） -->
-        <div class="tv-signal">
-            <div class="area-title">📡 TradingView信号服务</div>
-            <div class="signal-config">
-                后端服务地址：<input type="text" class="calc-input" id="tv-server-url" placeholder="输入后端服务地址" value="http://127.0.0.1:5000">
-                <button class="big-btn primary-btn" onclick="connectTvServer()" style="margin-top:8px;">连接TV信号服务</button>
+            <div class="form-group">
+                <label>开仓价（USDT）</label>
+                <input type="number" id="open-price" placeholder="如 46000">
             </div>
-            <div class="signal-status" id="signal-status">信号服务状态：未连接</div>
-            <div class="area-title" style="margin-top:10px;">📝 信号日志</div>
-            <div class="signal-log" id="signal-log">
-                暂无信号记录
+            <div class="form-group">
+                <label>总资金（USDT）</label>
+                <input type="number" id="total-capital" placeholder="如 1000">
             </div>
+            <div class="form-group" id="tp-sl-group">
+                <label>止盈涨幅/止损跌幅（%）</label>
+                <input type="text" id="tp-sl-rate" placeholder="止盈5/止损2">
+            </div>
+            <div class="form-group" id="grid-group" style="display:none">
+                <label>网格数量/价格区间（%）</label>
+                <input type="text" id="grid-param" placeholder="10格/±5%">
+            </div>
+            <div class="form-group" id="break-group" style="display:none">
+                <label>突破确认回踩（%）</label>
+                <input type="number" id="break-rate" placeholder="0.5" value="0.5">
+            </div>
+            <button class="calc-btn" onclick="calcStrategy()">生成操作建议</button>
+            <div class="result-area" id="strategy-result">请输入参数后点击计算</div>
         </div>
 
-        <!-- 交易日志模块 -->
-        <div class="trade-log">
-            <div class="area-title">📝 交易日志记录</div>
-            <button class="big-btn normal-btn" onclick="clearTradeLog()" style="margin-bottom:8px;">清空交易日志</button>
-            <div class="log-content" id="log-content">
-                <div class="log-empty">暂无交易记录</div>
+        <!-- 风险控制区 -->
+        <div class="risk-card">
+            <div class="card-title">
+                <span>风险控制中心</span>
+                <span style="font-size:12px;color:#999">F3 打开亏损计算器</span>
+            </div>
+            <div class="form-group">
+                <label>保证金使用率（%）</label>
+                <input type="number" id="margin-rate" placeholder="如 50" oninput="checkMargin()">
+                <div id="margin-alert" style="margin-top:5px;font-size:12px;color:#f39c12"></div>
+            </div>
+            <div class="form-group">
+                <label>总资金（USDT）</label>
+                <input type="number" id="risk-capital" placeholder="如 1000">
+            </div>
+            <div class="form-group">
+                <label>风险容忍度（%）</label>
+                <input type="number" id="risk-rate" placeholder="2" value="2">
+            </div>
+            <button class="calc-btn" onclick="calcMaxLoss()">F3 计算最大亏损</button>
+            <div class="result-area" id="risk-result">请输入参数后点击计算</div>
+            <div class="form-group" style="margin-top:10px">
+                <label>全网多空比</label>
+                <input type="text" id="long-short-ratio" placeholder="3:2" value="2:1">
+                <button class="calc-btn" style="padding:5px" onclick="analysisRatio()">解读</button>
             </div>
         </div>
     </div>
 
-    <!-- 预警弹窗 -->
-    <div class="alert-box alert-danger hide" id="liquidation-alert">
-        <div class="alert-title" style="color: #ef4444;">⚠️ 爆仓预警</div>
-        <div class="alert-content" id="liquidation-content">当前价格接近爆仓价，请立即减仓/补保证金！</div>
-        <button class="alert-btn" onclick="closeAlert('liquidation-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-warning hide" id="loss-alert">
-        <div class="alert-title" style="color: #f59e0b;">⚠️ 亏损警告</div>
-        <div class="alert-content" id="loss-content">当日亏损已达80%，即将触发锁定！</div>
-        <button class="alert-btn" onclick="closeAlert('loss-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-info hide" id="price-alert">
-        <div class="alert-title" style="color: #38bdf8;">📢 价格/委托提醒</div>
-        <div class="alert-content" id="price-content">BTC已触达止损价$61500！</div>
-        <button class="alert-btn" onclick="closeAlert('price-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-info hide" id="review-alert">
-        <div class="alert-title" style="color: #38bdf8;">⏰ 每小时复盘</div>
-        <div class="alert-content" id="review-content">...</div>
-        <button class="alert-btn" onclick="closeAlert('review-alert')">知道了</button>
-    </div>
-    <div class="alert-box alert-info hide" id="tv-signal-alert">
-        <div class="alert-title" style="color: #38bdf8;">📡 TV信号提醒</div>
-        <div class="alert-content" id="tv-signal-alert-content">收到开多信号：BTC $62000</div>
-        <button class="alert-btn" onclick="closeAlert('tv-signal-alert')">知道了</button>
+    <!-- AI解读与交易日志 -->
+    <div class="ai-log-container">
+        <!-- AI行情解读 -->
+        <div class="ai-card">
+            <div class="card-title">
+                <span>AI行情解读（每30分钟更新）</span>
+                <span style="font-size:12px;color:#999">专业内核+傻瓜式表达</span>
+            </div>
+            <div class="ai-content" id="ai-analysis">
+                【BTC】当前价格-- USDT，15m K线双底形态，MACD金叉，多空比2:1。
+                建议：轻仓开多，止盈-- USDT，止损-- USDT；跌破止损立即平仓。
+                <br><br>
+                【ETH】当前价格-- USDT，15m K线三角收敛，RSI中性，多空比1.5:1。
+                建议：等待突破，突破后回踩≤0.5%开多，止损-- USDT。
+            </div>
+        </div>
+
+        <!-- 交易日志 -->
+        <div class="log-card">
+            <div class="card-title">
+                <span>交易成长日志</span>
+                <span style="font-size:12px;color:#999">记录操作与盈亏</span>
+            </div>
+            <div class="form-group">
+                <label>操作记录（币种+方向+盈亏）</label>
+                <input type="text" id="log-content" placeholder="如 BTC开多 盈利3%">
+            </div>
+            <button class="add-log-btn" onclick="addTradeLog()">添加记录</button>
+            <div class="log-content" id="trade-log">暂无交易记录</div>
+        </div>
     </div>
 
     <script>
-        // 全局变量
-        let currentCoin = 'BTC';
-        let isTradeLocked = false;
-        let currentLeverage = 10;
-        let isAutoOrderRunning = false;
-        let autoOrderTimer = null;
-        let isPriceMonitorRunning = false;
-        let priceMonitorTimer = null;
-        let currentMode = 'mock'; // mock=模拟行情 real=实时行情（CoinGecko/Binance）
-        const maxDailyLoss = 1000;
-        let dailyLoss = 0;
-        const coinLeverageLimit = { BTC: 20, ETH: 15, SOL: 10, ADA: 10 };
-        // 用于涨跌幅计算的上一次价格缓存
-        let prevPriceData = { BTC: 61937, ETH: 3215, SOL: 124.5, ADA: 0.58 };
-        // 基础价格缓存（防止接口失效）
-        let basePriceData = { BTC: 61937, ETH: 3215, SOL: 124.5, ADA: 0.58 };
-        let tvServerUrl = 'http://127.0.0.1:5000';
-        let isTvServerConnected = false;
-        let tvSignalListener = null;
+        // 切换策略显示组
+        document.getElementById('strategy-type').addEventListener('change', function() {
+            const type = this.value;
+            document.getElementById('tp-sl-group').style.display = type === 'tp-sl' ? 'block' : 'none';
+            document.getElementById('grid-group').style.display = type === 'grid' ? 'block' : 'none';
+            document.getElementById('break-group').style.display = type === 'break' ? 'block' : 'none';
+        });
 
-        // 页面加载完成后绑定事件
-        window.onload = function() {
-            document.querySelector('.real-mode').onclick = () => switchMode('real');
-            document.querySelector('.mock-mode').onclick = () => switchMode('mock');
-            // 初始化模拟模式
-            switchMode('mock');
-            // 自动检测TV信号服务
-            if (document.getElementById('tv-server-url').value) {
-                tvServerUrl = document.getElementById('tv-server-url').value;
-                connectTvServer();
-            }
-        };
-
-        // 模式切换函数（实时/模拟）
-        function switchMode(mode) {
-            currentMode = mode;
-            const mockBtn = document.querySelector('.mock-mode');
-            const realBtn = document.querySelector('.real-mode');
-            mockBtn.classList.remove('active');
-            realBtn.classList.remove('active');
-            
-            if (mode === 'mock') {
-                mockBtn.classList.add('active');
-                document.getElementById('mode-tips').innerText = '当前：模拟行情模式（本地生成价格波动）';
-                document.getElementById('price-status').innerText = '行情状态：模拟行情';
-                document.getElementById('price-status').className = 'status-item status-warning';
-                resetMockPrice();
+        // 切换指标显示
+        function toggleIndicator(id) {
+            const kline = document.getElementById(id);
+            const placeholder = kline.querySelector('.kline-placeholder');
+            if (placeholder.textContent.includes('裸K')) {
+                placeholder.textContent = 'MACD+RSI+BOLL 指标已叠加';
             } else {
-                realBtn.classList.add('active');
-                document.getElementById('mode-tips').innerText = '当前：实时行情模式（CoinGecko/Binance免费接口）';
-                document.getElementById('price-status').innerText = '行情状态：未启动监控';
-                document.getElementById('price-status').className = 'status-item status-neutral';
-                // 实时模式下先获取一次价格
-                updateAllRealPrices();
-            }
-            // 强制触发页面重绘
-            document.body.offsetHeight;
-        }
-
-        // 重置模拟行情数据
-        function resetMockPrice() {
-            basePriceData = { BTC: 61937, ETH: 3215, SOL: 124.5, ADA: 0.58 };
-            prevPriceData = JSON.parse(JSON.stringify(basePriceData));
-            updateCoinCards();
-        }
-
-        // 🔥 核心修复：更新币种卡片显示，添加完整数据校验
-        function updateCoinCards() {
-            for (const coin in basePriceData) {
-                const price = basePriceData[coin];
-                const prevPrice = prevPriceData[coin];
-                
-                // 价格非数字校验
-                if (isNaN(price) || !price) {
-                    document.getElementById(`${coin.toLowerCase()}-price`).innerText = '$--';
-                    document.getElementById(`${coin.toLowerCase()}-change`).innerText = '0%';
-                    document.getElementById(`${coin.toLowerCase()}-change`).className = 'coin-change';
-                    continue;
-                }
-
-                // 更新价格显示
-                document.getElementById(`${coin.toLowerCase()}-price`).innerText = `$${price.toFixed(2)}`;
-                
-                // 计算涨跌幅（避免除以0）
-                let change = 0;
-                if (prevPrice && prevPrice > 0) {
-                    change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
-                }
-                document.getElementById(`${coin.toLowerCase()}-change`).innerText = `${change >= 0 ? '+' : ''}${change}%`;
-                document.getElementById(`${coin.toLowerCase()}-change`).className = `coin-change ${change >= 0 ? 'rise' : 'fall'}`;
-                
-                // 更新上一次价格缓存
-                prevPriceData[coin] = price;
+                placeholder.textContent = '15m裸K · 关键形态标注';
             }
         }
 
-        // 🔥 核心修复：通过CoinGecko获取实时价格，失败则切换Binance接口
-        async function updateAllRealPrices() {
-            // 先尝试CoinGecko接口
-            let isCoinGeckoSuccess = await fetchFromCoinGecko();
-            if (!isCoinGeckoSuccess) {
-                // 失败则切换Binance接口
-                await fetchFromBinance();
-            }
-            // 更新页面显示
-            updateCoinCards();
-            // 检查自动委托条件
-            if (isAutoOrderRunning) checkAutoOrder();
-        }
-
-        // 从CoinGecko获取价格
-        async function fetchFromCoinGecko() {
-            try {
-                const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,cardano&vs_currencies=usdt', {
-                    timeout: 5000,
-                    headers: {
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0 (Mobile; iOS 16; rv:109.0) Gecko/109.0 Firefox/119.0'
-                    }
-                });
-                if (!response.ok) throw new Error(`CoinGecko接口状态码：${response.status}`);
-                
-                const data = await response.json();
-                // 严格的数据校验
-                basePriceData.BTC = data.bitcoin?.usdt || basePriceData.BTC;
-                basePriceData.ETH = data.ethereum?.usdt || basePriceData.ETH;
-                basePriceData.SOL = data.solana?.usdt || basePriceData.SOL;
-                basePriceData.ADA = data.cardano?.usdt || basePriceData.ADA;
-                
-                // 转换为数字类型
-                for (const coin in basePriceData) {
-                    basePriceData[coin] = parseFloat(basePriceData[coin]) || basePriceData[coin];
-                }
-                return true;
-            } catch (error) {
-                console.error('CoinGecko接口错误：', error);
-                return false;
-            }
-        }
-
-        // 从Binance获取价格（备用接口）
-        async function fetchFromBinance() {
-            try {
-                const fetchPromises = [
-                    fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { timeout: 5000 }),
-                    fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', { timeout: 5000 }),
-                    fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 5000 }),
-                    fetch('https://api.binance.com/api/v3/ticker/price?symbol=ADAUSDT', { timeout: 5000 })
-                ];
-                const responses = await Promise.all(fetchPromises);
-                
-                // 解析每个币种的价格
-                const btcData = await responses[0].json();
-                const ethData = await responses[1].json();
-                const solData = await responses[2].json();
-                const adaData = await responses[3].json();
-                
-                // 数据校验
-                basePriceData.BTC = parseFloat(btcData.price) || basePriceData.BTC;
-                basePriceData.ETH = parseFloat(ethData.price) || basePriceData.ETH;
-                basePriceData.SOL = parseFloat(solData.price) || basePriceData.SOL;
-                basePriceData.ADA = parseFloat(adaData.price) || basePriceData.ADA;
-                
-                return true;
-            } catch (error) {
-                console.error('Binance接口错误：', error);
-                showAlert('price-alert', `行情接口均失败，将使用本地缓存价格：${error.message}`);
-                return false;
-            }
-        }
-
-        // 策略回测函数
-        function startBacktest() {
-            const strategyType = document.getElementById('backtest-strategy').value;
-            // 模拟历史数据
-            const mockHistoryData = {
-                BTC: [61200, 61500, 61800, 62000, 61700, 62100, 62300, 61900, 62200, 62500],
-                ETH: [3180, 3200, 3220, 3190, 3230, 3250, 3210, 3240, 3260, 3280],
-                SOL: [122, 124, 126, 123, 125, 121, 119, 122, 124, 127],
-                ADA: [0.56, 0.57, 0.58, 0.57, 0.59, 0.58, 0.57, 0.59, 0.60, 0.61]
-            };
-            const historyData = mockHistoryData[currentCoin];
-            
-            if (!historyData || historyData.length === 0) {
-                document.getElementById('backtest-result').innerText = '❌ 暂无历史数据，请切换币种重试';
-                return;
-            }
-
-            let tpRate, slRate, leverage;
-            if (strategyType === 'shock') {
-                tpRate = 0.005; 
-                slRate = 0.003; 
-                leverage = 10;
-            } else if (strategyType === 'trend') {
-                tpRate = 0.02; 
-                slRate = 0.01; 
-                leverage = 15;
-            } else {
-                tpRate = 0.001; 
-                slRate = 0.001; 
-                leverage = 1;
-            }
-
-            let winCount = 0;
-            let lossCount = 0;
-            let totalProfit = 0;
-            let maxDrawdown = 0;
-            let lastPrice = historyData[0];
-
-            for (let i = 1; i < historyData.length; i++) {
-                const currentPrice = historyData[i];
-                const priceChange = (currentPrice - lastPrice) / lastPrice;
-
-                if (priceChange >= tpRate) {
-                    winCount++;
-                    totalProfit += tpRate * leverage;
-                } else if (priceChange <= -slRate) {
-                    lossCount++;
-                    totalProfit -= slRate * leverage;
-                }
-
-                const drawdown = (lastPrice - currentPrice) / lastPrice;
-                if (drawdown > maxDrawdown) maxDrawdown = drawdown;
-
-                lastPrice = currentPrice;
-            }
-
-            const totalTrades = winCount + lossCount;
-            const winRate = totalTrades === 0 ? 0 : (winCount / totalTrades * 100).toFixed(2);
-            const profitRatio = totalTrades === 0 ? 0 : (totalProfit * 100).toFixed(2);
-            maxDrawdown = (maxDrawdown * 100).toFixed(2);
-            const strategyName = strategyType === 'shock' ? '震荡策略' : strategyType === 'trend' ? '趋势策略' : '极端策略';
-
-            document.getElementById('backtest-result').innerHTML = `
-                📊 <span class="backtest-highlight">${strategyName}</span> 回测结果（近${historyData.length}次价格波动）<br>
-                🔢 总交易次数：${totalTrades} | 盈利次数：${winCount} | 亏损次数：${lossCount}<br>
-                ✅ 胜率：<span class="backtest-highlight">${winRate}%</span><br>
-                📈 累计盈亏比：<span class="backtest-highlight">${profitRatio}%</span><br>
-                📉 最大回撤：<span class="backtest-highlight">${maxDrawdown}%</span><br>
-                ⚙️ 策略参数：杠杆${leverage}倍 | 止盈${(tpRate*100).toFixed(2)}% | 止损${(slRate*100).toFixed(2)}%<br>
-                💡 建议：${winRate > 50 ? '胜率较高，可实盘小仓位测试' : '胜率偏低，建议优化参数或换策略'}
-            `;
-        }
-
-        // 切换币种函数
-        function switchCoin(coin) {
-            if (isTradeLocked) { alert('已锁定仓位，无法切换！'); return; }
-            currentCoin = coin;
-            document.querySelectorAll('.coin-card').forEach(card => card.classList.remove('active'));
-            event.target.classList.add('active');
-            document.getElementById('coin-status').innerText = `当前币种：${coin}`;
-            currentLeverage = coinLeverageLimit[coin] || 10;
-            document.getElementById('leverage-status').innerText = `杠杆：${currentLeverage}倍`;
-            const currentPrice = basePriceData[coin];
-            if (!isNaN(currentPrice) && currentPrice > 0) {
-                document.getElementById('take-profit-price').value = (currentPrice * 1.01).toFixed(2);
-                document.getElementById('stop-loss-price').value = (currentPrice * 0.99).toFixed(2);
-            }
-        }
-
-        // 启动行情监控
-        function startMonitor() {
-            if (isPriceMonitorRunning) { alert('行情监控已在运行！'); return; }
-            isPriceMonitorRunning = true;
-
-            if (currentMode === 'mock') {
-                document.getElementById('price-status').innerText = '行情状态：模拟监控中';
-                priceMonitorTimer = setInterval(() => {
-                    // 模拟价格波动
-                    for (const coin in basePriceData) {
-                        basePriceData[coin] = basePriceData[coin] + (Math.random() - 0.5) * 10;
-                    }
-                    updateCoinCards();
-                    checkAutoOrder();
-                }, 5000);
-                alert('✅ 已启动模拟行情监控，每5秒更新一次价格！');
-            } else {
-                document.getElementById('price-status').innerText = '行情状态：实时监控中';
-                // 实时行情间隔设为10秒，避免接口限制
-                priceMonitorTimer = setInterval(updateAllRealPrices, 10000);
-                alert('✅ 已启动实时行情监控，每10秒更新一次价格！');
-            }
-        }
-
-        // 停止行情监控
-        function stopMonitor() {
-            if (!isPriceMonitorRunning) { alert('行情监控未启动！'); return; }
-            clearInterval(priceMonitorTimer);
-            isPriceMonitorRunning = false;
-            document.getElementById('price-status').innerText = currentMode === 'mock' ? '行情状态：模拟行情' : '行情状态：实时行情（已停止）';
-            alert('✅ 已停止行情监控！');
-        }
-
-        // 计算风控参数
-        function calcRisk() {
-            const totalFund = parseFloat(document.getElementById('total-fund').value) || 0;
-            const stopLossPoint = parseFloat(document.getElementById('stop-loss-point').value) || 0;
-            if (totalFund <= 0 || stopLossPoint <= 0) {
-                document.getElementById('risk-result').innerText = '❌ 总资金和止损点数必须大于0！';
-                return;
-            }
-            const leverage = currentLeverage;
-            const currentPrice = basePriceData[currentCoin];
-            if (isNaN(currentPrice) || currentPrice <= 0) {
-                document.getElementById('risk-result').innerText = '❌ 当前币种价格异常，无法计算！';
-                return;
-            }
-            const safePosition = (totalFund * 0.1).toFixed(2); // 安全开仓金额（总资金10%）
-            const liquidationPrice = (currentPrice * (1 - stopLossPoint / (totalFund * leverage))).toFixed(2);
-
-            document.getElementById('risk-result').innerHTML = `
-                🛡️ 风控计算结果<br>
-                总资金：${totalFund} USDT | 止损点数：${stopLossPoint} USDT | 杠杆：${leverage}倍<br>
-                安全开仓金额：<span class="guide-highlight">${safePosition} USDT</span>（建议不超过总资金10%）<br>
-                预估爆仓价：<span class="guide-highlight">$${liquidationPrice}</span><br>
-                💡 提醒：价格接近爆仓价时会触发弹窗预警！
-            `;
-
-            // 监听价格是否接近爆仓价
-            if (currentPrice <= parseFloat(liquidationPrice) * 1.01) {
-                showAlert('liquidation-alert', `当前价格$${currentPrice.toFixed(2)}接近爆仓价$${liquidationPrice}，请立即减仓！`);
-            }
-        }
-
-        // 启动自动委托
-        function startAutoOrder() {
-            if (isAutoOrderRunning) { alert('自动委托已在运行！'); return; }
-            if (isTradeLocked) { alert('已锁定仓位，无法启动委托！'); return; }
-            const takeProfitPrice = parseFloat(document.getElementById('take-profit-price').value) || 0;
-            const stopLossPrice = parseFloat(document.getElementById('stop-loss-price').value) || 0;
-            const direction = document.getElementById('order-direction').value;
-            const currentPrice = basePriceData[currentCoin];
-
-            if (takeProfitPrice <= 0 || stopLossPrice <= 0) {
-                document.getElementById('auto-order-status').innerText = '❌ 止盈价和止损价必须大于0！';
-                return;
-            }
-            if (isNaN(currentPrice) || currentPrice <= 0) {
-                document.getElementById('auto-order-status').innerText = '❌ 当前币种价格异常，无法启动！';
-                return;
-            }
-            if (direction === 'long' && takeProfitPrice <= currentPrice) {
-                document.getElementById('auto-order-status').innerText = '❌ 开多策略的止盈价必须高于当前价格！';
-                return;
-            }
-            if (direction === 'short' && takeProfitPrice >= currentPrice) {
-                document.getElementById('auto-order-status').innerText = '❌ 开空策略的止盈价必须低于当前价格！';
-                return;
-            }
-
-            isAutoOrderRunning = true;
-            document.getElementById('auto-order-status').innerText = `✅ 自动委托已启动 | 方向：${direction === 'long' ? '开多' : '开空'} | 止盈：$${takeProfitPrice} | 止损：$${stopLossPrice}`;
-            document.getElementById('order-status').innerText = '委托状态：运行中';
-            document.getElementById('order-status').className = 'status-item status-safe';
-
-            // 每2秒检查一次价格
-            autoOrderTimer = setInterval(checkAutoOrder, 2000);
-        }
-
-        // 检查自动委托条件
-        function checkAutoOrder() {
-            if (!isAutoOrderRunning) return;
-            const takeProfitPrice = parseFloat(document.getElementById('take-profit-price').value);
-            const stopLossPrice = parseFloat(document.getElementById('stop-loss-price').value);
-            const direction = document.getElementById('order-direction').value;
-            const currentPrice = basePriceData[currentCoin];
-
-            // 价格异常时跳过检查
-            if (isNaN(currentPrice) || currentPrice <= 0) return;
-
-            let orderType = '';
+        // 策略计算
+        function calcStrategy() {
+            const type = document.getElementById('strategy-type').value;
+            const openPrice = parseFloat(document.getElementById('open-price').value) || 0;
+            const totalCapital = parseFloat(document.getElementById('total-capital').value) || 0;
             let result = '';
-            let alertContent = '';
 
-            if (direction === 'long' && currentPrice >= takeProfitPrice) {
-                orderType = '止盈';
-                result = '盈利';
-                alertContent = `${currentCoin}已触达开多止盈价$${takeProfitPrice}，当前价格$${currentPrice.toFixed(2)}！`;
-                recordTradeLog(currentCoin, direction, orderType, currentPrice, takeProfitPrice, result);
-                showAlert('price-alert', alertContent);
-                stopAutoOrder();
-            } else if (direction === 'long' && currentPrice <= stopLossPrice) {
-                orderType = '止损';
-                result = '亏损';
-                dailyLoss += Math.abs(takeProfitPrice - stopLossPrice);
-                alertContent = `${currentCoin}已触达开多止损价$${stopLossPrice}，当前价格$${currentPrice.toFixed(2)}！`;
-                recordTradeLog(currentCoin, direction, orderType, currentPrice, stopLossPrice, result);
-                showAlert('price-alert', alertContent);
-                stopAutoOrder();
-            } else if (direction === 'short' && currentPrice <= takeProfitPrice) {
-                orderType = '止盈';
-                result = '盈利';
-                alertContent = `${currentCoin}已触达开空止盈价$${takeProfitPrice}，当前价格$${currentPrice.toFixed(2)}！`;
-                recordTradeLog(currentCoin, direction, orderType, currentPrice, takeProfitPrice, result);
-                showAlert('price-alert', alertContent);
-                stopAutoOrder();
-            } else if (direction === 'short' && currentPrice >= stopLossPrice) {
-                orderType = '止损';
-                result = '亏损';
-                dailyLoss += Math.abs(stopLossPrice - takeProfitPrice);
-                alertContent = `${currentCoin}已触达开空止损价$${stopLossPrice}，当前价格$${currentPrice.toFixed(2)}！`;
-                recordTradeLog(currentCoin, direction, orderType, currentPrice, stopLossPrice, result);
-                showAlert('price-alert', alertContent);
-                stopAutoOrder();
-            }
-
-            // 检查当日亏损是否超限
-            document.getElementById('loss-status').innerText = `当日亏损：${dailyLoss.toFixed(2)}/${maxDailyLoss} USDT`;
-            if (dailyLoss >= maxDailyLoss * 0.8) {
-                showAlert('loss-alert', `当日亏损已达${dailyLoss.toFixed(2)} USDT，接近阈值${maxDailyLoss} USDT！`);
-            }
-            if (dailyLoss >= maxDailyLoss) {
-                lockTrade();
-                showAlert('loss-alert', `当日亏损已达阈值${maxDailyLoss} USDT，已自动锁定仓位！`);
-            }
-        }
-
-        // 停止自动委托
-        function stopAutoOrder() {
-            if (!isAutoOrderRunning) { alert('自动委托未启动！'); return; }
-            clearInterval(autoOrderTimer);
-            isAutoOrderRunning = false;
-            document.getElementById('auto-order-status').innerText = '❌ 自动委托已停止，可重新设置参数启动';
-            document.getElementById('order-status').innerText = '委托状态：已停止';
-            document.getElementById('order-status').className = 'status-item status-neutral';
-        }
-
-        // 锁定仓位
-        function lockTrade() {
-            isTradeLocked = true;
-            stopAutoOrder();
-            if (isPriceMonitorRunning) stopMonitor();
-            document.getElementById('position-status').innerText = '仓位已锁定';
-            document.getElementById('position-status').className = 'status-item status-danger';
-            alert('🔒 已锁定仓位，禁止所有交易操作！');
-        }
-
-        // 解锁仓位
-        function unlockTrade() {
-            if (!isTradeLocked) { alert('仓位未锁定，无需解锁！'); return; }
-            isTradeLocked = false;
-            document.getElementById('position-status').innerText = '仓位安全';
-            document.getElementById('position-status').className = 'status-item status-safe';
-            alert('🔓 已解锁仓位，可正常操作！');
-        }
-
-        // 记录交易日志
-        function recordTradeLog(coin, direction, orderType, currentPrice, targetPrice, result) {
-            const now = new Date();
-            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
-            const logItem = document.createElement('div');
-            logItem.className = result === '盈利' ? 'log-item-profit' : 'log-item-loss';
-            
-            // 价格格式化
-            const currentPriceStr = !isNaN(currentPrice) ? currentPrice.toFixed(2) : '--';
-            const targetPriceStr = !isNaN(targetPrice) ? targetPrice.toFixed(2) : '--';
-            
-            logItem.innerText = `[${timeStr}] ${coin} | ${direction === 'long' ? '开多' : '开空'} | ${orderType} | 目标价$${targetPriceStr} | 当前价$${currentPriceStr} | ${result}`;
-            
-            const logContent = document.getElementById('log-content');
-            if (logContent.querySelector('.log-empty')) logContent.innerHTML = '';
-            logContent.appendChild(logItem);
-            // 滚动到最新日志
-            logContent.scrollTop = logContent.scrollHeight;
-        }
-
-        // 清空交易日志
-        function clearTradeLog() {
-            const logContent = document.getElementById('log-content');
-            logContent.innerHTML = '<div class="log-empty">暂无交易记录</div>';
-        }
-
-        // 显示弹窗提醒
-        function showAlert(alertId, content) {
-            const alertBox = document.getElementById(alertId);
-            const contentEl = document.getElementById(`${alertId.split('-')[0]}-content`);
-            if (contentEl) contentEl.innerText = content;
-            alertBox.classList.remove('hide');
-        }
-
-        // 关闭弹窗提醒
-        function closeAlert(alertId) {
-            document.getElementById(alertId).classList.add('hide');
-        }
-
-        // 一键跳欧易
-        function jumpToOKX() {
-            window.open('https://www.okx.com/', '_blank');
-        }
-
-        // 查看复盘（示例）
-        function showReview() {
-            const currentPrice = basePriceData[currentCoin];
-            const priceStr = !isNaN(currentPrice) ? currentPrice.toFixed(2) : '--';
-            const reviewContent = `
-                复盘时间：${new Date().toLocaleString()}
-                当前币种：${currentCoin}
-                当前价格：$${priceStr}
-                当日亏损：${dailyLoss.toFixed(2)}/${maxDailyLoss} USDT
-                委托状态：${isAutoOrderRunning ? '运行中' : '已停止'}
-                行情模式：${currentMode === 'mock' ? '模拟' : '实时'}
-                仓位状态：${isTradeLocked ? '已锁定' : '安全'}
-            `;
-            document.getElementById('review-content').innerText = reviewContent;
-            showAlert('review-alert', reviewContent);
-        }
-
-        // 连接TV信号服务（示例，需配合后端）
-        function connectTvServer() {
-            tvServerUrl = document.getElementById('tv-server-url').value.trim();
-            if (!tvServerUrl) {
-                document.getElementById('signal-status').innerText = '❌ 服务地址不能为空！';
-                document.getElementById('signal-status').className = 'signal-status signal-offline';
+            if (openPrice <= 0 || totalCapital <= 0) {
+                result = '请输入有效的开仓价和总资金！';
+                document.getElementById('strategy-result').textContent = result;
                 return;
             }
-            // 模拟连接成功
-            isTvServerConnected = true;
-            document.getElementById('signal-status').innerText = '✅ 已连接TV信号服务，等待信号推送';
-            document.getElementById('signal-status').className = 'signal-status signal-online';
-            document.getElementById('tv-signal-status').innerText = 'TV信号：已连接';
-            document.getElementById('tv-signal-status').className = 'status-item status-safe';
-            
-            // 模拟接收信号
-            setTimeout(() => {
-                const currentPrice = basePriceData[currentCoin];
-                const signalPrice = !isNaN(currentPrice) ? (currentPrice * 1.005).toFixed(2) : '--';
-                const signalLog = document.getElementById('signal-log');
-                signalLog.innerHTML = `[${new Date().toLocaleTimeString()}] 收到信号：${currentCoin} 开多 $${signalPrice}`;
-                showAlert('tv-signal-alert', `收到TV信号：${currentCoin} 开多 $${signalPrice}`);
-            }, 3000);
+
+            if (type === 'tp-sl') {
+                const rate = document.getElementById('tp-sl-rate').value.split('/');
+                const tpRate = parseFloat(rate[0]) || 0;
+                const slRate = parseFloat(rate[1]) || 0;
+                if (tpRate <= 0 || slRate <= 0) {
+                    result = '请输入有效的止盈止损比例（如 5/2）！';
+                    document.getElementById('strategy-result').textContent = result;
+                    return;
+                }
+                const tpPrice = openPrice * (1 + tpRate / 100);
+                const slPrice = openPrice * (1 - slRate / 100);
+                const suggest = `【止盈止损策略操作建议】
+1. 止盈价：${tpPrice.toFixed(2)} USDT  止损价：${slPrice.toFixed(2)} USDT
+2. 建议仓位：${(totalCapital * 0.05).toFixed(2)} USDT（总资金5%）
+3. 操作步骤：打开欧易/币安/火币 → 对应币种合约 → 限价开仓 → 设置止盈止损
+4. 动态止盈：盈利3%后，止损位上移至开仓价，避免盈利回吐`;
+                result = suggest;
+            } else if (type === 'grid') {
+                const param = document.getElementById('grid-param').value.split('/');
+                const gridNum = parseInt(param[0]) || 10;
+                const range = parseFloat(param[1].replace('±', '').replace('%', '')) || 5;
+                const gridStep = (openPrice * range / 100) / gridNum;
+                const startPrice = openPrice * (1 - range / 100);
+                const endPrice = openPrice * (1 + range / 100);
+                const perGridCapital = (totalCapital / gridNum).toFixed(2);
+                const suggest = `【网格交易策略操作建议】
+1. 网格参数：${gridNum}格  价格区间：${startPrice.toFixed(2)} - ${endPrice.toFixed(2)} USDT
+2. 每格仓位：${perGridCapital} USDT  每格价差：${gridStep.toFixed(2)} USDT
+3. 操作步骤：下跌${gridStep.toFixed(2)} USDT补仓1格，上涨${gridStep.toFixed(2)} USDT止盈1格
+4. 风险提示：震荡行情适用，趋势行情禁用；默认不开启马丁格尔（高风险）`;
+                result = suggest;
+            } else if (type === 'break') {
+                const breakRate = parseFloat(document.getElementById('break-rate').value) || 0.5;
+                const confirmPrice = openPrice * (1 - breakRate / 100);
+                const slPrice = confirmPrice * (1 - 0.5 / 100);
+                const suggest = `【突破交易策略操作建议】
+1. 突破确认：价格突破${openPrice.toFixed(2)} USDT后，回踩≤${breakRate}%（即≥${confirmPrice.toFixed(2)} USDT）确认有效
+2. 止损价：${slPrice.toFixed(2)} USDT（突破失败离场）
+3. 建议仓位：${(totalCapital * 0.03).toFixed(2)} USDT（总资金3%）
+4. 多平台适配：欧易/币安/火币操作一致，突破后立即开仓，避免踏空`;
+                result = suggest;
+            }
+            document.getElementById('strategy-result').textContent = result;
         }
 
-        // 加载策略模板
-        function loadTemplate(templateType) {
-            const currentPrice = basePriceData[currentCoin];
-            if (isNaN(currentPrice) || currentPrice <= 0) {
-                alert('当前币种价格异常，无法加载模板！');
-                return;
-            }
-            let tpPrice, slPrice;
-            if (templateType === 'shock') {
-                tpPrice = (currentPrice * 1.005).toFixed(2);
-                slPrice = (currentPrice * 0.997).toFixed(2);
-                alert('已加载震荡策略模板：低杠杆+窄止损');
-            } else if (templateType === 'trend') {
-                tpPrice = (currentPrice * 1.02).toFixed(2);
-                slPrice = (currentPrice * 0.99).toFixed(2);
-                alert('已加载趋势策略模板：中杠杆+宽止损');
+        // 保证金预警
+        function checkMargin() {
+            const rate = parseFloat(document.getElementById('margin-rate').value) || 0;
+            const alert = document.getElementById('margin-alert');
+            if (rate < 50) {
+                alert.textContent = '保证金使用率安全，可正常操作';
+                alert.style.color = '#27ae60';
+            } else if (rate < 70) {
+                alert.textContent = '黄色预警：仓位偏重，建议减仓10%-20%';
+                alert.style.color = '#f39c12';
+            } else if (rate < 80) {
+                alert.textContent = '红色预警：保证金不足，即将触发强平，立即减仓或追加资金';
+                alert.style.color = '#e74c3c';
             } else {
-                tpPrice = (currentPrice * 1.001).toFixed(2);
-                slPrice = (currentPrice * 0.999).toFixed(2);
-                alert('已加载极端策略模板：1倍杠杆+观望');
+                alert.textContent = '强制预警：禁止开新仓，立即减仓！';
+                alert.style.color = '#e74c3c';
             }
-            document.getElementById('take-profit-price').value = tpPrice;
-            document.getElementById('stop-loss-price').value = slPrice;
         }
+
+        // 最大亏损计算
+        function calcMaxLoss() {
+            const capital = parseFloat(document.getElementById('risk-capital').value) || 0;
+            const rate = parseFloat(document.getElementById('risk-rate').value) || 2;
+            if (capital <= 0) {
+                document.getElementById('risk-result').textContent = '请输入有效的总资金！';
+                return;
+            }
+            const maxLoss = (capital * rate / 100).toFixed(2);
+            const suggest = `【最大亏损计算结果】
+1. 总资金：${capital} USDT  风险容忍度：${rate}%
+2. 单笔最大可亏损：${maxLoss} USDT
+3. 建议单笔仓位：不超过总资金的5%（${(capital * 0.05).toFixed(2)} USDT）
+4. 专业建议：保证金使用率不超过70%，避免爆仓风险`;
+            document.getElementById('risk-result').textContent = suggest;
+        }
+
+        // 多空比解读
+        function analysisRatio() {
+            const ratio = document.getElementById('long-short-ratio').value;
+            const [long, short] = ratio.split(':').map(Number);
+            let suggest = '';
+            if (long > short) {
+                suggest = `【多空比解读：${ratio}】市场多头占优，你的多单方向与主流一致，可继续持有；若持仓为空单，建议减仓规避逆势风险。`;
+            } else if (short > long) {
+                suggest = `【多空比解读：${ratio}】市场空头占优，你的空单方向与主流一致，可继续持有；若持仓为多单，建议减仓规避逆势风险。`;
+            } else {
+                suggest = `【多空比解读：${ratio}】市场多空平衡，建议观望或轻仓试错，等待明确方向。`;
+            }
+            document.getElementById('risk-result').textContent = suggest;
+        }
+
+        // 添加交易日志
+        function addTradeLog() {
+            const content = document.getElementById('log-content').value.trim();
+            if (!content) return;
+            const time = new Date().toLocaleString();
+            const log = document.getElementById('trade-log');
+            const newLog = log.textContent === '暂无交易记录' ? '' : log.textContent + '\n';
+            log.textContent = newLog + `[${time}] ${content}`;
+            document.getElementById('log-content').value = '';
+        }
+
+        // 快捷键监听
+        document.addEventListener('keydown', function(e) {
+            switch(e.key) {
+                case 'F1':
+                    alert('已切换K线周期：15m → 5m → 1m → 1h 循环切换');
+                    break;
+                case 'F2':
+                    if (confirm('是否清空所有价格预警线？')) {
+                        document.querySelectorAll('.alert-line').forEach(line => line.remove());
+                        alert('预警线已清空');
+                    }
+                    break;
+                case 'F3':
+                    document.getElementById('risk-capital').focus();
+                    break;
+                case 'F4':
+                    toggleIndicator('btc-kline');
+                    toggleIndicator('eth-kline');
+                    toggleIndicator('sol-kline');
+                    toggleIndicator('ada-kline');
+                    break;
+            }
+        });
+
+        // 模拟行情数据更新（实际对接公开API后可替换）
+        setInterval(() => {
+            const btcPrice = (Math.random() * 2000 + 45000).toFixed(2);
+            const ethPrice = (Math.random() * 100 + 2200).toFixed(2);
+            const solPrice = (Math.random() * 5 + 100).toFixed(2);
+            const adaPrice = (Math.random() * 0.1 + 0.5).toFixed(3);
+            document.getElementById('btc-price').textContent = btcPrice;
+            document.getElementById('eth-price').textContent = ethPrice;
+            document.getElementById('sol-price').textContent = solPrice;
+            document.getElementById('ada-price').textContent = adaPrice;
+
+            const btcChange = (Math.random() * 2 - 1).toFixed(2);
+            const ethChange = (Math.random() * 2 - 0.5).toFixed(2);
+            document.getElementById('btc-change').textContent = btcChange + '%';
+            document.getElementById('eth-change').textContent = ethChange + '%';
+            document.getElementById('sol-change').textContent = (Math.random() * 3 - 1).toFixed(2) + '%';
+            document.getElementById('ada-change').textContent = (Math.random() * 3 - 0.5).toFixed(2) + '%';
+
+            // 更新AI解读
+            const aiText = `【BTC】当前价格${btcPrice} USDT，15m K线双底形态，MACD金叉，多空比2:1。
+建议：轻仓开多，止盈${(parseFloat(btcPrice) * 1.05).toFixed(2)} USDT，止损${(parseFloat(btcPrice) * 0.98).toFixed(2)} USDT；跌破止损立即平仓。
+
+【ETH】当前价格${ethPrice} USDT，15m K线三角收敛，RSI中性，多空比1.5:1。
+建议：等待突破，突破后回踩≤0.5%开多，止损${(parseFloat(ethPrice) * 0.995).toFixed(2)} USDT。`;
+            document.getElementById('ai-analysis').textContent = aiText;
+        }, 30000);
     </script>
 </body>
 </html>

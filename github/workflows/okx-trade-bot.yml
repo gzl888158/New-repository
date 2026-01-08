@@ -2,14 +2,14 @@ name: OKX Contract AI Analysis Bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *" # 每30分钟执行一次
-  workflow_dispatch: # 手动触发
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 jobs:
   run-ai-analysis:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -19,22 +19,20 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install requests numpy
 
-      - name: Run AI Analysis Script
+      - name: Run AI Script
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
-        run: |
-          python okx_trade_tool.py
+        run: python okx_trade_tool.py
 
-      - name: Commit AI Analysis Log
+      - name: Commit Log
         run: |
-          git config --global user.name "GitHub Actions Bot"
+          git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git add ai_analysis_log.json
-          git commit -m "Update AI analysis log: $(date +'%Y-%m-%d %H:%M:%S')"
-          git push
-        continue-on-error: true # 无更新时跳过
+          git commit -m "Update AI log: $(date +'%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+          git push || echo "Push skipped (no changes)"

@@ -1,0 +1,26 @@
+# 敏感配置文件
+.env
+*.env
+
+# Python缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 日志目录
+logs/
+*.log
+
+# 数据文件（回测/分析结果）
+ai_analysis_log.json
+multi_coin_multi_timeframe_log.json
+backtest_result.json
+
+# 虚拟环境
+venv/
+env/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db

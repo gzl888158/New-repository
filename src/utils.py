@@ -1,43 +1,33 @@
 import logging
-import time
-from logging.handlers import TimedRotatingFileHandler
+import os
 from datetime import datetime
 
-def setup_logger():
-    """配置按天轮转的日志"""
-    logger = logging.getLogger("okx_trader")
+# 日志配置
+LOG_DIR = "logs"
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+LOG_FILE = os.path.join(LOG_DIR, f"okx_robot_{datetime.now().strftime('%Y%m%d')}.log")
+
+def setup_logger() -> logging.Logger:
+    """初始化日志"""
+    logger = logging.getLogger("OKX_Grid_Robot")
     logger.setLevel(logging.INFO)
-    if logger.handlers:
-        return logger
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     
-    # 日志格式
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    # 文件处理器
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
     
-    # 控制台输出
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # 文件输出（按天轮转，保留7天）
-    file_handler = TimedRotatingFileHandler(
-        "logs/okx_trader.log",
-        when="D",
-        interval=1,
-        backupCount=7,
-        encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
+    # 控制台处理器
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
     return logger
 
-def timestamp_to_datetime(ts: int) -> str:
-    """毫秒时间戳转格式化字符串"""
-    return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
-
-def get_current_timestamp() -> int:
-    """获取当前毫秒时间戳"""
-    return int(time.time() * 1000)
+def get_logs() -> list:
+    """获取最新日志"""
+    if not os.path.exists(LOG_FILE):
+        return ["日志文件未生成"]
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
+        return f.readlines()

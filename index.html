@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>欧易合约监控（含盈亏计算）</title>
+    <title>欧易合约监控（含持仓盈亏计算）</title>
     <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
     <script src="https://cdn.bootcdn.net/ajax/libs/jquery/3.6.4/jquery.min.js"></script>
     <style>
@@ -42,6 +42,17 @@
             border-radius: 4px; 
             color: #fff; 
             cursor: pointer;
+        }
+        .record-group { margin-bottom: 10px; }
+        .record-group button { 
+            padding: 6px 12px; 
+            background: #ff4d4f; 
+            border: none; 
+            border-radius: 4px; 
+            color: #fff; 
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 10px;
         }
         .profit-table { 
             width: 100%; 
@@ -118,6 +129,14 @@
                 <input type="number" id="entryPrice" placeholder="开仓价格" step="0.01">
                 <input type="number" id="positionAmt" placeholder="持仓数量" step="0.001">
                 <button onclick="calculateProfit()">计算盈亏</button>
+                <button onclick="savePositionRecord()" style="background: #1890ff;">保存记录</button>
+            </div>
+            <div class="record-group">
+                <span>历史持仓记录：</span>
+                <select id="recordSelect" onchange="loadPositionRecord()">
+                    <option value="">请选择保存的记录</option>
+                </select>
+                <button onclick="deletePositionRecord()">删除记录</button>
             </div>
             <table class="profit-table">
                 <thead>
@@ -152,6 +171,7 @@
         let btcChart, depthChart;
         let currentInstId = "BTC-USDT";
         let currentPrice = 0; // 存储当前最新价
+        const RECORD_KEY = "okx_position_records"; // 本地缓存键名
 
         // 初始化状态提示
         const statusBar = document.getElementById("statusBar");
@@ -172,6 +192,8 @@
                 currentInstId = $("#instIdSelect").val();
                 fetchAllData();
             });
+            // 加载本地保存的持仓记录
+            loadAllPositionRecords();
         });
 
         // 初始化图表
@@ -199,14 +221,50 @@
             });
         }
 
-        // 拉取所有数据
+        // 拉取所有数据（修复报错和深度图加载问题）
         function fetchAllData() {
             updateStatus(`正在拉取${currentInstId}行情数据...`, false);
-            Promise.all([fetchKlineData(), fetchDepthData(), fetchTickerData()]).then(() => {
-                updateStatus(`${currentInstId}数据刷新成功（每10秒自动更新）`, true);
-            }).catch((err) => {
-                updateStatus(`数据拉取失败：${err.message}`, false);
+            // 分别处理每个接口，避免一个失败导致全部报错
+            fetchKlineData().catch(err => console.log("K线拉取失败：", err.message || err));
+            fetchTickerData().catch(err => console.log("最新价拉取失败：", err.message || err));
+            fetchDepthData().catch(err => {
+                console.log("深度图拉取失败：", err.message || err);
+                // 深度图加载失败时显示最新买卖一价
+                $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
+                    if (res.code === "0") {
+                        const bid = res.data[0].bid; // 买一价
+                        const ask = res.data[0].ask; // 卖一价
+                        depthChart.setOption({
+                            title: { 
+                                text: `卖一：${ask} USDT\n买一：${bid} USDT`, 
+                                left: "center", 
+                                top: "40%",
+                                textStyle: { color: "#fff", fontSize: 14 } 
+                            },
+                            series: [{ data: [] }, { data: [] }]
+                        });
+                    } else {
+                        depthChart.setOption({
+                            title: { 
+                                text: "深度数据加载失败（移动端网络限制）", 
+                                left: "center", 
+                                top: "40%",
+                                textStyle: { color: "#999", fontSize: 12 } 
+                            },
+                            series: [{ data: [] }, { data: [] }]
+                        });
+                    }
+                });
             });
+            // 延迟判断整体状态
+            setTimeout(() => {
+                if (currentPrice > 0) {
+                    updateStatus(`${currentInstId}数据刷新成功（每10秒自动更新）`, true);
+                } else {
+                    const errMsg = "行情接口访问失败，请使用手机自带浏览器打开";
+                    updateStatus(errMsg, false);
+                }
+            }, 3000);
         }
 
         // 拉取K线数据
@@ -272,11 +330,9 @@
             // 计算盈亏
             let profit, profitRatio;
             if (direction === "long") {
-                // 做多：盈亏 = (当前价 - 开仓价) * 持仓量
-                profit = (currentPrice - entryPrice) * positionAmt;
+                profit = (currentPrice - entryPrice) * positionAmt; // 做多盈亏
             } else {
-                // 做空：盈亏 = (开仓价 - 当前价) * 持仓量
-                profit = (entryPrice - currentPrice) * positionAmt;
+                profit = (entryPrice - currentPrice) * positionAmt; // 做空盈亏
             }
             profitRatio = (profit / (entryPrice * positionAmt)) * 100; // 盈亏比例(%)
 
@@ -296,6 +352,95 @@
             $("#profitTableBody").html(html);
         }
 
+        // ========== 本地持仓记录保存/加载/删除功能 ==========
+        // 保存持仓记录到本地缓存
+        function savePositionRecord() {
+            const instId = $("#instIdSelect").val();
+            const direction = $("#directionSelect").val();
+            const entryPrice = parseFloat($("#entryPrice").val());
+            const positionAmt = parseFloat($("#positionAmt").val());
+
+            if (isNaN(entryPrice) || isNaN(positionAmt) || entryPrice <= 0 || positionAmt <= 0) {
+                alert("请先输入有效的持仓信息！");
+                return;
+            }
+
+            // 构造记录对象
+            const record = {
+                id: new Date().getTime(), // 唯一ID
+                name: `${instId}-${direction === "long" ? "多" : "空"}`,
+                instId: instId,
+                direction: direction,
+                entryPrice: entryPrice,
+                positionAmt: positionAmt,
+                createTime: new Date().toLocaleString()
+            };
+
+            // 从本地缓存获取现有记录
+            let records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
+            records.push(record);
+            // 保存到本地缓存
+            localStorage.setItem(RECORD_KEY, JSON.stringify(records));
+            // 刷新记录下拉框
+            loadAllPositionRecords();
+            alert(`持仓记录【${record.name}】保存成功！`);
+        }
+
+        // 加载所有本地持仓记录到下拉框
+        function loadAllPositionRecords() {
+            const records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
+            const $select = $("#recordSelect");
+            // 清空原有选项（保留默认项）
+            $select.html('<option value="">请选择保存的记录</option>');
+            // 添加记录选项
+            records.forEach(record => {
+                $select.append(`<option value="${record.id}">${record.name}（${record.createTime}）</option>`);
+            });
+        }
+
+        // 加载选中的持仓记录到输入框
+        function loadPositionRecord() {
+            const recordId = $("#recordSelect").val();
+            if (!recordId) return;
+
+            const records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
+            const record = records.find(item => item.id == recordId);
+            if (record) {
+                // 填充到输入框
+                $("#instIdSelect").val(record.instId);
+                $("#directionSelect").val(record.direction);
+                $("#entryPrice").val(record.entryPrice);
+                $("#positionAmt").val(record.positionAmt);
+                // 自动计算盈亏
+                calculateProfit();
+                // 同步币种到行情监控
+                currentInstId = record.instId;
+                fetchAllData();
+            }
+        }
+
+        // 删除选中的持仓记录
+        function deletePositionRecord() {
+            const recordId = $("#recordSelect").val();
+            if (!recordId) {
+                alert("请先选择要删除的持仓记录！");
+                return;
+            }
+
+            if (confirm("确定要删除该持仓记录吗？删除后无法恢复！")) {
+                let records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
+                records = records.filter(item => item.id != recordId);
+                // 保存修改后的记录
+                localStorage.setItem(RECORD_KEY, JSON.stringify(records));
+                // 刷新下拉框并清空输入
+                loadAllPositionRecords();
+                $("#entryPrice").val("");
+                $("#positionAmt").val("");
+                $("#profitTableBody").html('<tr><td colspan="7">请录入持仓信息并点击计算</td></tr>');
+                alert("持仓记录删除成功！");
+            }
+        }
+
         // 绑定快捷键
         function bindShortcuts() {
             document.addEventListener("keydown", (e) => {
@@ -308,7 +453,7 @@
                     alert(`已切换至${currentInstId}行情监控`);
                 }
                 if (e.key === "F2") {
-                    alert("策略运行中：\n1. GitHub Actions每30分钟执行AI分析\n2. 前端每10秒刷新行情数据\n3. 支持手动录入持仓计算盈亏");
+                    alert("策略运行中：\n1. GitHub Actions每30分钟执行AI分析\n2. 前端每10秒刷新行情数据\n3. 支持本地保存持仓记录，刷新不丢失");
                 }
             });
         }

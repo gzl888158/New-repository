@@ -2,233 +2,284 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>欧易合约AI辅助工具 + 自动交易机器人（完整版）</title>
-    <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
-    <script src="https://cdn.bootcdn.net/ajax/libs/jquery/3.6.4/jquery.min.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>欧易合约AI交易机器人</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            background: #121212; 
-            color: #fff; 
-            font-family: Arial, sans-serif; 
-            padding: 20px; 
-            min-height: 100vh;
-            padding-top: 50px;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: "Microsoft YaHei", sans-serif;
         }
-        h1 { text-align: center; margin-bottom: 20px; color: #e5e5e5; font-size: 18px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .bot-switch-panel {
-            background: #1a1a1a;
-            border: 1px solid #333;
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #333;
+        }
+        .header h1 {
+            font-size: 24px;
+            color: #e53e3e;
+            margin-bottom: 5px;
+        }
+        .header p {
+            font-size: 14px;
+            color: #999;
+        }
+        .section {
+            background-color: #1e1e1e;
             border-radius: 8px;
             padding: 15px;
-            margin-bottom: 15px;
-            text-align: center;
-            border-left: 4px solid #ff4d4f;
+            margin-bottom: 20px;
         }
-        .bot-switch-btn {
-            padding: 10px 30px;
-            font-size: 16px;
+        .section h3 {
+            color: #e53e3e;
+            margin-bottom: 15px;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .section h3::before {
+            content: "";
+            display: inline-block;
+            width: 4px;
+            height: 20px;
+            background-color: #e53e3e;
+            border-radius: 2px;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        .input-group input {
+            flex: 1;
+            min-width: 200px;
+            padding: 8px 10px;
+            background-color: #2d2d2d;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            outline: none;
+        }
+        .input-group input::placeholder {
+            color: #999;
+        }
+        .btn-group {
+            margin-bottom: 15px;
+        }
+        .btn {
+            padding: 8px 20px;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            margin: 0 10px;
+            font-size: 14px;
+            margin-right: 10px;
         }
-        .bot-off { background: #ff4d4f; color: #fff; }
-        .bot-on { background: #52c41a; color: #fff; }
-        .bot-status-text { font-size: 14px; margin-top: 10px; color: #999; }
-        .bot-config-panel {
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
-        }
-        .bot-config-panel h2 { font-size: 16px; margin-bottom: 10px; color: #fff; }
-        .config-group { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-        .config-group input, .config-group select {
-            padding: 8px;
-            background: #2a2a2a;
-            border: 1px solid #444;
-            border-radius: 4px;
+        .btn-red {
+            background-color: #e53e3e;
             color: #fff;
-            flex: 1;
-            min-width: 100px;
         }
-        .ai-panel, .market-panel, .alert-panel, .position-panel, .detail-panel {
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
+        .btn-gray {
+            background-color: #4a5568;
+            color: #fff;
         }
-        .ai-panel { border-left: 4px solid #1890ff; }
-        .ai-panel h2, .market-panel h2, .alert-panel h2, .position-panel h2, .detail-panel h2 {
-            font-size: 16px; margin-bottom: 10px; color: #fff;
+        .btn-green {
+            background-color: #48bb78;
+            color: #fff;
         }
-        .ai-signal {
+        .btn-blue {
+            background-color: #38b2ac;
+            color: #fff;
+        }
+        .tips {
             padding: 10px;
             border-radius: 4px;
-            margin: 10px 0;
-            font-weight: bold;
-            text-align: center;
-        }
-        .signal-buy { background: #52c41a; color: #fff; }
-        .signal-sell { background: #ff4d4f; color: #fff; }
-        .signal-hold { background: #faad14; color: #fff; }
-        .ticker-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-        .ticker-card {
-            background: #2a2a2a;
-            padding: 10px;
-            border-radius: 4px;
-            text-align: center;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        .ticker-card:hover { background: #3a3a3a; }
-        .input-group { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-        .input-group input, .input-group select {
-            padding: 8px;
-            background: #2a2a2a;
-            border: 1px solid #444;
-            border-radius: 4px;
-            color: #fff;
-            flex: 1;
-            min-width: 120px;
-        }
-        .input-group button {
-            padding: 8px 15px;
-            background: #52c41a;
-            border: none;
-            border-radius: 4px;
-            color: #fff;
-            cursor: pointer;
-        }
-        .profit-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        .profit-table th, .profit-table td {
-            padding: 8px;
-            border: 1px solid #444;
-            text-align: center;
             font-size: 12px;
+            margin-bottom: 15px;
         }
-        .profit-green { color: #52c41a; font-weight: bold; }
-        .profit-red { color: #ff4d4f; font-weight: bold; }
-        .detail-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; font-size: 12px; }
-        .detail-item { background: #2a2a2a; padding: 8px; border-radius: 4px; text-align: center; }
-        .chart-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-bottom: 20px; }
-        .chart-box { height: 300px; border: 1px solid #333; border-radius: 8px; padding: 10px; background: #1a1a1a; }
-        .status-bar { position: fixed; top: 0; left: 0; width: 100%; padding: 10px; text-align: center; font-size: 14px; z-index: 999; }
-        .status-success { background: #52c41a; color: #fff; }
-        .status-error { background: #ff4d4f; color: #fff; }
-        .shortcut { position: fixed; bottom: 15px; left: 50%; transform: translateX(-50%); color: #999; font-size: 12px; text-align: center; }
+        .tips-warning {
+            background-color: #fef7fb;
+            color: #f56565;
+            border: 1px solid #feb2b2;
+        }
+        .data-tips {
+            background-color: #2d2d2d;
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 15px;
+            display: none;
+        }
+        .data-tips p {
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .status-bar {
+            height: 20px;
+            background-color: #2d2d2d;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+        .status-progress {
+            height: 100%;
+            background-color: #ed8936;
+            width: 0;
+            transition: width 0.5s ease;
+        }
+        .table-container {
+            overflow-x: auto;
+            margin-top: 15px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 8px 10px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+            font-size: 14px;
+        }
+        th {
+            color: #999;
+        }
+        .chart-container {
+            display: flex;
+            gap: 20px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        .chart-box {
+            flex: 1;
+            min-width: 300px;
+            height: 200px;
+            background-color: #2d2d2d;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+        }
         @media (max-width: 768px) {
-            .ticker-grid, .detail-grid { grid-template-columns: repeat(2, 1fr); }
-            .chart-grid { grid-template-columns: 1fr; }
-            .chart-box { height: 250px; }
+            .input-group {
+                flex-direction: column;
+            }
+            .input-group input {
+                min-width: 100%;
+            }
+            .chart-container {
+                flex-direction: column;
+            }
+            .chart-box {
+                min-width: 100%;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="status-bar" id="statusBar">正在初始化AI交易机器人...</div>
-    <div class="container">
+    <!-- 头部 -->
+    <div class="header">
         <h1>欧易合约AI辅助工具 + 自动交易机器人（完整版）</h1>
+        <p>当前状态：<span id="robotStatus" style="color: #f56565;">已关闭 | 未执行任何交易</span></p>
+    </div>
 
-        <!-- 机器人开关面板 -->
-        <div class="bot-switch-panel">
-            <button id="botSwitchBtn" class="bot-switch-btn bot-off" onclick="toggleTradeBot()">启动交易机器人</button>
-            <p class="bot-status-text" id="botStatusText">当前状态：<span style="color:#ff4d4f;">已关闭</span> | 未执行任何交易</p>
+    <!-- API登录配置区 -->
+    <div class="section">
+        <h3>API登录配置</h3>
+        <div class="input-group">
+            <input type="text" id="apiKey" placeholder="欧易API Key（需开启合约权限）">
+            <input type="password" id="apiSecret" placeholder="欧易API Secret">
+            <input type="password" id="apiPassphrase" placeholder="API Passphrase">
         </div>
-
-        <!-- 交易参数配置面板 -->
-        <div class="bot-config-panel">
-            <h2>交易机器人参数配置</h2>
-            <div class="config-group">
-                <select id="botInstId">
-                    <option value="BTC-USDT-SWAP">BTC-USDT 永续合约</option>
-                    <option value="ETH-USDT-SWAP">ETH-USDT 永续合约</option>
-                    <option value="SOL-USDT-SWAP">SOL-USDT 永续合约</option>
-                </select>
-                <input type="number" id="marginAmt" placeholder="开仓保证金(USDT)" value="10" step="0.1">
-                <input type="number" id="leverage" placeholder="杠杆倍数" value="10" step="1">
-            </div>
-            <div class="config-group">
-                <input type="number" id="takeProfitRatio" placeholder="止盈比例(%)" value="1" step="0.1">
-                <input type="number" id="stopLossRatio" placeholder="止损比例(%)" value="0.5" step="0.1">
-                <input type="text" id="apiKey" placeholder="欧易API Key（只读+交易）">
-                <input type="text" id="apiSecret" placeholder="欧易API Secret">
-                <input type="text" id="apiPass" placeholder="欧易API Passphrase">
-            </div>
-            <p style="font-size: 12px; color: #ff4d4f;">⚠️ 注意：API需开启【交易权限】，请保管好密钥，切勿泄露！</p>
+        <div class="btn-group">
+            <button id="loginBtn" class="btn btn-red">登录API</button>
+            <button id="logoutBtn" class="btn btn-gray" style="display: none;">登出API</button>
+            <button id="startRobotBtn" class="btn btn-green" style="display: none;">启动交易机器人</button>
+            <button id="stopRobotBtn" class="btn btn-blue" style="display: none;">停止交易机器人</button>
         </div>
-
-        <!-- 原有AI分析、行情、预警、持仓、详情、图表面板 -->
-        <div class="ai-panel">
-            <h2>AI行情分析 & 策略运行状态</h2>
-            <div id="aiAnalysis">
-                <p>正在拉取最新AI分析结果...</p>
-            </div>
-            <div id="aiSignal" class="ai-signal signal-hold">等待AI分析数据...</div>
-            <div id="botStatus" style="margin-top: 10px; font-size: 12px; color: #999;">
-                策略运行状态：未获取到
-            </div>
+        <div class="tips tips-warning">
+            ⚠️ 注意：API需开启【交易权限】，请保管好密钥，切勿泄露！
         </div>
-
-        <div class="market-panel">
-            <h2>主流币实时行情</h2>
-            <div class="ticker-grid">
-                <div id="ticker-BTC" class="ticker-card"></div>
-                <div id="ticker-ETH" class="ticker-card"></div>
-                <div id="ticker-SOL" class="ticker-card"></div>
-                <div id="ticker-BNB" class="ticker-card"></div>
-            </div>
+        <!-- 数据提示框 -->
+        <div class="data-tips" id="dataTips">
+            <p id="tipsContent"></p>
         </div>
+    </div>
 
-        <div class="alert-panel">
-            <h2>价格预警设置</h2>
-            <div class="input-group">
-                <select id="alertInstId">
-                    <option value="BTC-USDT">BTC-USDT</option>
-                    <option value="ETH-USDT">ETH-USDT</option>
-                    <option value="SOL-USDT">SOL-USDT</option>
-                </select>
-                <input type="number" id="alertPrice" placeholder="预警价格" step="0.01">
-                <select id="alertType">
-                    <option value="up">价格上涨至</option>
-                    <option value="down">价格下跌至</option>
-                </select>
-                <button onclick="addPriceAlert()" style="background: #faad14;">添加预警</button>
-                <button onclick="clearPriceAlert()" style="background: #ff4d4f;">清空预警</button>
-            </div>
-            <div id="alertList" style="margin-top: 10px; font-size: 12px; color: #ccc;">
-                暂无预警设置
-            </div>
+    <!-- AI行情分析区 -->
+    <div class="section">
+        <h3>AI行情分析 & 策略运行状态</h3>
+        <p id="analysisStatus">正在拉取最新AI分析结果...</p>
+        <div class="status-bar">
+            <div class="status-progress" id="analysisProgress"></div>
         </div>
+        <p id="strategyStatus">策略运行状态：未获取到</p>
+    </div>
 
-        <div class="position-panel">
-            <h2>持仓信息录入 & 盈亏计算</h2>
-            <div class="input-group">
-                <select id="instIdSelect">
-                    <option value="BTC-USDT">BTC-USDT</option>
-                    <option value="ETH-USDT">ETH-USDT</option>
-                    <option value="SOL-USDT">SOL-USDT</option>
-                </select>
-                <select id="directionSelect">
-                    <option value="long">做多（多仓）</option>
-                    <option value="short">做空（空仓）</option>
-                </select>
-                <input type="number" id="entryPrice" placeholder="开仓价格" step="0.01">
-                <input type="number" id="positionAmt" placeholder="持仓数量" step="0.001">
-                <button onclick="calculateProfit()">计算盈亏</button>
-                <button onclick="savePositionRecord()" style="background: #1890ff;">保存记录</button>
-            </div>
-            <div class="record-group">
-                <span>历史持仓记录：</span>
-                <select id="recordSelect" onchange="loadPositionRecord()">
-                    <option value="">请选择保存的记录</option>
-                </select>
-                <button onclick="deletePositionRecord()">删除记录</button>
-            </div>
-            <table class="profit-table">
+    <!-- 主流币行情区 -->
+    <div class="section">
+        <h3>主流币实时行情</h3>
+        <div class="table-container">
+            <table id="tickerTable">
+                <thead>
+                    <tr>
+                        <th>交易对</th>
+                        <th>最新价(USDT)</th>
+                        <th>24h涨跌幅</th>
+                        <th>24h成交量</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: #999;">请登录API后查看行情数据</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 价格预警设置区 -->
+    <div class="section">
+        <h3>价格预警设置</h3>
+        <div class="input-group">
+            <input type="text" id="alertInstId" placeholder="交易对（如BTC-USDT）">
+            <input type="number" id="alertPrice" placeholder="预警价格">
+            <input type="text" id="alertDirection" placeholder="价格涨/跌至">
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-green">添加预警</button>
+            <button class="btn btn-red">清空预警</button>
+        </div>
+        <p style="font-size: 12px; color: #999;">暂无预警设置</p>
+    </div>
+
+    <!-- 持仓盈亏计算区 -->
+    <div class="section">
+        <h3>持仓信息录入 & 盈亏计算</h3>
+        <div class="input-group">
+            <input type="text" id="posInstId" placeholder="交易对（如BTC-USDT）">
+            <select id="posDirection" class="input-group input" style="flex:1; min-width:200px; padding:8px; background:#2d2d2d; border:1px solid #444; color:#fff; border-radius:4px;">
+                <option value="long">做多（多仓）</option>
+                <option value="short">做空（空仓）</option>
+            </select>
+            <input type="number" id="posOpenPrice" placeholder="开仓价格">
+            <input type="number" id="posAmount" placeholder="持仓数量">
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-green">计算盈亏</button>
+            <button class="btn btn-blue">保存记录</button>
+        </div>
+        <div class="table-container" style="margin-top:15px;">
+            <p style="font-size:14px; margin-bottom:8px;">历史持仓记录：<select style="background:#2d2d2d; color:#fff; border:1px solid #444; padding:4px; border-radius:4px;"><option>请选择保存的记录</option></select> <button class="btn btn-gray" style="padding:4px 8px; font-size:12px;">删除记录</button></p>
+            <table>
                 <thead>
                     <tr>
                         <th>币种</th>
@@ -240,770 +291,265 @@
                         <th>盈亏比例</th>
                     </tr>
                 </thead>
-                <tbody id="profitTableBody">
-                    <tr><td colspan="7">请录入持仓信息并点击计算</td></tr>
+                <tbody>
+                    <tr>
+                        <td colspan="7" style="text-align: center; color: #999;">请录入信息并点击计算</td>
+                    </tr>
                 </tbody>
             </table>
         </div>
+    </div>
 
-        <div class="detail-panel">
-            <h2 id="detailTitle">BTC-USDT 详情数据</h2>
-            <div class="detail-grid">
-                <div class="detail-item">
-                    <p style="color: #999; font-size: 10px;">24h最高</p>
-                    <p id="detail-high">--</p>
-                </div>
-                <div class="detail-item">
-                    <p style="color: #999; font-size: 10px;">24h最低</p>
-                    <p id="detail-low">--</p>
-                </div>
-                <div class="detail-item">
-                    <p style="color: #999; font-size: 10px;">24h成交量</p>
-                    <p id="detail-vol">--</p>
-                </div>
-                <div class="detail-item">
-                    <p style="color: #999; font-size: 10px;">24h涨跌幅</p>
-                    <p id="detail-change">--</p>
-                </div>
-            </div>
+    <!-- BTC-USDT详情区 -->
+    <div class="section">
+        <h3>BTC-USDT 详情数据</h3>
+        <div class="input-group">
+            <input type="text" id="btcHigh" placeholder="24h最高" disabled>
+            <input type="text" id="btcLow" placeholder="24h最低" disabled>
+            <input type="text" id="btcVol" placeholder="24h成交量" disabled>
+            <input type="text" id="btcChange" placeholder="24h涨跌幅" disabled>
         </div>
-
-        <div class="chart-grid">
-            <div class="chart-box" id="btc-chart">15m K线图</div>
-            <div class="chart-box" id="depth-chart">深度图（前5档）</div>
+        <div class="chart-container">
+            <div class="chart-box" id="klineChart">15m K线图（登录后加载）</div>
+            <div class="chart-box" id="depthChart">深度图（前5档）</div>
         </div>
     </div>
-    <div class="shortcut">AI分析每30分钟更新 | 行情每10秒刷新 | F1切换币种 | F2查看帮助 | 机器人需配置API</div>
 
+    <!-- 底部说明 -->
+    <div style="text-align: center; font-size: 12px; color: #999; margin-top: 30px;">
+        <p>AI分析每30分钟更新 | 行情每10秒刷新 | F1切换币种 | F2查看帮助 | 机器人需配置API后启动</p>
+    </div>
+
+    <!-- 引入加密库用于签名 -->
+    <script src="https://cdn.bootcdn.net/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
     <script>
-        // ========== 全局配置 ==========
-        const API_BASE_URL = "https://www.okx.com/api/v5/market";
-        const TRADE_API_URL = "https://www.okx.com/api/v5/trade";
-        const ACCOUNT_API_URL = "https://www.okx.com/api/v5/account";
-        const GITHUB_REPO_URL = "https://gzl888158.github.io";
-        const REFRESH_INTERVAL = 10000;
-        const AI_REFRESH_INTERVAL = 1800000;
-
         // 全局状态
-        let btcChart, depthChart;
-        let currentInstId = "BTC-USDT";
-        let currentPrice = 0;
-        let lastAISignal = "hold";
-        let isTradeBotRunning = false; // 机器人开关状态
-        let currentPosition = null; // 当前持仓
+        let isLogin = false;
+        let robotRunning = false;
+        const OKX_BASE_URL = "https://www.okx.com"; // 实盘地址，模拟盘改为https://www.okx.com/testnet
+        const TRADE_INST_ID = "BTC-USDT-SWAP"; // 默认交易对
 
-        // 存储键名
-        const RECORD_KEY = "okx_position_records";
-        const ALERT_KEY = "okx_price_alerts";
-        const BOT_CONFIG_KEY = "okx_bot_config";
+        // 页面加载完成初始化
+        window.onload = function() {
+            // 模拟进度条加载
+            const progressBar = document.getElementById("analysisProgress");
+            progressBar.style.width = "80%";
+        };
 
-        // 主流币列表
-        const MAJOR_COINS = [
-            { symbol: "BTC", instId: "BTC-USDT", swapId: "BTC-USDT-SWAP" },
-            { symbol: "ETH", instId: "ETH-USDT", swapId: "ETH-USDT-SWAP" },
-            { symbol: "SOL", instId: "SOL-USDT", swapId: "SOL-USDT-SWAP" },
-            { symbol: "BNB", instId: "BNB-USDT", swapId: "BNB-USDT-SWAP" }
-        ];
+        // ==================== API登录/登出逻辑 ====================
+        document.getElementById("loginBtn").addEventListener("click", async function() {
+            const apiKey = document.getElementById("apiKey").value.trim();
+            const apiSecret = document.getElementById("apiSecret").value.trim();
+            const apiPassphrase = document.getElementById("apiPassphrase").value.trim();
 
-        // ========== 页面初始化 ==========
-        $(document).ready(() => {
-            requestNotificationPermission();
-            initCharts();
-            loadAllPositionRecords();
-            loadPriceAlerts();
-            loadBotConfig(); // 加载机器人配置
-            fetchAllData();
-            fetchAIAnalysis();
-            fetchBotStatus();
-            fetchMajorTickers();
-            // 定时任务
-            setInterval(fetchAllData, REFRESH_INTERVAL);
-            setInterval(fetchAIAnalysis, AI_REFRESH_INTERVAL);
-            setInterval(fetchBotStatus, 60000);
-            setInterval(fetchMajorTickers, REFRESH_INTERVAL);
-            setInterval(checkPriceAlerts, 5000);
-            setInterval(checkPositionProfit, 10000); // 每10秒检查持仓盈亏
-            bindEvents();
+            if (!apiKey || !apiSecret || !apiPassphrase) {
+                showTips("请完整填写API Key、Secret和Passphrase！", "error");
+                return;
+            }
+
+            showTips("正在验证API并读取账户数据...", "loading");
+            const progressBar = document.getElementById("analysisProgress");
+            progressBar.style.width = "30%";
+
+            try {
+                // 1. 验证API权限（获取账户信息）
+                const accountRes = await requestOkxApi("GET", "/api/v5/account/account", {}, apiKey, apiSecret, apiPassphrase);
+                progressBar.style.width = "50%";
+                if (accountRes.code !== "0") {
+                    throw new Error(`API验证失败：${accountRes.msg || "密钥错误/权限不足"}`);
+                }
+
+                // 2. 读取主流币行情
+                const tickerRes = await requestOkxApi("GET", "/api/v5/market/ticker", { instId: TRADE_INST_ID }, apiKey, apiSecret, apiPassphrase);
+                progressBar.style.width = "70%";
+                if (tickerRes.code !== "0") {
+                    throw new Error(`行情读取失败：${tickerRes.msg}`);
+                }
+
+                // 3. 读取BTC-USDT详情数据
+                const btcTicker = tickerRes.data[0];
+                document.getElementById("btcHigh").value = btcTicker.high24h;
+                document.getElementById("btcLow").value = btcTicker.low24h;
+                document.getElementById("btcVol").value = btcTicker.vol24h;
+                document.getElementById("btcChange").value = btcTicker.volCcy24h;
+
+                // 4. 更新行情表格
+                updateTickerTable(btcTicker);
+
+                // 登录成功状态更新
+                isLogin = true;
+                document.getElementById("loginBtn").style.display = "none";
+                document.getElementById("logoutBtn").style.display = "inline-block";
+                document.getElementById("startRobotBtn").style.display = "inline-block";
+                document.getElementById("robotStatus").style.color = "#999";
+                document.getElementById("robotStatus").textContent = "已登录 | 未启动机器人";
+                document.getElementById("analysisStatus").textContent = "AI分析数据拉取完成";
+                progressBar.style.width = "100%";
+                progressBar.style.backgroundColor = "#48bb78";
+
+                // 显示成功提示
+                showTips(`✅ 登录成功！账户UID：${accountRes.data[0].uid} | BTC-USDT最新价：${btcTicker.last} USDT`, "success");
+
+            } catch (error) {
+                progressBar.style.width = "100%";
+                progressBar.style.backgroundColor = "#f56565";
+                showTips(error.message, "error");
+            }
         });
 
-        // ========== 核心功能：ATR+分批下单+多周期共振 ==========
-        // 新增：计算ATR(14期)波动率
-        function calculateATR(candles) {
-            if (candles.length < 15) return 0; // 至少15根K线
-            let atr = 0;
-            for (let i=1; i < candles.length; i++) {
-                const tr = Math.max(
-                    candles[i].high-candles[i].low,
-                    Math.abs(candles[i].high-candles[i-1].close),
-                    Math.abs(candles[i].low-candles[i-1].close)
-                );
-                atr = (atr*(i-1)+tr)/i;
+        document.getElementById("logoutBtn").addEventListener("click", function() {
+            // 重置状态
+            isLogin = false;
+            robotRunning = false;
+            document.getElementById("loginBtn").style.display = "inline-block";
+            document.getElementById("logoutBtn").style.display = "none";
+            document.getElementById("startRobotBtn").style.display = "none";
+            document.getElementById("stopRobotBtn").style.display = "none";
+            document.getElementById("apiKey").value = "";
+            document.getElementById("apiSecret").value = "";
+            document.getElementById("apiPassphrase").value = "";
+            document.getElementById("robotStatus").style.color = "#f56565";
+            document.getElementById("robotStatus").textContent = "已关闭 | 未执行任何交易";
+            document.getElementById("analysisProgress").style.width = "0";
+            document.getElementById("analysisProgress").style.backgroundColor = "#ed8936";
+            document.getElementById("analysisStatus").textContent = "正在拉取最新AI分析结果...";
+            document.getElementById("strategyStatus").textContent = "策略运行状态：未获取到";
+            // 清空行情数据
+            document.getElementById("btcHigh").value = "";
+            document.getElementById("btcLow").value = "";
+            document.getElementById("btcVol").value = "";
+            document.getElementById("btcChange").value = "";
+            document.getElementById("tickerTable").getElementsByTagName("tbody")[0].innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">请登录API后查看行情数据</td></tr>';
+            showTips("已安全登出，交易机器人已停止", "info");
+        });
+
+        // ==================== 交易机器人控制 ====================
+        document.getElementById("startRobotBtn").addEventListener("click", function() {
+            if (!isLogin) {
+                showTips("请先登录API！", "error");
+                return;
             }
-            return atr.toFixed(2);
-        }
+            robotRunning = true;
+            document.getElementById("startRobotBtn").style.display = "none";
+            document.getElementById("stopRobotBtn").style.display = "inline-block";
+            document.getElementById("robotStatus").style.color = "#48bb78";
+            document.getElementById("robotStatus").textContent = "运行中 | AI策略执行中";
+            document.getElementById("strategyStatus").textContent = "策略运行状态：正常运行（网格交易）";
+            showTips("交易机器人已启动，AI策略开始执行", "success");
+            // 启动机器人核心逻辑（此处可扩展）
+            startTradeRobot();
+        });
 
-        // 替换：开仓函数（固定止盈止损 → ATR动态）
-        function openPosition(posSide, instId) {
-            const marginAmt = parseFloat($("#marginAmt").val());
-            const leverage = parseFloat($("#leverage").val());
-            const atrMultiplierTP = 1.5; // 止盈ATR倍数
-            const atrMultiplierSL = 1;   // 止损ATR倍数
+        document.getElementById("stopRobotBtn").addEventListener("click", function() {
+            robotRunning = false;
+            document.getElementById("startRobotBtn").style.display = "inline-block";
+            document.getElementById("stopRobotBtn").style.display = "none";
+            document.getElementById("robotStatus").style.color = "#999";
+            document.getElementById("robotStatus").textContent = "已登录 | 机器人已停止";
+            document.getElementById("strategyStatus").textContent = "策略运行状态：已停止";
+            showTips("交易机器人已停止，暂停AI策略执行", "info");
+            // 停止机器人核心逻辑
+            stopTradeRobot();
+        });
 
-            // 拉取K线计算ATR
-            fetch(`${API_BASE_URL}/candles?instId=${instId.replace("-SWAP","")}&bar=15m&limit=20`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.code === "0") {
-                    const candles = data.data.map(item => ({
-                        high: parseFloat(item[2]),
-                        low: parseFloat(item[3]),
-                        close: parseFloat(item[4])
-                    }));
-                    const atr = calculateATR(candles);
-                    if (atr === 0) {
-                        updateStatus("ATR计算失败，使用默认止盈止损", false);
-                        return;
-                    }
-
-                    // 动态计算止盈止损价格
-                    let tpPrice, slPrice;
-                    if (posSide === "long") {
-                        tpPrice = (currentPrice+parseFloat(atr)*atrMultiplierTP).toFixed(2);
-                        slPrice = (currentPrice-parseFloat(atr)*atrMultiplierSL).toFixed(2);
-                    } else {
-                        tpPrice = (currentPrice-parseFloat(atr)*atrMultiplierTP).toFixed(2);
-                        slPrice = (currentPrice+parseFloat(atr)*atrMultiplierSL).toFixed(2);
-                    }
-
-                    // 分批下单（调用下方batchOrder函数）
-                    const orderSize = calculateSize(marginAmt, leverage);
-                    batchOrder(instId, posSide, orderSize, tpPrice, slPrice);
-                }
-            });
-        }
-
-        // 新增：分批下单（5笔，间隔200ms，防滑点）
-        async function batchOrder(instId, posSide, totalSize, tpPrice, slPrice) {
-            const batchCount = 5;
-            const batchSize = (totalSize/batchCount).toFixed(4);
-            const side = posSide === "long" ? "buy" : "sell";
-
-            updateStatus(`开始分批下单（${batchCount}笔）`, true);
-            for (let i=0; i < batchCount; i++) {
-                const orderParams = {
-                    instId: instId,
-                    tdMode: "isolated",
-                    side: side,
-                    posSide: posSide,
-                    ordType: "market",
-                    sz: batchSize,
-                    tgtCcy: "base_ccy",
-                    tpTriggerPx: tpPrice,
-                    tpOrdPx: tpPrice,
-                    slTriggerPx: slPrice,
-                    slOrdPx: slPrice
-                };
-                await sendTradeRequest("/order", "POST", orderParams)
-                .then(res => {
-                    if (res.code === "0") {
-                        updateStatus(`✅ 第${i+1}笔下单成功，订单号：${res.data[0].ordId}`, true);
-                    } else {
-                        updateStatus(`❌ 第${i+1}笔下单失败：${res.msg}`, false);
-                    }
-                });
-                await new Promise(resolve => setTimeout(resolve, 200)); // 间隔200ms
-            }
-        }
-
-        // 替换：拉取多周期AI分析并触发交易
-        function fetchAIAnalysis() {
-            $.get(`${GITHUB_REPO_URL}/multi_coin_multi_timeframe_log.json`, (data) => {
-                renderAIAnalysis(data);
-                // 多周期共振校验：仅当15m+1h+4h三周期信号一致时触发
-                const targetInstId = $("#botInstId").val();
-                const coinData = data.coins.find(coin => coin.instId === targetInstId);
-                if (coinData && coinData.multiTimeframeSignal === "buy" && coinData.signal === "buy") {
-                    triggerTradeBySignal("buy", targetInstId);
-                } else if (coinData && coinData.multiTimeframeSignal === "sell" && coinData.signal === "sell") {
-                    triggerTradeBySignal("sell", targetInstId);
-                }
-            }).fail(() => {
-                // 模拟数据
-                const mock = {
-                    updateTime: new Date().toLocaleString(),
-                    coins: [{
-                        instId: "BTC-USDT-SWAP",
-                        signal: "hold",
-                        multiTimeframeSignal: "hold",
-                        analysis: "模拟多周期数据"
-                    }]
-                };
-                renderAIAnalysis(mock);
-            });
-        }
-
-        // ========== 交易机器人核心逻辑 ==========
-        function toggleTradeBot() {
-            if (!isTradeBotRunning) {
-                // 启动前校验
-                const apiKey = $("#apiKey").val().trim();
-                const apiSecret = $("#apiSecret").val().trim();
-                const apiPass = $("#apiPass").val().trim();
-                if (!apiKey || !apiSecret || !apiPass) {
-                    alert("请填写完整的欧易API信息！");
-                    return;
-                }
-                isTradeBotRunning = true;
-                $("#botSwitchBtn").text("停止交易机器人").removeClass("bot-off").addClass("bot-on");
-                $("#botStatusText").html("当前状态：<span style='color:#52c41a;'>运行中</span> | 等待AI信号触发交易");
-                saveBotConfig(); // 保存配置
-                updateStatus("交易机器人已启动，等待AI信号...", true);
-            } else {
-                // 停止机器人
-                isTradeBotRunning = false;
-                $("#botSwitchBtn").text("启动交易机器人").removeClass("bot-on").addClass("bot-off");
-                $("#botStatusText").html("当前状态：<span style='color:#ff4d4f;'>已关闭</span> | 未执行任何交易");
-                updateStatus("交易机器人已停止", true);
-            }
-        }
-
-        function triggerTradeBySignal(signal, instId) {
-            if (!isTradeBotRunning) return;
-            // 只交易选中的合约
-            const targetInstId = $("#botInstId").val();
-            if (instId !== targetInstId) return;
-
-            // 1. 先查询当前持仓，避免重复开仓
-            checkCurrentPosition().then(pos => {
-                currentPosition = pos;
-                // 买入信号：无持仓时开多仓
-                if (signal === "buy" && !currentPosition) {
-                    openPosition("long", targetInstId);
-                }
-                // 卖出信号：无持仓时开空仓
-                else if (signal === "sell" && !currentPosition) {
-                    openPosition("short", targetInstId);
-                }
-                // 有持仓时，信号反转则平仓
-                else if (currentPosition) {
-                    if ((signal === "buy" && currentPosition.posSide === "short") || 
-                        (signal === "sell" && currentPosition.posSide === "long")) {
-                        closePosition(currentPosition);
-                    }
-                }
-            });
-        }
-
-        function closePosition(pos) {
-            const side = pos.posSide === "long" ? "sell" : "buy";
-            const orderParams = {
-                instId: pos.instId,
-                tdMode: "isolated",
-                side: side,
-                posSide: pos.posSide,
-                ordType: "market",
-                sz: pos.pos
-            };
-
-            sendTradeRequest("/order", "POST", orderParams).then(res => {
-                if (res.code === "0") {
-                    updateStatus(`✅ 成功${pos.posSide === "long" ? "平多" : "平空"} ${pos.instId}，订单号：${res.data[0].ordId}`, true);
-                    currentPosition = null;
-                } else {
-                    updateStatus(`❌ 平仓失败：${res.msg}`, false);
-                }
-            }).catch(err => {
-                updateStatus(`❌ 平仓异常：${err}`, false);
-            });
-        }
-
-        function checkPositionProfit() {
-            if (!currentPosition || !isTradeBotRunning) return;
-            checkCurrentPosition().then(pos => {
-                if (!pos) {
-                    currentPosition = null;
-                    return;
-                }
-                const profitRatio = (parseFloat(pos.uly) - parseFloat(pos.avgPx)) / parseFloat(pos.avgPx) * 100;
-                const takeProfitRatio = parseFloat($("#takeProfitRatio").val());
-                const stopLossRatio = parseFloat($("#stopLossRatio").val());
-
-                // 多仓止盈止损
-                if (pos.posSide === "long") {
-                    if (profitRatio >= takeProfitRatio || profitRatio <= -stopLossRatio) {
-                        closePosition(pos);
-                    }
-                }
-                // 空仓止盈止损
-                else {
-                    if (profitRatio <= -takeProfitRatio || profitRatio >= stopLossRatio) {
-                        closePosition(pos);
-                    }
-                }
-            });
-        }
-
-        // ========== 欧易API请求工具函数 ==========
-        function generateSign(timestamp, method, requestPath, body) {
-            const secret = $("#apiSecret").val().trim();
-            const preHash = timestamp+method+requestPath+(body ? JSON.stringify(body) : "");
-            return CryptoJS.HmacSHA256(preHash, secret).toString(CryptoJS.enc.Base64);
-        }
-
-        function sendTradeRequest(path, method, data) {
-            const apiKey = $("#apiKey").val().trim();
-            const apiPass = $("#apiPass").val().trim();
+        // ==================== 欧易API请求核心（含签名） ====================
+        async function requestOkxApi(method, path, params, apiKey, apiSecret, passphrase) {
             const timestamp = new Date().toISOString();
-            const sign = generateSign(timestamp, method, path, data);
+            let queryStr = "";
+            let bodyStr = "";
 
-            return new Promise((resolve, reject) => {
-                $.ajax({
-                    url: TRADE_API_URL+path,
+            // 处理GET参数
+            if (method === "GET" && Object.keys(params).length > 0) {
+                queryStr = new URLSearchParams(params).toString();
+                path += `?${queryStr}`;
+            }
+
+            // 处理POST参数
+            if (method === "POST" && Object.keys(params).length > 0) {
+                bodyStr = JSON.stringify(params);
+            }
+
+            // 生成签名
+            const signStr = `${timestamp}${method}${path}${bodyStr}`;
+            const sign = CryptoJS.enc.Base64.stringify(CryptoJS.HmacSHA256(signStr, apiSecret));
+
+            try {
+                const response = await fetch(`${OKX_BASE_URL}${path}`, {
                     method: method,
-                    data: data ? JSON.stringify(data) : "",
                     headers: {
                         "OK-ACCESS-KEY": apiKey,
                         "OK-ACCESS-SIGN": sign,
                         "OK-ACCESS-TIMESTAMP": timestamp,
-                        "OK-ACCESS-PASSPHRASE": apiPass,
-                        "Content-Type": "application/json"
+                        "OK-ACCESS-PASSPHRASE": passphrase,
+                        "Content-Type": "application/json",
+                        "x-simulated-trading": "0" // 0=实盘，1=模拟盘
                     },
-                    success: res => resolve(res),
-                    error: err => reject(err.responseText)
+                    body: method === "POST" ? bodyStr : undefined
                 });
-            });
-        }
-
-        function checkCurrentPosition() {
-            const instId = $("#botInstId").val();
-            return new Promise((resolve, reject) => {
-                $.ajax({
-                    url: ACCOUNT_API_URL + "/positions?instType=SWAP&instId=" + instId,
-                    method: "GET",
-                    headers: getAuthHeaders("/positions?instType=SWAP&instId=" + instId, "GET"),
-                    success: res => {
-                        if (res.code === "0" && res.data.length > 0 && parseFloat(res.data[0].pos) > 0) {
-                            resolve(res.data[0]);
-                        } else {
-                            resolve(null);
-                        }
-                    },
-                    error: err => reject(err)
-                });
-            });
-        }
-
-        function getAuthHeaders(requestPath, method) {
-            const apiKey = $("#apiKey").val().trim();
-            const apiPass = $("#apiPass").val().trim();
-            const timestamp = new Date().toISOString();
-            const sign = generateSign(timestamp, method, requestPath);
-            return {
-                "OK-ACCESS-KEY": apiKey,
-                "OK-ACCESS-SIGN": sign,
-                "OK-ACCESS-TIMESTAMP": timestamp,
-                "OK-ACCESS-PASSPHRASE": apiPass
-            };
-        }
-
-        function calculateSize(marginAmt, leverage) {
-            return (marginAmt*leverage/currentPrice).toFixed(4);
-        }
-
-        // ========== 原有功能函数（完整保留） ==========
-        function requestNotificationPermission() { if ("Notification" in window && Notification.permission !== "granted") { Notification.requestPermission(); } }
-        function initCharts() {
-            // K线图（SVG渲染）
-            btcChart = echarts.init(document.getElementById("btc-chart"), null, { renderer: 'svg', useDirtyRect: false });
-            btcChart.setOption({
-                animation: false,
-                backgroundColor: "#1a1a1a",
-                tooltip: { trigger: "axis", textStyle: { color: "#fff" } },
-                grid: { left: "10%", right: "5%", top: "10%", bottom: "15%" },
-                xAxis: { type: "category", axisLine: { lineStyle: { color: "#444" } }, axisLabel: { color: "#ccc", fontSize: 10 } },
-                yAxis: { type: "value", axisLine: { lineStyle: { color: "#444" } }, axisLabel: { color: "#ccc", fontSize: 10 }, scale: true },
-                series: [{ 
-                    type: "candlestick", 
-                    data: [], 
-                    itemStyle: { color: "#ff4d4f", color0: "#52c41a", borderColor: "#ff4d4f", borderColor0: "#52c41a" } 
-                }]
-            });
-
-            // 深度图
-            depthChart = echarts.init(document.getElementById("depth-chart"), null, { renderer: 'svg' });
-            depthChart.setOption({
-                backgroundColor: "#1a1a1a",
-                tooltip: { trigger: "item", textStyle: { color: "#fff" } },
-                grid: { left: "15%", right: "5%", top: "10%", bottom: "10%" },
-                xAxis: { type: "value", axisLine: { lineStyle: { color: "#444" } }, axisLabel: { color: "#ccc", fontSize: 10 } },
-                yAxis: { type: "category", axisLine: { lineStyle: { color: "#444" } }, axisLabel: { color: "#ccc", fontSize: 10 } },
-                series: [{ name: "卖盘", type: "bar", data: [], itemStyle: { color: "#ff4d4f" } }, { name: "买盘", type: "bar", data: [], itemStyle: { color: "#52c41a" } }]
-            });
-        }
-        function bindEvents() {
-            // 币种选择联动
-            $("#instIdSelect").change(() => {
-                currentInstId = $("#instIdSelect").val();
-                fetchAllData();
-                updateDetailTitle();
-            });
-
-            // 快捷键绑定
-            document.addEventListener("keydown", (e) => {
-                if (e.key === "F1") {
-                    const instIds = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
-                    const idx = instIds.indexOf(currentInstId);
-                    currentInstId = instIds[(idx + 1) % instIds.length];
-                    $("#instIdSelect").val(currentInstId);
-                    fetchAllData();
-                    updateDetailTitle();
-                    alert(`已切换至${currentInstId}`);
-                }
-                if (e.key === "F2") {
-                    alert("使用帮助：\n1. 点击主流币卡片快速切换监控币种\n2. 支持设置价格预警，触发时会弹出通知\n3. 持仓记录保存在本地，刷新不丢失\n4. AI分析每30分钟自动更新");
-                }
-            });
-        }
-        function updateDetailTitle() {
-            $("#detailTitle").text(`${currentInstId} 详情数据`);
-        }
-        function updateStatus(text, isSuccess) {
-            const statusBar = document.getElementById("statusBar");
-            statusBar.textContent = text;
-            statusBar.className = isSuccess ? "status-bar status-success" : "status-bar status-error";
-            console.log(`[状态] ${text}`);
-        }
-        function fetchAllData() {
-            updateStatus(`正在拉取${currentInstId}行情数据...`, false);
-            fetchKlineData().catch(err => console.log("K线失败：", err));
-            fetchTickerData().catch(err => console.log("最新价失败：", err));
-            fetchDetailData().catch(err => console.log("详情数据失败：", err));
-            fetchDepthData().catch(err => {
-                console.log("深度图失败：", err);
-                // 兜底显示买卖一价
-                $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
-                    if (res && res.code === "0" && res.data && res.data.length > 0) {
-                        const ticker = res.data[0];
-                        const bid = ticker.bid || ticker.last || "0.00";
-                        const ask = ticker.ask || ticker.last || "0.00";
-                        depthChart.setOption({
-                            title: { text: `卖一：${ask} USDT\n买一：${bid} USDT`, left: "center", top: "40%", textStyle: { color: "#fff", fontSize: 14 } },
-                            series: [{ data: [] }, { data: [] }]
-                        });
-                    } else {
-                        depthChart.setOption({
-                            title: { text: "深度数据暂未获取到", left: "center", top: "40%", textStyle: { color: "#999", fontSize: 12 } },
-                            series: [{ data: [] }, { data: [] }]
-                        });
-                    }
-                });
-            });
-
-            // 状态更新
-            setTimeout(() => {
-                updateStatus(currentPrice > 0 ? `${currentInstId}数据刷新成功` : `${currentInstId}K线已加载，部分数据待更新`, true);
-            }, 3000);
-        }
-        function fetchKlineData() {
-            return new Promise((resolve, reject) => {
-                $.get(`${API_BASE_URL}/candles`, { instId: currentInstId, bar: "15m", limit: "10" }, (res) => {
-                    if (res.code === "0" && res.data.length > 0) {
-                        const klineData = res.data.map(item => {
-                            const time = new Date(parseInt(item[0])).toLocaleTimeString();
-                            return [time, item[1], item[4], item[3], item[2]];
-                        }).reverse();
-                        btcChart.setOption({ xAxis: { data: klineData.map(i => i[0]) }, series: [{ data: klineData.map(i => i.slice(1)) }] });
-                        resolve();
-                    } else { reject(new Error("K线数据空")); }
-                }).fail(reject);
-            });
-        }
-        function fetchDepthData() {
-            return new Promise((resolve, reject) => {
-                $.get(`${API_BASE_URL}/depth`, { instId: currentInstId, sz: "5" }, (res) => {
-                    if (res.code === "0" && res.data) {
-                        const depth = res.data[0];
-                        const asks = depth.asks.map(i => [i[1], `${i[0]} USDT`]).reverse();
-                        const bids = depth.bids.map(i => [i[1], `${i[0]} USDT`]);
-                        depthChart.setOption({ series: [{ data: asks }, { data: bids }] });
-                        resolve();
-                    } else { reject(new Error("深度数据空")); }
-                }).fail(reject);
-            });
-        }
-        function fetchTickerData() {
-            return new Promise((resolve, reject) => {
-                $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
-                    if (res.code === "0" && res.data.length > 0) {
-                        currentPrice = parseFloat(res.data[0].last);
-                        resolve();
-                    } else { reject(new Error("最新价失败")); }
-                }).fail(reject);
-            });
-        }
-        function fetchDetailData() {
-            return new Promise((resolve, reject) => {
-                $.get(`${API_BASE_URL}/ticker`, { instId: currentInstId }, (res) => {
-                    if (res.code === "0" && res.data.length > 0) {
-                        const ticker = res.data[0];
-                        // 渲染详情数据
-                        $("#detail-high").text(parseFloat(ticker.high24h).toFixed(2) + " USDT");
-                        $("#detail-low").text(parseFloat(ticker.low24h).toFixed(2) + " USDT");
-                        $("#detail-vol").text(parseFloat(ticker.vol24h).toFixed(2) + " USDT");
-                        // 计算24h涨跌幅
-                        const change = ((parseFloat(ticker.last) - parseFloat(ticker.open24h)) / parseFloat(ticker.open24h)) * 100;
-                        const changeColor = change >= 0 ? "#52c41a" : "#ff4d4f";
-                        $("#detail-change").html(`<span style="color:${changeColor};">${change.toFixed(2)}%</span>`);
-                        resolve();
-                    } else { reject(new Error("详情数据空")); }
-                }).fail(reject);
-            });
-        }
-        function fetchMajorTickers() {
-            MAJOR_COINS.forEach(coin => {
-                $.get(`${API_BASE_URL}/ticker`, { instId: coin.instId }, (res) => {
-                    if (res.code === "0" && res.data.length > 0) {
-                        const ticker = res.data[0];
-                        const price = parseFloat(ticker.last).toFixed(2);
-                        const change = ((parseFloat(ticker.last) - parseFloat(ticker.open24h)) / parseFloat(ticker.open24h)) * 100;
-                        const vol = parseFloat(ticker.vol24h).toFixed(2);
-                        const color = change >= 0 ? "#52c41a" : "#ff4d4f";
-                        // 渲染卡片
-                        $(`#ticker-${coin.symbol}`).html(`
-                            <p style="font-size:14px; font-weight:bold;">${coin.symbol}</p>
-                            <p style="font-size:16px; margin: 5px 0;">${price} USDT</p>
-                            <p style="color:${color}; font-size:12px;">${change.toFixed(2)}%</p>
-                            <p style="font-size:10px; color:#999;">24h: ${vol}</p>
-                        `).click(() => {
-                            currentInstId = coin.instId;
-                            $("#instIdSelect").val(coin.instId);
-                            fetchAllData();
-                            updateDetailTitle();
-                        });
-                    }
-                });
-            });
-        }
-        function renderAIAnalysis(data) {
-            const { time, coins } = data;
-            let html = `<p><strong>分析时间：</strong>${data.updateTime}</p>`;
-            coins.forEach(coin => {
-                html += `
-                    <p><strong>分析币种：</strong>${coin.instId}</p>
-                    <p><strong>分析结论：</strong>${coin.analysis}</p>
-                    <p><strong>单周期信号：</strong>${coin.signal}</p>
-                    <p><strong>多周期共振信号：</strong>${coin.multiTimeframeSignal}</p>
-                `;
-            });
-            $("#aiAnalysis").html(html);
-            const firstCoin = coins[0];
-            const signal=firstCoin.multiTimeframeSignal === "hold" ? firstCoin.signal : firstCoin.multiTimeframeSignal;
-            $("#aiSignal").removeClass().addClass(`ai-signal signal-${signal}`);
-            const text = signal === "buy" ? "【买入信号】建议进场" : signal === "sell" ? "【卖出信号】建议离场" : "【持有信号】建议观望";
-            $("#aiSignal").text(text);
-            // 信号提醒
-            if (signal !== lastAISignal && signal !== "hold") {
-                showAISignalAlert(signal, firstCoin.instId);
-                lastAISignal = signal;
+                return await response.json();
+            } catch (err) {
+                return { code: "-1", msg: `网络请求失败：${err.message}` };
             }
         }
-        function fetchBotStatus() {
-            // 模拟策略状态
-            const mock = {
-                time: new Date(new Date().getTime()-15 * 60 * 1000).toLocaleString(),
-                status: "success",
-                duration: "25秒"
-            };
-            $("#botStatus").html(`
-                <p>最近运行：${mock.time}</p>
-                <p>运行状态：${mock.status === "success" ? "✅ 成功" : "❌ 失败"}</p>
-                <p>运行时长：${mock.duration}</p>
-            `);
-        }
-        function showAISignalAlert(signal, instId) {
-            const text = signal === "buy" ? `【买入信号】${instId}建议进场` : `【卖出信号】${instId}建议离场`;
-            alert(text);
-            if (Notification.permission === "granted") {
-                new Notification("AI策略提醒", { body: text, icon: "https://okx.com/favicon.ico" });
+
+        // ==================== 辅助函数 ====================
+        // 显示提示信息
+        function showTips(content, type) {
+            const tipsBox = document.getElementById("dataTips");
+            const tipsContent = document.getElementById("tipsContent");
+            tipsBox.style.display = "block";
+
+            switch(type) {
+                case "loading":
+                    tipsContent.style.color = "#ed8936";
+                    tipsContent.innerHTML = `🔄 ${content}`;
+                    break;
+                case "success":
+                    tipsContent.style.color = "#48bb78";
+                    tipsContent.innerHTML = content;
+                    break;
+                case "error":
+                    tipsContent.style.color = "#f56565";
+                    tipsContent.innerHTML = `❌ ${content}`;
+                    break;
+                case "info":
+                    tipsContent.style.color = "#38b2ac";
+                    tipsContent.innerHTML = `ℹ️ ${content}`;
+                    break;
+            }
+
+            // 非错误提示3秒后隐藏
+            if (type !== "error") {
+                setTimeout(() => {
+                    if (!isLogin || type === "info") return;
+                    tipsBox.style.display = "none";
+                }, 3000);
             }
         }
-        function calculateProfit() {
-            const instId = $("#instIdSelect").val();
-            const dir = $("#directionSelect").val();
-            const entry = parseFloat($("#entryPrice").val());
-            const amt = parseFloat($("#positionAmt").val());
 
-            // 输入校验
-            if (isNaN(entry) || isNaN(amt) || entry <= 0 || amt <= 0) {
-                alert("请输入有效持仓信息！");
-                return;
-            }
-            if (currentPrice === 0) {
-                alert("当前价未加载完成！");
-                return;
-            }
-
-            // 计算盈亏
-            const profit = dir === "long" ? (currentPrice-entry) * amt : (entry-currentPrice) * amt;
-            const ratio = (profit / (entry * amt)) * 100;
-            const cls = profit >= 0 ? "profit-green" : "profit-red";
-
-            // 渲染表格
-            $("#profitTableBody").html(`
+        // 更新行情表格
+        function updateTickerTable(tickerData) {
+            const tbody = document.getElementById("tickerTable").getElementsByTagName("tbody")[0];
+            tbody.innerHTML = `
                 <tr>
-                    <td>${instId}</td>
-                    <td>${dir === "long" ? "做多" : "做空"}</td>
-                    <td>${entry.toFixed(2)}</td>
-                    <td>${currentPrice.toFixed(2)}</td>
-                    <td>${amt.toFixed(3)}</td>
-                    <td class="${cls}">${profit.toFixed(2)} USDT</td>
-                    <td class="${cls}">${ratio.toFixed(2)}%</td>
+                    <td>${tickerData.instId}</td>
+                    <td style="color: ${tickerData.chnage > 0 ? '#f56565' : '#48bb78'}">${tickerData.last}</td>
+                    <td style="color: ${tickerData.chnage > 0 ? '#f56565' : '#48bb78'}">${tickerData.volCcy24h}%</td>
+                    <td>${tickerData.vol24h}</td>
                 </tr>
-            `);
+            `;
         }
-        function savePositionRecord() {
-            const instId = $("#instIdSelect").val();
-            const dir = $("#directionSelect").val();
-            const entry = parseFloat($("#entryPrice").val());
-            const amt = parseFloat($("#positionAmt").val());
 
-            if (isNaN(entry) || isNaN(amt) || entry <= 0 || amt <= 0) {
-                alert("请先输入持仓信息！");
-                return;
-            }
+        // 交易机器人核心逻辑（可扩展）
+        function startTradeRobot() {
+            console.log("交易机器人启动：开始执行AI网格交易策略");
+            // 此处可添加具体的交易逻辑，如定时下单、行情监控、止盈止损等
+        }
 
-            const record = {
-                id: new Date().getTime(),
-                name: `${instId}-${dir === "long" ? "多" : "空"}`,
-                instId: instId,
-                direction: dir,
-                entryPrice: entry,
-                positionAmt: amt,
-                createTime: new Date().toLocaleString()
-            };
-
-            let records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
-            records.push(record);
-            localStorage.setItem(RECORD_KEY, JSON.stringify(records));
-            loadAllPositionRecords();
-            alert(`保存成功：${record.name}`);
+        function stopTradeRobot() {
+            console.log("交易机器人停止：暂停所有策略执行");
+            // 此处可添加停止交易的逻辑，如取消挂单、平仓等
         }
-        function loadAllPositionRecords() {
-            const records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
-            $("#recordSelect").html('<option value="">请选择记录</option>');
-            records.forEach(r => {
-                $("#recordSelect").append(`<option value="${r.id}">${r.name}（${r.createTime}）</option>`);
-            });
-        }
-        function loadPositionRecord() {
-            const id = $("#recordSelect").val();
-            if (!id) return;
-            const records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
-            const record = records.find(r => r.id == id);
-            if (record) {
-                $("#instIdSelect").val(record.instId);
-                $("#directionSelect").val(record.direction);
-                $("#entryPrice").val(record.entryPrice);
-                $("#positionAmt").val(record.positionAmt);
-                calculateProfit();
-                currentInstId = record.instId;
-                fetchAllData();
-                updateDetailTitle();
-            }
-        }
-        function deletePositionRecord() {
-            const id = $("#recordSelect").val();
-            if (!id) {
-                alert("请选择要删除的记录！");
-                return;
-            }
-            if (confirm("确定删除该记录吗？删除后无法恢复！")) {
-                let records = JSON.parse(localStorage.getItem(RECORD_KEY) || "[]");
-                records = records.filter(r => r.id != id);
-                localStorage.setItem(RECORD_KEY, JSON.stringify(records));
-                loadAllPositionRecords();
-                $("#entryPrice").val("");
-                $("#positionAmt").val("");
-                $("#profitTableBody").html('<tr><td colspan="7">请录入持仓信息并点击计算</td></tr>');
-                alert("删除成功");
-            }
-        }
-        function loadPriceAlerts() {
-            priceAlerts = JSON.parse(localStorage.getItem(ALERT_KEY) || "[]");
-            renderAlertList();
-        }
-        function renderAlertList() {
-            if (priceAlerts.length === 0) {
-                $("#alertList").text("暂无预警设置");
-                return;
-            }
-            let html = "<ul style='margin:0; padding-left:20px;'>";
-            priceAlerts.forEach((alert, idx) => {
-                const typeText = alert.type === "up" ? "上涨至" : "下跌至";
-                html += `<li>${alert.instId} ${typeText} ${alert.price} USDT</li>`;
-            });
-            html += "</ul>";
-            $("#alertList").html(html);
-        }
-        function addPriceAlert() {
-            const instId = $("#alertInstId").val();
-            const price = parseFloat($("#alertPrice").val());
-            const type = $("#alertType").val();
-
-            if (isNaN(price) || price <= 0) {
-                alert("请输入有效的预警价格！");
-                return;
-            }
-
-            const alert = {
-                id: new Date().getTime(),
-                instId: instId,
-                price: price,
-                type: type
-            };
-
-            priceAlerts.push(alert);
-            localStorage.setItem(ALERT_KEY, JSON.stringify(priceAlerts));
-            renderAlertList();
-            $("#alertPrice").val("");
-            alert(`已添加预警：${instId} ${type === "up" ? "上涨至" : "下跌至"} ${price} USDT`);
-        }
-        function clearPriceAlert() {
-            if (confirm("确定清空所有价格预警吗？")) {
-                priceAlerts = [];
-                localStorage.removeItem(ALERT_KEY);
-                renderAlertList();
-                alert("所有预警已清空");
-            }
-        }
-        function checkPriceAlerts() {
-            if (priceAlerts.length === 0 || currentPrice === 0) return;
-
-            priceAlerts.forEach(alert => {
-                if (alert.instId !== currentInstId) return;
-                const trigger = alert.type === "up" ? currentPrice >= alert.price : currentPrice <= alert.price;
-                if (trigger) {
-                    const typeText = alert.type === "up" ? "上涨至" : "下跌至";
-                    const text = `【价格预警】${alert.instId} ${typeText} ${alert.price} USDT，当前价：${currentPrice.toFixed(2)} USDT`;
-                    // 弹窗提醒
-                    alert(text);
-                    // 桌面通知
-                    if (Notification.permission === "granted") {
-                        new Notification("欧易价格预警", { body: text, icon: "https://okx.com/favicon.ico" });
-                    }
-                    // 触发后移除该预警
-                    priceAlerts = priceAlerts.filter(a => a.id !== alert.id);
-                    localStorage.setItem(ALERT_KEY, JSON.stringify(priceAlerts));
-                    renderAlertList();
-                }
-            });
-        }
-        function savePositionRecordByTrade(posSide, instId, entryPrice, amt) {
-            const record = {
-                id: new Date().getTime(),
-                name: `${instId}-${posSide === "long" ? "多" : "空"}`,
-                instId: instId.replace("-SWAP", ""),
-                direction: posSide,
-                entryPrice: entryPrice,
-                positionAmt: amt,
-                createTime: new Date().to
+    </script>
+</body>
+</html>

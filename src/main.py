@@ -2,311 +2,274 @@ import time
 import json
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple
-from .utils import setup_logger
-from .okx_api import fetch_candles, get_account_balance, get_position, place_order, get_okx_headers
-import requests
+from typing import List, Dict, Any, Tuple, Optional
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import yaml
 import os
 from dotenv import load_dotenv
+from .utils import setup_logger
+from .okx_api import (
+    fetch_candles, get_account_balance, get_position, place_order,
+    get_okx_headers, OKX_MARKET_URL, OKX_TRADE_URL, OKX_ACCOUNT_URL
+)
 
-# 加载环境变量与配置
+# 初始化
 load_dotenv()
-logger = setup_logger()
+logger=setup_logger()
+app=FastAPI(title="OKX Grid Trading Robot API")
+
+# 加载配置
 with open("config/config.yaml", "r", encoding="utf-8") as f:
-    import yaml
-    config = yaml.safe_load(f)
+    config=yaml.safe_load(f)
 
-# 配置常量
-INST_IDS = config["strategy"]["inst_ids"]
-TIMEFRAMES = config["strategy"]["timeframes"]
-KLINE_LIMIT = config["strategy"]["kline_limit"]
-MAX_DAILY_LOSS = config["risk"]["max_daily_loss"]
-MAX_CONSECUTIVE_LOSS = config["risk"]["max_consecutive_loss"]
-DAILY_TRADE_LIMIT = config["risk"]["daily_trade_limit"]
-RISK_RATIO = config["risk"]["risk_ratio"]
-LEVERAGE = config["risk"]["leverage"]
-ATR_TP_MULTIPLIER = config["strategy"]["atr_tp_multiplier"]
-ATR_SL_MULTIPLIER = config["strategy"]["atr_sl_multiplier"]
+# 全局状态（控制策略运行）
+ROBOT_RUNNING=False
+GRID_PARAMS={}
+RISK_STATE={
+    "daily_loss": 0.0,
+    "consecutive_loss": 0,
+    "trade_count": 0
+}
 
-# ==================== 指标计算 ====================
-def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
-    """计算EMA均线"""
-    alpha = 2 / (period + 1)
-    ema = np.zeros_like(prices, dtype=float)
-    ema[period - 1] = np.mean(prices[:period])
-    for i in range(period, len(prices)):
-        ema[i] = alpha * prices[i] + (1 - alpha) * ema[i - 1]
-    return ema
+# Pydantic模型（前端参数校验）
+class GridStartRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    api_passphrase: str
+    inst_id: str = "BTC-USDT-SWAP"
+    grid_levels: int = 5
+    atr_multiplier: float = 1.2
+    atr_period: int=14
+    leverage: int=config["risk"]["leverage"]
+    risk_ratio: float=config["risk"]["risk_ratio"]
 
-def calculate_macd(close_prices: np.ndarray, fastperiod: int = 12, slowperiod: int = 26, signalperiod: int = 9) -> Tuple[np.ndarray, np.ndarray]:
-    """计算MACD指标"""
-    if len(close_prices) < max(fastperiod, slowperiod, signalperiod) + 1:
-        return np.array([]), np.array([])
-    ema_fast = calculate_ema(close_prices, fastperiod)
-    ema_slow = calculate_ema(close_prices, slowperiod)
-    macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line, signalperiod)
-    min_len = min(len(macd_line), len(signal_line))
-    return macd_line[-min_len:], signal_line[-min_len:]
-
+# 核心指标计算（复用+优化）
 def calculate_atr(candles: List[Dict[str, float]], period: int = 14) -> float:
-    """计算ATR波动率"""
-    if len(candles) < period + 1:
+    if len(candles) < period+1:
         return 0.0
     tr_list = []
     for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i-1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr=max(candles[i]["high"] - candles[i]["low"],
+                 abs(candles[i]["high"] - candles[i-1]["close"]),
+                 abs(candles[i]["low"] - candles[i-1]["close"]))
         tr_list.append(tr)
     return round(np.mean(tr_list[-period:]), 4)
 
-def get_single_timeframe_signal(candles: List[Dict[str, float]]) -> str:
-    """单周期信号判断"""
-    if len(candles) < 30:
-        return "hold"
-    close_prices = np.array([c["close"] for c in candles])
-    macd_line, signal_line = calculate_macd(close_prices)
-    if len(macd_line) < 2 or len(signal_line) < 2:
-        return "hold"
-    if macd_line[-1] > signal_line[-1] and macd_line[-2] < signal_line[-2]:
+# 多周期共振信号（开仓过滤）
+def get_multi_timeframe_signal(inst_id: str, api_key: str, api_secret: str, api_passphrase: str) -> str:
+    timeframes = ["15m", "1h", "4h"]
+    signals = []
+    for tf in timeframes:
+        candles=fetch_candles(inst_id, tf, config["strategy"]["kline_limit"])
+        if len(candles) < 30:
+            signals.append("hold")
+            continue
+        close_prices=np.array([c["close"] for c in candles])
+        # 简易MACD金叉死叉判断
+        ema_fast=calculate_ema(close_prices, 12)
+        ema_slow=calculate_ema(close_prices, 26)
+        if len(ema_fast) < 1 or len(ema_slow) < 1:
+            signals.append("hold")
+            continue
+        if ema_fast[-1] > ema_slow[-1] and ema_fast[-2] < ema_slow[-2]:
+            signals.append("buy")
+        elif ema_fast[-1] < ema_slow[-1] and ema_fast[-2] > ema_slow[-2]:
+            signals.append("sell")
+        else:
+            signals.append("hold")
+    # 多周期共振才开仓
+    if all(s == "buy" for s in signals):
         return "buy"
-    elif macd_line[-1] < signal_line[-1] and macd_line[-2] > signal_line[-2]:
+    elif all(s == "sell" for s in signals):
         return "sell"
     else:
         return "hold"
 
-# ==================== 多周期分析 ====================
-def analyze_multi_timeframe(inst_id: str) -> Dict[str, Any]:
-    """多周期共振分析"""
-    timeframe_signals = {}
-    for tf in TIMEFRAMES:
-        candles = fetch_candles(inst_id, tf, KLINE_LIMIT)
-        timeframe_signals[tf] = get_single_timeframe_signal(candles) if candles else "hold"
-    
-    # 共振信号判断
-    multi_signal = "hold"
-    if all(s == "buy" for s in timeframe_signals.values()):
-        multi_signal = "buy"
-    elif all(s == "sell" for s in timeframe_signals.values()):
-        multi_signal = "sell"
-    
-    # 15m K线补充数据
-    main_candles = fetch_candles(inst_id, "15m", KLINE_LIMIT)
-    single_signal = get_single_timeframe_signal(main_candles) if main_candles else "hold"
-    atr = calculate_atr(main_candles) if main_candles else 0.0
-    last_price = main_candles[-1]["close"] if main_candles else 0.0
-    
-    return {
-        "instId": inst_id,
-        "signal": single_signal,
-        "multiTimeframeSignal": multi_signal,
-        "atr": atr,
-        "lastPrice": last_price,
-        "timeframeSignals": timeframe_signals,
-        "analysis": f"多周期信号: {timeframe_signals} | 共振: {multi_signal} | ATR: {atr}"
-    }
+def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
+    alpha=2/(period+1)
+    ema=np.zeros_like(prices, dtype=float)
+    ema[period-1] = np.mean(prices[:period])
+    for i in range(period, len(prices)):
+        ema[i] = alpha*prices[i] + (1-alpha)*ema[i-1]
+    return ema
 
-# ==================== 风控熔断 ====================
-def get_today_trades(inst_id: str) -> List[Dict[str, Any]]:
-    """获取今日交易记录"""
-    url = f"{config['okx']['trade_url']}/orders"
-    params = {
-        "instId": inst_id,
-        "state": "filled",
-        "begin": int((datetime.now().replace(hour=0, minute=0, second=0) - timedelta(days=1)).timestamp() * 1000)
-    }
-    headers = get_okx_headers("/api/v5/trade/orders")
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        data = response.json()
-        return data["data"] if data["code"] == "0" else []
-    except Exception as e:
-        logger.error(f"获取交易记录异常: {str(e)}")
-        return []
+# 网格交易核心策略（低买高卖）
+def grid_trading_strategy(params: GridStartRequest):
+    global RISK_STATE
+    logger.info(f"启动网格交易：{params.inst_id}，层数：{params.grid_levels}，ATR乘数：{params.atr_multiplier}")
+    # 1. 获取K线+ATR+最新价格
+    candles=fetch_candles(params.inst_id, "15m", config["strategy"]["kline_limit"])
+    atr=calculate_atr(candles, params.atr_period)
+    last_price=candles[-1]["close"] if candles else 0.0
+    if atr == 0 or last_price == 0:
+        logger.error("数据异常，ATR/价格为0，停止策略")
+        return {"status": "failed", "msg": "数据异常"}
 
-def check_risk_control(inst_id: str) -> bool:
-    """风控检查"""
-    today_trades = get_today_trades(inst_id)
-    if len(today_trades) >= DAILY_TRADE_LIMIT:
-        logger.warning(f"触发单日交易次数限制: {len(today_trades)}/{DAILY_TRADE_LIMIT}")
-        return False
-    
-    # 计算盈亏与连续亏损
-    total_profit = 0.0
-    consecutive_loss = 0
-    for trade in today_trades:
-        profit = float(trade["fillPx"]) * float(trade["fillSz"]) * (1 if trade["side"] == "buy" else -1)
-        total_profit += profit
-        consecutive_loss = consecutive_loss + 1 if profit < 0 else 0
-    
-    if consecutive_loss >= MAX_CONSECUTIVE_LOSS:
-        logger.warning(f"触发连续亏损限制: {consecutive_loss}/{MAX_CONSECUTIVE_LOSS}")
-        return False
-    
-    balance = get_account_balance()
-    if balance > 0 and abs(total_profit) / balance >= MAX_DAILY_LOSS:
-        logger.warning(f"触发单日亏损限制: {abs(total_profit)/balance*100:.2f}%/{MAX_DAILY_LOSS*100:.2f}%")
-        return False
-    
-    return True
+    # 2. 设置网格参数（低买高卖）
+    grid_spacing=atr*params.atr_multiplier
+    base_price=last_price
+    grid_buy_prices = [base_price-grid_spacing*i for i in range(1, params.grid_levels+1)]
+    grid_sell_prices = [base_price+grid_spacing*i for i in range(1, params.grid_levels+1)]
+    GRID_PARAMS.update({
+        "inst_id": params.inst_id,
+        "base_price": base_price,
+        "grid_spacing": grid_spacing,
+        "buy_levels": grid_buy_prices,
+        "sell_levels": grid_sell_prices,
+        "params": params
+    })
 
-# ==================== 自动交易 ====================
-def auto_trade():
-    """全自动交易执行"""
-    logger.info("===== 开始全自动交易执行 =====")
-    for inst_id in INST_IDS:
-        # 1. 获取多周期信号
-        analysis = analyze_multi_timeframe(inst_id)
-        signal = analysis["multiTimeframeSignal"]
-        if signal == "hold":
-            continue
-        
-        # 2. 风控检查
-        if not check_risk_control(inst_id):
-            logger.info(f"{inst_id} 触发风控，跳过交易")
-            continue
-        
-        # 3. 检查持仓
-        position = get_position(inst_id)
-        if position["posAmt"] > 0 and signal == "buy":
-            logger.info(f"{inst_id} 已有多仓，跳过买入")
-            continue
-        if position["posAmt"] < 0 and signal == "sell":
-            logger.info(f"{inst_id} 已有空仓，跳过卖出")
-            continue
-        
-        # 4. 计算下单参数
-        atr = analysis["atr"]
-        last_price = analysis["lastPrice"]
-        if atr == 0 or last_price == 0:
-            logger.error(f"{inst_id} 数据异常，跳过交易")
-            continue
-        
-        tp_price = last_price + atr * ATR_TP_MULTIPLIER if signal == "buy" else last_price - atr * ATR_TP_MULTIPLIER
-        sl_price = last_price - atr * ATR_SL_MULTIPLIER if signal == "buy" else last_price + atr * ATR_SL_MULTIPLIER
-        balance = get_account_balance()
-        vol = (balance * RISK_RATIO) / (abs(last_price - sl_price)) * LEVERAGE
-        if vol < config["risk"]["min_order_volume"]:
-            logger.info(f"{inst_id} 下单量过小，跳过")
-            continue
-        
-        # 5. 下单
-        pos_side = "long" if signal == "buy" else "short"
-        order_result = place_order(inst_id, pos_side, vol, tp_price, sl_price)
-        if order_result["status"] == "success":
-            logger.info(f"{inst_id} 交易执行成功")
-        else:
-            logger.error(f"{inst_id} 交易执行失败: {order_result['msg']}")
+    # 3. 风控检查（熔断）
+    if not check_risk_control(params.inst_id, params.api_key, params.api_secret, params.api_passphrase):
+        logger.error("触发风控熔断，停止策略")
+        return {"status": "failed", "msg": "触发风控熔断"}
 
-# ==================== 回测模块 ====================
-def backtest_strategy(inst_id: str) -> Dict[str, Any]:
-    """策略回测"""
-    logger.info(f"开始回测{inst_id}近{config['run']['backtest_days']}天数据")
-    end_ts = int(time.time() * 1000)
-    start_ts = int((datetime.now() - timedelta(days=config['run']['backtest_days'])).timestamp() * 1000)
-    
-    candles = fetch_candles(inst_id, "4h", 1000)
-    if not candles:
-        return {"status": "failed", "msg": "回测数据拉取失败"}
-    
-    backtest_candles = [c for c in candles if start_ts <= c["ts"] <= end_ts]
-    if len(backtest_candles) < 10:
-        return {"status": "failed", "msg": "有效数据不足"}
-    
-    # 回测初始化
-    capital = config["run"]["init_capital"]
-    position = 0
-    trades = []
-    win_count = 0
-    total_trades = 0
+    # 4. 多周期共振开仓+网格挂单
+    signal=get_multi_timeframe_signal(params.inst_id, params.api_key, params.api_secret, params.api_passphrase)
+    if signal == "buy":
+        # 低买：开多+挂多档买单+挂多档卖单（止盈）
+        order_result=place_grid_order(
+            params.inst_id, "long", params.leverage, params.risk_ratio,
+            grid_buy_prices, grid_sell_prices, params.api_key, params.api_secret, params.api_passphrase
+        )
+    elif signal == "sell":
+        # 高卖：开空+挂多档卖单+挂多档买单（止盈）
+        order_result=place_grid_order(
+            params.inst_id, "short", params.leverage, params.risk_ratio,
+            grid_buy_prices, grid_sell_prices, params.api_key, params.api_secret, params.api_passphrase
+        )
+    else:
+        logger.info("无共振信号，只挂单不开仓")
+        order_result={"status": "success", "msg": "无共振信号，挂单完成"}
 
-    for i in range(14, len(backtest_candles)):
-        current_candles = backtest_candles[:i+1]
-        signal = get_single_timeframe_signal(current_candles)
-        current_price = current_candles[-1]["close"]
-        atr = calculate_atr(current_candles)
-        
-        if atr == 0:
-            continue
-        
-        risk_per_trade = capital * RISK_RATIO
-        stop_loss = current_price - atr * 1 if signal == "buy" else current_price + atr * 1
-        position_size = risk_per_trade / (abs(current_price - stop_loss)) / LEVERAGE
-
-        # 开仓
-        if position == 0:
-            if signal == "buy":
-                position = position_size
-                entry_price = current_price
-                total_trades += 1
-            elif signal == "sell":
-                position = -position_size
-                entry_price = current_price
-                total_trades += 1
-        # 平仓
-        else:
-            if (position > 0 and current_price <= stop_loss) or (position < 0 and current_price >= stop_loss):
-                profit = (current_price - entry_price) * position * LEVERAGE if position > 0 else (entry_price - current_price) * abs(position) * LEVERAGE
-                capital += profit
-                win_count += 1 if profit > 0 else 0
-                trades.append({"profit": profit, "capital": capital})
-                position = 0
-            elif (position > 0 and signal == "sell") or (position < 0 and signal == "buy"):
-                profit = (current_price - entry_price) * position * LEVERAGE if position > 0 else (entry_price - current_price) * abs(position) * LEVERAGE
-                capital += profit
-                win_count += 1 if profit > 0 else 0
-                trades.append({"profit": profit, "capital": capital})
-                position = 0
-
-    total_return = (capital - config["run"]["init_capital"]) / config["run"]["init_capital"] * 100
-    win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
     return {
         "status": "success",
+        "base_price": base_price,
+        "grid_spacing": grid_spacing,
+        "buy_levels": grid_buy_prices,
+        "sell_levels": grid_sell_prices,
+        "order_result": order_result
+    }
+
+# 风控熔断函数
+def check_risk_control(inst_id: str, api_key: str, api_secret: str, api_passphrase: str) -> bool:
+    global RISK_STATE
+    max_daily_loss=config["risk"]["max_daily_loss"]
+    max_consecutive_loss=config["risk"]["max_consecutive_loss"]
+    daily_trade_limit=config["risk"]["daily_trade_limit"]
+
+    # 1. 今日交易次数检查
+    if RISK_STATE["trade_count"] >= daily_trade_limit:
+        return False
+    # 2. 单日亏损检查
+    if RISK_STATE["daily_loss"] >= max_daily_loss:
+        return False
+    # 3. 连续亏损检查
+    if RISK_STATE["consecutive_loss"] >= max_consecutive_loss:
+        return False
+    return True
+
+# 网格下单函数（核心低买高卖执行）
+def place_grid_order(inst_id: str, pos_side: str, leverage: int, risk_ratio: float,
+                     buy_levels: List[float], sell_levels: List[float],
+                     api_key: str, api_secret: str, api_passphrase: str) -> Dict:
+    # 计算下单量（按风险率）
+    balance=get_account_balance("USDT", api_key, api_secret, api_passphrase)
+    atr=GRID_PARAMS["grid_spacing"] / GRID_PARAMS["params"].atr_multiplier
+    order_vol=(balance*risk_ratio) / (atr*leverage)
+    order_vol=max(order_vol, config["risk"]["min_order_volume"]) # 最小下单量
+
+    # 开仓（市价）+ 止盈止损（限价）
+    last_price=GRID_PARAMS["base_price"]
+    tp_price=last_price+atr*config["strategy"]["atr_tp_multiplier"] if pos_side == "long" else last_price-atr*config["strategy"]["atr_tp_multiplier"]
+    sl_price=last_price-atr*config["strategy"]["atr_sl_multiplier"] if pos_side == "long" else last_price+atr*config["strategy"]["atr_sl_multiplier"]
+
+    # 主单开仓
+    main_order=place_order(inst_id, pos_side, order_vol, tp_price, sl_price, api_key, api_secret, api_passphrase)
+    if main_order["status"] != "success":
+        return {"status": "failed", "msg": f"主单开仓失败：{main_order['msg']}"}
+
+    # 网格挂单（低买高卖）
+    grid_orders = []
+    for buy_price in buy_levels:
+        # 买单（低买）
+        buy_order=place_limit_order(inst_id, "buy" if pos_side == "long" else "sell", buy_price, order_vol/len(buy_levels), api_key, api_secret, api_passphrase)
+        grid_orders.append({"type": "buy", "price": buy_price, "order": buy_order})
+    for sell_price in sell_levels:
+        # 卖单（高卖）
+        sell_order=place_limit_order(inst_id, "sell" if pos_side == "long" else "buy", sell_price, order_vol/len(sell_levels), api_key, api_secret, api_passphrase)
+        grid_orders.append({"type": "sell", "price": sell_price, "order": sell_order})
+
+    return {"status": "success", "main_order": main_order, "grid_orders": grid_orders}
+
+# 限价单函数（补充okx_api.py的接口）
+def place_limit_order(inst_id: str, side: str, price: float, vol: float, api_key: str, api_secret: str, api_passphrase: str) -> Dict:
+    url=f"{OKX_TRADE_URL}/order"
+    method = "POST"
+    body=json.dumps({
         "instId": inst_id,
-        "init_capital": config["run"]["init_capital"],
-        "final_capital": round(capital, 2),
-        "total_return": f"{round(total_return, 2)}%",
-        "win_rate": f"{round(win_rate, 2)}%",
-        "total_trades": total_trades
-    }
+        "tdMode": "isolated",
+        "side": side,
+        "posSide": "long" if side == "buy" else "short",
+        "ordType": "limit",
+        "px": str(round(price, 4)),
+        "sz": str(round(vol, 4))
+    })
+    headers=get_okx_headers("/api/v5/trade/order", body, method, api_key, api_secret, api_passphrase)
+    try:
+        response=requests.post(url, headers=headers, data=body, timeout=10)
+        data=response.json()
+        if data["code"] == "0":
+            return {"status": "success", "ordId": data["data"][0]["ordId"]}
+        else:
+            return {"status": "failed", "msg": data["msg"]}
+    except Exception as e:
+        return {"status": "failed", "msg": str(e)}
 
-# ==================== 主函数 ====================
-def main():
-    # 1. 策略回测
-    logger.info("===== 开始策略回测 =====")
-    backtest_results = []
-    for inst in INST_IDS:
-        res = backtest_strategy(inst)
-        backtest_results.append(res)
-        logger.info(f"{inst}回测结果: {json.dumps(res, ensure_ascii=False)}")
-    with open("backtest_result.json", "w", encoding="utf-8") as f:
-        json.dump(backtest_results, f, ensure_ascii=False, indent=4)
-    
-    # 2. 多周期分析
-    logger.info("===== 开始多周期分析 =====")
-    analysis_results = {
-        "updateTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "updateTimestamp": int(time.time() * 1000),
-        "coins": [],
-        "backtestSummary": backtest_results
-    }
-    for inst in INST_IDS:
-        res = analyze_multi_timeframe(inst)
-        analysis_results["coins"].append(res)
-    with open("multi_coin_multi_timeframe_log.json", "w", encoding="utf-8") as f:
-        json.dump(analysis_results, f, ensure_ascii=False, indent=4)
-    
-    # 3. 自动交易
-    auto_trade()
+# FastAPI接口（前端调用）
+@app.post("/start_grid")
+async def start_grid(request: GridStartRequest):
+    global ROBOT_RUNNING
+    if ROBOT_RUNNING:
+        raise HTTPException(status_code=400, detail="机器人已在运行中")
+    ROBOT_RUNNING=True
+    try:
+        result=grid_trading_strategy(request)
+        if result["status"] != "success":
+            ROBOT_RUNNING=False
+            raise HTTPException(status_code=400, detail=result["msg"])
+        return {
+            "status": "success",
+            "base_price": result["base_price"],
+            "grid_spacing": result["grid_spacing"],
+            "buy_levels": result["buy_levels"],
+            "sell_levels": result["sell_levels"]
+        }
+    except Exception as e:
+        ROBOT_RUNNING=False
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/stop_grid")
+async def stop_grid():
+    global ROBOT_RUNNING, GRID_PARAMS, RISK_STATE
+    if not ROBOT_RUNNING:
+        raise HTTPException(status_code=400, detail="机器人未运行")
+    # 1. 取消所有挂单
+    cancel_all_orders(GRID_PARAMS.get("inst_id", "BTC-USDT-SWAP"))
+    # 2. 重置状态
+    ROBOT_RUNNING=False
+    GRID_PARAMS={}
+    RISK_STATE={
+        "daily_loss": 0.0,
+        "consecutive_loss": 0,
+        "trade_count": 0
+    }
+    return {"status": "success", "msg": "网格交易机器人已停止，所有挂单已取消"}
+
+# 启动服务（main函数）
 if __name__ == "__main__":
-    logger.info("===== 欧易全自动交易系统启动 =====")
-    while True:
-        try:
-            main()
-        except Exception as e:
-            logger.error(f"程序运行异常: {str(e)}")
-        logger.info(f"===== 休眠{config['run']['interval']/60}分钟 =====")
-        time.sleep(config["run"]["interval"])
+    # 启动FastAPI服务，端口8000，允许前端跨域调用
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

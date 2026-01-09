@@ -6,5 +6,292 @@
     <title>欧易网格交易机器人 V3.0（智能交易搭档）</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #121212; color: #fff; font-family: sans-serif; padding: 15px; max-width: 1400px; margin: 0 auto; }
-        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+        body { background: #121212; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 15px; max-width: 1400px; margin: 0 auto; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+        .card-title { font-size: 18px; font-weight: 600; margin-bottom: 15px; color: #4fc3f7; display: flex; align-items: center; }
+        .card-title i { margin-right: 8px; }
+        .btn { border: none; border-radius: 6px; padding: 12px 20px; font-size: 16px; font-weight: 500; cursor: pointer; transition: all 0.3s; }
+        .btn-success { background: #4caf50; color: #fff; }
+        .btn-danger { background: #f44336; color: #fff; }
+        .btn-disabled { background: #555; cursor: not-allowed; opacity: 0.7; }
+        .btn:hover:not(.btn-disabled) { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+        .flex { display: flex; }
+        .flex-wrap { flex-wrap: wrap; }
+        .justify-between { justify-content: space-between; }
+        .align-center { align-items: center; }
+        .gap-10 { gap: 10px; }
+        .gap-15 { gap: 15px; }
+        .margin-bottom-10 { margin-bottom: 10px; }
+        .margin-bottom-15 { margin-bottom: 15px; }
+        .text-success { color: #4caf50; }
+        .text-danger { color: #f44336; }
+        .text-warning { color: #ff9800; }
+        .text-info { color: #4fc3f7; }
+        .param-group { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #2c2c2c; }
+        .param-label { color: #bbb; }
+        .param-value { font-weight: 500; }
+        .tabs { display: flex; border-bottom: 1px solid #2c2c2c; margin-bottom: 15px; }
+        .tab { padding: 10px 15px; cursor: pointer; color: #bbb; transition: all 0.3s; }
+        .tab.active { color: #4fc3f7; border-bottom: 2px solid #4fc3f7; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .logs-container { height: 250px; overflow-y: auto; background: #2c2c2c; padding: 15px; border-radius: 8px; font-size: 14px; line-height: 1.6; }
+        .log-item { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #3c3c3c; }
+        .log-time { color: #888; margin-right: 8px; }
+        .order-book { display: flex; flex-direction: column; gap: 5px; }
+        .order-book-row { display: flex; justify-content: space-between; padding: 5px 0; font-size: 14px; }
+        .bids { color: #f44336; }
+        .asks { color: #4caf50; }
+        .trade-item { display: flex; justify-content: space-between; padding: 5px 0; font-size: 14px; border-bottom: 1px solid #3c3c3c; }
+        .trade-buy { color: #f44336; }
+        .trade-sell { color: #4caf50; }
+        .chart-container { height: 300px; background: #2c2c2c; border-radius: 8px; padding: 10px; margin-bottom: 15px; }
+        .select-box { background: #2c2c2c; border: 1px solid #3c3c3c; border-radius: 6px; padding: 10px 15px; color: #fff; font-size: 16px; width: 100%; max-width: 300px; }
+        .backtest-result { background: #2c2c2c; padding: 15px; border-radius: 8px; margin-top: 15px; }
+        .progress-bar { height: 8px; background: #3c3c3c; border-radius: 4px; margin-top: 5px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #4caf50; }
+        .progress-fill-negative { background: #f44336; }
+
+        /* 移动端适配 */
+        @media (max-width: 768px) {
+            .flex { flex-direction: column; }
+            .btn { width: 100%; margin-bottom: 10px; }
+            .tabs { overflow-x: auto; }
+            .tab { white-space: nowrap; }
+            .param-group { flex-direction: column; gap: 5px; }
+            .param-label { margin-bottom: 5px; }
+        }
+    </style>
+</head>
+<body>
+    <!-- 顶部状态栏 -->
+    <div class="card">
+        <div class="card-title">
+            <<i>📊</</i> 机器人核心状态
+        </div>
+        <div class="flex justify-between align-center margin-bottom-15">
+            <div>
+                <div class="param-label">当前状态</div>
+                <div id="robot-status" class="param-value text-warning">加载中...</div>
+            </div>
+            <div>
+                <div class="param-label">账户总资金</div>
+                <div id="total-funds" class="param-value">-- USDT</div>
+            </div>
+            <div>
+                <div class="param-label">总收益率</div>
+                <div id="total-return" class="param-value">--%</div>
+            </div>
+        </div>
+
+        <!-- 币种选择与策略控制 -->
+        <div class="flex gap-15 align-center margin-bottom-15">
+            <div>
+                <div class="param-label">选择交易币种</div>
+                <select id="coin-select" class="select-box">
+                    <option value="">加载中...</option>
+                </select>
+            </div>
+            <div class="flex gap-10">
+                <button id="start-btn" class="btn btn-success">启动策略</button>
+                <button id="stop-btn" class="btn btn-danger btn-disabled">停止策略</button>
+            </div>
+        </div>
+
+        <!-- 核心参数显示 -->
+        <div class="flex flex-wrap gap-15 margin-bottom-10">
+            <div style="flex: 1; min-width: 150px;">
+                <div class="param-label">当前杠杆</div>
+                <div id="current-leverage" class="param-value">-- 倍</div>
+            </div>
+            <div style="flex: 1; min-width: 150px;">
+                <div class="param-label">当前趋势</div>
+                <div id="current-trend" class="param-value">--</div>
+            </div>
+            <div style="flex: 1; min-width: 150px;">
+                <div class="param-label">RSI指标</div>
+                <div id="current-rsi" class="param-value">--</div>
+            </div>
+            <div style="flex: 1; min-width: 150px;">
+                <div class="param-label">爆仓风险</div>
+                <div id="liquidation-risk" class="param-value text-success">安全</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 行情与交易数据标签页 -->
+    <div class="card">
+        <div class="card-title">
+            <<i>📈</</i> 实时行情与交易数据
+        </div>
+        <div class="tabs">
+            <div class="tab active" data-tab="market">行情概览</div>
+            <div class="tab" data-tab="order-book">盘口深度</div>
+            <div class="tab" data-tab="trades">成交明细</div>
+            <div class="tab" data-tab="backtest">策略回测</div>
+        </div>
+
+        <!-- 行情概览 -->
+        <div class="tab-content active" id="market-tab">
+            <div class="chart-container">
+                <canvas id="price-chart"></canvas> <!-- 1分钟K线图占位 -->
+            </div>
+            <div class="flex flex-wrap gap-15">
+                <div style="flex: 1; min-width: 120px;">
+                    <div class="param-label">最新价格</div>
+                    <div id="latest-price" class="param-value">-- USDT</div>
+                </div>
+                <div style="flex: 1; min-width: 120px;">
+                    <div class="param-label">24h最高</div>
+                    <div id="24h-high" class="param-value">-- USDT</div>
+                </div>
+                <div style="flex: 1; min-width: 120px;">
+                    <div class="param-label">24h最低</div>
+                    <div id="24h-low" class="param-value">-- USDT</div>
+                </div>
+                <div style="flex: 1; min-width: 120px;">
+                    <div class="param-label">24h波动率</div>
+                    <div id="24h-volatility" class="param-value">--%</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 盘口深度 -->
+        <div class="tab-content" id="order-book-tab">
+            <div class="order-book">
+                <div class="param-label text-info">卖单（卖一到卖五）</div>
+                <div id="asks-container" class="order-book-row asks">加载中...</div>
+                <div style="height: 10px;"></div>
+                <div class="param-label text-info">买单（买一到买五）</div>
+                <div id="bids-container" class="order-book-row bids">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 成交明细 -->
+        <div class="tab-content" id="trades-tab">
+            <div id="trades-container" style="height: 300px; overflow-y: auto;">
+                <div class="trade-item">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 策略回测 -->
+        <div class="tab-content" id="backtest-tab">
+            <div class="flex gap-15 margin-bottom-15">
+                <div>
+                    <div class="param-label">网格层数</div>
+                    <select id="backtest-grid-levels" class="select-box" style="max-width: 150px;">
+                        <option value="5">5层</option>
+                        <option value="8">8层</option>
+                        <option value="10">10层</option>
+                    </select>
+                </div>
+                <div>
+                    <div class="param-label">ATR倍率</div>
+                    <select id="backtest-atr-multi" class="select-box" style="max-width: 150px;">
+                        <option value="1.2">1.2倍</option>
+                        <option value="1.5">1.5倍</option>
+                        <option value="1.8">1.8倍</option>
+                    </select>
+                </div>
+                <button id="run-backtest-btn" class="btn btn-success" style="align-self: flex-end;">运行回测</button>
+            </div>
+            <div class="backtest-result" id="backtest-result">
+                <div class="param-label">回测结果（最近30天）</div>
+                <div class="margin-bottom-10">点击上方"运行回测"查看结果</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 策略运行日志 -->
+    <div class="card">
+        <div class="card-title">
+            <<i>📝</</i> 运行日志（最近50条）
+        </div>
+        <div id="logs-container" class="logs-container">
+            <div class="log-item">加载中...</div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        // 后端接口地址（本地运行默认127.0.0.1:8000）
+        const API_BASE = "http://127.0.0.1:8000";
+
+        // 全局状态
+        let currentCoin = "";
+        let priceChart = null; // K线图实例
+        let marketDataInterval = null; // 行情数据刷新定时器
+
+        // 页面加载完成后初始化
+        window.onload = async function() {
+            try {
+                // 1. 初始化基础数据（API状态、币种列表）
+                await initBaseData();
+                // 2. 初始化标签页切换
+                initTabs();
+                // 3. 初始化K线图
+                initPriceChart();
+                // 4. 加载运行日志
+                loadLogs();
+                // 5. 定时刷新数据（日志、行情）
+                setInterval(loadLogs, 5000);
+            } catch (err) {
+                updateLog(`初始化失败：${err.message}`, "error");
+                document.getElementById("robot-status").textContent = "初始化失败";
+                document.getElementById("robot-status").className = "param-value text-danger";
+            }
+        };
+
+        // 初始化基础数据（API状态、币种列表）
+        async function initBaseData() {
+            // 获取API状态
+            const apiRes = await fetch(`${API_BASE}/get_api_status`);
+            if (!apiRes.ok) throw new Error("后端服务未响应");
+            const apiData = await apiRes.json();
+            if (apiData.status !== "success") throw new Error(apiData.msg);
+
+            // 更新账户总资金
+            document.getElementById("total-funds").textContent = `${apiData.total_funds.toFixed(2)} USDT`;
+
+            // 获取币种列表
+            const coinRes = await fetch(`${API_BASE}/get_coin_list`);
+            const coinData = await coinRes.json();
+            const coinSelect = document.getElementById("coin-select");
+            coinSelect.innerHTML = "";
+
+            // 填充币种下拉框
+            coinData.coins.forEach(coin => {
+                const option = document.createElement("option");
+                option.value = coin.instId;
+                option.textContent = `${coin.instId}（资金占比：${(coin.weight*100).toFixed(0)}%）`;
+                if (coin.instId === coinData.current_coin) {
+                    option.selected = true;
+                    currentCoin = coin.instId;
+                }
+                coinSelect.appendChild(option);
+            });
+
+            // 监听币种切换
+            coinSelect.addEventListener("change", function() {
+                currentCoin = this.value;
+                // 切换币种后刷新行情数据
+                if (marketDataInterval) clearInterval(marketDataInterval);
+                if (currentCoin) {
+                    loadMarketData(currentCoin);
+                    marketDataInterval = setInterval(() => loadMarketData(currentCoin), 3000);
+                }
+            });
+
+            // 初始化当前币种的行情数据
+            if (currentCoin) {
+                loadMarketData(currentCoin);
+                marketDataInterval = setInterval(() => loadMarketData(currentCoin), 3000);
+            }
+
+            // 更新机器人状态
+            document.getElementById("robot-status").textContent = "已就绪";
+            document.getElementById("robot-status").className = "param-value text-success";
+            document.getElementById("start-btn").disabled = false;
+        }
+
+        // 初始化标签页

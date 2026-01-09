@@ -16,6 +16,20 @@ from .okx_api import (
 )
 from .utils import setup_logger, get_logs
 
+# -------------------------- 内置配置（已填入你的API信息） --------------------------
+BUILTIN_API_INFO = {
+    "apiKey": "b9781f6b-08a0-469b-9674-ae3ff3fc9744",       # 你的API Key
+    "apiSecret": "68AA1EAC3B22BEBA32765764D10F163D",     # 你的Secret
+    "apiPassphrase": "Gzl123.@", # 你的Passphrase
+    "instId": "BTC-USDT-SWAP",        # 交易对（与界面一致）
+    "env": "实盘"                     # 环境："实盘"或"模拟盘"
+}
+BUILTIN_GRID_PARAMS = {
+    "atrMulti": 1.2,  # 网格倍率（与界面一致）
+    "gridLevels": 5   # 网格层数（与界面一致）
+}
+# -----------------------------------------------------------------------------------
+
 # 初始化
 load_dotenv()
 app = FastAPI(title="OKX Grid Trading Robot")
@@ -40,56 +54,63 @@ GLOBAL_STATE = {
     "risk_state": {"daily_loss": 0.0, "consecutive_loss": 0, "trade_count": 0}
 }
 
-# API接口
-@app.post("/verify_api")
-async def verify_api(params: Dict):
-    """验证API并获取基础信息"""
+# 启动时自动验证API
+@app.on_event("startup")
+async def auto_verify_api():
+    """启动时自动完成API验证，无需手动输入"""
     try:
         uid = verify_api(
-            params["apiKey"], params["apiSecret"], params["apiPassphrase"],
-            params["instId"], params["env"]
+            BUILTIN_API_INFO["apiKey"], BUILTIN_API_INFO["apiSecret"],
+            BUILTIN_API_INFO["apiPassphrase"], BUILTIN_API_INFO["instId"],
+            BUILTIN_API_INFO["env"]
         )
-        ticker = fetch_ticker(params["instId"], params["env"])
-        candles = fetch_candles(params["instId"], "15m", CONFIG["strategy"]["kline_limit"], params["env"])
+        ticker = fetch_ticker(BUILTIN_API_INFO["instId"], BUILTIN_API_INFO["env"])
+        candles = fetch_candles(
+            BUILTIN_API_INFO["instId"], "15m", 
+            CONFIG["strategy"]["kline_limit"], BUILTIN_API_INFO["env"]
+        )
         atr = calculate_atr(candles, CONFIG["strategy"]["atr_period"])
         ticker["atr"] = atr
-        GLOBAL_STATE["api_info"] = params
-        logger.info(f"API验证成功，账户UID：{uid}")
-        return {"status": "success", "uid": uid, "ticker": ticker}
+        GLOBAL_STATE["api_info"] = BUILTIN_API_INFO
+        logger.info(f"API自动验证成功 | 账户UID：{uid}")
     except Exception as e:
-        logger.error(f"API验证失败：{str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"API自动验证失败：{str(e)}")
+        raise SystemExit(f"程序启动失败：API初始化错误")
 
+# 启动网格策略（自动使用内置参数）
 @app.post("/start_grid")
-async def start_grid(params: Dict):
-    """启动网格交易策略"""
+async def start_grid():
+    """启动网格交易，无需手动传参"""
     global ROBOT_RUNNING
     if ROBOT_RUNNING:
-        raise HTTPException(status_code=400, detail="机器人已运行")
+        raise HTTPException(status_code=400, detail="机器人已处于运行状态")
     try:
-        # 获取数据
+        api_info = GLOBAL_STATE["api_info"]
+        params = {**BUILTIN_GRID_PARAMS, "instId": api_info["instId"], "env": api_info["env"]}
+
+        # 获取K线与ATR
         candles = fetch_candles(params["instId"], "15m", CONFIG["strategy"]["kline_limit"], params["env"])
         atr = calculate_atr(candles, CONFIG["strategy"]["atr_period"])
         last_price = candles[-1]["close"]
         if atr == 0:
-            raise Exception("ATR计算失败")
+            raise Exception("ATR指标计算失败（K线数据异常）")
         
-        # 计算网格参数
+        # 计算网格档位
         grid_spacing = atr * params["atrMulti"]
         grid_levels = params["gridLevels"]
         buy_levels = [round(last_price - grid_spacing * i, 4) for i in range(1, grid_levels+1)]
         sell_levels = [round(last_price + grid_spacing * i, 4) for i in range(1, grid_levels+1)]
         
-        # 风控检查
-        account = get_account_info(params["apiKey"], params["apiSecret"], params["apiPassphrase"], params["env"])
+        # 风控计算下单量
+        account = get_account_info(api_info["apiKey"], api_info["apiSecret"], api_info["apiPassphrase"], api_info["env"])
         balance = float(account["available"])
         order_volume = (balance * CONFIG["risk"]["risk_ratio"]) / (grid_spacing * CONFIG["risk"]["leverage"])
         order_volume = max(order_volume, CONFIG["risk"]["min_order_volume"])
         
-        # 挂网格单
+        # 挂网格订单
         place_grid_orders(
             params["instId"], buy_levels, sell_levels, order_volume,
-            params["apiKey"], params["apiSecret"], params["apiPassphrase"], params["env"]
+            api_info["apiKey"], api_info["apiSecret"], api_info["apiPassphrase"], api_info["env"]
         )
         
         # 更新状态
@@ -108,9 +129,10 @@ async def start_grid(params: Dict):
         logger.error(f"策略启动失败：{str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
+# 停止机器人
 @app.post("/stop_grid")
 async def stop_grid():
-    """停止机器人"""
+    """停止机器人并取消所有挂单"""
     global ROBOT_RUNNING
     if not ROBOT_RUNNING:
         raise HTTPException(status_code=400, detail="机器人未运行")
@@ -118,17 +140,17 @@ async def stop_grid():
         api_info = GLOBAL_STATE["api_info"]
         cancel_all_orders(api_info["instId"], api_info["apiKey"], api_info["apiSecret"], api_info["apiPassphrase"], api_info["env"])
         ROBOT_RUNNING = False
-        logger.info("机器人已停止，所有挂单已取消")
+        logger.info("机器人已停止 | 所有挂单已取消")
         return {"status": "success", "msg": "停止成功"}
     except Exception as e:
         logger.error(f"停止失败：{str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
+# 获取最新日志
 @app.get("/get_logs")
 async def get_logs_api():
-    """获取运行日志"""
-    return {"logs": get_logs()[-20:]}  # 返回最新20条
+    """获取最近20条运行日志"""
+    return {"logs": get_logs()[-20:]}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    

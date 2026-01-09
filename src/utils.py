@@ -1,33 +1,43 @@
 import logging
 import os
-from datetime import datetime
 
-# 日志配置
-LOG_DIR = "logs"
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
-LOG_FILE = os.path.join(LOG_DIR, f"okx_robot_{datetime.now().strftime('%Y%m%d')}.log")
-
-def setup_logger() -> logging.Logger:
-    """初始化日志"""
-    logger = logging.getLogger("OKX_Grid_Robot")
+# -------------------------- 【修改】完善日志配置（添加文件持久化） --------------------------
+def setup_logger():
+    logger = logging.getLogger("okx_grid_robot")
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    logger.propagate = False  # 避免重复输出
     
-    # 文件处理器
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    # 控制台处理器（输出到终端）
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
     
-    # 控制台处理器
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    # 【新增】文件处理器（保存到logs/robot.log）
+    os.makedirs("logs", exist_ok=True)  # 自动创建logs目录
+    file_handler = logging.FileHandler("logs/robot.log", encoding="utf-8", mode="a")
+    file_handler.setLevel(logging.INFO)
+    
+    # 日志格式化（包含时间、级别、信息）
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    
+    # 添加处理器
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
     return logger
 
-def get_logs() -> list:
-    """获取最新日志"""
-    if not os.path.exists(LOG_FILE):
+# 获取最新日志
+def get_logs():
+    """读取日志文件，返回最新日志列表"""
+    log_file = "logs/robot.log"
+    if not os.path.exists(log_file):
         return ["日志文件未生成"]
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
-        return f.readlines()
+    
+    with open(log_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        # 返回最后20条日志（避免日志过多）
+        return [line.strip() for line in lines[-20:]]

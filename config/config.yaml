@@ -1,41 +1,76 @@
-# 基础策略配置
+# 基础策略配置（新增多因子参数）
 strategy:
   kline_limit: 100          # K线数据数量
   atr_period: 14            # ATR计算周期
   grid_levels: 5            # 初始网格层数
   atr_multi: 1.2            # 网格间距倍率
   order_timeout: 30         # 订单超时时间（分钟）
-  grid_expand_threshold: 1  # 价格突破网格后，新增网格数量（1-2档）
+  grid_expand_threshold: 1  # 价格突破网格后，新增网格数量
+  rsi_period: 14            # RSI计算周期
+  macd_fast: 12             # MACD快线周期
+  macd_slow: 26             # MACD慢线周期
+  macd_signal: 9            # MACD信号线周期
+  trend_threshold: 0.02     # 趋势判断阈值（EMA差值占比）
 
-# 风控核心配置（生死线）
+# 多币种配置（支持主流币种，可自定义）
+coins:
+  - instId: "BTC-USDT-SWAP"
+    weight: 0.5             # 资金分配比例（50%）
+    min_volatility: 0.05    # 最小波动率（5%）
+    max_volatility: 0.15    # 最大波动率（15%）
+  - instId: "ETH-USDT-SWAP"
+    weight: 0.3             # 资金分配比例（30%）
+    min_volatility: 0.06
+    max_volatility: 0.16
+  - instId: "SOL-USDT-SWAP"
+    weight: 0.2             # 资金分配比例（20%）
+    min_volatility: 0.08
+    max_volatility: 0.18
+
+# 风控核心配置（新增动态杠杆、爆仓预警）
 risk:
-  max_global_loss_rate: 0.05  # 账户最大亏损比例（5%），触发后禁止启动
-  max_single_position_rate: 0.3  # 单方向最大仓位比例（30%可用资金）
+  max_global_loss_rate: 0.05  # 账户最大亏损比例（5%）
+  max_single_position_rate: 0.3  # 单方向最大仓位比例（30%）
   take_profit_rate: 0.08      # 单轮策略止盈比例（8%）
   stop_loss_rate: 0.05        # 单轮策略止损比例（5%）
-  volatility_limit: 0.1       # 1分钟最大波动率（10%），触发异常停机
+  volatility_limit: 0.1       # 1分钟最大波动率（10%）
   min_order_volume: 0.001     # 最小下单量
   max_order_volume: 0.01      # 最大下单量
-  leverage: 10                # 杠杆倍数
+  leverage_range:             # 动态杠杆范围
+    low_vol: [10, 15]         # 低波动（ATR<20）：10-15倍
+    mid_vol: [5, 10]          # 中波动（20<ATR<50）：5-10倍
+    high_vol: [1, 5]          # 高波动（ATR>50）：1-5倍
+  margin_call_ratio: 0.05    # 保证金预警比例（安全空间<5%触发）
 
-# 自动化配置
+# 自动化配置（新增多币种监控间隔）
 auto:
-  check_interval: 30          # 全局检查间隔（秒）：止损、订单超时、行情异常
+  check_interval: 30          # 全局检查间隔（秒）
   retry_times: 3              # API请求重试次数
   retry_delay: 3              # 重试间隔（秒）
   position_check_interval: 10 # 仓位/盈亏检查间隔（秒）
+  coin_monitor_interval: 60   # 多币种监控间隔（秒）
   daily_report_time: "00:00"  # 每日报告生成时间（UTC+0）
 
-# 告警配置
+# 告警配置（新增短信告警支持）
 alert:
   enable_email_alert: True    # 是否启用邮件告警
-  email_sender: "your-email@xxx.com"  # 发件人邮箱
-  email_password: "your-email-password"  # 邮箱授权码
-  email_receiver: "your-receiver@xxx.com"  # 收件人邮箱
-  smtp_server: "smtp.xxx.com" # SMTP服务器（如QQ邮箱：smtp.qq.com）
-  smtp_port: 465              # SMTP端口（SSL默认465）
+  enable_sms_alert: False     # 是否启用短信告警（需对接第三方API）
+  email_sender: "your-email@xxx.com"
+  email_password: "your-email-auth-code"
+  email_receiver: "your-receiver@xxx.com"
+  smtp_server: "smtp.xxx.com"
+  smtp_port: 465
+  sms_api_key: "your-sms-api-key"  # 短信API密钥（如阿里云、腾讯云）
+  sms_phone: "your-phone-number"   # 接收短信的手机号
 
 # 数据持久化配置
 persistence:
   data_path: "data/strategy_data.json"  # 策略状态保存路径
   backup_interval: 600        # 数据备份间隔（秒）
+  backtest_data_path: "data/backtest/"  # 回测数据保存路径
+
+# 远程控制配置（支持微信/短信指令）
+remote_control:
+  enable: False               # 是否启用远程控制
+  wechat_api_key: "your-wechat-api-key"  # 微信API密钥（如企业微信）
+  command_prefix: "TRADER_"   # 指令前缀（如TRADER_START、TRADER_STOP）

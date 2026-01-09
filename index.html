@@ -3,292 +3,131 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>欧易合约AI网格交易机器人（强化登录版）</title>
+    <title>欧易合约AI网格交易机器人</title>
     <style>
-        * {margin:0;padding:0;box-sizing:border-box;font-family:"Microsoft YaHei", sans-serif;}
-        body {background:#121212;color:#fff;padding:20px;}
-        .header {text-align:center;margin-bottom:20px;padding-bottom:10px;border-bottom:1px solid #333;}
-        .header h1 {font-size:24px;color:#e53e3e;margin-bottom:5px;}
-        .section {background:#1e1e1e;border-radius:8px;padding:15px;margin-bottom:20px;}
-        .section h3 {color:#e53e3e;margin-bottom:15px;font-size:18px;display:flex;align-items:center;gap:8px;}
-        .section h3::before {content:"";width:4px;height:20px;background:#e53e3e;border-radius:2px;}
-        .input-group {display:flex;gap:10px;margin-bottom:15px;flex-wrap:wrap;}
-        .input-group input, .input-group select {flex:1;min-width:200px;padding:8px 10px;background:#2d2d2d;border:1px solid #444;border-radius:4px;color:#fff;outline:none;}
-        .btn {padding:8px 20px;border:none;border-radius:4px;cursor:pointer;font-size:14px;margin-right:10px;}
-        .btn-red {background:#e53e3e;color:#fff;}
-        .btn-green {background:#48bb78;color:#fff;}
-        .btn-gray {background:#4a5568;color:#fff;}
-        .btn:disabled {background:#666;cursor:not-allowed;}
-        .data-tips {background:#2d2d2d;border-radius:8px;padding:10px;margin-bottom:15px;display:none;}
-        .status-bar {height:20px;background:#2d2d2d;border-radius:10px;overflow:hidden;margin-bottom:10px;}
-        .status-progress {height:100%;background:#ed8936;width:0;transition:width 0.5s ease, background-color 0.5s ease;}
-        .table-container {overflow-x:auto;margin-top:15px;}
-        table {width:100%;border-collapse:collapse;}
-        th, td {padding:8px 10px;text-align:left;border-bottom:1px solid #333;font-size:14px;}
-        .chart-box {flex:1;min-width:300px;height:200px;background:#2d2d2d;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#999;}
-        .log-container {height:200px;background:#2d2d2d;border-radius:8px;padding:10px;overflow-y:auto;margin-top:10px;font-size:12px;line-height:1.5;}
+        body { background: #121212; color: #fff; font-family: sans-serif; padding: 20px; }
+        .status-bar { text-align: center; margin-bottom: 20px; }
+        .config-card, .status-card { background: #1e1e1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .btn { background: #e53935; border: none; color: #fff; padding: 10px 20px; border-radius: 4px; cursor: pointer; }
+        .btn:disabled { background: #555; cursor: not-allowed; }
+        .error { color: #e53935; margin-top: 10px; }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>欧易合约AI网格交易机器人（强化登录版）</h1>
-        <p>当前状态：<span id="robotStatus" style="color:#f56565;">未登录 | 机器人停止</span></p>
+    <div class="status-bar">
+        <h1>欧易合约AI网格交易机器人（自动登录版）</h1>
+        <p id="current-status">当前状态：加载中 | 机器人停止</p>
     </div>
 
-    <!-- API登录区 -->
-    <div class="section">
-        <h3>API配置</h3>
-        <div class="input-group">
-            <input type="text" id="apiKey" placeholder="欧易API Key">
-            <input type="password" id="apiSecret" placeholder="API Secret">
-            <input type="password" id="apiPassphrase" placeholder="Passphrase">
-            <select id="tradeEnv">
-                <option value="real">实盘</option>
-                <option value="sim">模拟盘</option>
-            </select>
-        </div>
-        <div class="input-group">
-            <input type="text" id="instId" placeholder="交易对（默认BTC-USDT-SWAP）" value="BTC-USDT-SWAP">
-            <input type="number" id="gridLevels" placeholder="网格层数（默认5）" value="5">
-            <input type="number" id="atrMulti" placeholder="ATR乘数（默认1.2）" value="1.2">
-        </div>
-        <button id="loginBtn" class="btn btn-red">登录API</button>
-        <button id="logoutBtn" class="btn btn-gray" style="display:none;">登出</button>
-        <button id="startRobotBtn" class="btn btn-green" style="display:none;">启动机器人</button>
-        <button id="stopRobotBtn" class="btn btn-gray" style="display:none;">停止机器人</button>
-        <div class="data-tips" id="dataTips"><p id="tipsContent"></p></div>
+    <!-- 移除原API配置表单，改为自动状态同步 -->
+    <div class="config-card">
+        <h2>策略配置（已内置）</h2>
+        <p>交易对：BTC-USDT-SWAP</p>
+        <p>网格层数：5</p>
+        <p>ATR倍率：1.2</p>
+        <p>环境：实盘</p>
     </div>
 
-    <!-- 策略状态区 -->
-    <div class="section">
-        <h3>策略运行状态</h3>
-        <p id="analysisStatus">等待API登录...</p>
-        <div class="status-bar"><div class="status-progress" id="analysisProgress"></div></div>
-        <p>基准价：<span id="basePrice">--</span> | 网格间距：<span id="gridSpacing">--</span></p>
-        <p>买单档位：<span id="buyLevels">--</span> | 卖单档位：<span id="sellLevels">--</span></p>
+    <div class="status-card">
+        <h2>策略运行状态</h2>
+        <p id="strategy-status">等待初始化...</p>
+        <p>基准价：<span id="base-price">--</span> | 网格间距：<span id="grid-spacing">--</span></p>
+        <p>买单档位：<span id="buy-levels">--</span> | 卖单档位：<span id="sell-levels">--</span></p>
+        <button id="start-btn" class="btn" disabled>启动策略</button>
+        <button id="stop-btn" class="btn" disabled>停止策略</button>
     </div>
 
-    <!-- 行情区 -->
-    <div class="section">
-        <h3>实时行情</h3>
-        <div class="table-container">
-            <table>
-                <thead><tr><th>交易对</th><th>最新价</th><th>24h涨跌幅</th><th>ATR值</th></tr></thead>
-                <tbody id="tickerTbody"><tr><td colspan="4" style="text-align:center;">未登录</td></tr></tbody>
-            </table>
-        </div>
+    <div class="logs-card">
+        <h2>运行日志</h2>
+        <div id="logs-container" style="height: 200px; overflow-y: auto; background: #2c2c2c; padding: 10px; border-radius: 4px;"></div>
     </div>
 
-    <!-- 日志监控区 -->
-    <div class="section">
-        <h3>运行日志监控</h3>
-        <div class="log-container" id="logContainer">请启动机器人查看日志...</div>
-    </div>
-
-    <script src="https://cdn.bootcdn.net/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
     <script>
-        let isLogin = false, robotRunning = false;
-        const BASE_API_URL = "http://localhost:8000";
+        // 后端接口地址（替换为你的后端IP+端口）
+        const API_BASE = "http://你的后端IP:8000";
 
-        // 强化版提示函数（支持换行）
-        function showTips(content, type) {
-            const box = document.getElementById("dataTips");
-            const text = document.getElementById("tipsContent");
-            box.style.display = "block";
-            text.style.color = type === "error" ? "#f56565" : type === "success" ? "#48bb78" : "#ed8936";
-            const contentHtml = content.replace(/\n/g, "<br>");
-            text.innerHTML = type === "loading" ? `🔄 ${contentHtml}` : contentHtml;
-            if (type !== "error") {
-                setTimeout(() => {
-                    if (!isLogin || type === "info") return;
-                    box.style.display = "none";
-                }, type === "success" ? 5000 : 3000);
-            }
-        }
-
-        // 登录逻辑（强化版，含超时+异常诊断）
-        document.getElementById("loginBtn").addEventListener("click", async () => {
-            const apiKey = document.getElementById("apiKey").value.trim();
-            const apiSecret = document.getElementById("apiSecret").value.trim();
-            const apiPassphrase = document.getElementById("apiPassphrase").value.trim();
-            const instId = document.getElementById("instId").value.trim();
-            const env = document.getElementById("tradeEnv").value;
-            const loginBtn = document.getElementById("loginBtn");
-            const progressBar = document.getElementById("analysisProgress");
-
-            // 1. 输入前置校验
-            if (!apiKey) {
-                showTips("请填写欧易API Key！", "error");
-                return;
-            }
-            if (!apiSecret) {
-                showTips("请填写欧易API Secret！", "error");
-                return;
-            }
-            if (!apiPassphrase) {
-                showTips("请填写API Passphrase！", "error");
-                return;
-            }
-            if (!instId) {
-                showTips("请填写交易对（如BTC-USDT-SWAP）！", "error");
-                return;
-            }
-
-            // 2. 初始化登录状态
-            loginBtn.disabled = true;
-            loginBtn.textContent = "登录中...";
-            showTips("正在验证API并拉取数据（超时时间：10秒）...", "loading");
-            progressBar.style.width = "30%";
-            progressBar.style.backgroundColor = "#ed8936";
-
-            // 3. 10秒请求超时控制
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error("请求超时！\n可能原因：\n1.后端服务未启动\n2.端口8000被占用\n3.防火墙拦截后端请求")), 10000);
-            });
-
+        // 页面加载后自动同步状态
+        window.onload = async function() {
             try {
-                // 4. 并发请求：API验证 + 超时控制
-                const res = await Promise.race([
-                    fetch(`${BASE_API_URL}/verify_api`, {
-                        method: "POST",
-                        headers: {"Content-Type": "application/json"},
-                        body: JSON.stringify({apiKey, apiSecret, apiPassphrase, instId, env})
-                    }),
-                    timeoutPromise
-                ]);
-
-                // 5. 响应状态码检查
-                if (!res.ok) {
-                    throw new Error(`后端服务返回错误：${res.status} ${res.statusText}\n建议检查后端服务是否正常运行`);
+                // 1. 验证后端API状态
+                const apiRes = await fetch(`${API_BASE}/get_api_status`);
+                const apiData = await apiRes.json();
+                
+                if (apiData.status === "success") {
+                    document.getElementById("current-status").textContent = "当前状态：已登录 | 机器人停止";
+                    document.getElementById("start-btn").disabled = false;
+                    document.getElementById("strategy-status").textContent = "已就绪，可启动策略";
+                } else {
+                    throw new Error("API自动验证失败");
                 }
 
-                const data = await res.json();
-                progressBar.style.width = "70%";
+                // 2. 加载最新日志
+                loadLogs();
+            } catch (err) {
+                document.getElementById("current-status").textContent = "当前状态：未登录 | 机器人停止";
+                document.querySelector(".error").textContent = "错误：" + err.message;
+            }
+        };
 
-                // 6. 业务逻辑异常诊断
-                if (data.status !== "success") {
-                    let errorMsg = data.msg;
-                    // API错误自动诊断
-                    if (errorMsg.includes("API错误")) {
-                        errorMsg += "\n\n可能原因：\n1.API密钥/密码填写错误\n2.未开启合约交易权限\n3.实盘API未配置IP白名单\n4.模拟盘/实盘选择与API不匹配";
-                    }
-                    // 网络错误自动诊断
-                    if (errorMsg.includes("网络请求失败")) {
-                        errorMsg += "\n\n可能原因：\n1.后端服务未启动\n2.端口8000被其他程序占用\n3.本地防火墙拦截请求";
-                    }
-                    throw new Error(errorMsg);
+        // 启动策略
+        document.getElementById("start-btn").addEventListener("click", async function() {
+            try {
+                const res = await fetch(`${API_BASE}/start_grid`, { method: "POST" });
+                const data = await res.json();
+                
+                if (data.status === "success") {
+                    document.getElementById("current-status").textContent = "当前状态：已登录 | 机器人运行中";
+                    document.getElementById("strategy-status").textContent = "策略运行中";
+                    document.getElementById("base-price").textContent = data.basePrice;
+                    document.getElementById("grid-spacing").textContent = data.gridSpacing;
+                    document.getElementById("buy-levels").textContent = data.buyLevels.join(", ");
+                    document.getElementById("sell-levels").textContent = data.sellLevels.join(", ");
+                    document.getElementById("start-btn").disabled = true;
+                    document.getElementById("stop-btn").disabled = false;
+                    log("策略启动成功");
                 }
-
-                // 7. 登录成功处理
-                isLogin = true;
-                progressBar.style.width = "100%";
-                progressBar.style.backgroundColor = "#48bb78";
-                loginBtn.style.display = "none";
-                document.getElementById("logoutBtn").style.display = "inline-block";
-                document.getElementById("startRobotBtn").style.display = "inline-block";
-                document.getElementById("robotStatus").style.color = "#999";
-                document.getElementById("robotStatus").textContent = "已登录 | 机器人未启动";
-                document.getElementById("analysisStatus").textContent = `API验证成功，账户UID：${data.uid}`;
-                localStorage.setItem("okx_api", JSON.stringify({apiKey, apiSecret, apiPassphrase, instId, env}));
-                // 多行成功提示
-                showTips(`✅ 登录成功！\n- 账户UID：${data.uid}\n- ${data.ticker.instId}最新价：${data.ticker.last} USDT\n- ATR值：${data.ticker.atr}`, "success");
-                // 更新行情表格
-                updateTicker(data.ticker);
-
             } catch (err) {
-                // 8. 异常处理：恢复状态+显示错误
-                progressBar.style.width = "100%";
-                progressBar.style.backgroundColor = "#f56565";
-                showTips(`❌ 登录失败：${err.message}`, "error");
-                loginBtn.disabled = false;
-                loginBtn.textContent = "登录API";
+                log("策略启动失败：" + err.message);
             }
         });
 
-        // 登出逻辑
-        document.getElementById("logoutBtn").addEventListener("click", () => {
-            localStorage.removeItem("okx_api");
-            location.reload();
-        });
-
-        // 启动机器人逻辑
-        document.getElementById("startRobotBtn").addEventListener("click", async () => {
-            if (!isLogin) {
-                showTips("请先完成API登录！", "error");
-                return;
-            }
-            const apiInfo = JSON.parse(localStorage.getItem("okx_api"));
-            const params = {
-                ...apiInfo,
-                gridLevels: parseInt(document.getElementById("gridLevels").value),
-                atrMulti: parseFloat(document.getElementById("atrMulti").value)
-            };
-            showTips("启动网格策略...", "loading");
+        // 停止策略
+        document.getElementById("stop-btn").addEventListener("click", async function() {
             try {
-                const res = await fetch(`${BASE_API_URL}/start_grid`, {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify(params)
-                });
+                const res = await fetch(`${API_BASE}/stop_grid`, { method: "POST" });
                 const data = await res.json();
-                if (data.status !== "success") throw new Error(data.msg);
-                robotRunning = true;
-                document.getElementById("startRobotBtn").style.display = "none";
-                document.getElementById("stopRobotBtn").style.display = "inline-block";
-                document.getElementById("robotStatus").style.color = "#48bb78";
-                document.getElementById("robotStatus").textContent = "已登录 | 机器人运行中";
-                document.getElementById("basePrice").textContent = data.basePrice;
-                document.getElementById("gridSpacing").textContent = data.gridSpacing;
-                document.getElementById("buyLevels").textContent = data.buyLevels.join(", ");
-                document.getElementById("sellLevels").textContent = data.sellLevels.join(", ");
-                showTips("机器人启动成功！开始低买高卖网格交易", "success");
-                startLogMonitor();
+                
+                if (data.status === "success") {
+                    document.getElementById("current-status").textContent = "当前状态：已登录 | 机器人停止";
+                    document.getElementById("strategy-status").textContent = "已就绪，可启动策略";
+                    document.getElementById("start-btn").disabled = false;
+                    document.getElementById("stop-btn").disabled = true;
+                    log("策略停止成功");
+                }
             } catch (err) {
-                showTips(`❌ 启动失败：${err.message}`, "error");
+                log("策略停止失败：" + err.message);
             }
         });
 
-        // 停止机器人逻辑
-        document.getElementById("stopRobotBtn").addEventListener("click", async () => {
-            try {
-                const res = await fetch(`${BASE_API_URL}/stop_grid`, {method: "POST"});
-                const data = await res.json();
-                if (data.status !== "success") throw new Error(data.msg);
-                robotRunning = false;
-                document.getElementById("stopRobotBtn").style.display = "none";
-                document.getElementById("startRobotBtn").style.display = "inline-block";
-                document.getElementById("robotStatus").style.color = "#999";
-                document.getElementById("robotStatus").textContent = "已登录 | 机器人停止";
-                showTips("机器人已停止，所有挂单已取消", "info");
-            } catch (err) {
-                showTips(`❌ 停止失败：${err.message}`, "error");
-            }
-        });
-
-        // 辅助函数：更新行情表格
-        function updateTicker(ticker) {
-            document.getElementById("tickerTbody").innerHTML = `
-                <tr>
-                    <td>${ticker.instId}</td>
-                    <td style="color:${ticker.change > 0 ? '#f56565' : '#48bb78'}">${ticker.last}</td>
-                    <td style="color:${ticker.change > 0 ? '#f56565' : '#48bb78'}">${ticker.change}%</td>
-                    <td>${ticker.atr}</td>
-                </tr>
-            `;
+        // 加载日志
+        async function loadLogs() {
+            const res = await fetch(`${API_BASE}/get_logs`);
+            const data = await res.json();
+            const logsContainer = document.getElementById("logs-container");
+            logsContainer.innerHTML = data.logs.map(log => `<div>${log}</div>`).join("");
+            logsContainer.scrollTop = logsContainer.scrollHeight;
         }
 
-        // 辅助函数：实时日志监控
-        function startLogMonitor() {
-            const logBox = document.getElementById("logContainer");
-            setInterval(async () => {
-                try {
-                    const res = await fetch(`${BASE_API_URL}/get_logs`);
-                    const data = await res.json();
-                    logBox.innerHTML = data.logs.join("<br>");
-                    logBox.scrollTop = logBox.scrollHeight;
-                } catch (err) {}
-            }, 2000);
+        // 记录日志
+        function log(msg) {
+            const logsContainer = document.getElementById("logs-container");
+            const time = new Date().toLocaleTimeString();
+            logsContainer.innerHTML += `<div>[${time}] ${msg}</div>`;
+            logsContainer.scrollTop = logsContainer.scrollHeight;
         }
+
+        // 定时刷新日志（每5秒）
+        setInterval(loadLogs, 5000);
     </script>
 </body>
 </html>

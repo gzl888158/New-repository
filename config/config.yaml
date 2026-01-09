@@ -1,10 +1,41 @@
-# -------------------------- 策略参数 --------------------------
+# 基础策略配置
 strategy:
-  kline_limit: 100        # 获取K线数据的数量（至少大于ATR周期）
-  atr_period: 14          # ATR指标计算周期（默认14根K线）
+  kline_limit: 100          # K线数据数量
+  atr_period: 14            # ATR计算周期
+  grid_levels: 5            # 初始网格层数
+  atr_multi: 1.2            # 网格间距倍率
+  order_timeout: 30         # 订单超时时间（分钟）
+  grid_expand_threshold: 1  # 价格突破网格后，新增网格数量（1-2档）
 
-# -------------------------- 风控参数 --------------------------
+# 风控核心配置（生死线）
 risk:
-  risk_ratio: 0.1         # 单次策略占用的可用资金比例（10%）
-  leverage: 10            # 合约杠杆倍数（与欧易账户设置一致）
-  min_order_volume: 0.001 # 最小下单量（BTC-USDT-SWAP最小0.001 BTC）
+  max_global_loss_rate: 0.05  # 账户最大亏损比例（5%），触发后禁止启动
+  max_single_position_rate: 0.3  # 单方向最大仓位比例（30%可用资金）
+  take_profit_rate: 0.08      # 单轮策略止盈比例（8%）
+  stop_loss_rate: 0.05        # 单轮策略止损比例（5%）
+  volatility_limit: 0.1       # 1分钟最大波动率（10%），触发异常停机
+  min_order_volume: 0.001     # 最小下单量
+  max_order_volume: 0.01      # 最大下单量
+  leverage: 10                # 杠杆倍数
+
+# 自动化配置
+auto:
+  check_interval: 30          # 全局检查间隔（秒）：止损、订单超时、行情异常
+  retry_times: 3              # API请求重试次数
+  retry_delay: 3              # 重试间隔（秒）
+  position_check_interval: 10 # 仓位/盈亏检查间隔（秒）
+  daily_report_time: "00:00"  # 每日报告生成时间（UTC+0）
+
+# 告警配置
+alert:
+  enable_email_alert: True    # 是否启用邮件告警
+  email_sender: "your-email@xxx.com"  # 发件人邮箱
+  email_password: "your-email-password"  # 邮箱授权码
+  email_receiver: "your-receiver@xxx.com"  # 收件人邮箱
+  smtp_server: "smtp.xxx.com" # SMTP服务器（如QQ邮箱：smtp.qq.com）
+  smtp_port: 465              # SMTP端口（SSL默认465）
+
+# 数据持久化配置
+persistence:
+  data_path: "data/strategy_data.json"  # 策略状态保存路径
+  backup_interval: 600        # 数据备份间隔（秒）

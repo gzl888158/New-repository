@@ -16,7 +16,7 @@ from .okx_api import (
 )
 from .utils import setup_logger, get_logs
 
-# -------------------------- 内置配置（已填入你的API信息） --------------------------
+# -------------------------- 【新增/修改】内置API和网格参数 --------------------------
 BUILTIN_API_INFO = {
     "apiKey": "b9781f6b-08a0-469b-9674-ae3ff3fc9744",
     "apiSecret": "68AA1EAC3B22BEBA32765764D10F163D",
@@ -54,7 +54,7 @@ GLOBAL_STATE = {
     "risk_state": {"daily_loss": 0.0, "consecutive_loss": 0, "trade_count": 0}
 }
 
-# 启动时自动验证API
+# -------------------------- 【新增】启动时自动验证API --------------------------
 @app.on_event("startup")
 async def auto_verify_api():
     try:
@@ -76,14 +76,14 @@ async def auto_verify_api():
         logger.error(f"API自动验证失败：{str(e)}")
         raise SystemExit(f"程序启动失败：API初始化错误")
 
-# 新增：API状态查询接口
+# -------------------------- 【新增】API状态查询接口 --------------------------
 @app.get("/get_api_status")
 async def get_api_status():
     if GLOBAL_STATE["api_info"]:
         return {"status": "success", "msg": "API已验证"}
     return {"status": "failed", "msg": "API未验证"}
 
-# 启动网格策略
+# -------------------------- 【修改】启动网格策略（无需传参） --------------------------
 @app.post("/start_grid")
 async def start_grid():
     global ROBOT_RUNNING
@@ -129,7 +129,7 @@ async def start_grid():
         logger.error(f"策略启动失败：{str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# 停止机器人
+# 停止机器人（无修改）
 @app.post("/stop_grid")
 async def stop_grid():
     global ROBOT_RUNNING
@@ -145,7 +145,7 @@ async def stop_grid():
         logger.error(f"停止失败：{str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# 获取最新日志
+# 获取最新日志（无修改）
 @app.get("/get_logs")
 async def get_logs_api():
     return {"logs": get_logs()[-20:]}

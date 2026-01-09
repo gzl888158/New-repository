@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>欧易合约AI网格交易机器人（自动登录版）</title>
+    <style>
+        body { background: #121212; color: #fff; font-family: sans-serif; padding: 20px; max-width: 1200px; margin: 0 auto; }
+        .status-bar { text-align: center; margin-bottom: 30px; padding: 20px; background: #1e1e1e; border-radius: 8px; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .btn { background: #e53935; border: none; color: #fff; padding: 12px 24px; border-radius: 4px; cursor: pointer; font-size: 16px; margin-right: 10px; }
+        .btn:disabled { background: #555; cursor: not-allowed; }
+        .btn-success { background: #43a047; }
+        .logs-container { height: 250px; overflow-y: auto; background: #2c2c2c; padding: 15px; border-radius: 4px; font-size: 14px; line-height: 1.6; }
+        .param-group { margin: 10px 0; }
+        .error { color: #e53935; margin-top: 10px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="status-bar">
+        <h1>欧易合约AI网格交易机器人</h1>
+        <p id="current-status" style="font-size: 18px; margin-top: 10px;">当前状态：加载中 | 机器人停止</p>
+    </div>
+
+    <div class="card">
+        <h2>策略配置（已内置）</h2>
+        <div class="param-group">交易对：<strong>BTC-USDT-SWAP</strong></div>
+        <div class="param-group">网格层数：<strong>5</strong></div>
+        <div class="param-group">ATR倍率：<strong>1.2</strong></div>
+        <div class="param-group">环境：<strong>实盘</strong></div>
+        <div class="param-group">杠杆倍数：<strong>10倍</strong></div>
+    </div>
+
+    <div class="card">
+        <h2>策略运行状态</h2>
+        <div class="param-group">运行状态：<span id="strategy-status">等待初始化...</span></div>
+        <div class="param-group">基准价：<span id="base-price">--</span> USDT</div>
+        <div class="param-group">网格间距：<span id="grid-spacing">--</span> USDT</div>
+        <div class="param-group">买单档位：<span id="buy-levels">--</span></div>
+        <div class="param-group">卖单档位：<span id="sell-levels">--</span></div>
+        <button id="start-btn" class="btn btn-success" disabled>启动策略</button>
+        <button id="stop-btn" class="btn" disabled>停止策略</button>
+        <div id="operate-error" class="error"></div>
+    </div>
+
+    <div class="card">
+        <h2>运行日志（最新20条）</h2>
+        <div id="logs-container" class="logs-container"></div>
+    </div>
+
+    <script>
+        // -------------------------- 【修改】替换为你的后端IP+端口 --------------------------
+        const API_BASE = "http://127.0.0.1:8000"; // 本地运行时用127.0.0.1，局域网用内网IP
+
+        // 页面加载后自动同步状态
+        window.onload = async function() {
+            try {
+                // 1. 验证API状态
+                const apiRes = await fetch(`${API_BASE}/get_api_status`);
+                if (!apiRes.ok) throw new Error("后端服务未响应");
+                
+                const apiData = await apiRes.json();
+                if (apiData.status === "success") {
+                    document.getElementById("current-status").textContent = "当前状态：已登录 | 机器人停止";
+                    document.getElementById("strategy-status").textContent = "已就绪，可启动策略";
+                    document.getElementById("start-btn").disabled = false;
+                } else {
+                    throw new Error(apiData.msg || "API验证失败");
+                }
+
+                // 2. 加载初始日志
+                await loadLogs();
+                // 3. 定时刷新日志（每5秒）
+                setInterval(loadLogs, 5000);
+            } catch (err) {
+                document.getElementById("current-status").textContent = "当前状态：未登录 | 机器人停止";
+                document.getElementById("operate-error").textContent = "错误：" + err.message;
+            }
+        };
+
+        // 启动策略
+        document.getElementById("start-btn").addEventListener("click", async function() {
+            try {
+                const res = await fetch(`${API_BASE}/start_grid`, { method: "POST" });
+                const data = await res.json();
+                
+                if (data.status === "success") {
+                    document.getElementById("current-status").textContent = "当前状态：已登录 | 机器人运行中";
+                    document.getElementById("strategy-status").textContent = "策略运行中（自动挂单）";
+                    document.getElementById("base-price").textContent = data.basePrice;
+                    document.getElementById("grid-spacing").textContent = data.gridSpacing;
+                    document.getElementById("buy-levels").textContent = data.buyLevels.join(", ");
+                    document.getElementById("sell-levels").textContent = data.sellLevels.join(", ");
+                    document.getElementById("start-btn").disabled = true;
+                    document.getElementById("stop-btn").disabled = false;
+                    document.getElementById("operate-error").textContent = "";
+                    log("策略启动成功：已挂单买单" + data.buyLevels.length + "档，卖单" + data.sellLevels.length + "档");
+                }
+            } catch (err) {
+                document.getElementById("operate-error").textContent = "启动失败：" + err.message;
+                log("策略启动失败：" + err.message);
+            }
+        });
+
+        // 停止策略
+        document.getElementById("stop-btn").addEventListener("click", async function() {
+            try {
+                const res = await fetch(`${API_BASE}/stop_grid`, { method: "POST" });
+                const data = await res.json();
+                
+                if (data.status === "success") {
+                    document.getElementById("current-status").textContent = "当前状态：已登录 | 机器人停止";
+                    document.getElementById("strategy-status").textContent = "已就绪，可启动策略";
+                    document.getElementById("start-btn").disabled = false;
+                    document.getElementById("stop-btn").disabled = true;
+                    document.getElementById("operate-error").textContent = "";
+                    log("策略停止成功：所有挂单已取消");
+                }
+            } catch (err) {
+                document.getElementById("operate-error").textContent = "停止失败：" + err.message;
+                log("策略停止失败：" + err.message);
+            }
+        });
+
+        // 加载日志
+        async function loadLogs() {
+            try {
+                const res = await fetch(`${API_BASE}/get_logs`);
+                const data = await res.json();
+                const logsContainer = document.getElementById("logs-container");
+                logsContainer.innerHTML = data.logs.map(log => `<div>${log}</div>`).join("");
+                logsContainer.scrollTop = logsContainer.scrollHeight; // 滚动到最新日志
+            } catch (err) {
+                log("日志加载失败：" + err.message);
+            }
+        }
+
+        // 手动添加日志
+        function log(msg) {
+            const logsContainer = document.getElementById("logs-container");
+            const time = new Date().toLocaleTimeString();
+            logsContainer.innerHTML += `<div>[${time}] ${msg}</div>`;
+            logsContainer.scrollTop = logsContainer.scrollHeight;
+        }
+    </script>
+</body>
+</html>

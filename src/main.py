@@ -18,15 +18,15 @@ from .utils import setup_logger, get_logs
 
 # -------------------------- 内置配置（已填入你的API信息） --------------------------
 BUILTIN_API_INFO = {
-    "apiKey": "b9781f6b-08a0-469b-9674-ae3ff3fc9744",       # 你的API Key
-    "apiSecret": "68AA1EAC3B22BEBA32765764D10F163D",     # 你的Secret
-    "apiPassphrase": "Gzl123.@", # 你的Passphrase
-    "instId": "BTC-USDT-SWAP",        # 交易对（与界面一致）
-    "env": "实盘"                     # 环境："实盘"或"模拟盘"
+    "apiKey": "b9781f6b-08a0-469b-9674-ae3ff3fc9744",
+    "apiSecret": "68AA1EAC3B22BEBA32765764D10F163D",
+    "apiPassphrase": "Gzl123.@",
+    "instId": "BTC-USDT-SWAP",
+    "env": "实盘"
 }
 BUILTIN_GRID_PARAMS = {
-    "atrMulti": 1.2,  # 网格倍率（与界面一致）
-    "gridLevels": 5   # 网格层数（与界面一致）
+    "atrMulti": 1.2,
+    "gridLevels": 5
 }
 # -----------------------------------------------------------------------------------
 
@@ -57,7 +57,6 @@ GLOBAL_STATE = {
 # 启动时自动验证API
 @app.on_event("startup")
 async def auto_verify_api():
-    """启动时自动完成API验证，无需手动输入"""
     try:
         uid = verify_api(
             BUILTIN_API_INFO["apiKey"], BUILTIN_API_INFO["apiSecret"],
@@ -77,10 +76,16 @@ async def auto_verify_api():
         logger.error(f"API自动验证失败：{str(e)}")
         raise SystemExit(f"程序启动失败：API初始化错误")
 
-# 启动网格策略（自动使用内置参数）
+# 新增：API状态查询接口
+@app.get("/get_api_status")
+async def get_api_status():
+    if GLOBAL_STATE["api_info"]:
+        return {"status": "success", "msg": "API已验证"}
+    return {"status": "failed", "msg": "API未验证"}
+
+# 启动网格策略
 @app.post("/start_grid")
 async def start_grid():
-    """启动网格交易，无需手动传参"""
     global ROBOT_RUNNING
     if ROBOT_RUNNING:
         raise HTTPException(status_code=400, detail="机器人已处于运行状态")
@@ -88,32 +93,27 @@ async def start_grid():
         api_info = GLOBAL_STATE["api_info"]
         params = {**BUILTIN_GRID_PARAMS, "instId": api_info["instId"], "env": api_info["env"]}
 
-        # 获取K线与ATR
         candles = fetch_candles(params["instId"], "15m", CONFIG["strategy"]["kline_limit"], params["env"])
         atr = calculate_atr(candles, CONFIG["strategy"]["atr_period"])
         last_price = candles[-1]["close"]
         if atr == 0:
             raise Exception("ATR指标计算失败（K线数据异常）")
         
-        # 计算网格档位
         grid_spacing = atr * params["atrMulti"]
         grid_levels = params["gridLevels"]
         buy_levels = [round(last_price - grid_spacing * i, 4) for i in range(1, grid_levels+1)]
         sell_levels = [round(last_price + grid_spacing * i, 4) for i in range(1, grid_levels+1)]
         
-        # 风控计算下单量
         account = get_account_info(api_info["apiKey"], api_info["apiSecret"], api_info["apiPassphrase"], api_info["env"])
         balance = float(account["available"])
         order_volume = (balance * CONFIG["risk"]["risk_ratio"]) / (grid_spacing * CONFIG["risk"]["leverage"])
         order_volume = max(order_volume, CONFIG["risk"]["min_order_volume"])
         
-        # 挂网格订单
         place_grid_orders(
             params["instId"], buy_levels, sell_levels, order_volume,
             api_info["apiKey"], api_info["apiSecret"], api_info["apiPassphrase"], api_info["env"]
         )
         
-        # 更新状态
         ROBOT_RUNNING = True
         GLOBAL_STATE["grid_params"] = {
             "base_price": last_price, "grid_spacing": grid_spacing,
@@ -132,7 +132,6 @@ async def start_grid():
 # 停止机器人
 @app.post("/stop_grid")
 async def stop_grid():
-    """停止机器人并取消所有挂单"""
     global ROBOT_RUNNING
     if not ROBOT_RUNNING:
         raise HTTPException(status_code=400, detail="机器人未运行")
@@ -149,7 +148,6 @@ async def stop_grid():
 # 获取最新日志
 @app.get("/get_logs")
 async def get_logs_api():
-    """获取最近20条运行日志"""
     return {"logs": get_logs()[-20:]}
 
 if __name__ == "__main__":

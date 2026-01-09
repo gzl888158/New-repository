@@ -1,21 +1,10 @@
-# 策略参数
+# -------------------------- 策略参数 --------------------------
 strategy:
-  kline_limit: 100
-  atr_period: 14
-  atr_tp_multiplier: 2.0
-  atr_sl_multiplier: 1.0
+  kline_limit: 100        # 获取K线数据的数量（至少大于ATR周期）
+  atr_period: 14          # ATR指标计算周期（默认14根K线）
 
-# 风控参数
+# -------------------------- 风控参数 --------------------------
 risk:
-  leverage: 5
-  risk_ratio: 0.02  # 单次风险占账户2%
-  max_daily_loss: 0.1  # 单日最大亏损10%
-  max_consecutive_loss: 3  # 最大连续亏损次数
-  daily_trade_limit: 20  # 单日最大交易次数
-  min_order_volume: 0.001  # 最小下单量
-
-# 欧易API配置
-okx:
-  real_base_url: "https://www.okx.com"
-  sim_base_url: "https://www.okx.com/testnet"
-  timeout: 10
+  risk_ratio: 0.1         # 单次策略占用的可用资金比例（10%）
+  leverage: 10            # 合约杠杆倍数（与欧易账户设置一致）
+  min_order_volume: 0.001 # 最小下单量（BTC-USDT-SWAP最小0.001 BTC）

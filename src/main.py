@@ -18,14 +18,16 @@ from .utils import (
     setup_logger, init_data_persistence, save_strategy_state,
     update_profit_loss, load_strategy_state, send_alert,
     generate_daily_report, calculate_rsi, calculate_macd,
-    judge_trend, backtest_strategy
+    judge_trend, backtest_strategy, calculate_atr,  # 补充缺失的calculate_atr
+    save_coin_state, set_current_coin, update_funds_distribution  # 补充缺失的工具函数
 )
 
 # -------------------------- 初始化配置 --------------------------
 logger = setup_logger()
 
-# 加载配置文件
-with open("config/config.yaml", "r", encoding="utf-8") as f:
+# 修正配置文件路径为绝对路径（适配任意运行目录）
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "config.yaml")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = yaml.safe_load(f)
 
 # 内置API信息
@@ -37,7 +39,8 @@ BUILTIN_API_INFO = {
 }
 
 # 初始化数据持久化
-init_data_persistence(CONFIG["persistence"]["data_path"])
+DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), CONFIG["persistence"]["data_path"])
+init_data_persistence(DATA_PATH)
 
 # 全局状态
 GLOBAL_STATE = {
@@ -205,7 +208,7 @@ def global_check_task():
             logger.info(f"已自动减仓50%，降低爆仓风险")
 
         # 2. 检查止损/止盈（单币种）
-        coin_state = load_strategy_state(CONFIG["persistence"]["data_path"])["coin_states"].get(instId, {})
+        coin_state = load_strategy_state(DATA_PATH)["coin_states"].get(instId, {})
         total_pnl = coin_state.get("profit", 0.0) - coin_state.get("loss", 0.0)
         coin_funds = GLOBAL_STATE["funds_distribution"][instId]
         if total_pnl <= -coin_funds * GLOBAL_STATE["risk_params"]["stop_loss_rate"]:
@@ -220,7 +223,7 @@ def global_check_task():
             new_coin = select_best_coin()
             if new_coin:
                 GLOBAL_STATE["current_coin"] = new_coin
-                set_current_coin(CONFIG["persistence"]["data_path"], new_coin)
+                set_current_coin(DATA_PATH, new_coin)
                 start_strategy(new_coin)
         elif total_pnl >= coin_funds * GLOBAL_STATE["risk_params"]["take_profit_rate"]:
             logger.info(f"{instId}触发止盈：总盈亏{total_pnl:.2f} USDT")
@@ -233,7 +236,7 @@ def global_check_task():
             new_coin = select_best_coin()
             if new_coin:
                 GLOBAL_STATE["current_coin"] = new_coin
-                set_current_coin(CONFIG["persistence"]["data_path"], new_coin)
+                set_current_coin(DATA_PATH, new_coin)
                 start_strategy(new_coin)
 
         # 3. 检查订单超时（省略，同V2.0逻辑）
@@ -265,7 +268,7 @@ def coin_monitor_task():
                 stop_strategy(GLOBAL_STATE["current_coin"])
             # 切换到新币种
             GLOBAL_STATE["current_coin"] = best_coin
-            set_current_coin(CONFIG["persistence"]["data_path"], best_coin)
+            set_current_coin(DATA_PATH, best_coin)
             start_strategy(best_coin)
     except Exception as e:
         logger.error(f"多币种监控任务失败：{str(e)}")
@@ -276,7 +279,7 @@ def coin_monitor_task():
 def daily_report_task():
     """每日报告生成"""
     try:
-        report_content = generate_daily_report(CONFIG["persistence"]["data_path"])
+        report_content = generate_daily_report(DATA_PATH)
         send_alert(
             GLOBAL_STATE["alert_config"],
             f"【每日报告】欧易网格机器人运行报告（{datetime.now().strftime('%Y%m%d')}）",
@@ -305,6 +308,9 @@ def daily_report_task():
 def start_strategy(instId):
     """启动单个币种策略"""
     try:
+        # 补充risk_ratio参数（原配置中缺失，默认0.1）
+        risk_ratio = GLOBAL_STATE["risk_params"].get("risk_ratio", 0.1)
+        
         # 1. 获取基础数据
         candles = fetch_candles(instId, "15m", GLOBAL_STATE["strategy_params"]["kline_limit"], BUILTIN_API_INFO["env"])
         atr = calculate_atr(candles, GLOBAL_STATE["strategy_params"]["atr_period"])
@@ -333,7 +339,7 @@ def start_strategy(instId):
 
         # 5. 资金分配与下单量
         coin_funds = GLOBAL_STATE["funds_distribution"][instId]
-        order_volume = (coin_funds * GLOBAL_STATE["risk_params"]["risk_ratio"]) / (grid_spacing * leverage)
+        order_volume = (coin_funds * risk_ratio) / (grid_spacing * leverage)
         order_volume = max(min(order_volume, GLOBAL_STATE["risk_params"]["max_order_volume"]), GLOBAL_STATE["risk_params"]["min_order_volume"])
         order_volume = round(order_volume, 4)
 
@@ -346,7 +352,7 @@ def start_strategy(instId):
         )
 
         # 7. 保存状态
-        save_coin_state(CONFIG["persistence"]["data_path"], instId, {
+        save_coin_state(DATA_PATH, instId, {
             "is_running": True,
             "base_price": current_price,
             "grid_spacing": grid_spacing,
@@ -374,7 +380,7 @@ def stop_strategy(instId):
     """停止单个币种策略"""
     try:
         # 取消订单
-        coin_state = load_strategy_state(CONFIG["persistence"]["data_path"])["coin_states"].get(instId, {})
+        coin_state = load_strategy_state(DATA_PATH)["coin_states"].get(instId, {})
         order_ids = coin_state.get("order_ids", [])
         if order_ids:
             cancel_orders(
@@ -383,7 +389,7 @@ def stop_strategy(instId):
                 BUILTIN_API_INFO["apiPassphrase"], BUILTIN_API_INFO["env"]
             )
         # 更新状态
-        save_coin_state(CONFIG["persistence"]["data_path"], instId, {
+        save_coin_state(DATA_PATH, instId, {
             "is_running": False,
             "order_ids": []
         })
@@ -415,12 +421,12 @@ async def auto_verify_api():
         GLOBAL_STATE["total_funds"] = account_info["total"]
         # 计算资金分配
         GLOBAL_STATE["funds_distribution"] = calculate_funds_distribution(account_info["total"])
-        update_funds_distribution(CONFIG["persistence"]["data_path"], GLOBAL_STATE["funds_distribution"])
+        update_funds_distribution(DATA_PATH, GLOBAL_STATE["funds_distribution"])
         # 筛选初始最优币种
         initial_coin = select_best_coin()
         if initial_coin:
             GLOBAL_STATE["current_coin"] = initial_coin
-            set_current_coin(CONFIG["persistence"]["data_path"], initial_coin)
+            set_current_coin(DATA_PATH, initial_coin)
         logger.info(f"API自动验证成功 | 账户UID：{uid} | 总资金：{account_info['total']:.2f} USDT | 初始币种：{initial_coin or '未选择'}")
     except Exception as e:
         logger.error(f"API自动验证失败：{str(e)}")
@@ -454,7 +460,7 @@ async def start_strategy_api(instId: str = Query(None)):
         # 启动定时任务
         GLOBAL_STATE["is_running"] = True
         GLOBAL_STATE["current_coin"] = target_coin
-        set_current_coin(CONFIG["persistence"]["data_path"], target_coin)
+        set_current_coin(DATA_PATH, target_coin)
         # 启动策略
         start_strategy(target_coin)
         # 启动定时任务
@@ -498,8 +504,8 @@ async def get_market_data(instId: str):
     """获取实时行情、盘口、成交明细"""
     try:
         ticker = fetch_ticker(instId, BUILTIN_API_INFO["env"])
-        order_book = fetch_order_book(instId, depth=5, env=BUILTIN_API_INFO["env"])
-        trades = fetch_trades(instId, limit=100, env=BUILTIN_API_INFO["env"])
+        order_book = fetch_order_book(instId, BUILTIN_API_INFO["env"], depth=5)  # 修正参数顺序
+        trades = fetch_trades(instId, BUILTIN_API_INFO["env"], limit=100)  # 修正参数顺序
         candles = fetch_candles(instId, "1m", 60, BUILTIN_API_INFO["env"])  # 1分钟K线（最近60根）
         return {
             "ticker": ticker,
@@ -553,7 +559,7 @@ async def remote_control_api(command: str):
                     "is_running": GLOBAL_STATE["is_running"],
                     "current_coin": GLOBAL_STATE["current_coin"],
                     "total_funds": GLOBAL_STATE["total_funds"],
-                    "total_profit": load_strategy_state(CONFIG["persistence"]["data_path"])["total_profit"]
+                    "total_profit": load_strategy_state(DATA_PATH)["total_profit"]
                 }
             }
         else:
@@ -564,7 +570,8 @@ async def remote_control_api(command: str):
 @app.get("/get_logs")
 async def get_logs_api():
     """获取运行日志"""
-    log_file = f"logs/robot_{datetime.now().strftime('%Y%m%d')}.log"
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    log_file = os.path.join(log_dir, f"robot_{datetime.now().strftime('%Y%m%d')}.log")
     if not os.path.exists(log_file):
         return {"logs": ["日志文件未生成"]}
     with open(log_file, "r", encoding="utf-8") as f:

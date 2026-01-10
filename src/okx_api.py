@@ -6,6 +6,12 @@ from urllib.parse import urljoin
 import json
 from .utils import request_retry
 
+# -------------------------- 代理配置（新增） --------------------------
+PROXIES = {
+    "http": "http://你的代理地址:端口",
+    "https": "http://你的代理地址:端口"
+}
+
 # -------------------------- 基础配置（无修改） --------------------------
 def get_okx_domain(env):
     if env == "实盘":
@@ -37,7 +43,8 @@ def verify_api(api_key, api_secret, api_passphrase, instId, env):
         "Content-Type": "application/json"
     }
     
-    response = requests.get(url, headers=headers, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, headers=headers, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -49,7 +56,8 @@ def fetch_ticker(instId, env):
     domain = get_okx_domain(env)
     path = f"/api/v5/market/ticker?instId={instId}"
     url = urljoin(domain, path)
-    response = requests.get(url, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -69,7 +77,8 @@ def fetch_candles(instId, bar, limit, env):
     domain = get_okx_domain(env)
     path = f"/api/v5/market/candles?instId={instId}&bar={bar}&limit={limit}"
     url = urljoin(domain, path)
-    response = requests.get(url, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -87,12 +96,13 @@ def fetch_candles(instId, bar, limit, env):
     return candles
 
 @request_retry(retry_times=3, retry_delay=3)
-def fetch_order_book(instId, depth=5, env):
+def fetch_order_book(instId, env, depth=5):
     """获取盘口深度数据（买一到买五、卖一到卖五）"""
     domain = get_okx_domain(env)
     path = f"/api/v5/market/books?instId={instId}&sz={depth}"
     url = urljoin(domain, path)
-    response = requests.get(url, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -105,12 +115,13 @@ def fetch_order_book(instId, depth=5, env):
     return {"bids": bids, "asks": asks, "timestamp": int(book["ts"]) / 1000}
 
 @request_retry(retry_times=3, retry_delay=3)
-def fetch_trades(instId, limit=100, env):
+def fetch_trades(instId, env, limit=100):
     """获取实时成交明细（最近100笔）"""
     domain = get_okx_domain(env)
     path = f"/api/v5/market/trades?instId={instId}&limit={limit}"
     url = urljoin(domain, path)
-    response = requests.get(url, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -141,7 +152,8 @@ def get_account_info(api_key, api_secret, api_passphrase, env):
         "Content-Type": "application/json"
     }
     
-    response = requests.get(url, headers=headers, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, headers=headers, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -172,7 +184,8 @@ def get_all_positions(api_key, api_secret, api_passphrase, env):
         "Content-Type": "application/json"
     }
     
-    response = requests.get(url, headers=headers, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, headers=headers, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -206,7 +219,8 @@ def get_position_risk(api_key, api_secret, api_passphrase, instId, env):
         "Content-Type": "application/json"
     }
     
-    response = requests.get(url, headers=headers, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, headers=headers, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -262,7 +276,8 @@ def place_grid_orders(instId, buy_levels, sell_levels, volume, api_key, api_secr
             "OK-ACCESS-PASSPHRASE": api_passphrase,
             "Content-Type": "application/json"
         }
-        response = requests.post(url, headers=headers, data=body, timeout=5)
+        # 添加代理参数
+        response = requests.post(url, headers=headers, data=body, timeout=10, proxies=PROXIES)
         response.raise_for_status()
         data = response.json()
         if data["code"] != "0":
@@ -289,7 +304,8 @@ def cancel_orders(instId, order_ids, api_key, api_secret, api_passphrase, env):
             "OK-ACCESS-PASSPHRASE": api_passphrase,
             "Content-Type": "application/json"
         }
-        response = requests.post(url, headers=headers, data=body, timeout=5)
+        # 添加代理参数
+        response = requests.post(url, headers=headers, data=body, timeout=10, proxies=PROXIES)
         response.raise_for_status()
         data = response.json()
         if data["code"] != "0":
@@ -309,7 +325,8 @@ def cancel_all_orders(instId, api_key, api_secret, api_passphrase, env):
         "OK-ACCESS-PASSPHRASE": api_passphrase,
         "Content-Type": "application/json"
     }
-    response = requests.post(url, headers=headers, timeout=5)
+    # 添加代理参数
+    response = requests.post(url, headers=headers, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":
@@ -331,7 +348,8 @@ def query_order_status(instId, order_ids, api_key, api_secret, api_passphrase, e
         "OK-ACCESS-PASSPHRASE": api_passphrase,
         "Content-Type": "application/json"
     }
-    response = requests.get(url, headers=headers, params=params, timeout=5)
+    # 添加代理参数
+    response = requests.get(url, headers=headers, params=params, timeout=10, proxies=PROXIES)
     response.raise_for_status()
     data = response.json()
     if data["code"] != "0":

@@ -1,0 +1,365 @@
+OKX 量化交易系统 —— 企业化升级清单（个人使用版）
+============================================================
+
+文档定位
+------------------------------------------------------------
+本清单基于当前代码库的实盘架构逐目录盘点后产出，目标不是"新增更多功能"，
+而是把已高度完备的系统做"工程化收敛 + 可靠性加固"，使其能单人长期稳定维护、
+快速定位问题、安全升级。所有条目均针对当前真实存在的债务，非假设性需求。
+
+优先级约定（沿用既有 P0~P3 习惯）
+  P0 = 止血 / 资金安全 / 系统崩溃级（立即）
+  P1 = 重要 / 可维护性 / 可定位性（近期）
+  P2 = 增强 / 性能 / 体验（中期）
+  P3 = 长期架构演进（远期，按需）
+
+
+============================================================
+一、现状诊断（架构评估结论）
+============================================================
+
+1. 已具备的企业级能力（无需重复建设）
+   - 多策略并行：网格 / 趋势 / 剥头皮 / 套利 / 现货网格 / 现货马丁 +
+     唐奇安突破、布林均值回归、EMA 趋势、动量轮动、资金费率增强、波动率突破过滤
+     共 15 个策略文件（strategies/）。
+   - 阶梯风控：global_risk / strategy_risk / correlation_risk /
+     black_swan_protection / risk_budget_engine / circuit_breaker_v2 /
+     adaptive_controller / profit_optimizer / allocation_agent /
+     portfolio_rebalancer / diversification_optimizer（risk/ 18 文件）。
+   - 智能执行：VWAP / TWAP / 冰山 / 暗池路由 / 智能路由 / 滑点优化 /
+     成交质量追踪（execution/algo_orders/）。
+   - 自适应学习：meta_learner / online_learner / strategy_evolver /
+     knowledge_base / market_regime_detector / performance_feedback /
+     parameter_adaptor（app/services/adaptive_learning/）。
+   - 参数优化：贝叶斯 / 遗传 / 蒙特卡洛 / walk-forward（analysis/parameter_optimization/）。
+   - 监控告警：metrics_collector / performance_monitor / health_scorer /
+     auto_recovery / alert_engine / notification_channels（monitoring/ 11 文件）。
+   - 测试：约 30 个测试文件（单元 / 集成 / 性能）已存在。
+   - 数据迁移骨架：alembic/ 已初始化。
+
+2. 当前三大核心工程债
+   A. 仓库卫生债：根目录堆积 60+ 个一次性调试脚本（_debug_*.py、_tmp_*.py、
+      _check_*.py、_analyze_*.py、_diag_*.py、_review_*.py、_p1_analyze.py、
+      _p2_analyze.py 等），以及 `=`、_analysis_report.md 等垃圾文件。
+   B. 模块冗余债：多个同名/近义模块跨层级重复，职责边界模糊，例如：
+      - execution/execution_monitor.py 与 execution/algo_orders/execution_monitor.py
+      - services/position_manager.py 与 core/position_manager.py
+      - core/circuit_breaker.py 与 risk/circuit_breaker_v2.py
+      - monitoring/alert_manager.py / enhanced_alert_manager.py / alert_engine.py /
+        alert_rules.py 与 core/alert_evaluator.py / core/alert_registry.py
+      - services/trading_scheduler.py 与 core/scheduler.py 与 services/trading_core.py
+      - services/portfolio_manager.py 与 core/portfolio_optimizer.py 与
+        risk/portfolio_rebalancer.py 与 risk/diversification_optimizer.py
+   C. 依赖与文档债：lib/ 目录把数十个第三方库源码直接拷入（PIL/numpy/pandas/
+      matplotlib/aiohttp/redis/sqlalchemy/pydantic 等），既非标准 venv 也非规范
+      vendor；docs/architecture.md 明显过时（仍写 4 策略、tier1 含 BNB，实际
+      tier1 仅 BTC/ETH、策略已 15 个）。
+
+3. 结论：本轮升级聚焦"收敛 + 加固 + 可观测 + 可回滚"，不新增交易逻辑。
+
+
+============================================================
+二、分模块升级清单
+============================================================
+
+------------------------------------------------------------
+模块 1：仓库卫生与代码治理       优先级 P0
+------------------------------------------------------------
+目标：把根目录从"脚本垃圾场"变成"入口清晰"的仓库，消除误读风险。
+
+现状问题：
+  - 根目录混入 60+ 个一次性调试/分析脚本，命名含下划线前缀无统一规则。
+  - 存在 `=` 文件、_analysis_report.md 等非源码残留。
+  - lib/ 目录内嵌第三方库，与 .venv 真实解释器版本可能不一致，存在隐性冲突。
+
+升级内容：
+  (1) 归档而非删除：新建 tools/archive/ 或 scripts/legacy/，把 _debug_*、_tmp_*、
+      _check_*、_analyze_*、_diag_*、_review_* 等一次性脚本整体移入，保留留痕。
+  (2) 删除纯垃圾：`=`、_analysis_report.md、无引用的 _tmp_*.py 直接删除。
+  (3) 明确根目录仅保留：main.py、dashboard_api.py、watchdog.py、start/stop、
+      config.yaml、requirements.txt、pyproject.toml、health_check、README（补）。
+  (4) lib/ 处置：确认 .venv 已含全部依赖后，删除 lib/ 第三方库目录，统一走
+      requirements.txt + .venv；若确需离线 vendor，改为 docs 记录并固定版本。
+
+验收标准：
+  - 根目录 python 源文件数量降至 20 个以内，全部为正式入口/脚本。
+  - `pip freeze` 与 requirements.txt 一致，lib/ 目录已移除。
+  - 系统重启后各策略/风控导入无 ImportError。
+
+
+------------------------------------------------------------
+模块 2：架构收敛与模块去重       优先级 P0
+------------------------------------------------------------
+目标：消除同名/近义模块，建立唯一职责归属，杜绝"改了 A 没改 B"。
+
+现状问题（已实盘确认的重复对）：
+  - execution_monitor（两处）
+  - position_manager（services 与 core 两处）
+  - circuit_breaker（core 与 risk 两处，v1/v2）
+  - alert 体系（monitoring 4 个 + core 2 个，共 6 个告警相关模块）
+  - 调度（services/trading_scheduler、core/scheduler、services/trading_core）
+  - 组合/再平衡（portfolio_manager、portfolio_optimizer、
+    portfolio_rebalancer、diversification_optimizer）
+
+升级内容：
+  (1) 建立"模块唯一归属表"：每个能力只保留一个主实现，其余标记 deprecated
+      或删除，其余模块通过 import 复用主实现。
+  (2) 逐对收敛，先做"引用审计"（grep 谁在 import 谁），确认无活引用后再删。
+  (3) 保留一层薄封装仅在确需兼容旧接口时使用，且必须在 docstring 标注
+      "deprecated，转用 xxx"。
+  (4) 收敛顺序建议：execution_monitor → position_manager → circuit_breaker
+      → alert → scheduler → portfolio。
+
+验收标准：
+  - 每个能力全库仅一个权威实现，grep 同名类不超过 1 个有效定义。
+  - 收敛后系统启动正常，风控/告警/调度日志行为不变。
+
+
+------------------------------------------------------------
+模块 3：依赖管理规范化         优先级 P1
+------------------------------------------------------------
+目标：单一可信依赖来源，可复现安装，锁定版本。
+
+现状问题：
+  - lib/ 内嵌第三方库与 .venv 双轨，版本来源不唯一。
+  - requirements.txt 未锁定精确版本（或与 lib/ 不一致）。
+
+升级内容：
+  (1) 用 `pip freeze > requirements-lock.txt` 生成锁定版本，requirements.txt
+      保留顶层直接依赖（宽松约束），二者并存。
+  (2) 明确 .venv 为唯一运行环境；删除 lib/ 第三方库（见模块 1）。
+  (3) pyproject.toml 补齐 [project] 元数据与可选依赖分组（dev/test/prod）。
+  (4) 记录 Python 版本（当前系统 Python 3.12）与平台（Windows）约束。
+
+验收标准：
+  - 全新 `python -m venv .venv && pip install -r requirements-lock.txt`
+    可完整复现环境并启动系统。
+  - lib/ 目录不再被任何 import 引用。
+
+
+------------------------------------------------------------
+模块 4：配置管理企业化         优先级 P1
+------------------------------------------------------------
+目标：配置可版本化、可校验、可回滚、可溯源。
+
+现状问题：
+  - config.yaml 与 configs/settings.py（Pydantic）+ config_manager.py 并存，
+    已有 config_versions 表，但缺乏统一入口与变更审计闭环。
+
+升级内容：
+  (1) 确立"单一配置事实源"：config.yaml 为唯一入口，Pydantic 负责校验，
+      config_manager 负责加载/热更新/版本快照。
+  (2) 每次配置变更自动落 config_versions（含时间戳、变更摘要、旧值快照）。
+  (3) 增加"配置预检"：启动与热更新前校验必填项、取值范围、非法枚举。
+  (4) 敏感项（API 密钥）从 config.yaml 中剥离，仅走 .env + api_key_manager。
+
+验收标准：
+  - 任一配置变更可从 config_versions 一键回滚。
+  - 非法配置会在启动前被拦截并给出明确报错，而非运行期崩溃。
+
+
+------------------------------------------------------------
+模块 5：数据治理与数据库         优先级 P1
+------------------------------------------------------------
+目标：数据库结构可迁移、可备份、可对账，杜绝 SQLite 死锁与脏数据。
+
+现状问题：
+  - SQLite 多文件（trading.db / tick_data.db / trading_logs.db）。
+  - alembic/ 已初始化但迁移链是否完整未知。
+  - 历史存在 SQLite 死锁、connection 未关闭教训（见项目记忆）。
+
+升级内容：
+  (1) 统一数据库连接管理：单例连接池 + WAL 模式 + busy_timeout，
+      所有裸连接使用后强制 close，再走 SQLAlchemy session。
+  (2) 用 alembic 重建迁移基线：以当前 schema 生成初始 migration，
+      后续结构变更一律走 migration，禁止手改 schema。
+  (3) 每日自动备份 trading.db（保留最近 N 份），备份前执行 integrity_check。
+  (4) 清理 tick_data.db 与 trading_logs.db 的过期数据（按保留策略）。
+
+验收标准：
+  - 迁移链从零可重建当前完整 schema。
+  - 连续运行 24h 无 SQLite 死锁告警。
+  - 数据库损坏可从前一日备份恢复。
+
+
+------------------------------------------------------------
+模块 6：测试体系         优先级 P1
+------------------------------------------------------------
+目标：关键路径（下单/风控/平仓/对账）有可重复的回归保障，改动能放心上线。
+
+现状问题：
+  - 约 30 个测试文件，但分散在 tests/ 根与 tests/unit/，命名不规范
+    （test_xxx.py 与 test_xxx_v2.py 混存）。
+  - 缺少统一的 pytest 配置（pyproject/pytest.ini）。
+  - 关键风控/执行逻辑覆盖率未知。
+
+升级内容：
+  (1) 统一测试目录层级：tests/unit、tests/integration、tests/perf，
+     清理重复的 test_*_v2.py（合并进正式用例）。
+  (2) 在 pyproject.toml 配置 pytest（markers、测试路径、覆盖率阈值）。
+  (3) 优先补齐高风险用例：减仓/平仓 reduce_only 正确性、51169 幽灵仓位清理、
+      429 降级、熔断触发/恢复、订单量 lot/tick 取整、条件单参数。
+  (4) 引入 local_client 做确定性回放，避免测试依赖真实网络。
+
+验收标准：
+  - `pytest` 一键全绿，高风险模块行覆盖率 >= 60%。
+  - 每次改动可先跑相关测试再上线，形成"改动必测"习惯。
+
+
+------------------------------------------------------------
+模块 7：可观测性（日志/监控/告警）         优先级 P1
+------------------------------------------------------------
+目标：任一异常都能在日志/指标中 5 分钟内定位到根因。
+
+现状问题：
+  - 告警模块冗余（6 个），职责重叠。
+  - 日志既有 loguru 又有自研 log_persistence，格式/级别不统一。
+  - 已有 metrics_collector / performance_monitor / apm_monitor，但指标去向
+    与告警联动可能未闭环。
+
+升级内容：
+  (1) 统一日志规范：单一日志门面（loguru），统一格式含 trace_id / event_id，
+      业务日志与错误日志分流，关键路径结构化字段化。
+  (2) 收敛告警为单一入口（见模块 2），定义告警级别/去重/升级策略。
+  (3) 打通"指标采集 → 阈值告警 → 通知渠道（Webhook/Telegram）"闭环。
+  (4) 保留端到端延迟追踪（价格到达→计算→信号→风控→下单，>500ms 标记）。
+
+验收标准：
+  - 任一交易失败/风控触发，日志能回溯到信号来源与决策链路。
+  - 告警去重生效，同一事件不重复轰炸。
+
+
+------------------------------------------------------------
+模块 8：部署与运维         优先级 P1
+------------------------------------------------------------
+目标：一键启停、进程可靠、崩溃自愈、版本可回滚。
+
+现状问题：
+  - 多套启动脚本（start.ps1 / start.py / stop.py / start.bat / stop.bat /
+    watchdog.py / health_check.py/bat / 启动交易系统.bat）逻辑重复且不一致。
+  - start.ps1 已修复 BOM 与进程清理逻辑，但整体仍多入口。
+  - 无容器化，无版本化发布。
+
+升级内容：
+  (1) 收敛为唯一编排入口：start.py（或 start.ps1）作为唯一启动器，其余 bat
+      仅做转发壳，消除逻辑分叉。
+  (2) watchdog 增加"进程树精确识别"（按父子关系，而非命令行模糊匹配，
+      已应用），确保清理/重启不残留 base python。
+  (3) 版本化：git tag + 启动时打印当前 commit/版本，支持快速回滚到上一版本。
+  (4) 健康检查脚本统一输出 JSON 状态，供 dashboard 与告警复用。
+
+验收标准：
+  - 任意时刻 `start` / `stop` 结果确定，无重复进程、无残留锁。
+  - 崩溃后 watchdog 在限定次数内自愈，且不产生重复交易。
+
+
+------------------------------------------------------------
+模块 9：安全与密钥管理         优先级 P1
+------------------------------------------------------------
+目标：密钥不入库、不落日志、不随代码外泄。
+
+现状问题：
+  - 已有 .env + api_key_manager + order_fingerprint_masker + signal_obfuscator，
+    反指纹能力较强。
+  - 但 .env 是否被 .gitignore 覆盖、密钥是否误入日志需确认。
+
+升级内容：
+  (1) 确认 .gitignore 覆盖 .env、data/*.db、logs/*、config_versions 敏感快照。
+  (2) 全局日志脱敏：API Key、clOrdId 关键段、账户余额等敏感字段自动掩码。
+  (3) api_key_manager 增加密钥轮换提醒与失效自检。
+  (4) 下单指纹混淆（order_fingerprint_masker）与信号混淆（signal_obfuscator）
+      纳入回归测试，防止升级破坏反识别能力。
+
+验收标准：
+  - 全量日志/备份中 grep 不到真实 API Key。
+  - 密钥失效能被检测并告警，而非静默下单失败。
+
+
+------------------------------------------------------------
+模块 10：性能与并发         优先级 P2
+------------------------------------------------------------
+目标：高频信号下不丢单、不重复、不过载。
+
+现状问题：
+  - 已有多层异步 + 令牌桶限流 + 429 动态退避 + 查询缓存。
+  - 存在性能火焰图产物（py_spy_profile.json 等）但未形成常态分析。
+
+升级内容：
+  (1) 用 py-spy 定期采样 CPU 热点，定位调度/回测/对账的耗时大头。
+  (2) 统一查询缓存 TTL 策略（tick 120s、账户/持仓短 TTL），避免重复 API 调用。
+  (3) 压力测试：用 local_client 回放历史高峰流量，验证不丢单、不超限。
+  (4) 清理 py_spy_profile*.json 等临时性能产物（归档后删除）。
+
+验收标准：
+  - 高峰回放无 429 风暴、无信号堆积、无内存持续上涨。
+  - 关键接口 P99 延迟有基线数据。
+
+
+------------------------------------------------------------
+模块 11：文档体系         优先级 P2
+------------------------------------------------------------
+目标：文档与代码同步，新人（或 3 个月后的自己）能据此接手。
+
+现状问题：
+  - docs/architecture.md 过时（4 策略、tier1 含 BNB，与实际不符）。
+  - 5 份 md 文档与真实模块清单脱节。
+
+升级内容：
+  (1) 以本清单 + 实际目录为准，重写 architecture.md 的模块清单与分层。
+  (2) 补充"模块唯一归属表"（模块 2 产出）作为权威索引。
+  (3) deployment.md 对齐唯一启动入口与健康检查方式。
+  (4) 删除或归档 docs 中与现状矛盾的内容。
+
+验收标准：
+  - 文档列出的模块/策略/启动方式与代码一一对应。
+
+
+------------------------------------------------------------
+模块 12：策略与风控工程化         优先级 P2
+------------------------------------------------------------
+目标：策略参数变更可验证、可回滚，避免负期望策略长期空转。
+
+现状问题：
+  - 已有 strategy_optimizer / 参数热更新 / 30 分钟验证回滚机制（项目记忆）。
+  - 但负期望策略（历史剥头皮/趋势曾 0% 胜率）仍可能被重新激活空转。
+
+升级内容：
+  (1) 策略上线前强制跑 mini_backtester + stress_test 通过门禁。
+  (2) 参数变更自动记录基线 PnL/胜率，30 分钟验证不达标自动回滚（已有，补齐
+      触发日志与回滚审计）。
+  (3) 负期望/连续亏损策略自动降权或暂停（已有 learn_from_history，补齐
+      明确的"激活前再确认"门槛）。
+  (4) 每个策略定义"退出条件"，长期负期望不再自动重启。
+
+验收标准：
+  - 任一策略参数变更均有基线与回滚记录。
+  - 负期望策略不会在无人工确认下自动恢复到生产。
+
+
+============================================================
+三、实施顺序（建议节奏）
+============================================================
+
+阶段 1（P0，先做，低风险高收益）：
+  - 模块 1（仓库卫生）+ 模块 2（模块去重）
+  这两个是后续一切的基础，且不改变交易行为，风险最低。
+
+阶段 2（P1，稳定性加固）：
+  - 模块 3（依赖）→ 模块 5（数据/DB）→ 模块 8（部署运维）
+  → 模块 7（可观测）→ 模块 4（配置）→ 模块 9（安全）
+
+阶段 3（P1~P2，质量与可维护）：
+  - 模块 6（测试）→ 模块 11（文档）→ 模块 10（性能）→ 模块 12（策略工程化）
+
+说明：每完成一个模块即重启验证一次（当前已具备完整重启与日志校验能力），
+避免多模块叠加导致问题难定位。
+
+
+============================================================
+四、验收总标准
+============================================================
+  - 根目录清爽、模块唯一、依赖可复现、配置可回滚。
+  - 任一关键路径（下单/风控/平仓/对账）有回归测试兜底。
+  - 启动/停止/崩溃自愈结果确定，无重复交易、无残留进程。
+  - 异常 5 分钟内可定位根因；密钥零泄漏。
+  - 文档与代码一致，3 个月后可无痛接手。

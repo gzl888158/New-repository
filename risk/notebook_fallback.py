@@ -1,0 +1,254 @@
+"""负责笔记本环境降级保护：电量、温度、防休眠与进程崩溃监控。"""
+import asyncio
+import psutil
+import platform
+import subprocess
+import os
+import signal
+from datetime import datetime
+from typing import Dict, Any, Optional
+from loguru import logger
+
+
+class NotebookFallbackControl:
+    def __init__(self, config: Dict[str, Any], okx_client, redis_cache):
+        self.config = config
+        self.okx_client = okx_client
+        self.redis_cache = redis_cache
+        
+        self._temp_threshold = config["hardware"]["temperature_threshold"]
+        self._temp_critical = 95
+        self._battery_critical = 10
+        self._battery_warning = 30
+        self._battery_normal = 50
+        
+        self._is_battery_mode = False
+        self._battery_level = 100
+        
+        self._overheating = False
+        self._last_temp_check = datetime.now()
+        
+        self._last_wake_time = datetime.now()
+        self._sleep_prevention_active = True
+        
+        self._process_crashes = {}
+        self._max_crashes = 5
+        self._crash_window = 300
+
+    async def start(self):
+        asyncio.create_task(self._monitor_loop())
+        asyncio.create_task(self._sleep_prevention_loop())
+        asyncio.create_task(self._crash_monitor_loop())
+
+    async def _monitor_loop(self):
+        while True:
+            await self._check_battery()
+            await self._check_temperature()
+            await asyncio.sleep(10)
+
+    async def _check_battery(self):
+        if not self._is_laptop():
+            return
+        
+        battery = psutil.sensors_battery()
+        if battery is None:
+            return
+        
+        self._battery_level = battery.percent
+        self._is_battery_mode = not battery.power_plugged
+        
+        if self._is_battery_mode:
+            logger.warning(f"Battery mode active: {self._battery_level}%")
+            
+            if self._battery_level <= self._battery_critical:
+                logger.critical(f"Battery critically low ({self._battery_level}%), initiating emergency shutdown")
+                await self._emergency_shutdown()
+            
+            elif self._battery_level <= self._battery_warning:
+                logger.warning(f"Battery low ({self._battery_level}%), closing aggressive positions")
+                await self._close_aggressive_positions()
+            
+            elif self._battery_level <= self._battery_normal:
+                logger.info(f"Battery below {self._battery_normal}%, sending alert")
+                await self._send_battery_alert()
+
+    async def _check_temperature(self):
+        try:
+            temps = psutil.sensors_temperatures()
+        except AttributeError:
+            return
+        
+        cpu_temp = 0
+        if "coretemp" in temps:
+            cpu_temp = max(temp.current for temp in temps["coretemp"])
+        elif "cpu_thermal" in temps:
+            cpu_temp = max(temp.current for temp in temps["cpu_thermal"])
+        elif "acpitz" in temps:
+            cpu_temp = max(temp.current for temp in temps["acpitz"])
+        
+        if cpu_temp >= self._temp_critical:
+            logger.critical(f"CPU temperature {cpu_temp}°C critically high, initiating emergency shutdown")
+            await self._emergency_shutdown()
+        elif cpu_temp >= self._temp_threshold:
+            logger.warning(f"CPU temperature {cpu_temp}°C exceeds threshold {self._temp_threshold}°C")
+            if not self._overheating:
+                self._overheating = True
+                await self._handle_overheating()
+        else:
+            self._overheating = False
+
+    async def _handle_overheating(self):
+        logger.error("CPU overheating, pausing high-frequency strategies")
+        await self._pause_high_frequency_strategies()
+
+    async def _emergency_shutdown(self):
+        positions = self.okx_client.get_positions()
+        for pos_data in positions:
+            position = self.okx_client._parse_position(pos_data)
+            if position and float(position.quantity) > 0:
+                side = "sell" if position.side == "long" else "buy"
+                self.okx_client.place_order(
+                    symbol=position.symbol,
+                    side=side,
+                    order_type="market",
+                    quantity=abs(float(position.quantity)),
+                    leverage=position.leverage
+                )
+        
+        logger.critical("All positions closed. System shutting down.")
+        self._sleep_prevention_active = False
+
+    async def _close_aggressive_positions(self):
+        positions = self.okx_client.get_positions()
+        for pos_data in positions:
+            position = self.okx_client._parse_position(pos_data)
+            if position and float(position.quantity) > 0:
+                leverage = position.leverage
+                if leverage >= 8:
+                    side = "sell" if position.side == "long" else "buy"
+                    self.okx_client.place_order(
+                        symbol=position.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=abs(float(position.quantity)),
+                        leverage=position.leverage
+                    )
+
+    async def _pause_high_frequency_strategies(self):
+        pass
+
+    async def _send_battery_alert(self):
+        logger.info(f"Battery alert: {self._battery_level}% remaining")
+
+    async def _sleep_prevention_loop(self):
+        while self._sleep_prevention_active:
+            try:
+                self._prevent_sleep()
+            except Exception as e:
+                logger.error(f"Sleep prevention failed: {e}")
+            await asyncio.sleep(60)
+
+    def _prevent_sleep(self):
+        system = platform.system()
+        if system == "Windows":
+            subprocess.run(
+                ["powercfg", "-change", "-monitor-timeout-ac", "0"],
+                capture_output=True
+            )
+            subprocess.run(
+                ["powercfg", "-change", "-standby-timeout-ac", "0"],
+                capture_output=True
+            )
+            subprocess.run(
+                ["powercfg", "-change", "-hibernate-timeout-ac", "0"],
+                capture_output=True
+            )
+        elif system == "Darwin":
+            subprocess.run(
+                ["caffeinate", "-d", "-i", "-m", "-s"],
+                capture_output=True
+            )
+        elif system == "Linux":
+            subprocess.run(
+                ["xdg-screensaver", "suspend"],
+                capture_output=True,
+                errors="ignore"
+            )
+
+    async def _crash_monitor_loop(self):
+        while True:
+            await self._check_process_crashes()
+            await asyncio.sleep(60)
+
+    async def _check_process_crashes(self):
+        current_time = datetime.now().timestamp()
+        
+        for process_name, crashes in list(self._process_crashes.items()):
+            self._process_crashes[process_name] = [
+                crash_time for crash_time in crashes 
+                if current_time - crash_time < self._crash_window
+            ]
+            
+            if not self._process_crashes[process_name]:
+                del self._process_crashes[process_name]
+
+    def report_crash(self, process_name: str):
+        current_time = datetime.now().timestamp()
+        
+        if process_name not in self._process_crashes:
+            self._process_crashes[process_name] = []
+        
+        self._process_crashes[process_name].append(current_time)
+        
+        crash_count = len(self._process_crashes[process_name])
+        logger.warning(f"Process {process_name} crashed {crash_count} times in last {self._crash_window}s")
+        
+        if crash_count >= self._max_crashes:
+            logger.error(f"Process {process_name} exceeded max crashes ({self._max_crashes}), stopping strategy")
+            return False
+        
+        return True
+
+    def _is_laptop(self) -> bool:
+        system = platform.system()
+        if system == "Windows":
+            try:
+                result = subprocess.run(
+                    ["powercfg", "/query"],
+                    capture_output=True,
+                    text=True
+                )
+                return "Battery" in result.stdout
+            except:
+                return True
+        elif system == "Darwin":
+            try:
+                result = subprocess.run(
+                    ["system_profiler", "SPPowerDataType"],
+                    capture_output=True,
+                    text=True
+                )
+                return "Battery Information" in result.stdout
+            except:
+                return True
+        return False
+
+    def get_battery_status(self) -> Dict[str, Any]:
+        return {
+            "level": self._battery_level,
+            "is_battery_mode": self._is_battery_mode,
+            "overheating": self._overheating
+        }
+
+    def get_system_status(self) -> Dict[str, Any]:
+        cpu_usage = psutil.cpu_percent()
+        memory_usage = psutil.virtual_memory().percent
+        
+        return {
+            "cpu_usage": cpu_usage,
+            "memory_usage": memory_usage,
+            "battery_level": self._battery_level,
+            "is_battery_mode": self._is_battery_mode,
+            "overheating": self._overheating,
+            "process_crashes": self._process_crashes
+        }

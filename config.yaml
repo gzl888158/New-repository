@@ -1,0 +1,1857 @@
+currencies:
+  tier1_settings:
+    leverage_min: 2
+    leverage_max: 5
+    leverage_default: 3
+    position_limit: 0.25
+    grid_spacing_min: 0.0114
+    grid_spacing_max: 0.012
+    slippage: 0.001
+  tier1_symbols:
+  - ETH
+  tier2_settings:
+    leverage_min: 3
+    leverage_max: 5
+    leverage_default: 5
+    position_limit: 0.25
+    grid_spacing_min: 0.0114
+    grid_spacing_max: 0.018
+    slippage: 0.0015
+  tier2_symbols:
+  - SOL
+  - XRP
+  - DOGE
+  tier3_settings:
+    leverage_min: 2
+    leverage_max: 5
+    leverage_default: 3
+    position_limit: 0.25
+    grid_spacing_min: 0.0114
+    grid_spacing_max: 0.025
+    slippage: 0.002
+  tier3_symbols:
+  - SUI
+trade_cost:
+  fetch_realtime_fee: true
+  fee_cache_ttl: 3600
+  default_level: Lv1
+  fee_schedule: {}
+execution:
+  asyncio_workers: 4
+  batch_processing_size: 10
+  concurrent_strategies: 8
+  max_parallel_tasks: 16
+  order_priority:
+  - reduce_order
+  - conditional_order
+  - limit_order
+  rate_limit:
+    rest_requests_per_second: 5
+    websocket_requests_per_second: 10
+  reconciliation_interval: 10
+  retry_attempts: 3
+  slippage_tolerance: 0.001
+  orphan_position_auto_close: false
+  no_trade_volatility_threshold: 0.1
+  thread_pool_size: 8
+  idempotency_enabled: true
+  idempotency_prefix: okxqt
+  clordid_cache_size: 1000
+  clordid_cache_ttl_sec: 3600
+  retry_base_delay_sec: 1.0
+  retry_max_delay_sec: 60.0
+  retry_jitter_pct: 0.3
+  retry_multiplier: 2.0
+  partial_fill_enabled: true
+  partial_fill_action: cancel_remaining
+  partial_fill_min_fill_ratio: 0.5
+  partial_fill_max_wait_sec: 10.0
+  partial_fill_tracker_ttl_sec: 300.0
+  persist_active_orders: true
+  fill_reconcile_interval_sec: 30
+websocket:
+  enabled: true
+  ping_interval: 20
+  pong_timeout: 20
+  data_timeout: 90
+  reconnect_base: 1.0
+  reconnect_max: 30.0
+  reconnect_jitter: 0.3
+  buffer_size: 10000
+  public_channels:
+    tickers: true
+    books_depth: 5
+    trades: false
+    mark_price: false
+  private_channels:
+    positions: true
+    orders: true
+    account: true
+strategy_engine:
+  default_mode: normal
+  production_pipeline_enabled: true
+  pre_trade_risk_check: true
+  capital_check_enabled: true
+  session_check_enabled: true
+  metrics_enabled: true
+  notifications_enabled: true
+  max_risk_score_for_open: 0.7
+  max_risk_score_for_trade: 0.85
+  market_drawdown_aggressive: 0.05
+  market_drawdown_conservative: 0.1
+  market_drawdown_emergency: 0.18
+  vol_spike_to_conservative: 0.85
+  vol_calm_to_aggressive: 0.25
+  daily_loss_to_conservative_pct: 0.03
+  daily_loss_to_emergency_pct: 0.08
+position_manager:
+  enabled: true
+  sync_interval_sec: 3
+  risk_check_interval_sec: 5
+  max_total_positions: 12
+  max_positions_per_symbol: 2
+  max_positions_per_strategy: 5
+  risk_linkage:
+    drawdown_trigger: 0.15
+    drawdown_reduce_pct: 0.3
+    margin_ratio_warning: 0.5
+    margin_ratio_critical: 0.3
+    position_loss_limit: 0.1
+  dynamic_adjust:
+    enabled: true
+    rebalance_interval: 300
+    max_adjust_per_iter: 0.1
+    min_position_value: 5.0
+  persistence:
+    enabled: true
+    save_interval: 60
+    max_snapshots: 100
+equity_monitor:
+  emergency_drop_pct: 0.1
+  emergency_recovery_pct: 0.05
+  deposit_detect_pct: 0.05
+  save_interval: 60
+  ema_alpha: 0.05
+  trend_confirm_bars: 5
+hardware:
+  cpu_cores: 4
+  high_priority_cores:
+  - 0
+  - 1
+  logical_processors: 8
+  low_priority_cores:
+  - 4
+  - 5
+  - 6
+  - 7
+  max_cpu_usage: 80
+  max_memory_usage_mb: 2048
+  medium_priority_cores:
+  - 2
+  - 3
+  memory_warning_threshold_mb: 1536
+  temperature_threshold: 85.0
+monitoring:
+  alert_webhook: ${ALERT_WEBHOOK}
+  api_latency_critical_ms: 8000
+  api_latency_warning_ms: 3000
+  metrics_port: 9090
+notification:
+  enabled: true
+  batch_window_sec: 5.0
+  max_batch_size: 10
+  queue_max_size: 10000
+  silent_hours:
+  - start: 0
+    end: 6
+  channels:
+    console:
+      enabled: true
+      rate_limit_per_min: 120
+      rate_limit_per_hour: 1000
+    telegram:
+      enabled: false
+      auth_token: ${TELEGRAM_BOT_TOKEN}
+      chat_id: ${TELEGRAM_CHAT_ID}
+      rate_limit_per_min: 20
+      rate_limit_per_hour: 200
+      batch_window_sec: 10.0
+      max_batch_size: 5
+      retry_count: 3
+      retry_delay_sec: 2.0
+      timeout_sec: 10.0
+      circuit_breaker_threshold: 5
+      circuit_breaker_cooldown: 120.0
+    webhook:
+      enabled: false
+      endpoint: ''
+      auth_token: ''
+      rate_limit_per_min: 30
+      rate_limit_per_hour: 300
+      timeout_sec: 10.0
+      circuit_breaker_threshold: 5
+      circuit_breaker_cooldown: 120.0
+    email:
+      enabled: false
+      endpoint: ''
+      rate_limit_per_min: 10
+      rate_limit_per_hour: 100
+  templates:
+    risk_alert: '[风险告警] {severity_label} - {dimension}
+
+      数值: {value:.2%}
+
+      阈值: {threshold:.2%}
+
+      级别: {level}
+
+      时间: {timestamp}
+
+      建议: {suggestion}
+
+      '
+    trade_signal: '[交易信号] {symbol} {direction}
+
+      类型: {signal_type}
+
+      价格: {price:.4f}
+
+      数量: {quantity}
+
+      置信度: {confidence:.2%}
+
+      '
+    daily_report: '[每日报告] {date}
+
+      总盈亏: {total_pnl:+.2f} USDT
+
+      成交笔数: {total_trades}
+
+      胜率: {win_rate:.1%}
+
+      手续费: {total_fees:.2f} USDT
+
+      最大回撤: {max_drawdown:.2%}
+
+      策略表现: {strategy_performance}
+
+      '
+okx:
+  api_key: ${OKX_API_KEY}
+  is_testnet: false
+  passphrase: ${OKX_PASSPHRASE}
+  proxy: http://127.0.0.1:7897
+  rest_url: https://www.okx.com
+  secret_key: ${OKX_SECRET_KEY}
+  websocket_private_url: wss://ws.okx.com:8443/ws/v5/private
+  websocket_url: wss://ws.okx.com:8443/ws/v5/public
+redis:
+  db: 0
+  enabled: false
+  host: 127.0.0.1
+  password: ${REDIS_PASSWORD}
+  port: 6379
+risk:
+  black_swan:
+    btc_flash_crash_pct: 0.03
+    btc_volatility_spike_pct: 0.05
+    check_interval_seconds: 10
+    emergency_full_close_pct: 0.12
+    enabled: true
+    flash_crash_window_seconds: 300
+    market_circuit_breaker_pct: 0.08
+    volatility_window_minutes: 60
+  circuit_breakers:
+    api_timeout: 30
+    btc_movement_threshold: 0.05
+    btc_movement_window: 60
+    drawdown_acceleration_threshold: 0.01
+    liquidation_volume_threshold: 1000000
+    liquidation_window: 300
+    network_timeout: 120
+    rapid_drawdown_threshold: 0.03
+    rapid_drawdown_window: 60
+  correlation:
+    check_interval_seconds: 300
+    kline_bar: 1H
+    lookback_bars: 50
+    max_concentration: 0.4
+    reduce_ratio: 0.5
+    threshold: 0.7
+  full_close_threshold: 0.2
+  margin_call_threshold: 0.3
+  margin_warning_threshold: 0.5
+  max_symbol_position_ratio: 0.7
+  network_timeout_threshold: 300
+  emergency_cooldown_seconds: 300
+  position_loss_threshold: 0.1
+sqlite:
+  db_path: data/trading.db
+strategies:
+  arbitrage:
+    enabled: false
+    funding_rate_threshold: 0.0003
+    consecutive_periods: 1
+    close_threshold: 0.0002
+    leverage: 5
+    basis_threshold: 0.0012
+    basis_reversal_threshold: 0.0005
+    rate_forecast_window: 4
+    stop_loss_pct: 0.015
+    take_profit_pct: 0.02
+    max_hold_hours: 16
+    hedge_leverage: 5
+    min_net_profit_pct: 0.0008
+    min_signal_quality: 0.1
+    arbitrage_types:
+    - funding
+    - basis
+    - correlation
+    check_interval: 900
+    forecast_interval: 7200
+    adaptive_params: true
+    kelly_enabled: true
+    kelly_fraction: 0.25
+    atr_stop_enabled: true
+    atr_stop_multiplier: 2.0
+    regime_adaptive: true
+    batch_execution: true
+    batch_min_notional: 100.0
+    batch_count: 3
+    batch_interval_sec: 30
+    alert_integration: true
+    max_concurrent: 5
+    max_net_exposure_pct: 0.05
+    correlation_cache_ttl: 3600
+    correlation_lookback: 48
+    correlation_kline_bar: 1H
+    risk_lock_quality_boost: 0.1
+  grid:
+    enabled: true
+    grid_count_min: 2
+    grid_count_max: 3
+    martingale_layers: 0
+    martingale_coefficient: 1.1
+    dynamic_adjust_interval: 120
+    volatility_threshold: 0.015
+    atr_period: 14
+    atr_multiplier: 0.8
+    volume_profile_period: 30
+    price_update_interval_ms: 20
+    stop_loss_pct: 0.078
+    trailing_stop_enabled: true
+    trailing_stop_pct: 0.018
+    breakeven_trigger_pct: 0.012
+    breakeven_stop_pct: 0.003
+    min_signal_quality: 0.35
+    extreme_volatility_pause_minutes: 5
+    max_stop_loss_pct: 0.02
+    min_signal_interval: 15
+    signal_cooldown: 30.0
+    take_profit_enabled: true
+    tp1_ratio: 0.4
+    tp1_pct: 2.0
+    tp2_ratio: 0.5
+    tp2_pct: 4.0
+    tp3_ratio: 0.1
+    tp3_trailing_pct: 0.02
+    time_exit_enabled: true
+    max_hold_hours: 72.0
+    time_exit_partial_pct: 0.5
+    time_exit_after_hours: 48.0
+    volatility_stop_enabled: true
+    vol_spike_threshold: 2.5
+    vol_stop_partial_pct: 0.3
+    volatility_lockout_minutes: 30
+    coin_health_check_interval: 120
+    coin_max_lifecycle_events: 100
+    coin_health_max_errors: 5
+    coin_health_degraded_score: 0.6
+    coin_auto_pause_on_error: true
+    locked_params:
+    - min_signal_quality
+    - stop_loss_pct
+    max_grid_spacing: 0.04
+    min_grid_spacing: 0.03
+    volatility_adaptive_spacing: true
+    long_only: false
+    dynamic_grid_count: true
+    multi_symbol_scheduling: true
+    grid_rebuild_cooldown_seconds: 300
+    use_fill_driven_position: true
+    max_daily_loss_usdt: 0.5
+  scalping:
+    enabled: true
+    run_hours_start: 0
+    run_hours_end: 24
+    min_drop: 0.008
+    min_rise: 0.008
+    price_deviation: 0.003
+    max_hold_minutes: 10
+    profit_target_min: 0.008
+    profit_target_max: 0.015
+    stop_loss: 0.005
+    momentum_periods: 5
+    reversal_threshold: 0.002
+    rsi_period: 4
+    rsi_oversold: 30.0
+    rsi_overbought: 70.0
+    stoch_period: 10
+    volume_delta_threshold: 0.2
+    trailing_stop_activation: 0.3
+    tick_processing_interval_ms: 50
+    profit_taking_levels:
+    - threshold: 0.003
+      close_ratio: 0.4
+    - threshold: 0.006
+      close_ratio: 0.4
+    - threshold: 0.01
+      close_ratio: 0.2
+    trailing_stop_initial: 0.012
+    trailing_stop_min: 0.005
+    volatility_adaptive_sl: true
+    profit_protection_max_drawdown: 0.4
+    adaptive_enabled: true
+    min_signal_quality: 0.18
+    market_state_lookback: 20
+    max_positions: 2
+    position_sizing_mode: conservative
+    take_profit_enabled: true
+    tp1_ratio: 0.5
+    tp1_pct: 0.5
+    tp2_ratio: 0.5
+    tp2_pct: 1.0
+    tp3_ratio: 0.0
+    tp3_trailing_pct: 0.005
+    time_exit_enabled: false
+    max_hold_hours: 4.0
+    time_exit_partial_pct: 0.5
+    time_exit_after_hours: 2.0
+    volatility_stop_enabled: true
+    vol_spike_threshold: 3.0
+    vol_stop_partial_pct: 0.5
+    volatility_lockout_minutes: 15
+    risk_lock_quality_boost: 0.1
+    max_single_trade_loss_usdt: 0.5
+    max_single_position_margin_pct: 0.25
+    max_daily_trades: 20
+    max_stop_loss_pct: 0.02
+    trailing_stop_enabled: true
+    trailing_stop_pct: 0.018
+    breakeven_trigger_pct: 0.012
+    breakeven_stop_pct: 0.003
+    max_signals_per_minute: 4
+    use_fill_driven_position: true
+    pending_ttl_seconds: 15
+    min_order_book_depth_usdt: 100.0
+    locked_params:
+    - min_signal_quality
+  spot_grid:
+    enabled: false
+    grid_count_min: 5
+    grid_count_max: 10
+    dynamic_adjust_interval: 300
+    volatility_threshold: 0.003
+    atr_period: 14
+    atr_multiplier: 0.3
+    volume_profile_period: 30
+    dynamic_grid_count: true
+    volatility_adaptive_spacing: true
+    multi_symbol_scheduling: true
+    min_grid_spacing: 0.002
+    max_grid_spacing: 0.03
+    min_signal_quality: 0.2
+    take_profit_pct: 0.015
+    stop_loss_pct: 0.08
+    trend_filter_enabled: true
+    ema_fast_period: 12
+    ema_slow_period: 26
+    grid_reset_enabled: true
+    grid_reset_delay: 60
+    volume_filter_enabled: true
+    volume_threshold_ratio: 0.3
+  spot_martingale:
+    enabled: false
+    base_position_ratio: 0.25
+    martingale_coefficient: 1.5
+    max_layers: 5
+    price_drop_pct: 0.02
+    take_profit_pct: 0.015
+    stop_loss_pct: 0.15
+    check_interval: 5
+    min_signal_quality: 0.3
+    atr_period: 14
+    volatility_adaptive: true
+    volatility_threshold_high: 0.05
+    volatility_threshold_low: 0.02
+    dynamic_take_profit: true
+    take_profit_decay: 0.002
+    ema_fast_period: 12
+    ema_slow_period: 26
+    bear_market_suspend: true
+    max_hold_time_hours: 72
+    partial_close_enabled: true
+    partial_close_threshold: 3
+    partial_close_ratio: 0.5
+    dynamic_drop_threshold: true
+    max_daily_trades_per_symbol: 5
+    same_symbol_cooldown_minutes: 10
+  trend:
+    enabled: false
+    timeframe: 15m
+    confirmation_periods:
+    - 4h
+    - 1h
+    - 15m
+    max_additions: 0
+    initial_position_ratio: 1.0
+    addition_ratio: 0.0
+    profit_targets: []
+    trailing_stop_tier1: 0.025
+    trailing_stop_tier2: 0.04
+    trailing_stop_tier3: 0.05
+    false_break_threshold: 0.012
+    trailing_stop_initial: 0.04
+    trailing_stop_min: 0.015
+    volatility_adaptive_sl: true
+    profit_protection_max_drawdown: 0.4
+    reversal_confirmation_bars: 2
+    reversal_adx_threshold: 25.0
+    adaptive_enabled: true
+    min_signal_quality: 0.45
+    market_state_lookback: 20
+    breakeven_trigger_pct: 0.012
+    breakeven_stop_pct: 0.003
+    max_stop_loss_pct: 0.02
+    take_profit_enabled: true
+    tp1_ratio: 0.4
+    tp1_pct: 0.02
+    tp2_ratio: 0.4
+    tp2_pct: 0.04
+    tp3_ratio: 0.2
+    tp3_trailing_pct: 0.02
+    time_exit_enabled: true
+    max_hold_hours: 48.0
+    time_exit_partial_pct: 0.5
+    time_exit_after_hours: 36.0
+    volatility_stop_enabled: true
+    vol_spike_threshold: 2.0
+    vol_stop_partial_pct: 0.3
+    volatility_lockout_minutes: 30
+    stop_loss_pct: 0.02
+    take_profit_pct: 0.06
+    trailing_stop_pct: 0.04
+    min_confirmation_count: 2
+    confidence_threshold: 0.35
+    detector_confidence_weight: 0.4
+    starvation_log_interval: 1800
+    shared_trend_vote_enabled: true
+    shared_trend_vote_weight: 0.15
+    shared_vote_adx_floor: 25.0
+    shared_vote_adx_saturation: 40.0
+    post_only: true
+    pending_tier_count: 3
+    pending_tier_spread: 0.005
+    pending_timeout_seconds: 1800
+    locked_params:
+    - confirmation_periods
+    - min_signal_quality
+    - min_confirmation_count
+    - confidence_threshold
+    - detector_confidence_weight
+    - shared_trend_vote_enabled
+    - shared_trend_vote_weight
+    - shared_vote_adx_floor
+    - shared_vote_adx_saturation
+    adx_vol_high: 30
+    adx_vol_low: 20
+    adx_vol_normal: 25
+    chandelier_atr_period: 22
+    chandelier_exit_enabled: true
+    chandelier_multiplier_base: 3.0
+    chandelier_profit_threshold: 0.02
+    divergence_detection: true
+    divergence_lookback_bars: 30
+    divergence_min_strength: 0.6
+    dynamic_adx_threshold: true
+    market_structure_enabled: true
+    max_concurrent_positions: 1
+    min_swing_points: 3
+    swing_window: 5
+    sub_strategy_bar: 4H
+    sub_ma_atr_threshold: 0.003
+    sub_donchian_period: 20
+    sub_donchian_atr_sl: 2.0
+    sub_donchian_atr_tp: 3.0
+    sub_momentum_top_n: 3
+    sub_momentum_bottom_n: 3
+    use_fill_driven_position: true
+    max_position_usdt: 15
+    pending_ttl_seconds: 15
+  ema_trend:
+    enabled: false
+    timeframe: 15m
+    ema_fast: 9
+    ema_slow: 21
+    atr_pct_threshold: 0.004
+    atr_sl_mult: 2.0
+    atr_tp_mult: 3.5
+    min_signal_quality: 0.35
+    leverage: 5
+    max_concurrent_positions: 2
+    capital_allocation: 0.1
+    max_stop_loss_pct: 0.02
+    take_profit_pct: 0.04
+    loop_interval_seconds: 60
+  donchian_breakout:
+    enabled: true
+    timeframe: 1D
+    donchian_period: 70
+    atr_sl_multiplier: 3.0
+    atr_tp_multiplier: 8.0
+    atr_pct_threshold: 0.002
+    min_signal_quality: 0.35
+    leverage: 5
+    max_concurrent_positions: 2
+    capital_allocation: 0.1
+    max_stop_loss_pct: 0.02
+    take_profit_pct: 0.04
+    loop_interval_seconds: 60
+    adaptive_enabled: true
+    risk_lock_quality_boost: 0.1
+    adx_max_filter_enabled: true
+    adx_max_threshold: 25.0
+    adx_period: 14
+    symbol_pnl_cap_enabled: true
+    symbol_pnl_cap_ratio: 0.15
+  momentum_rotation:
+    enabled: false
+    timeframe: 1h
+    lookback: 24
+    top_n: 3
+    bottom_n: 2
+    min_long_return: 0.0
+    enable_short: false
+    min_signal_quality: 0.35
+    leverage: 5
+    max_concurrent_positions: 6
+    capital_allocation: 0.15
+    max_stop_loss_pct: 0.02
+    take_profit_pct: 0.04
+    loop_interval_seconds: 1800
+  bollinger_mean_reversion:
+    enabled: false
+    timeframe: 15m
+    boll_period: 20
+    boll_std_mult: 2.0
+    trend_ema_period: 50
+    trend_lookback: 10
+    atr_pct_threshold: 0.002
+    atr_sl_mult: 2.0
+    min_signal_quality: 0.35
+    leverage: 3
+    max_concurrent_positions: 1
+    capital_allocation: 0.05
+    max_stop_loss_pct: 0.02
+    take_profit_pct: 0.02
+    loop_interval_seconds: 60
+  oscillation_harvest:
+    enabled: true
+    timeframe: 1H
+    lookback_bars: 96
+    support_band_pct: 0.01
+    mid_tp_ratio: 1.0
+    min_band_width_pct: 0.003
+    rsi_period: 14
+    rsi_oversold: 30.0
+    rsi_overbought: 70.0
+    atr_sl_mult: 1.5
+    min_regime_confidence: 0.4
+    symbol_cooldown_seconds: 300
+    min_signal_quality: 0.35
+    confirm_bar: 4H
+    confirm_trend_threshold: 0.02
+    min_band_touch_count: 2
+    touch_proximity_pct: 0.0015
+    use_bollinger_confirm: true
+    boll_period: 20
+    boll_std_mult: 2.0
+    adaptive_enabled: true
+    risk_lock_quality_boost: 0.15
+    leverage: 5
+    max_concurrent_positions: 2
+    capital_allocation: 0.05
+    max_stop_loss_pct: 0.02
+    take_profit_pct: 0.02
+    loop_interval_seconds: 60
+  funding_rate_enhancer:
+    enabled: true
+    long_penalty_threshold: 0.0003
+    long_penalty_high: 0.0008
+    long_favor_threshold: -0.0002
+    short_penalty_threshold: -0.0003
+    short_penalty_high: -0.0008
+    short_favor_threshold: 0.0002
+    max_confidence_adjust: 0.15
+    min_hold_multiplier: 0.5
+    max_hold_multiplier: 1.3
+    cache_ttl_seconds: 300
+  volatility_breakout_filter:
+    enabled: true
+    require_confirmation: false
+    squeeze_period: 20
+    squeeze_compare: 60
+    squeeze_ratio_threshold: 0.6
+    volume_ratio_threshold: 1.5
+signal_generation:
+  enabled: true
+  min_signal_weight: 0.35
+  min_quality_score: 0.4
+  max_signals_per_second: 10
+  max_signals_per_symbol_second: 3
+  signal_cooldown_seconds: 5
+  conflict_resolution: majority_vote
+  max_conflicting_signals: 3
+  opposite_signal_delay_seconds: 30
+  confirmation_required: true
+  min_confirmation_rules: 2
+  confirmation_window_seconds: 10
+  multi_timeframe_confirm: true
+  volume_confirmation: true
+  order_book_confirmation: false
+  market_regime_filter: true
+  signal_aggregation: true
+  aggregation_window_seconds: 5
+  max_aggregated_signals: 5
+  adaptive_learning:
+    enabled: true
+    learning_rate: 0.1
+    interval_seconds: 3600
+    min_samples: 10
+    max_weight_change: 0.3
+    decay_factor: 0.95
+    min_rule_weight: 0.2
+    max_rule_weight: 2.0
+  rules:
+    trend_breakout:
+      enabled: true
+      weight: 1.0
+      breakout_threshold: 0.02
+      confirmation_periods: 2
+      volume_factor: 1.5
+      min_adx: 25
+      dynamic_threshold: true
+      atr_adjust_factor: 1.5
+    mean_reversion:
+      enabled: true
+      weight: 0.8
+      rsi_oversold: 30
+      rsi_overbought: 70
+      boll_upper_threshold: 0.95
+      boll_lower_threshold: 0.05
+    volatility_arb:
+      enabled: true
+      weight: 0.6
+      vol_high_threshold: 0.8
+      vol_low_threshold: 0.2
+      atr_multiplier: 2.0
+    grid_rebound:
+      enabled: true
+      weight: 0.7
+      grid_spacing: 0.01
+      rebound_threshold: 0.005
+    risk_control:
+      enabled: true
+      weight: 1.0
+      max_loss_pct: 0.03
+      max_profit_pct: 0.1
+      max_hold_hours: 24
+    divergence_detection:
+      enabled: true
+      weight: 0.7
+      lookback_bars: 20
+      min_divergence_strength: 0.6
+    market_structure:
+      enabled: true
+      weight: 0.7
+      swing_window: 5
+      min_swing_points: 3
+  include_market_context: true
+  include_risk_metrics: true
+  include_position_context: true
+  persist_signals: true
+  signal_history_size: 500
+  dispatch_mode: immediate
+  dispatch_priority: quality_first
+anti_targeting:
+  enabled: true
+  signal_obfuscator:
+    enabled: true
+    mode: standard
+    delay_enabled: true
+    delay_min_ms: 50
+    delay_max_ms: 500
+    delay_distribution: exponential
+    weight_jitter_enabled: true
+    weight_jitter_pct: 0.05
+    dummy_injection_enabled: true
+    dummy_probability: 0.03
+    dummy_max_per_batch: 2
+    type_rotation_enabled: true
+    rotation_probability: 0.08
+    expiry_jitter_enabled: true
+    expiry_jitter_seconds: 10
+    adaptive_enabled: true
+    pattern_detection_threshold: 0.7
+    adaptive_decay: 0.95
+  order_fingerprint_masker:
+    enabled: true
+    mode: standard
+    quantity_jitter_enabled: true
+    quantity_jitter_min_pct: 0.03
+    quantity_jitter_max_pct: 0.08
+    price_jitter_enabled: true
+    price_jitter_pct: 0.0005
+    split_enabled: true
+    split_min_notional: 500.0
+    split_min_parts: 2
+    split_max_parts: 5
+    split_size_ratio_min: 0.15
+    split_size_ratio_max: 0.6
+    time_slice_enabled: true
+    time_slice_min_ms: 100
+    time_slice_max_ms: 2000
+    time_slice_distribution: exponential
+    type_rotation_enabled: true
+    limit_order_ratio: 0.7
+    post_only_ratio: 0.15
+  anti_pattern_detector:
+    enabled: true
+    check_interval_seconds: 60
+    signal_window_size: 100
+    order_window_size: 50
+    analysis_window_minutes: 30
+    self_similarity_enabled: true
+    similarity_threshold: 0.75
+    similarity_weight: 0.25
+    timing_entropy_enabled: true
+    entropy_threshold_low: 0.5
+    entropy_threshold_warn: 0.3
+    timing_entropy_weight: 0.2
+    volume_pattern_enabled: true
+    volume_cv_threshold: 0.15
+    volume_pattern_weight: 0.2
+    price_clustering_enabled: true
+    price_cluster_radius_pct: 0.002
+    price_cluster_ratio_threshold: 0.6
+    price_clustering_weight: 0.2
+    front_running_enabled: true
+    front_running_slippage_threshold: 0.003
+    front_running_ratio_threshold: 0.3
+    front_running_weight: 0.15
+system:
+  log_level: INFO
+  name: OKX Quant Trading
+  timezone: Asia/Shanghai
+  version: 2.0.0
+notifications:
+  enabled: true
+  level: INFO
+  providers:
+  - console
+  - telegram
+  - webhook
+  - email
+telegram:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+capital_pool:
+  base_ratio: 0.6
+  add_reserve_ratio: 0.25
+  risk_isolation_ratio: 0.15
+allocation_agent:
+  enabled: true
+  rebalance_interval: 3600
+  min_trade_count: 20
+  max_allocation_change: 0.05
+  method: dynamic
+focused_allocation:
+  enabled: true
+  nano_equity_threshold: 50.0
+  focus_strategy: auto
+  focus_symbol: auto
+  strategy_priority:
+  - trend
+  - grid
+  - arbitrage
+  - scalping
+  symbol_priority:
+  - SOL
+  - DOGE
+  - XRP
+  - SUI
+  - ETH
+  single_position: true
+symbol_allocation:
+  max_symbol_weight: 0.15
+  min_symbol_weight: 0.02
+  rebalance_interval: 300
+  max_weight_change: 0.03
+  volatility_weight: 0.35
+  momentum_weight: 0.25
+  liquidity_weight: 0.2
+  performance_weight: 0.2
+leverage_tiers:
+  light_min: 1
+  light_max: 5
+  main_min: 5
+  main_max: 10
+  absolute_max: 10
+pnl_reallocation:
+  profit_to_add_ratio: 0.5
+  loss_shrink_ratio: 0.3
+  consecutive_profit_days: 3
+  consecutive_loss_days: 2
+  max_add_pool_ratio: 0.4
+  min_base_pool_ratio: 0.5
+capital_efficiency:
+  idle_cash_threshold: 0.15
+  efficiency_min: 0.02
+  turnover_min: 1.0
+  trend_window: 5
+  deployment_min: 0.3
+  idle_sweep_threshold: 0.2
+  idle_sweep_min_duration: 30
+  utilization_reclaim_threshold: 0.5
+  min_capital_efficiency: 0.15
+  emergency_reserve_threshold: 0.1
+  max_concentration_ratio: 0.5
+  volatility_pool_adapt: true
+  opportunity_cost_daily: 0.0005
+  positive_return_protection: true
+grid_adaptive_utilization:
+  min_trades_for_activation: 20
+  min_trades_for_confidence: 50
+  confidence_lookback_trades: 30
+  max_position_multiplier: 2.5
+  min_position_multiplier: 0.5
+  step_up_limit: 0.05
+  step_down_limit: 0.1
+  win_rate_floor: 0.35
+  profit_factor_floor: 0.8
+  consecutive_loss_freeze: 5
+  consecutive_loss_reduce: 3
+  confidence_recent_weight: 0.6
+  confidence_historical_weight: 0.4
+  freeze_after_reduce_count: 3
+  recovery_required_trades: 10
+  stale_minutes: 120
+  persist_path: data/grid_adaptive_state.json
+  save_interval_seconds: 300
+enterprise_sync:
+  sync_check_interval_sec: 3.0
+  report_interval_sec: 60.0
+  persist_path: data/enterprise_sync_state.json
+  persist_interval_sec: 300
+  auto_recovery_enabled: true
+  alert_on_stale: true
+  alert_on_drift: true
+  alert_on_disconnect: true
+  health:
+    max_data_age_healthy_sec: 10.0
+    max_data_age_degraded_sec: 30.0
+    max_data_age_stale_sec: 60.0
+    max_consecutive_errors: 5
+    max_channel_drift_sec: 5.0
+    latency_warning_ms: 1000
+    latency_critical_ms: 3000
+  stale:
+    position_ttl_sec: 15.0
+    order_ttl_sec: 10.0
+    account_ttl_sec: 30.0
+    dashboard_ttl_sec: 5.0
+    check_interval_sec: 3.0
+    auto_invalidate: true
+    stale_alert_threshold: 3
+  recovery:
+    max_gap_small_sec: 30.0
+    max_gap_large_sec: 120.0
+    max_consecutive_failures: 3
+    recovery_cooldown_sec: 30.0
+    gap_check_interval_sec: 5.0
+hedge_scheduler:
+  max_hedge_ratio: 0.7
+  min_hedge_ratio: 0.3
+  hedge_trigger_volatility: 0.04
+  hedge_trigger_drawdown: 0.05
+  max_hedge_positions: 10
+  hedge_check_interval: 60
+volatility_targeting:
+  target_volatility: 0.2
+  max_volatility: 0.5
+  min_volatility: 0.05
+  ewma_lambda: 0.94
+  garch_omega: 1.0e-05
+  garch_alpha: 0.05
+  garch_beta: 0.9
+  forecast_horizon: 21
+  confidence_z: 1.96
+adaptive_kelly:
+  max_kelly_fraction: 0.25
+  default_kelly_fraction: 0.5
+  min_trade_count_kelly: 20
+  kelly_trending_up: 1.1
+  kelly_trending_down: 0.6
+  kelly_ranging: 0.9
+  kelly_high_vol: 0.5
+  kelly_low_vol: 1.0
+  kelly_unknown: 0.8
+  kelly_dd_start: 0.05
+  kelly_dd_max: 0.3
+  kelly_dd_min: 0.3
+  kelly_streak_win_step: 0.05
+  kelly_streak_loss_step: 0.08
+  kelly_streak_max_adj: 0.3
+adaptive_position_sizing:
+  force_order_chain: true
+  default_risk_fraction: 0.15
+  min_risk_fraction: 0.15
+  max_risk_fraction: 0.3
+  min_notional_usd: 1.0
+  signal_strength_neutral: 0.5
+  volatility_max: 0.05
+  atr_sl_multiplier: 2.0
+  use_equity_multiplier: true
+  use_signal_factor: true
+  use_volatility_factor: true
+risk_budget:
+  enabled: true
+  daily_risk_budget_pct: 0.03
+  hourly_max_loss_pct: 0.015
+  max_per_trade_risk_pct: 0.008
+  max_position_boost: 2.0
+  strategy_budgets:
+    scalping: 0.4
+    trend: 0.25
+    grid: 0.2
+    arbitrage: 0.15
+  reallocation:
+    enabled: true
+    interval_minutes: 5
+    max_shift_ratio: 0.15
+    transfer_out_winrate_threshold: 0.35
+    transfer_out_drawdown_threshold: 0.08
+  concentration:
+    max_single_symbol_risk_pct: 0.008
+    max_correlated_group_risk_pct: 0.02
+  loss_streak:
+    max_consecutive_losses: 5
+    loss_streak_reduce_pct: 0.5
+    recovery_consecutive_wins: 3
+  high_correlation_threshold: 0.7
+  extreme_correlation_threshold: 0.85
+  data_dir: ./data
+reversal_take_profit:
+  enabled: true
+  hmm_reversal_regime: reversal
+  fallback_indicators: true
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  rsi_overbought: 70.0
+  rsi_oversold: 30.0
+  tighten_start_score: 0.4
+  tighten_max_factor: 0.5
+  partial_exit_score: 0.65
+  partial_exit_ratio: 0.5
+  full_exit_score: 0.85
+  min_profit_lock_pct: 0.002
+  cooldown_seconds: 300
+  price_precision: 4
+trailing_take_profit:
+  enabled: true
+  activation_pct: 0.03
+  trailing_distance_pct: 0.02
+  check_interval: 5
+  cooldown_seconds: 120
+  min_notional_usd: 1.0
+profit_lock:
+  enabled: true
+  breakeven_pct: 0.005
+  breakeven_exit_pct: 0.0
+  partial_pct: 0.01
+  partial_ratio: 0.35
+  trailing_distance_pct: 0.006
+  reversal_close_score: 0.5
+  reversal_min_profit_pct: 0.002
+  cooldown_seconds: 120
+trading:
+  arbitrage_allocation: 0.0
+  compound_enabled: true
+  compound_reinvest_ratio: 0.8
+  daily_max_loss: 0.03
+  daily_max_loss_hard: null
+  daily_max_trades: 500
+  daily_risk_limit: 0.03
+  funding_rate_check: true
+  funding_rate_min_hold: 0.0008
+  grid_allocation: 0.4
+  hourly_max_loss: 0.025
+  idle_cash_allocation: true
+  maker_fee_rate: 0.0002
+  max_concurrent_positions: 10
+  max_consecutive_losses: 5
+  min_pnl_for_loss: 0.005
+  loss_batch_window_sec: 5
+  max_daily_trades_per_symbol: 4
+  max_drawdown: 0.25
+  max_queue_size: 200
+  max_slippage_pct: 0.001
+  max_total_leverage: 5.0
+  min_balance: 5.0
+  min_hold_minutes: 5
+  min_margin_per_trade: 0.3
+  min_notional_usd: 1.0
+  min_profit_cost_ratio: 1.5
+  min_utilization: 0.75
+  profit_reserve_ratio: 0.0
+  risk_per_trade: 0.05
+  risk_reserve_ratio: 0.05
+  scalping_allocation: 0.6
+  spot_grid_allocation: 0.0
+  spot_martingale_allocation: 0.0
+  taker_fee_rate: 0.0005
+  target_return: 1.5
+  target_utilization: 0.85
+  total_capital: 251.014864
+  trading_capital_ratio: 0.95
+  trailing_profit_lock: 0.04
+  trend_allocation: 0.0
+capital_attrition:
+  enabled: true
+  taker_fee_rate: 0.0005
+  maker_fee_rate: 0.0002
+  adaptive_fee_enabled: true
+  adaptive_fee_window: 100
+  max_records: 10000
+  budget_check_enabled: true
+  budget_auto_pause: false
+  default_daily_budget_usdt: 5.0
+  default_weekly_budget_usdt: 25.0
+  alert_cooldown_seconds: 300
+  invalid_trade_threshold: 0.5
+  funding_rate_alert_threshold: 0.001
+  daily_reset_hour: 0
+  suggestion_interval_seconds: 3600
+  persist_path: ''
+  strategy_budgets:
+    grid:
+      daily_budget_usdt: 3.0
+      weekly_budget_usdt: 15.0
+      max_attrition_rate: 0.25
+    scalping:
+      daily_budget_usdt: 2.0
+      weekly_budget_usdt: 10.0
+      max_attrition_rate: 0.3
+    trend:
+      daily_budget_usdt: 4.0
+      weekly_budget_usdt: 20.0
+      max_attrition_rate: 0.25
+    arbitrage:
+      daily_budget_usdt: 1.0
+      weekly_budget_usdt: 5.0
+      max_attrition_rate: 0.15
+    spot_grid:
+      daily_budget_usdt: 0.5
+      weekly_budget_usdt: 2.5
+      max_attrition_rate: 0.1
+    spot_martingale:
+      daily_budget_usdt: 0.5
+      weekly_budget_usdt: 2.5
+      max_attrition_rate: 0.1
+parameter_optimization:
+  enabled: true
+  persist_dir: ./data/parameter_optimization
+  max_history: 100
+  max_persist_files: 50
+data_cleanup:
+  enabled: true
+  t1_memory_interval_min: 15
+  t2_db_light_interval_min: 30
+  t3_db_full_interval_min: 60
+  t4_deep_interval_hours: 24
+  cleanup_budget_sec: 30
+  archive_enabled: true
+  archive_dir: ./backups/archive
+  integrity_check_enabled: true
+  adaptive_interval: true
+  db_size_threshold_mb: 50
+  db_retention_days: 30
+  log_retention_days: 7
+  alert_retention_days: 7
+  review_max_daily: 90
+  review_max_monthly: 12
+  backup_retention_days: 30
+  param_opt_keep_count: 50
+  param_opt_retention_days: 30
+  param_opt_max_size_mb: 200
+  table_policies:
+    trade_records:
+      retention_days: 90
+      keep_profitable: true
+      archive_before_delete: true
+    position_history:
+      retention_days: 45
+      min_rows: 10000
+    trades:
+      retention_days: 90
+      keep_profitable: true
+      archive_before_delete: true
+    equity_curve:
+      retention_days: 60
+      min_rows: 2000
+    trading_signals:
+      retention_days: 14
+      min_rows: 200
+    alert_records:
+      retention_days: 14
+      min_rows: 50
+    risk_events:
+      retention_days: 30
+      min_rows: 100
+    fill_quality:
+      retention_days: 30
+      min_rows: 100
+    stop_loss_audit:
+      retention_days: 30
+      min_rows: 100
+    recovery_records:
+      retention_days: 30
+      min_rows: 20
+    signal_generator_history:
+      retention_days: 14
+      min_rows: 200
+dashboard:
+  db_path: data/trading.db
+  cache_ttl_seconds: 3
+  equity_cache_ttl: 60
+  snapshot_persist_interval: 300
+  refresh_interval_ms: 5000
+  frontend:
+    title: OKX Quant Terminal
+    theme: dark
+    default_tab: overview
+    enabled_tabs:
+    - overview
+    - strategy
+    - positions
+    - risk
+    - capital
+    - market
+  historical_performance:
+    default_period: 30
+    available_periods:
+    - 7
+    - 30
+    - 90
+    - 180
+    risk_free_rate: 0.03
+  capital_efficiency:
+    idle_threshold_pct: 0.3
+    idle_cost_rate: 0.0003
+    suggested_deploy_pct: 0.7
+    rebalance_check_interval: 3600
+  alerts:
+    margin_critical: 0.85
+    margin_warning: 0.7
+    drawdown_critical: 0.25
+    drawdown_warning: 0.15
+    liquidation_risk_critical: 60
+    funding_rate_threshold: 0.001
+    attrition_budget_warning: 0.7
+    attrition_budget_critical: 0.95
+    alert_cooldown_seconds: 300
+  funding_trend:
+    settlement_per_day: 3
+    rising_threshold: 0.0005
+    falling_threshold: -0.0005
+    predict_multiplier: 1.1
+  orderbook:
+    depth_levels: 20
+    depth_pct: 0.01
+    liquidity_score_base: 100000
+    spread_score_weight: 0.5
+    depth_score_weight: 0.5
+  heatmap:
+    default_period: 30
+    min_trades_for_status: 3
+  market:
+    bull_threshold: 0.05
+    bear_threshold: -0.05
+    volatile_threshold: 0.02
+    btc_symbol: BTC-USDT
+    eth_symbol: ETH-USDT
+    default_period_days: 30
+    auto_refresh: true
+auth:
+  enabled: true
+  sms:
+    provider: console
+    aliyun:
+      access_key_id: ''
+      access_key_secret: ''
+      sign_name: ''
+      template_code: ''
+    tencent:
+      secret_id: ''
+      secret_key: ''
+      sdk_app_id: ''
+      sign_name: ''
+      template_id: ''
+      region: ap-guangzhou
+  session:
+    ttl_days: 30
+  code:
+    cooldown_seconds: 60
+    max_per_hour: 5
+    expire_seconds: 300
+    max_attempts: 5
+  accounts:
+    admin: ChangeMe@123
+trading_session:
+  enabled: true
+  auto_start_enabled: false
+  auto_start_time: 00:00
+  auto_close_enabled: false
+  auto_close_time: '23:59'
+  schedule_check_interval: 30
+  pre_check_balance_min: 10.0
+  pre_check_connectivity: true
+  pre_check_risk_limits: true
+  pre_check_position_sync: true
+  pre_check_timeout: 30
+  emergency_drawdown_limit: 0.3
+  emergency_margin_limit: 0.85
+  emergency_auto_drain: true
+  drain_timeout: 300
+  drain_check_interval: 5
+  max_event_log: 1000
+  strategy_schedules:
+    trend:
+      priority: 0
+      start_delay_sec: 0
+      depends_on: []
+      auto_restart: true
+      max_restarts: 3
+      restart_cooldown_sec: 60
+    grid:
+      priority: 1
+      start_delay_sec: 2
+      depends_on: []
+      auto_restart: true
+      max_restarts: 3
+      restart_cooldown_sec: 60
+    scalping:
+      priority: 2
+      start_delay_sec: 3
+      depends_on: []
+      auto_restart: true
+      max_restarts: 5
+      restart_cooldown_sec: 30
+    arbitrage:
+      priority: 3
+      start_delay_sec: 5
+      depends_on:
+      - trend
+      auto_restart: true
+      max_restarts: 3
+      restart_cooldown_sec: 60
+    spot_grid:
+      priority: 4
+      start_delay_sec: 10
+      depends_on: []
+      auto_restart: false
+      max_restarts: 2
+      restart_cooldown_sec: 120
+    spot_martingale:
+      priority: 5
+      start_delay_sec: 15
+      depends_on: []
+      auto_restart: false
+      max_restarts: 2
+      restart_cooldown_sec: 120
+risk_monitor:
+  enabled: true
+  check_interval_sec: 3
+  scoring_weights:
+    direction: 0.2
+    leverage: 0.15
+    volatility: 0.15
+    correlation: 0.1
+    concentration: 0.15
+    drawdown: 0.15
+    margin: 0.1
+  thresholds:
+    direction:
+      warning: 0.4
+      critical: 0.6
+      emergency: 0.8
+    leverage:
+      warning: 0.5
+      critical: 0.7
+      emergency: 0.85
+    volatility:
+      warning: 0.4
+      critical: 0.6
+      emergency: 0.8
+    concentration:
+      warning: 0.3
+      critical: 0.5
+      emergency: 0.7
+    drawdown:
+      warning: 0.1
+      critical: 0.2
+      emergency: 0.3
+    margin:
+      warning: 0.5
+      critical: 0.7
+      emergency: 0.85
+    correlation:
+      warning: 0.6
+      critical: 0.8
+      emergency: 0.9
+    liquidity:
+      warning: 0.5
+      critical: 0.7
+      emergency: 0.85
+  auto_mitigation:
+    enabled: true
+    cooldown_sec: 60
+    max_per_hour: 10
+    actions:
+      warning: notify
+      critical: reduce_position
+      emergency: emergency_stop
+  alerts:
+    cooldown_sec: 300
+    escalation_enabled: true
+    escalation_interval_sec: 600
+    max_history: 500
+metrics_pipeline:
+  enabled: true
+  aggregation_window_sec: 60.0
+  max_samples: 1000
+  aggregate_interval_sec: 10
+  snapshot_interval_sec: 300
+  snapshot_max_age_days: 7
+  health_check_interval_sec: 30
+  custom_metrics: []
+  custom_thresholds:
+    system_cpu_usage_pct:
+      warning: 70
+      critical: 90
+    system_memory_usage_pct:
+      warning: 80
+      critical: 95
+    system_disk_free_gb:
+      min: 1.0
+    risk_drawdown_pct:
+      warning: 0.1
+      critical: 0.2
+    risk_margin_ratio:
+      warning: 0.5
+      critical: 0.7
+    risk_score:
+      warning: 0.5
+      critical: 0.7
+    capital_idle_pct:
+      warning: 0.3
+      critical: 0.5
+    trading_win_rate:
+      min: 0.3
+    perf_signal_process_ms:
+      warning: 100
+      critical: 200
+    perf_order_place_ms:
+      warning: 200
+      critical: 500
+    perf_ws_latency_ms:
+      warning: 1000
+      critical: 3000
+  export:
+    prometheus_enabled: true
+    json_enabled: true
+    csv_enabled: false
+    influxdb_enabled: false
+    export_path: data/metrics_export
+portfolio_optimizer:
+  enabled: true
+  default_objective: max_sharpe
+  rebalance_interval_hours: 4
+  min_rebalance_change_pct: 0.02
+  max_single_weight: 0.5
+  min_single_weight: 0.05
+  risk_free_rate: 0.03
+  correlation:
+    window_days: 30
+    high_threshold: 0.7
+    alert_threshold: 0.85
+  var:
+    confidence_levels:
+    - 0.95
+    - 0.99
+    horizon_days: 1
+    method: historical
+  stress_test:
+    enabled: true
+  persistence:
+    enabled: true
+    save_interval_sec: 300
+    state_file: data/portfolio_state.json
+conditional_order:
+  enabled: true
+  retry_interval_sec: 5
+  max_retries: 3
+  sync_interval_sec: 30
+  heartbeat_enabled: true
+  heartbeat_interval_sec: 60
+  immediate_trigger_protection: true
+  stop_loss:
+    margin_call_offset: 0.3
+    default_callback_rate: 0.015
+  persistence:
+    enabled: true
+    orders_file: data/conditional_orders.json
+    save_interval_sec: 60
+  audit:
+    enabled: true
+    max_entries: 500
+  batch:
+    max_batch_size: 20
+    batch_delay_sec: 0.5
+compute_scheduler:
+  enabled: true
+  max_cpu_usage: 80
+  max_memory_usage: 85
+  cpu_throttle_threshold: 72
+  cpu_critical_threshold: 80
+  high_volatility_percentile: 0.8
+  low_volatility_percentile: 0.2
+  priority_intervals:
+    high: 50
+    normal: 100
+    low: 500
+    throttled: 1000
+  low_vol_skip_ratio: 3
+  adaptive_throttle:
+    enabled: true
+    cpu_history_size: 10
+    trend_up_threshold: 5.0
+    trend_down_threshold: -5.0
+    max_skip_ratio: 10
+    min_skip_ratio: 1
+  compute_budget:
+    enabled: true
+    budget_per_sec:
+      high: 20
+      normal: 10
+      low: 3
+      throttled: 1
+  persistence:
+    enabled: true
+    state_file: data/compute_scheduler_state.json
+    save_interval_sec: 300
+paper_trading:
+  enabled: false
+  mode: sandbox
+  sandbox_id: paper_main
+  initial_capital: 10000.0
+  symbols:
+  - BTC-USDT-SWAP
+  - ETH-USDT-SWAP
+  - SOL-USDT-SWAP
+  - ADA-USDT-SWAP
+  - AVAX-USDT-SWAP
+  - NEAR-USDT-SWAP
+  - SUI-USDT-SWAP
+  - APT-USDT-SWAP
+  - ARB-USDT-SWAP
+  - OP-USDT-SWAP
+  strategies:
+  - grid
+  - trend
+  - scalping
+  timeframes:
+  - 1m
+  - 5m
+  - 15m
+  max_leverage: 5
+  max_positions: 8
+  risk_per_trade_pct: 0.02
+  max_daily_loss_pct: 0.1
+  max_drawdown_pct: 0.25
+  enable_auto_trading: true
+  enable_stop_loss: true
+  enable_take_profit: true
+  stop_loss_atr_mult: 2.0
+  take_profit_atr_mult: 3.0
+  min_signal_strength: 0.4
+  snapshot_interval_seconds: 60
+  order_timeout_seconds: 3600
+  persist_state: true
+  persist_dir: ./data/paper_trading
+  latency_pause_enabled: true
+  latency_warning_ms: 3000
+  latency_critical_ms: 8000
+  latency_pause_duration_sec: 300
+  limit_order_priority: true
+  limit_order_max_spread_pct: 0.001
+  compliance_check_enabled: true
+  compliance_check_interval_sec: 3600
+intelligent_agent:
+  whitelist_min_trades: 5
+  whitelist_min_win_rate: 0.4
+  whitelist_min_profit_factor: 1.2
+  whitelist_max_consecutive_losses: 5
+  max_rejection_rate: 0.7
+  cumulative_reject_rate_threshold: 0.7
+  min_audits_for_health_check: 20
+  min_confidence_threshold: 0.35
+  adaptive_confidence_cap: 0.5
+intelligent_decision_engine:
+  enabled: true
+  fusion_method: bayesian
+  tf_weights:
+    5m: 0.1
+    15m: 0.15
+    1h: 0.25
+    4h: 0.3
+    1d: 0.2
+  prior_buy: 0.33
+  prior_sell: 0.33
+  prior_hold: 0.34
+  tf_agreement_threshold: 0.6
+  base_confidence_threshold: 0.43
+  min_confidence_threshold: 0.3
+  max_confidence_threshold: 0.7
+  min_decision_interval_ms: 200
+  max_decisions_per_minute: 30
+  cooldown_after_loss_ms: 5000
+  min_expected_value_usdt: 0.5
+  taker_fee_rate: 0.0005
+  maker_fee_rate: 0.0002
+  base_slippage_pct: 0.0002
+  funding_rate_annual: 0.1
+scheduler_intervals:
+  intelligent_analysis: 21600
+regime_gate:
+  range_bound_trend_allow_high_confidence: true
+  range_bound_trend_confidence_threshold: 0.6
+  trend_regime_mean_reversion_allow_with_trend: true
+market_regime:
+  watched_symbols:
+  - BTC-USDT-SWAP
+  - ETH-USDT-SWAP
+  - SOL-USDT-SWAP
+  - XRP-USDT-SWAP
+  - DOGE-USDT-SWAP
+  - SUI-USDT-SWAP
+  trend_adx_period: 14
+  trend_adx_floor: 15
+  trend_adx_saturation: 40
+  trend_mtf_weight: 0.4
+online_learner:
+  learning_mode: online
+  learning_rate: 0.01
+  decay_rate: 0.99
+  min_samples: 100
+  sample_buffer:
+    max_size: 5000
+    weight_method: time_decay
+    decay_factor: 0.99
+  drift_detection:
+    enabled: true
+    lr_multiplier_on_drift: 3.0
+    auto_reset_on_drift: false
+    ks_test:
+      alpha: 0.05
+      window_size: 200
+    psi:
+      threshold: 0.25
+      n_bins: 10
+    adwin:
+      delta: 0.002
+  incremental_model:
+    model_type: linear_regression
+    lr_schedule: exponential_decay
+    learning_rate: 0.01
+    l2_penalty: 0.0001
+    ema_alpha: 0.9
+    lr_decay_rate: 0.999
+    lr_step_size: 100
+    lr_step_drop: 0.5
+    lr_cosine_t_max: 1000
+    lr_cosine_lr_min: 0.0001
+  feature_importance:
+    enabled: true
+    window_size: 500
+    n_permutations: 5
+  calibration:
+    enabled: true
+    ece_threshold: 0.1
+    n_bins: 10
+    lr: 0.01
+parameter_adaptor:
+  max_history: 100
+  adaptation_threshold: 0.1
+  min_samples: 20
+  default_target: 0.0
+  bayesian_enabled: true
+  bayesian:
+    gp_kernel: matern
+    gp_length_scale: 1.0
+    gp_signal_variance: 1.0
+    gp_noise_variance: 1.0e-06
+    acquisition: ucb
+    ucb_kappa: 2.0
+    ei_xi: 0.01
+    gp_max_history: 500
+  response_surface:
+    rs_regularization: 0.0001
+    rs_max_history: 1000
+  safety:
+    soft_penalty: 10.0
+    corr_tolerance: 0.2
+    auto_learn_boundaries: false
+    auto_learn_min_samples: 50
+    safe_history_max: 10000
+  multi_objective:
+    mo_method: weighted_sum
+    mo_max_history: 500
+  exploration:
+    explore_epsilon_start: 0.5
+    explore_epsilon_end: 0.05
+    explore_epsilon_decay: 0.995
+    explore_decay_type: exponential
+    explore_total_steps: 10000
+    explore_budget: 0.3
+    explore_uncertainty_threshold: 0.5
+performance_feedback:
+  scoring:
+    weights:
+      returns: 0.25
+      risk: 0.25
+      consistency: 0.15
+      efficiency: 0.2
+      adaptability: 0.15
+    rolling_windows:
+    - 24h
+    - 7d
+    - 30d
+    - 90d
+    degradation_threshold: 20.0
+    degradation_enabled: true
+  attribution:
+    factor_attribution: true
+    regime_attribution: true
+    time_attribution: true
+    size_attribution: true
+    position_buckets:
+    - 0.01
+    - 0.05
+    - 0.1
+    - 0.25
+    - 0.5
+  feedback:
+    learning_rate: 0.1
+    min_samples: 20
+    max_adjustment_pct: 0.3
+    oscillation_threshold: 3
+  comparison:
+    bootstrap_samples: 1000
+    bootstrap_confidence: 0.95
+  alerts:
+    max_drawdown_threshold: 0.15
+    min_sharpe_threshold: 0.5
+    min_win_rate_threshold: 0.35
+    max_consecutive_losses: 5
+    critical_score_threshold: 40.0
+    warning_score_threshold: 60.0
+    cooldown_seconds: 3600
+  max_history: 500
+  risk_free_rate: 0.03
+knowledge_base:
+  decay_half_life_hours: 168
+  max_experiences: 10000
+  min_weight: 0.01
+  distill_threshold: 50
+  persist_dir: ./data/knowledge
+  persist_interval_seconds: 300
+market_regime_detector:
+  max_history_per_symbol: 200
+  persist_dir: ./data/regime_detector
+  persist_interval_seconds: 600
+  train_min_samples: 50
+  auto_train: true
+  timeframes:
+  - short
+  - medium
+  - long
+  feature_cache_size: 1000
+  history_size: 500
+  vol_expansion_ratio: 2.0
+  volume_spike_ratio: 3.0
+  price_compression_pct: 0.3
+  confidence_base: 0.5
+meta_learner:
+  embedding_dim: 16
+  max_tasks: 500
+  meta_update_batch: 5
+  persist_dir: ./data/meta_learner
+  persist_interval_seconds: 300
+  inner_lr: 0.01
+  outer_lr: 0.001
+  inner_steps: 5
+  meta_param_dim: 32
+  max_param_value: 5.0
+  exploration:
+    max_exploration_steps: 200
+    min_improvement_threshold: 0.001
+    reset_patience: 50
+strategy_evolver:
+  evolution_strategy: gradient
+  population_size: 10
+  mutation_rate: 0.1
+  crossover_rate: 0.5
+  initial_temperature: 1.0
+  cooling_rate: 0.99
+  generations: 50
+  elite_count: 2
+  adaptive_mutation: true
+  min_mutation_rate: 0.01
+  max_mutation_rate: 0.5
+  stagnation_generations: 5
+  stagnation_threshold: 0.001
+  convergence_patience: 10
+  convergence_min_improvement: 0.0001
+  convergence_variance_threshold: 0.001
+  cma_es:
+    population_factor: 4
+    sigma: 0.3
+anti_debounce:
+  symbol_cooldown_seconds: 30.0
+  signal_dedup_window_seconds: 10.0
+  strategy_cooldown_seconds: 5.0
+  global_cooldown_seconds: 2.0
+  loss_cooldown_seconds: 120.0
+  churn_window_seconds: 60.0
+  churn_max_flips: 3
+  churn_block_seconds: 300.0
+  adaptive_volatility_threshold: 0.03
+  enable_symbol: true
+  enable_signal_dedup: true
+  enable_strategy: true
+  enable_global: true
+  enable_loss_cooldown: true
+  enable_churn: true
+  enable_adaptive: true

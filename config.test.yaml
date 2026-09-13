@@ -1,0 +1,24 @@
+# ============================================================
+# config.test.yaml — 测试环境叠加配置（OKX 模拟盘）
+#
+# 用法：设置环境变量 OKX_ENV=test 后启动，本文件会深度合并到
+#       config.yaml 之上，仅覆盖此处列出的差异项，其余全部继承 base。
+#
+# 语义：is_testnet=true（OKX 模拟盘），走真实下单/风控/WebSocket 链路，
+#       但连接 OKX demo 环境，不碰真实资金。
+# ============================================================
+
+okx:
+  is_testnet: true
+  # OKX 模拟盘需单独申请 demo API key，与实盘 key 隔离，避免误用实盘凭证
+  api_key: ${OKX_DEMO_API_KEY}
+  secret_key: ${OKX_DEMO_SECRET_KEY}
+  passphrase: ${OKX_DEMO_PASSPHRASE}
+
+trading:
+  total_capital: 1000.0          # 模拟盘小资金
+  daily_max_loss: 0.02           # 更严的风控阈值
+  daily_risk_limit: 0.02
+  max_drawdown: 0.15
+  max_concurrent_positions: 4
+  risk_per_trade: 0.01

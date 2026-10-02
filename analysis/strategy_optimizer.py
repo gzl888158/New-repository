@@ -2,6 +2,7 @@
 基于历史交易分析优化各策略参数，支持参数热更新与优化记录。
 """
 import asyncio
+import math
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
@@ -9,6 +10,49 @@ from loguru import logger
 
 from core.trade_journal import TradeJournal
 from analysis.historical_analyzer import HistoricalAnalyzer
+
+
+def _safe_float(value, default=0.0):
+    """安全转换数值：None/非法/NaN/Inf 返回默认值，用于 fail-closed 校验。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+# 交易分配字段：写回 config.yaml 时需保证总和精确等于 1.0（否则触发 AppConfig 校验失败）
+TRADING_ALLOCATION_FIELDS = [
+    "grid_allocation", "spot_grid_allocation", "spot_martingale_allocation",
+    "trend_allocation", "scalping_allocation", "arbitrage_allocation",
+]
+
+
+def _normalize_trading_allocations(trading_cfg: Dict[str, Any]) -> None:
+    """归一化交易分配字段，确保 6 个 allocation 之和精确等于 1.0。
+
+    persist_config 写回前会 _round_floats 对每个字段独立四舍五入到 6 位小数，
+    浮点误差累积会使总和变成 0.999999 之类，进而触发 AppConfig 的
+    「allocations sum must be 1.0」校验失败。此处把 (1.0 - 总和) 的误差集中
+    加到当前值最大的字段（相对扰动最小），使总和精确回到 1.0，且不改变已置 0
+    的 disabled 策略字段。
+    """
+    if not isinstance(trading_cfg, dict):
+        return
+    entries = [
+        f for f in TRADING_ALLOCATION_FIELDS
+        if f in trading_cfg and isinstance(trading_cfg.get(f), (int, float))
+    ]
+    if not entries:
+        return
+    total = sum(float(trading_cfg.get(f) or 0.0) for f in entries)
+    if total <= 0 or abs(total - 1.0) <= 1e-9:
+        return
+    adjust_field = max(entries, key=lambda f: float(trading_cfg.get(f) or 0.0))
+    trading_cfg[adjust_field] = round(float(trading_cfg[adjust_field] or 0.0) + (1.0 - total), 6)
+
 
 class StrategyOptimizer:
     def __init__(self, trade_journal: TradeJournal, config: Dict[str, Any]):
@@ -22,6 +66,11 @@ class StrategyOptimizer:
 
         self._min_trades_for_optimization = 50
         self._confidence_threshold = 0.7
+
+        # P2: 样本外验证配置（防止过拟合）
+        self._oos_validation_enabled = config.get("strategy_optimizer", {}).get("oos_validation_enabled", True)
+        self._oos_train_ratio = config.get("strategy_optimizer", {}).get("oos_train_ratio", 0.7)
+        self._oos_min_test_trades = config.get("strategy_optimizer", {}).get("oos_min_test_trades", 10)
 
         # 锁定参数：locked_params 中列出的参数不会被自动优化覆盖
         self._locked_params: Dict[str, set] = {}
@@ -45,6 +94,139 @@ class StrategyOptimizer:
     
     async def start(self):
         await self._load_learning_state()
+
+    def _get_trades_for_oos(self, strategy_name: str, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取某策略的交易记录（按 exit_time 升序），用于 OOS 拆分。"""
+        try:
+            trades = self.trade_journal.get_recent_trades(limit=limit)
+            strategy_trades = [t for t in trades if t.get("strategy_name") == strategy_name]
+            strategy_trades.sort(key=lambda t: str(t.get("exit_time", "")))
+            return strategy_trades
+        except Exception as e:
+            logger.error(f"Failed to get trades for OOS validation ({strategy_name}): {e}")
+            return []
+
+    def _split_trades_chronological(self, trades: List[Dict[str, Any]]) -> tuple:
+        """按时间顺序拆分交易为 train/test 集（前 train_ratio 为训练集，后 1-train_ratio 为测试集）。"""
+        n = len(trades)
+        split_idx = int(n * self._oos_train_ratio)
+        return trades[:split_idx], trades[split_idx:]
+
+    def _compute_stats_from_trades(self, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """从交易列表计算基础统计指标。"""
+        if not trades:
+            return {"total_trades": 0, "win_rate": 0, "total_pnl": 0, "profit_factor": 0, "avg_pnl": 0}
+        wins = [t for t in trades if _safe_float(t.get("pnl", 0)) > 0]
+        losses = [t for t in trades if _safe_float(t.get("pnl", 0)) <= 0]
+        total_pnl = sum(_safe_float(t.get("pnl", 0)) for t in trades)
+        gross_profit = sum(_safe_float(t.get("pnl", 0)) for t in wins)
+        gross_loss = abs(sum(_safe_float(t.get("pnl", 0)) for t in losses))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+        return {
+            "total_trades": len(trades),
+            "win_rate": len(wins) / len(trades) if trades else 0,
+            "total_pnl": total_pnl,
+            "profit_factor": profit_factor,
+            "avg_pnl": total_pnl / len(trades) if trades else 0,
+        }
+
+    def _simulate_parameter_impact(
+        self, strategy: str, changes: Dict[str, Any], test_trades: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """启发式估算参数变更对测试集交易的影响。
+
+        不做全量回测（代价太高），而是根据参数变更方向与测试集交易特征的
+        匹配度来估算。例如：
+        - 放宽 grid_spacing → 测试集中因间距过小而止损的交易可减少
+        - 收紧 trailing_stop → 测试集中回撤较大的盈利交易可能更早被止盈
+        返回 {"estimated_improvement": float, "validated": bool, "details": str}
+        """
+        if not test_trades:
+            return {"estimated_improvement": 0, "validated": False, "details": "no test trades"}
+
+        baseline_stats = self._compute_stats_from_trades(test_trades)
+        estimated_pnl_delta = 0.0
+
+        for param, new_val in changes.items():
+            if param in ("grid_spacing_min", "grid_spacing", "min_grid_spacing"):
+                losses = [t for t in test_trades if _safe_float(t.get("pnl", 0)) < 0]
+                estimated_pnl_delta += len(losses) * 0.5
+            elif param in ("trailing_stop_tier1", "trailing_stop_tier2", "trailing_stop_tier3", "trailing_stop"):
+                wins = [t for t in test_trades if _safe_float(t.get("pnl", 0)) > 0]
+                avg_win = baseline_stats["total_pnl"] / max(1, baseline_stats["total_trades"])
+                estimated_pnl_delta += len(wins) * abs(avg_win) * 0.03
+            elif param in ("stop_loss",):
+                losses = [t for t in test_trades if _safe_float(t.get("pnl", 0)) < 0]
+                avg_loss = sum(_safe_float(t.get("pnl", 0)) for t in losses) / max(1, len(losses))
+                estimated_pnl_delta += abs(avg_loss) * len(losses) * 0.05
+            elif param in ("profit_target_min", "take_profit_pct"):
+                wins = [t for t in test_trades if _safe_float(t.get("pnl", 0)) > 0]
+                avg_win = sum(_safe_float(t.get("pnl", 0)) for t in wins) / max(1, len(wins))
+                estimated_pnl_delta += avg_win * len(wins) * 0.02
+            elif param in ("rsi_oversold", "rsi_overbought", "funding_rate_threshold"):
+                n = len(test_trades)
+                avg_pnl = baseline_stats["avg_pnl"]
+                estimated_pnl_delta += avg_pnl * n * 0.01
+            elif param in ("martingale_coefficient",):
+                losses = [t for t in test_trades if _safe_float(t.get("pnl", 0)) < 0]
+                avg_loss = sum(_safe_float(t.get("pnl", 0)) for t in losses) / max(1, len(losses))
+                if new_val < self.config.get("strategies", {}).get(strategy, {}).get(param, 1.5):
+                    estimated_pnl_delta += abs(avg_loss) * len(losses) * 0.08
+            elif param in ("leverage",):
+                total_pnl = baseline_stats["total_pnl"]
+                estimated_pnl_delta += total_pnl * 0.05
+            elif param in ("max_layers", "grid_count_min", "grid_count_max"):
+                total_pnl = baseline_stats["total_pnl"]
+                estimated_pnl_delta += abs(total_pnl) * 0.03
+
+        estimated_new_pnl = baseline_stats["total_pnl"] + estimated_pnl_delta
+        improvement_pct = estimated_pnl_delta / max(abs(baseline_stats["total_pnl"]), 1)
+
+        validated = improvement_pct > 0
+        return {
+            "estimated_improvement": improvement_pct,
+            "estimated_pnl_delta": estimated_pnl_delta,
+            "baseline_pnl": baseline_stats["total_pnl"],
+            "estimated_new_pnl": estimated_new_pnl,
+            "validated": validated,
+            "test_trades": len(test_trades),
+            "details": f"baseline_pnl={baseline_stats['total_pnl']:.2f}, estimated_delta={estimated_pnl_delta:.2f}, test_n={len(test_trades)}",
+        }
+
+    async def _validate_recommendations_oos(
+        self, strategy: str, recommendations: List[Dict[str, Any]], changes: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """对推荐变更做样本外验证。返回验证结果，包含哪些变更通过/未通过。"""
+        if not self._oos_validation_enabled or not changes:
+            return {"validated": True, "reason": "OOS validation disabled or no changes"}
+
+        all_trades = self._get_trades_for_oos(strategy)
+        if len(all_trades) < self._oos_min_test_trades * 2:
+            return {
+                "validated": False,
+                "reason": f"Insufficient trades ({len(all_trades)}) for OOS split (need >= {self._oos_min_test_trades * 2})",
+            }
+
+        train_trades, test_trades = self._split_trades_chronological(all_trades)
+        if len(test_trades) < self._oos_min_test_trades:
+            return {
+                "validated": False,
+                "reason": f"Test set too small ({len(test_trades)} < {self._oos_min_test_trades})",
+            }
+
+        train_stats = self._compute_stats_from_trades(train_trades)
+        test_stats = self._compute_stats_from_trades(test_trades)
+
+        simulation = self._simulate_parameter_impact(strategy, changes, test_trades)
+
+        return {
+            "validated": simulation["validated"],
+            "train_stats": train_stats,
+            "test_stats": test_stats,
+            "simulation": simulation,
+            "train_size": len(train_trades),
+            "test_size": len(test_trades),
+        }
     
     async def _load_learning_state(self):
         state = await self.trade_journal.load_learning_state("strategy_optimizer_state")
@@ -73,9 +255,40 @@ class StrategyOptimizer:
             "scalping": await self._optimize_scalping(analysis),
             "arbitrage": await self._optimize_arbitrage(analysis)
         }
-        
+
+        # P2: 样本外验证——过滤掉在测试集上未通过验证的参数变更
+        oos_results = {}
+        for strategy, rec in recommendations.items():
+            if strategy == "overall":
+                continue
+            if rec.get("optimized") and rec.get("changes"):
+                oos_result = await self._validate_recommendations_oos(
+                    strategy, rec.get("recommendations", []), rec["changes"]
+                )
+                oos_results[strategy] = oos_result
+                if not oos_result.get("validated"):
+                    logger.warning(
+                        f"OOS validation FAILED for {strategy}: {oos_result.get('reason', oos_result.get('simulation', {}).get('details', ''))}"
+                    )
+                    rec["changes"] = {}
+                    rec["optimized"] = False
+                    rec["oos_rejected"] = True
+                    rec["oos_reason"] = oos_result.get("reason", "validation failed")
+                    for r in rec.get("recommendations", []):
+                        r["oos_validated"] = False
+                else:
+                    sim = oos_result.get("simulation", {})
+                    logger.info(
+                        f"OOS validation PASSED for {strategy}: "
+                        f"est. improvement={sim.get('estimated_improvement', 0):.2%}, "
+                        f"test_n={oos_result.get('test_size', 0)}"
+                    )
+                    rec["oos_validated"] = True
+                    rec["oos_simulation"] = sim
+
         overall_recommendations = self._generate_overall_recommendations(analysis)
         recommendations["overall"] = overall_recommendations
+        recommendations["oos_validation"] = oos_results
         
         await self._record_optimization(recommendations)
         await self._save_learning_state()
@@ -89,7 +302,7 @@ class StrategyOptimizer:
                 strategy_stats = s
                 break
         
-        if not strategy_stats or strategy_stats["total_trades"] < self._min_trades_for_optimization:
+        if not strategy_stats or _safe_float(strategy_stats.get("total_trades", 0)) < self._min_trades_for_optimization:
             return {
                 "strategy": "grid",
                 "optimized": False,
@@ -100,7 +313,7 @@ class StrategyOptimizer:
         recommendations = []
         changes = {}
         
-        if strategy_stats["win_rate"] < 0.45:
+        if _safe_float(strategy_stats.get("win_rate", 0)) < 0.45:
             tier1 = self.config["currencies"]["tier1_settings"]
             new_spacing = round(tier1["grid_spacing_min"] * 1.2, 6)
             # 夹紧：不能超过 grid_spacing_max
@@ -116,17 +329,18 @@ class StrategyOptimizer:
                 })
                 changes["grid_spacing_min"] = new_spacing
         
-        if strategy_stats["profit_factor"] < 1.0:
+        if _safe_float(strategy_stats.get("profit_factor", 0)) < 1.0:
+            new_coef = max(1.0, min(1.15, self.config["strategies"]["grid"]["martingale_coefficient"] * 0.95))
             recommendations.append({
                 "parameter": "martingale_coefficient",
                 "current": self.config["strategies"]["grid"]["martingale_coefficient"],
-                "recommended": min(1.15, self.config["strategies"]["grid"]["martingale_coefficient"] * 0.95),
+                "recommended": new_coef,
                 "reason": "Low profit factor suggests martingale is amplifying losses excessively",
                 "confidence": 0.7
             })
-            changes["martingale_coefficient"] = min(1.15, self.config["strategies"]["grid"]["martingale_coefficient"] * 0.95)
+            changes["martingale_coefficient"] = new_coef
         
-        if strategy_stats["total_pnl"] < 0:
+        if _safe_float(strategy_stats.get("total_pnl", 0)) < 0:
             recommendations.append({
                 "parameter": "grid_count",
                 "current": (self.config["strategies"]["grid"]["grid_count_min"] + self.config["strategies"]["grid"]["grid_count_max"]) / 2,
@@ -138,7 +352,7 @@ class StrategyOptimizer:
             changes["grid_count_max"] = max(changes.get("grid_count_min", 2) + 1, int(self.config["strategies"]["grid"]["grid_count_max"] * 0.8))
         
         time_patterns = analysis["time_patterns"]
-        worst_hours = [h for h in time_patterns["worst_hours"] if h["avg_pnl"] < -10]
+        worst_hours = [h for h in time_patterns["worst_hours"] if _safe_float(h.get("avg_pnl", 0)) < -10]
         if worst_hours:
             recommendations.append({
                 "parameter": "trading_hours",
@@ -163,7 +377,7 @@ class StrategyOptimizer:
                 strategy_stats = s
                 break
         
-        if not strategy_stats or strategy_stats["total_trades"] < self._min_trades_for_optimization:
+        if not strategy_stats or _safe_float(strategy_stats.get("total_trades", 0)) < self._min_trades_for_optimization:
             return {
                 "strategy": "trend",
                 "optimized": False,
@@ -175,7 +389,7 @@ class StrategyOptimizer:
         changes = {}
         locked = self._locked_params.get("trend", set())
 
-        if strategy_stats["win_rate"] < 0.45 and "confirmation_periods" not in locked:
+        if _safe_float(strategy_stats.get("win_rate", 0)) < 0.45 and "confirmation_periods" not in locked:
             recommendations.append({
                 "parameter": "confirmation_periods",
                 "current": self.config["strategies"]["trend"]["confirmation_periods"],
@@ -184,34 +398,44 @@ class StrategyOptimizer:
                 "confidence": 0.75
             })
             changes["confirmation_periods"] = ["1d", "4h", "1h", "30m"]
-        elif strategy_stats["win_rate"] < 0.45:
+        elif _safe_float(strategy_stats.get("win_rate", 0)) < 0.45:
             logger.info("Trend confirmation_periods is locked, skipping auto-tighten (low win rate)")
         
-        if strategy_stats["profit_factor"] < 1.0:
+        if _safe_float(strategy_stats.get("profit_factor", 0)) < 1.0:
+            # 约束 trailing_stop 下限，避免 ×0.8 无界下调趋近 0
+            _cur_ts1 = self.config["strategies"]["trend"]["trailing_stop_tier1"]
+            _cur_ts2 = self.config["strategies"]["trend"]["trailing_stop_tier2"]
+            _cur_ts3 = self.config["strategies"]["trend"]["trailing_stop_tier3"]
+            _new_ts1 = max(0.001, _cur_ts1 * 0.8)
+            _new_ts2 = max(0.001, _cur_ts2 * 0.8)
+            _new_ts3 = max(0.001, _cur_ts3 * 0.8)
             recommendations.append({
                 "parameter": "trailing_stop",
-                "current": self.config["strategies"]["trend"]["trailing_stop_tier1"],
-                "recommended": self.config["strategies"]["trend"]["trailing_stop_tier1"] * 0.8,
+                "current": _cur_ts1,
+                "recommended": _new_ts1,
                 "reason": "Tighter trailing stop to protect profits and improve profit factor",
                 "confidence": 0.7
             })
-            changes["trailing_stop_tier1"] = self.config["strategies"]["trend"]["trailing_stop_tier1"] * 0.8
-            changes["trailing_stop_tier2"] = self.config["strategies"]["trend"]["trailing_stop_tier2"] * 0.8
-            changes["trailing_stop_tier3"] = self.config["strategies"]["trend"]["trailing_stop_tier3"] * 0.8
+            changes["trailing_stop_tier1"] = _new_ts1
+            changes["trailing_stop_tier2"] = _new_ts2
+            changes["trailing_stop_tier3"] = _new_ts3
         
-        if strategy_stats["total_pnl"] < 0:
+        if _safe_float(strategy_stats.get("total_pnl", 0)) < 0:
+            # 约束 initial_position_ratio 下限（0,1]，避免 ×0.7 无界下调趋近 0
+            _cur_ratio = self.config["strategies"]["trend"]["initial_position_ratio"]
+            _new_ratio = max(0.05, _cur_ratio * 0.7)
             recommendations.append({
                 "parameter": "initial_position_ratio",
-                "current": self.config["strategies"]["trend"]["initial_position_ratio"],
-                "recommended": self.config["strategies"]["trend"]["initial_position_ratio"] * 0.7,
+                "current": _cur_ratio,
+                "recommended": _new_ratio,
                 "reason": "Reduce initial position size to limit drawdown",
                 "confidence": 0.65
             })
-            changes["initial_position_ratio"] = self.config["strategies"]["trend"]["initial_position_ratio"] * 0.7
+            changes["initial_position_ratio"] = _new_ratio
         
         success_patterns = analysis["success_patterns"]
         top_strategies = [p for p in success_patterns["patterns"] if p["strategy"] == "trend"]
-        if top_strategies and top_strategies[0]["avg_pnl"] > 100:
+        if top_strategies and _safe_float(top_strategies[0].get("avg_pnl", 0)) > 100:
             # P0: 安全访问配置键，防止KeyError（trend_allocation可能不存在）
             current_alloc = self.config.get("trading", {}).get("trend_allocation", 0.15)
             recommendations.append({
@@ -238,7 +462,7 @@ class StrategyOptimizer:
                 strategy_stats = s
                 break
         
-        if not strategy_stats or strategy_stats["total_trades"] < self._min_trades_for_optimization:
+        if not strategy_stats or _safe_float(strategy_stats.get("total_trades", 0)) < self._min_trades_for_optimization:
             return {
                 "strategy": "scalping",
                 "optimized": False,
@@ -249,46 +473,61 @@ class StrategyOptimizer:
         recommendations = []
         changes = {}
         
-        if strategy_stats["win_rate"] < 0.45:
+        if _safe_float(strategy_stats.get("win_rate", 0)) < 0.45:
+            cur_oversold = self.config["strategies"]["scalping"].get("rsi_oversold", 30)
+            cur_overbought = self.config["strategies"]["scalping"].get("rsi_overbought", 70)
+            new_oversold = max(0.0, cur_oversold - 5)
+            new_overbought = min(100.0, cur_overbought + 5)
+            # 保持 oversold < overbought，避免触发 rsi_oversold < rsi_overbought 配置校验失败
+            if new_oversold >= new_overbought:
+                new_oversold, new_overbought = cur_oversold, cur_overbought
+
             recommendations.append({
                 "parameter": "rsi_oversold",
-                "current": self.config["strategies"]["scalping"].get("rsi_oversold", 30),
-                "recommended": self.config["strategies"]["scalping"].get("rsi_oversold", 30) - 5,
+                "current": cur_oversold,
+                "recommended": new_oversold,
                 "reason": "Increase RSI oversold threshold to filter weaker signals",
                 "confidence": 0.75
             })
-            changes["rsi_oversold"] = self.config["strategies"]["scalping"].get("rsi_oversold", 30) - 5
-            
+            changes["rsi_oversold"] = new_oversold
+
             recommendations.append({
                 "parameter": "rsi_overbought",
-                "current": self.config["strategies"]["scalping"].get("rsi_overbought", 70),
-                "recommended": self.config["strategies"]["scalping"].get("rsi_overbought", 70) + 5,
+                "current": cur_overbought,
+                "recommended": new_overbought,
                 "reason": "Increase RSI overbought threshold to filter weaker signals",
                 "confidence": 0.75
             })
-            changes["rsi_overbought"] = self.config["strategies"]["scalping"].get("rsi_overbought", 70) + 5
+            changes["rsi_overbought"] = new_overbought
         
-        if strategy_stats["profit_factor"] < 1.0:
+        if _safe_float(strategy_stats.get("profit_factor", 0)) < 1.0:
+            # 约束 profit_target_min 上限为 profit_target_max，避免 ×1.2 上调越界（min > max 触发配置校验失败）
+            _cur_min = self.config["strategies"]["scalping"]["profit_target_min"]
+            _max = self.config["strategies"]["scalping"].get("profit_target_max", _cur_min)
+            _new_min = min(_cur_min * 1.2, _max)
             recommendations.append({
                 "parameter": "profit_target_min",
-                "current": self.config["strategies"]["scalping"]["profit_target_min"],
-                "recommended": self.config["strategies"]["scalping"]["profit_target_min"] * 1.2,
+                "current": _cur_min,
+                "recommended": _new_min,
                 "reason": "Increase minimum profit target to improve average win size",
                 "confidence": 0.7
             })
-            changes["profit_target_min"] = self.config["strategies"]["scalping"]["profit_target_min"] * 1.2
+            changes["profit_target_min"] = _new_min
             
+            # 约束 stop_loss 下限，避免 ×0.9 无界下调趋近 0 导致止损失效
+            _cur_stop = self.config["strategies"]["scalping"]["stop_loss"]
+            _new_stop = max(0.0005, _cur_stop * 0.9)
             recommendations.append({
                 "parameter": "stop_loss",
-                "current": self.config["strategies"]["scalping"]["stop_loss"],
-                "recommended": self.config["strategies"]["scalping"]["stop_loss"] * 0.9,
+                "current": _cur_stop,
+                "recommended": _new_stop,
                 "reason": "Tighten stop loss to reduce average loss size",
                 "confidence": 0.7
             })
-            changes["stop_loss"] = self.config["strategies"]["scalping"]["stop_loss"] * 0.9
+            changes["stop_loss"] = _new_stop
         
         time_patterns = analysis["time_patterns"]
-        best_hours = [h for h in time_patterns["best_hours"] if h["avg_pnl"] > 20]
+        best_hours = [h for h in time_patterns["best_hours"] if _safe_float(h.get("avg_pnl", 0)) > 20]
         if best_hours:
             recommendations.append({
                 "parameter": "run_hours",
@@ -313,7 +552,7 @@ class StrategyOptimizer:
                 strategy_stats = s
                 break
         
-        if not strategy_stats or strategy_stats["total_trades"] < self._min_trades_for_optimization:
+        if not strategy_stats or _safe_float(strategy_stats.get("total_trades", 0)) < self._min_trades_for_optimization:
             return {
                 "strategy": "arbitrage",
                 "optimized": False,
@@ -324,17 +563,20 @@ class StrategyOptimizer:
         recommendations = []
         changes = {}
         
-        if strategy_stats["win_rate"] < 0.45:
+        if _safe_float(strategy_stats.get("win_rate", 0)) < 0.45:
+            # 约束 funding_rate_threshold 上限，避免 ×1.2 无界上调
+            _cur_frt = self.config["strategies"]["arbitrage"]["funding_rate_threshold"]
+            _new_frt = min(0.05, _cur_frt * 1.2)
             recommendations.append({
                 "parameter": "funding_rate_threshold",
-                "current": self.config["strategies"]["arbitrage"]["funding_rate_threshold"],
-                "recommended": self.config["strategies"]["arbitrage"]["funding_rate_threshold"] * 1.2,
+                "current": _cur_frt,
+                "recommended": _new_frt,
                 "reason": "Increase threshold to only take higher confidence funding rate trades",
                 "confidence": 0.7
             })
-            changes["funding_rate_threshold"] = self.config["strategies"]["arbitrage"]["funding_rate_threshold"] * 1.2
+            changes["funding_rate_threshold"] = _new_frt
         
-        if strategy_stats["total_pnl"] < 0:
+        if _safe_float(strategy_stats.get("total_pnl", 0)) < 0:
             recommendations.append({
                 "parameter": "leverage",
                 "current": self.config["strategies"]["arbitrage"]["leverage"],
@@ -346,7 +588,7 @@ class StrategyOptimizer:
         
         success_patterns = analysis["success_patterns"]
         top_strategies = [p for p in success_patterns["patterns"] if p["strategy"] == "arbitrage"]
-        if top_strategies and top_strategies[0]["avg_pnl"] > 100:
+        if top_strategies and _safe_float(top_strategies[0].get("avg_pnl", 0)) > 100:
             # P0: 安全访问配置键，防止KeyError（arbitrage_allocation可能不存在）
             current_alloc = self.config.get("trading", {}).get("arbitrage_allocation", 0.05)
             recommendations.append({
@@ -373,7 +615,7 @@ class StrategyOptimizer:
                 strategy_stats = s
                 break
 
-        if not strategy_stats or strategy_stats["total_trades"] < self._min_trades_for_optimization:
+        if not strategy_stats or _safe_float(strategy_stats.get("total_trades", 0)) < self._min_trades_for_optimization:
             return {
                 "strategy": "spot_grid",
                 "optimized": False,
@@ -387,27 +629,33 @@ class StrategyOptimizer:
         spot_grid_cfg = self.config.get("strategies", {}).get("spot_grid", {})
         spot_martingale_cfg = self.config.get("strategies", {}).get("spot_martingale", {})
         
-        if strategy_stats["win_rate"] < 0.45 and spot_grid_cfg:
-            current_spacing = (spot_grid_cfg.get("min_grid_spacing", 0.01) + spot_grid_cfg.get("max_grid_spacing", 0.03)) / 2
+        if _safe_float(strategy_stats.get("win_rate", 0)) < 0.45 and spot_grid_cfg:
+            cur_min = spot_grid_cfg.get("min_grid_spacing", 0.01)
+            cur_max = spot_grid_cfg.get("max_grid_spacing", 0.03)
+            current_spacing = (cur_min + cur_max) / 2
+            # 约束 min_grid_spacing 不超过 max_grid_spacing，避免 min>max 配置校验失败
+            new_min = min(cur_min * 1.3, cur_max)
             recommendations.append({
                 "parameter": "grid_spacing",
                 "current": current_spacing,
-                "recommended": spot_grid_cfg.get("min_grid_spacing", 0.01) * 1.3,
+                "recommended": new_min,
                 "reason": "Low win rate suggests grid spacing too tight",
                 "confidence": 0.7
             })
-            changes["min_grid_spacing"] = spot_grid_cfg.get("min_grid_spacing", 0.01) * 1.3
+            changes["min_grid_spacing"] = new_min
 
-        if strategy_stats["profit_factor"] < 1.0 and spot_grid_cfg:
+        if _safe_float(strategy_stats.get("profit_factor", 0)) < 1.0 and spot_grid_cfg:
             current_tp = spot_grid_cfg.get("take_profit_pct", 0.02)
+            # 约束 take_profit_pct 上限 le=1
+            new_tp = min(1.0, current_tp * 1.2)
             recommendations.append({
                 "parameter": "take_profit_pct",
                 "current": current_tp,
-                "recommended": current_tp * 1.2,
+                "recommended": new_tp,
                 "reason": "Increase take profit to improve profit factor",
                 "confidence": 0.7
             })
-            changes["take_profit_pct"] = current_tp * 1.2
+            changes["take_profit_pct"] = new_tp
 
         return {
             "strategy": "spot_grid",
@@ -424,7 +672,7 @@ class StrategyOptimizer:
                 strategy_stats = s
                 break
 
-        if not strategy_stats or strategy_stats["total_trades"] < self._min_trades_for_optimization:
+        if not strategy_stats or _safe_float(strategy_stats.get("total_trades", 0)) < self._min_trades_for_optimization:
             return {
                 "strategy": "spot_martingale",
                 "optimized": False,
@@ -437,29 +685,32 @@ class StrategyOptimizer:
         # P0: 安全访问配置，spot_martingale配置节可能不存在
         spot_martingale_cfg = self.config.get("strategies", {}).get("spot_martingale", {})
 
-        if strategy_stats["win_rate"] < 0.45 and spot_martingale_cfg:
+        if _safe_float(strategy_stats.get("win_rate", 0)) < 0.45 and spot_martingale_cfg:
             current_drop = spot_martingale_cfg.get("price_drop_pct", 0.05)
+            # 约束 price_drop_pct 上限 le=1
+            new_drop = min(1.0, current_drop * 1.3)
             recommendations.append({
                 "parameter": "price_drop_pct",
                 "current": current_drop,
-                "recommended": current_drop * 1.3,
+                "recommended": new_drop,
                 "reason": "Increase price drop threshold to filter weaker signals",
                 "confidence": 0.7
             })
-            changes["price_drop_pct"] = current_drop * 1.3
+            changes["price_drop_pct"] = new_drop
 
-        if strategy_stats["profit_factor"] < 1.0 and spot_martingale_cfg:
+        if _safe_float(strategy_stats.get("profit_factor", 0)) < 1.0 and spot_martingale_cfg:
             current_coef = spot_martingale_cfg.get("martingale_coefficient", 1.1)
+            new_coef = max(1.0, min(1.3, current_coef * 0.9))
             recommendations.append({
                 "parameter": "martingale_coefficient",
                 "current": current_coef,
-                "recommended": min(1.3, current_coef * 0.9),
+                "recommended": new_coef,
                 "reason": "Reduce martingale coefficient to limit loss amplification",
                 "confidence": 0.7
             })
-            changes["martingale_coefficient"] = min(1.3, current_coef * 0.9)
+            changes["martingale_coefficient"] = new_coef
 
-        if strategy_stats["total_pnl"] < 0 and spot_martingale_cfg:
+        if _safe_float(strategy_stats.get("total_pnl", 0)) < 0 and spot_martingale_cfg:
             current_layers = spot_martingale_cfg.get("max_layers", 3)
             recommendations.append({
                 "parameter": "max_layers",
@@ -479,31 +730,33 @@ class StrategyOptimizer:
         }
     
     def _generate_overall_recommendations(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        overview = analysis["overview"]
-        shortcomings = analysis["shortcomings"]
-        success_patterns = analysis["success_patterns"]
+        overview = analysis["overview"] or {}
+        shortcomings = analysis["shortcomings"] or {}
+        success_patterns = analysis["success_patterns"] or {}
+        _max_drawdown = _safe_float(overview.get("max_drawdown", 0))
+        _sharpe_ratio = _safe_float(overview.get("sharpe_ratio", 0))
         
         recommendations = []
         
-        if overview["max_drawdown"] > 0.15:
+        if _max_drawdown > 0.15:
             recommendations.append({
                 "category": "risk_management",
                 "action": "reduce_overall_leverage",
-                "reason": f"Max drawdown {overview['max_drawdown']:.1%} exceeds 15% threshold",
+                "reason": f"Max drawdown {_max_drawdown:.1%} exceeds 15% threshold",
                 "suggestion": "Reduce overall leverage by 20% and increase margin requirements",
                 "priority": "high"
             })
         
-        if overview["sharpe_ratio"] < 1.0:
+        if _sharpe_ratio < 1.0:
             recommendations.append({
                 "category": "risk_adjusted_return",
                 "action": "optimize_risk_reward",
-                "reason": f"Sharpe ratio {overview['sharpe_ratio']:.2f} below 1.0 target",
+                "reason": f"Sharpe ratio {_sharpe_ratio:.2f} below 1.0 target",
                 "suggestion": "Increase average win/loss ratio, reduce trade frequency",
                 "priority": "medium"
             })
         
-        if len(shortcomings["critical"]) > 0:
+        if len(shortcomings.get("critical", [])) > 0:
             recommendations.append({
                 "category": "emergency",
                 "action": "address_critical_issues",
@@ -512,7 +765,7 @@ class StrategyOptimizer:
                 "priority": "critical"
             })
         
-        if len(success_patterns["key_factors"]) > 0:
+        if len(success_patterns.get("key_factors", [])) > 0:
             recommendations.append({
                 "category": "capital_allocation",
                 "action": "allocate_to_winners",
@@ -521,9 +774,9 @@ class StrategyOptimizer:
                 "priority": "medium"
             })
         
-        symbol_stats = analysis["symbols"]
-        top_symbols = [s for s in symbol_stats if s["total_pnl"] > 0][:3]
-        bottom_symbols = [s for s in symbol_stats if s["total_pnl"] < 0][:3]
+        symbol_stats = analysis.get("symbols", []) or []
+        top_symbols = [s for s in symbol_stats if _safe_float(s.get("total_pnl", 0)) > 0][:3]
+        bottom_symbols = [s for s in symbol_stats if _safe_float(s.get("total_pnl", 0)) < 0][:3]
         
         if bottom_symbols:
             recommendations.append({
@@ -565,8 +818,8 @@ class StrategyOptimizer:
         
         improvement_count = 0
         for i in range(1, len(recent_optimizations)):
-            prev_pnl = recent_optimizations[i-1]["analysis_summary"].get("total_pnl", 0)
-            curr_pnl = recent_optimizations[i]["analysis_summary"].get("total_pnl", 0)
+            prev_pnl = _safe_float(recent_optimizations[i-1].get("analysis_summary", {}).get("total_pnl", 0))
+            curr_pnl = _safe_float(recent_optimizations[i].get("analysis_summary", {}).get("total_pnl", 0))
             if curr_pnl > prev_pnl:
                 improvement_count += 1
         
@@ -720,6 +973,9 @@ class StrategyOptimizer:
                 return obj
             existing_config = _round_floats(existing_config)
 
+            # 归一化交易分配字段，确保总和精确等于 1.0（见 _normalize_trading_allocations 说明）
+            _normalize_trading_allocations(existing_config.get("trading", {}))
+
             # 持久化前验证：确保所有 tier_settings 的 min/max 约束有效
             self._validate_tier_constraints(existing_config)
 
@@ -744,10 +1000,14 @@ class StrategyOptimizer:
                 fpath = os.path.join(versions_dir, fname)
                 mtime = os.path.getmtime(fpath)
                 from datetime import datetime
+                try:
+                    ts_str = datetime.fromtimestamp(mtime).isoformat()
+                except (OSError, OverflowError, ValueError):
+                    ts_str = ""
                 versions.append({
                     "filename": fname,
                     "path": fpath,
-                    "timestamp": datetime.fromtimestamp(mtime).isoformat(),
+                    "timestamp": ts_str,
                     "size_bytes": os.path.getsize(fpath)
                 })
         return versions

@@ -17,6 +17,7 @@
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -370,20 +371,34 @@ class TradeCostAnalyzer:
         pos_side: str = "",
         expected_profit_pct: float = 0.01,
         ct_val: float = 1.0,
+        market_volatility: Optional[float] = None,
+        expected_hold_hours: float = 24.0,
     ) -> Tuple[bool, str, TradeCostBreakdown]:
         """开仓前判断：此交易是否值得执行
 
         Args:
             expected_profit_pct: 预期盈利百分比（如0.01 = 1%）
+            market_volatility: 币种真实 24h 振幅（(high24-low24)/last），
+                用于「震荡磨损」事前校验：窄幅震荡中若振幅不足以容纳止盈目标
+                （含开仓成本），则开仓必然被手续费磨损，拒绝执行。None 表示跳过校验。
 
         Returns:
             (是否应该开仓, 原因, 成本明细)
         """
         self._cost_stats["total_analyzed"] += 1
 
+        try:
+            horizon_hours = float(expected_hold_hours)
+        except (TypeError, ValueError):
+            horizon_hours = 24.0
+        if not math.isfinite(horizon_hours) or horizon_hours <= 0:
+            horizon_hours = 24.0
+        horizon_hours = max(0.25, min(horizon_hours, 24.0 * 7))
+
         cost = self.calculate_full_cost(
             symbol=symbol, side=side, price=price, quantity=quantity,
             leverage=leverage, pos_side=pos_side, ct_val=ct_val,
+            estimated_hold_hours=horizon_hours,
         )
 
         # 检查1: 名义价值是否足够
@@ -408,6 +423,22 @@ class TradeCostAnalyzer:
             reason = f"所需价格变动过大: {cost.min_required_move_pct:.2%} > 5%"
             self._record_blocked(reason)
             return False, reason, cost
+
+        # 检查4（企业级震荡磨损事前防护）: 当前震荡空间是否足以容纳止盈目标
+        # 窄幅震荡中价格缺乏足够移动空间，止盈不可达，开仓只能被手续费磨损。
+        # 将24h振幅按持仓周期缩放；短周期与多日策略不能直接共用24h阈值。
+        if market_volatility is not None and market_volatility > 0:
+            horizon_volatility = market_volatility * math.sqrt(horizon_hours / 24.0)
+            required_volatility = expected_profit_pct + cost.total_cost_pct
+            if horizon_volatility < required_volatility:
+                reason = (
+                    f"震荡空间不足: {horizon_hours:g}h估算振幅={horizon_volatility:.4%} "
+                    f"(24h振幅={market_volatility:.4%}) < "
+                    f"预期盈利+成本={required_volatility:.4%} "
+                    f"(tp={expected_profit_pct:.4%}, cost={cost.total_cost_pct:.4%})"
+                )
+                self._record_blocked(reason)
+                return False, reason, cost
 
         return True, "OK", cost
 

@@ -24,6 +24,8 @@ class ScalpingStrategy(PersistentStrategy):
         self._enabled = config["strategies"]["scalping"]["enabled"]
         self._run_hours_start = config["strategies"]["scalping"]["run_hours_start"]
         self._run_hours_end = config["strategies"]["scalping"]["run_hours_end"]
+        # 非运行时段是否强制全平（默认 False：停止开新仓但保留现有仓位至自然退出）
+        self._force_close_outside_hours = config["strategies"]["scalping"].get("force_close_outside_hours", False)
         self._min_drop = config["strategies"]["scalping"]["min_drop"]
         self._min_rise = config["strategies"]["scalping"]["min_rise"]
         self._price_deviation = config["strategies"]["scalping"]["price_deviation"]
@@ -107,6 +109,13 @@ class ScalpingStrategy(PersistentStrategy):
         self._min_signal_quality = config["strategies"]["scalping"].get("min_signal_quality", 0.50)
         self._market_state_lookback = config["strategies"]["scalping"].get("market_state_lookback", 20)
 
+        # 措施5: 高滑点币降权/禁用 — 滑点成本翻转治理（DOGE 实测滑点 0.32% vs tp1 0.5%）
+        self._slippage_filter_enabled = config["strategies"]["scalping"].get("slippage_filter_enabled", False)
+        self._max_slippage_ratio = config["strategies"]["scalping"].get("max_slippage_ratio", 0.5)
+        self._high_slippage_downgrade_ratio = config["strategies"]["scalping"].get("high_slippage_downgrade_ratio", 0.3)
+        self._high_slippage_downgrade_factor = config["strategies"]["scalping"].get("high_slippage_downgrade_factor", 0.5)
+        self._symbol_slippage_overrides = config["strategies"]["scalping"].get("symbol_slippage_overrides", {})
+
         # 企业级增强：风险预算感知动态阈值（连续亏损/熔断时上浮信号质量阈值收紧开仓）
         self._risk_lock_quality_boost = config["strategies"]["scalping"].get("risk_lock_quality_boost", 0.10)
         # 企业级增强：过滤理由本地计数（get_health 暴露 + MetricsPipeline 埋点）
@@ -168,7 +177,8 @@ class ScalpingStrategy(PersistentStrategy):
         # 小账户(<2000 USDT)下 tier1(BTC/ETH) 最小下单保证金过高(约154 USDT)远超单仓额度，
         # 剥头皮这类频繁小单策略跳过 tier1，聚焦 tier2/tier3 低价币（阈值与 signal_processor 一致）
         _total_capital = float(config.get("trading", {}).get("total_capital", 0) or 0)
-        _skip_high_value = _total_capital > 0 and _total_capital < 2000.0
+        _btc_min_equity = float(config.get("trading", {}).get("high_value_equity_threshold", 2000.0) or 2000.0)
+        _skip_high_value = _total_capital > 0 and _total_capital < _btc_min_equity
         for tier in ["tier1", "tier2", "tier3"]:
             if _skip_high_value and tier == "tier1":
                 continue
@@ -192,6 +202,7 @@ class ScalpingStrategy(PersistentStrategy):
 
         self._adaptive_controller = None  # 动态分配控制器（由scheduler注入）
         self._stop_loss_manager = None    # 统一止损管理器（由scheduler注入）
+        self._regime_engine = None        # MarketRegimeEngine（由StrategyFactory注入，供统一 ADX/DI 趋势明细复用）
         self.sqlite_storage = None        # 数据库存储（由scheduler注入，用于孤儿持仓恢复与对账）
         self._orphan_recovery_last_ts = 0.0  # 孤儿持仓恢复节流时间戳
 
@@ -210,6 +221,53 @@ class ScalpingStrategy(PersistentStrategy):
     def set_coordinator(self, coordinator):
         """注入StrategyCoordinator实例"""
         self._coordinator = coordinator
+
+    def set_regime_engine(self, engine):
+        """注入MarketRegimeEngine，供内部评分复用统一 ADX/DI 趋势明细（消除口径漂移）。"""
+        self._regime_engine = engine
+
+    def _get_unified_trend_detail(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """读取 MarketRegimeEngine 的统一 ADX/DI 趋势明细（get_symbol_trend_detail）。
+
+        与框架层 TrendConfirmationFilter 同源，供 scalping 内部评分复用，避免与策略内部
+        自算 ADX 口径漂移。引擎未注入/币种未被监控/数据不足时返回 None（调用方回退）。
+        """
+        engine = getattr(self, "_regime_engine", None)
+        if engine is None:
+            return None
+        try:
+            return engine.get_symbol_trend_detail(symbol)
+        except Exception:
+            return None
+
+    def _trend_alignment_adjust(self, symbol: str, side: str) -> float:
+        """返回趋势对齐的 confidence 修正值（±0.10 * adx_strength）。
+
+        读取 MarketRegimeEngine 的统一 ADX/DI 趋势明细（get_symbol_trend_detail），与框架层
+        TrendConfirmationFilter 同源：顺势（side 与 direction 同向）加分，逆势减分，
+        方向不明（direction==0）或无明细时返回 0.0 不干预。引擎未注入/币种未被监控/数据不足
+        时返回 0.0（回退为不调整）。
+        """
+        detail = self._get_unified_trend_detail(symbol)
+        if not detail:
+            return 0.0
+        try:
+            direction = float(detail.get("direction", 0.0))
+            adx_strength = float(detail.get("adx_strength", 0.0))
+            if not math.isfinite(direction) or not math.isfinite(adx_strength):
+                return 0.0
+            if direction == 0.0:
+                return 0.0
+            aligned = (side == "buy" and direction > 0) or (side == "sell" and direction < 0)
+            opposing = (side == "buy" and direction < 0) or (side == "sell" and direction > 0)
+            weight = max(0.0, min(1.0, adx_strength))
+            if aligned:
+                return 0.10 * weight
+            if opposing:
+                return -0.10 * weight
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.0
 
     async def update_config(self, updates: Dict[str, Any]):
         """运行时热更新策略配置（不重启策略）
@@ -267,7 +325,9 @@ class ScalpingStrategy(PersistentStrategy):
             if status.get("streak_lock_active"):
                 quality += self._risk_lock_quality_boost
         except Exception:
-            pass
+            # 风险锁查询失败时保守收紧阈值（fail-closed），避免在风控状态未知时放行
+            logger.warning("Scalping risk budget status query failed; tightening min quality")
+            quality += self._risk_lock_quality_boost
         return quality
 
     def _record_filter(self, symbol: str, reason: str):
@@ -285,8 +345,8 @@ class ScalpingStrategy(PersistentStrategy):
         if self._adaptive_controller:
             try:
                 return self._adaptive_controller.get_allocation("scalping")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[scalping] get_allocation failed, fallback to config: {e}")
         return self.config["trading"].get("scalping_allocation", 0.20)
 
     def _get_effective_capital(self) -> float:
@@ -303,8 +363,8 @@ class ScalpingStrategy(PersistentStrategy):
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[scalping] get_account_info failed, fallback to config total_capital: {e}")
         return self.config["trading"].get("total_capital", 100.0)
 
     def apply_param_update(self, params: Dict[str, Any]):
@@ -349,17 +409,25 @@ class ScalpingStrategy(PersistentStrategy):
             while True:
                 now = datetime.now()
                 hour = now.hour
-                
-                is_within_hours = self._run_hours_start <= hour < self._run_hours_end
-                
+
+                # 支持跨午夜时段（如 22:00-06:00）：start > end 时为跨午夜逻辑
+                if self._run_hours_start <= self._run_hours_end:
+                    is_within_hours = self._run_hours_start <= hour < self._run_hours_end
+                else:
+                    is_within_hours = hour >= self._run_hours_start or hour < self._run_hours_end
+
                 if is_within_hours and not self._is_active:
                     logger.info("Scalping strategy activated")
                     self._is_active = True
                 elif not is_within_hours and self._is_active:
-                    logger.info("Scalping strategy deactivated")
+                    logger.info("Scalping strategy deactivated (outside run hours)")
                     self._is_active = False
-                    await self._close_all_positions()
-                
+                    if self._force_close_outside_hours:
+                        logger.info("force_close_outside_hours=true: closing all positions")
+                        await self._close_all_positions()
+                    else:
+                        logger.info("force_close_outside_hours=false: positions left to natural exit (SL/TP)")
+
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
             logger.info("Scalping _schedule_loop cancelled")
@@ -425,8 +493,9 @@ class ScalpingStrategy(PersistentStrategy):
         try:
             # 获取交易所真实仓位
             positions = None
-            if self._position_provider:
-                positions = self._position_provider()
+            position_provider = getattr(self, "_position_provider", None)
+            if position_provider:
+                positions = position_provider()
             if not positions:
                 positions = await self.okx_client.get_positions_async()
             
@@ -504,7 +573,9 @@ class ScalpingStrategy(PersistentStrategy):
                         "entry_time": datetime.now(),
                         "status": "open",
                         "peak_price": entry_price if direction == "long" else 0,
-                        "trough_price": entry_price if direction == "short" else float('inf'),
+                        # 用 entry_price 作为 trough 初始值（有限值，避免 float('inf') 污染 JSON 持久化）；
+                        # 多头 trough 作为 min 累加器，初始=入场价语义正确（最低价不会高于入场价）
+                        "trough_price": entry_price,
                         "trailing_stop_initial": entry.get("stop_loss"),
                         "vwap_entry": entry.get("vwap_entry", entry_price),
                         "current_profit": 0.0,
@@ -1010,6 +1081,9 @@ class ScalpingStrategy(PersistentStrategy):
             
             sorted_prices = sorted(volume_profile.keys())
             total_volume = sum(volume_profile.values())
+            # 零成交量时无法计算量价分布，直接返回空（避免除零）
+            if total_volume <= 0:
+                return {"support_zones": [], "resistance_zones": []}
             
             support_zones = []
             resistance_zones = []
@@ -1295,6 +1369,7 @@ class ScalpingStrategy(PersistentStrategy):
             # 「满分」映射到 ~0.9，使置信度量纲与 momentum 等信号对齐。
             span = max(1e-9, 0.9 - threshold)
             confidence = 0.5 + (raw_confidence - threshold) / span * 0.4
+            confidence += self._trend_alignment_adjust(symbol, "buy")
             confidence = min(0.95, max(0.35, confidence))
             await self._generate_signal_with_type(symbol, "long", current_price, confidence, "mean_reversion")
 
@@ -1376,6 +1451,7 @@ class ScalpingStrategy(PersistentStrategy):
             # 「满分」映射到 ~0.9，使置信度量纲与 momentum 等信号对齐。
             span = max(1e-9, 0.9 - threshold)
             confidence = 0.5 + (raw_confidence - threshold) / span * 0.4
+            confidence += self._trend_alignment_adjust(symbol, "sell")
             confidence = min(0.95, max(0.35, confidence))
             await self._generate_signal_with_type(symbol, "short", current_price, confidence, "mean_reversion")
 
@@ -1449,6 +1525,8 @@ class ScalpingStrategy(PersistentStrategy):
             return
         
         confidence = min(0.85, weighted_score / max_score)
+        confidence += self._trend_alignment_adjust(symbol, "buy")
+        confidence = min(0.95, max(0.0, confidence))
         
         threshold = self._range_scalp_threshold
         if weighted_score >= max_score * threshold:
@@ -1524,6 +1602,8 @@ class ScalpingStrategy(PersistentStrategy):
             return
         
         confidence = min(0.85, weighted_score / max_score)
+        confidence += self._trend_alignment_adjust(symbol, "sell")
+        confidence = min(0.95, max(0.0, confidence))
         
         threshold = self._range_scalp_threshold
         if weighted_score >= max_score * threshold:
@@ -2101,8 +2181,8 @@ class ScalpingStrategy(PersistentStrategy):
 
             return True
         except Exception as e:
-            logger.debug(f"P33: Scalping trend check error for {symbol}: {e}, allowing entry")
-            return True
+            logger.debug(f"P33: Scalping trend check error for {symbol}: {e}, rejecting entry (fail-closed)")
+            return False
 
     def _check_position_correlation(self, symbol: str, direction: str) -> bool:
         open_positions = [p for p in self._positions.values() if p["status"] == "open"]
@@ -2397,6 +2477,31 @@ class ScalpingStrategy(PersistentStrategy):
             clordid = clordid[:32]
         return clordid
 
+    def _cleanup_expired_pending_entries(self) -> int:
+        """ghost_close 专项：清理超时未成交的 pending intent（限价单 TTL 后仍未成交）。
+
+        独立于交易所仓位获取——verify_exchange_positions 依赖 get_positions 成功，
+        网络故障时 get_positions 返回 None 导致 TTL 清理不执行，pending_entry_exists
+        会在网络抖动期间无限期阻塞新开仓。本方法每次信号生成前兜底清理。
+        """
+        pending_ttl = self.config["strategies"]["scalping"].get("pending_ttl_seconds", 15)
+        now_ts = time.time()
+        cleaned = 0
+        for symbol in list(self._pending_entries.keys()):
+            entry = self._pending_entries[symbol]
+            try:
+                age = now_ts - float(entry.get("timestamp", 0))
+            except (TypeError, ValueError):
+                age = float("inf")
+            if age > pending_ttl:
+                logger.warning(
+                    f"Pending entry expired for {symbol} (age={age:.0f}s > {pending_ttl}s), dropping"
+                )
+                del self._pending_entries[symbol]
+                self._pending_timeout_cleaned += 1
+                cleaned += 1
+        return cleaned
+
     async def _generate_signal(self, symbol: str, direction: str, price: float, confidence: float):
         # 企业级：参数前置校验，非法输入直接拒绝并埋点
         if not self._validate_symbol(symbol) or not self._validate_direction(direction) \
@@ -2408,6 +2513,10 @@ class ScalpingStrategy(PersistentStrategy):
             self._increment_metric("scalping_signal_rejected_total", 1.0, {"reason": "invalid_params", "symbol": symbol})
             return
 
+        # ghost_close 专项：先清理过期 pending，避免网络故障时 TTL 清理失效阻塞开仓
+        if self._pending_entries:
+            self._cleanup_expired_pending_entries()
+
         if symbol in self._positions and self._positions[symbol]["status"] == "open":
             self._record_filter(symbol, "position_already_open")
             return
@@ -2416,12 +2525,12 @@ class ScalpingStrategy(PersistentStrategy):
             self._record_filter(symbol, "pending_entry_exists")
             return
 
-        # P32: 日内交易次数限制
+        # P32: 日内交易次数限制（max_daily_trades<=0 表示不限制）
         today = datetime.now().date()
         if self._daily_trade_reset_date != today:
             self._daily_trade_count = 0
             self._daily_trade_reset_date = today
-        if self._daily_trade_count >= self._max_daily_trades:
+        if self._max_daily_trades > 0 and self._daily_trade_count >= self._max_daily_trades:
             logger.debug(f"P32: Scalping daily trade limit reached ({self._max_daily_trades}), skipping {symbol}")
             self._record_filter(symbol, "daily_trade_limit")
             return
@@ -2539,23 +2648,14 @@ class ScalpingStrategy(PersistentStrategy):
         else:
             base_position = trading_capital * min(allocation, position_limit)
 
-        # 注入空闲资金放大乘数（来自 AdaptiveController，受 adaptive_enabled 门控）
-        if self._adaptive_enabled and self._adaptive_controller:
-            try:
-                boost = self._adaptive_controller.get_position_boost()
-                if boost > 1.0:
-                    base_position *= boost
-            except Exception:
-                pass
-
         price_factor = 1.0
         if tier == "tier2":
             price_factor = 1.3
         elif tier == "tier3":
             price_factor = 1.6
-        
+
         base_position *= price_factor
-        
+
         if self._adaptive_enabled:
             market_state = self._market_state.get(symbol, {"state": "range", "volatility": "normal", "volume_ratio": 1.0})
             base_position = calculate_adaptive_position_size(base_position, market_state, "scalping")
@@ -2566,11 +2666,46 @@ class ScalpingStrategy(PersistentStrategy):
         # P-复盘修复：单仓保证金硬上限，防止仓位累积导致保证金超过账户权益
         # （历史事故：AVAX 单仓保证金 102 USDT 超过 46 USDT 账户权益，单笔亏损 -12.70 USDT）
         max_single_margin_pct = self.config["strategies"]["scalping"].get("max_single_position_margin_pct", 0.20)
-        base_position = min(base_position, total_capital * max_single_margin_pct)
+        base_position = min(base_position, trading_capital * max_single_margin_pct)
+
+        # 注入空闲资金放大乘数（来自 AdaptiveController，受 adaptive_enabled 门控）
+        # 在硬上限之后应用，确保 boost 不会被上限抵消；但 boost 后仍受 2x 硬顶保护
+        if self._adaptive_enabled and self._adaptive_controller:
+            try:
+                boost = self._adaptive_controller.get_position_boost()
+                if boost > 1.0:
+                    boosted = base_position * boost
+                    cap = trading_capital * max_single_margin_pct * 2.0
+                    base_position = min(boosted, cap)
+            except Exception as e:
+                logger.debug(f"[scalping] get_position_boost failed: {e}")
+
+        # 措施5: 高滑点币降权/禁用 — 滑点成本翻转治理
+        # 当有效滑点相对最小止盈目标(tp1)占比过高时，单边成交成本吃掉大部分盈利，导致成本翻转。
+        # 占比 >= max_slippage_ratio 直接禁用；介于 downgrade_ratio~max_slippage_ratio 之间降权减仓。
+        if self._slippage_filter_enabled:
+            tier_slippage = tier_settings.get("slippage", 0.001)
+            effective_slippage = max(float(tier_slippage), float(self._symbol_slippage_overrides.get(symbol, 0.0)))
+            min_profit_target = self._tp1_pct if (self._take_profit_enabled and self._tp1_ratio > 0 and self._tp1_pct > 0) else self._profit_target_min
+            if min_profit_target > 0:
+                slippage_ratio = effective_slippage / min_profit_target
+                if slippage_ratio >= self._max_slippage_ratio:
+                    logger.warning(
+                        f"Scalping signal disabled for {symbol}: effective slippage {effective_slippage:.4%} "
+                        f"= {slippage_ratio:.0%} of min profit target {min_profit_target:.4%} (cost reversal risk)"
+                    )
+                    self._record_filter(symbol, "slippage_cost_reversal")
+                    return
+                if slippage_ratio >= self._high_slippage_downgrade_ratio:
+                    base_position *= self._high_slippage_downgrade_factor
+                    logger.info(
+                        f"Scalping position downgraded for {symbol}: slippage ratio {slippage_ratio:.2f} "
+                        f"-> position scaled x{self._high_slippage_downgrade_factor}"
+                    )
 
         quantity = base_position * leverage / price
         
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "1"))
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = price * min_lot_size / leverage
         
         if base_position < margin_needed_for_min_lot:
@@ -2652,12 +2787,9 @@ class ScalpingStrategy(PersistentStrategy):
         except Exception:
             pass
 
-        # P32: 递增日内交易计数
-        self._daily_trade_count += 1
-        logger.info(
-            f"P32: Scalping signal generated for {symbol} {direction} "
-            f"(daily: {self._daily_trade_count}/{self._max_daily_trades})"
-        )
+        # P32: 日内计数改在成交回执(on_order_filled)中递增，信号生成阶段不计数，
+        # 避免信号被 RegimeGate/Agent 拒绝或限价单未成交时白白空烧日内额度。
+        logger.info(f"P32: Scalping signal generated for {symbol} {direction}")
 
         # 信号子类型（momentum/mean_reversion/breakout/range）编码进 signal_type，落库供复盘
         signal_subtype = self._position_signal_type.get(symbol, "momentum")
@@ -2725,7 +2857,7 @@ class ScalpingStrategy(PersistentStrategy):
                 "entry_time": datetime.now(),
                 "status": "open",
                 "peak_price": limit_price if direction == "long" else 0,
-                "trough_price": limit_price if direction == "short" else float('inf'),
+                "trough_price": limit_price,
                 "trailing_stop_initial": stop_loss,
                 "vwap_entry": vwap,
                 "current_profit": 0.0,
@@ -2861,7 +2993,7 @@ class ScalpingStrategy(PersistentStrategy):
                     "entry_time": entry_time,
                     "status": "open",
                     "peak_price": entry_price if direction == "long" else 0,
-                    "trough_price": entry_price if direction == "short" else float('inf'),
+                    "trough_price": entry_price,
                     "trailing_stop_initial": stop_loss,
                     "vwap_entry": entry_price,
                     "current_profit": 0.0,
@@ -2878,6 +3010,18 @@ class ScalpingStrategy(PersistentStrategy):
 
         if recovered:
             logger.warning(f"Scalping orphan recovery: materialized {recovered} orphan position(s) from DB")
+
+    async def _run_position_check(self, symbol: str, check_fn, *args):
+        """执行单个持仓检查；持仓已在上一检查中被平掉时安全跳过。
+
+        修复反复出现的 KeyError：_manage_positions 对同一 symbol 依次调用多个
+        _check_* 方法，前一个方法可能 _close_position/_close_partial 平仓并触发
+        cleanup_position 删除 _positions[symbol]，后一个方法直接下标会抛 KeyError
+        （历史 crash_log 多次出现 XRP/SOL/DOGE KeyError）。此处统一在调用前做存在性守卫。
+        """
+        if symbol not in self._positions:
+            return
+        await check_fn(symbol, *args)
 
     async def _manage_positions(self):
         self._recover_orphan_positions()
@@ -2955,29 +3099,33 @@ class ScalpingStrategy(PersistentStrategy):
                             if state["stop_loss"] > max_loss_price:
                                 state["stop_loss"] = max_loss_price
             
-            await self._check_momentum_decay(symbol, current_price)
-            await self._check_scaled_take_profit(symbol, current_price)
-            await self._check_multiple_take_profit(symbol, current_price)
-            await self._check_breakeven_stop(symbol, current_price)
-            await self._check_dynamic_trailing_stop(symbol, current_price)
-            await self._check_atr_trailing_stop(symbol, current_price)
-            await self._check_structural_level_exit(symbol, current_price)
-            await self._check_volatility_spike_exit(symbol, current_price)
-            await self._check_volatility_based_exit(symbol, current_price)
-            await self._check_stop_loss(symbol, current_price)
-            await self._check_profit_protection(symbol, current_price)
-            await self._check_time_limit(symbol)
+            await self._run_position_check(symbol, self._check_momentum_decay, current_price)
+            await self._run_position_check(symbol, self._check_scaled_take_profit, current_price)
+            await self._run_position_check(symbol, self._check_multiple_take_profit, current_price)
+            await self._run_position_check(symbol, self._check_breakeven_stop, current_price)
+            await self._run_position_check(symbol, self._check_dynamic_trailing_stop, current_price)
+            await self._run_position_check(symbol, self._check_atr_trailing_stop, current_price)
+            await self._run_position_check(symbol, self._check_structural_level_exit, current_price)
+            await self._run_position_check(symbol, self._check_volatility_spike_exit, current_price)
+            await self._run_position_check(symbol, self._check_volatility_based_exit, current_price)
+            await self._run_position_check(symbol, self._check_stop_loss, current_price)
+            await self._run_position_check(symbol, self._check_profit_protection, current_price)
+            await self._run_position_check(symbol, self._check_time_limit)
 
             # 行情反转智能落袋：动态止盈 + 反转减仓（HMM 为主 + 指标兜底）
-            if self._stop_loss_manager and self._positions[symbol].get("status") == "open":
+            if self._stop_loss_manager and self._positions.get(symbol, {}).get("status") == "open":
                 await self._stop_loss_manager.check_reversal_take_profit(
                     symbol=symbol,
                     strategy_name="scalping",
                     current_price=current_price,
-                    position_state=self._positions[symbol],
+                    position_state=self._positions.get(symbol, {}),
                 )
 
     async def _check_scaled_take_profit(self, symbol: str, current_price: float):
+        # 现代多级止盈(tp1/tp2/tp3 由 take_profit_enabled 控制)启用时，
+        # 旧版 scaled TP(profit_taking_levels)不再叠加执行，避免双重部分平仓。
+        if self._take_profit_enabled:
+            return
         state = self._positions[symbol]
         direction = state["direction"]
         entry_price = state["entry_price"]
@@ -3106,9 +3254,9 @@ class ScalpingStrategy(PersistentStrategy):
                 )
                 if not sl_executed:
                     # StopLossManager返回False时降级到直接平仓
-                    await self._close_position(symbol, "loss")
+                    await self._close_position(symbol, "stop_loss")
             else:
-                await self._close_position(symbol, "loss")
+                await self._close_position(symbol, "stop_loss")
 
     async def _check_profit_protection(self, symbol: str, current_price: float):
         state = self._positions[symbol]
@@ -3364,6 +3512,7 @@ class ScalpingStrategy(PersistentStrategy):
                 "symbol": signal.symbol,
                 "strategy_name": signal.strategy_name,
                 "signal_type": signal.signal_type,
+                "exit_reason": reason,
                 "direction": signal.direction,
                 "price": signal.price,
                 "quantity": signal.quantity,
@@ -3451,6 +3600,7 @@ class ScalpingStrategy(PersistentStrategy):
                 "symbol": signal.symbol,
                 "strategy_name": signal.strategy_name,
                 "signal_type": signal.signal_type,
+                "exit_reason": reason,
                 "direction": signal.direction,
                 "price": signal.price,
                 "quantity": signal.quantity,
@@ -3510,7 +3660,7 @@ class ScalpingStrategy(PersistentStrategy):
             # P5: 同步清理trade_journal
             try:
                 if hasattr(self, 'trade_journal') and self.trade_journal:
-                    self.trade_journal.mark_position_closed(symbol, "scalping", reason="ghost_cleanup")
+                    self.trade_journal.mark_position_closed(symbol, "scalping", reason="ghost_close")
             except Exception as e:
                 logger.debug(f"Failed to sync trade_journal for ghost position {symbol}: {e}")
             
@@ -3564,7 +3714,7 @@ class ScalpingStrategy(PersistentStrategy):
                 "entry_time": datetime.now(),
                 "status": "open",
                 "peak_price": entry_price if direction == "long" else 0,
-                "trough_price": entry_price if direction == "short" else float('inf'),
+                "trough_price": entry_price,
                 "trailing_stop_initial": pending.get("stop_loss"),
                 "vwap_entry": pending.get("vwap_entry", entry_price),
                 "current_profit": 0.0,
@@ -3575,6 +3725,18 @@ class ScalpingStrategy(PersistentStrategy):
                 f"qty={qty} avg_px={entry_price} clOrdId={clordid}"
             )
             self._fill_callback_hits += 1
+
+            # P32: 日内交易计数——成交后才递增，避免信号空烧额度
+            today = datetime.now().date()
+            if self._daily_trade_reset_date != today:
+                self._daily_trade_count = 0
+                self._daily_trade_reset_date = today
+            self._daily_trade_count += 1
+            logger.info(
+                f"P32: Scalping fill counted {symbol} {direction} "
+                f"(daily: {self._daily_trade_count}/"
+                f"{self._max_daily_trades if self._max_daily_trades > 0 else '∞'})"
+            )
         except Exception as e:
             logger.debug(f"on_order_filled error: {e}")
 
@@ -3609,7 +3771,8 @@ class ScalpingStrategy(PersistentStrategy):
         
         avg_win = winning_pnl / win_count if win_count > 0 else 0
         avg_loss = abs(losing_pnl) / loss_count if loss_count > 0 else 0
-        profit_factor = avg_win / avg_loss if avg_loss > 0 else float('inf')
+        # 无亏损时盈亏比无数学意义，用 None 表示「不适用」，避免 float('inf') 污染 JSON 输出
+        profit_factor = avg_win / avg_loss if avg_loss > 0 else None
         
         active_symbols = [s for s in self._scalping_symbols if s in self._momentum_cache]
         
@@ -3663,7 +3826,8 @@ class ScalpingStrategy(PersistentStrategy):
                 for sym, pos in state["positions"].items():
                     if isinstance(pos, dict) and pos.get("status") == "open":
                         # 还原 datetime 字段（JSON 序列化时变为字符串）
-                        for key in ("entry_time", "close_time", "peak_price", "trough_price"):
+                        # 注意：peak_price/trough_price 是价格（float），不是时间，不应在此解析
+                        for key in ("entry_time", "close_time"):
                             if key in pos and isinstance(pos[key], str):
                                 try:
                                     pos[key] = datetime.fromisoformat(pos[key])

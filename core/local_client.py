@@ -308,7 +308,7 @@ class LocalOKXClient:
             "filledSz": str(order.filled_quantity),
             "px": str(order.price),
             "state": order.status,
-            "ts": str(int(order.timestamp.timestamp() * 1000))
+            "ts": str(int(order.create_time.timestamp() * 1000))
         }
 
     def get_orders(self, inst_type: str = "SWAP") -> List[Dict[str, Any]]:
@@ -324,25 +324,26 @@ class LocalOKXClient:
                     "filledSz": str(order.filled_quantity),
                     "px": str(order.price),
                     "state": order.status,
-                    "ts": str(int(order.timestamp.timestamp() * 1000))
+                    "ts": str(int(order.create_time.timestamp() * 1000))
                 })
         return pending_orders
 
-    def get_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_order_history(self, limit: int = 50, state: str = "filled") -> List[Dict[str, Any]]:
         filled_orders = []
         for order in self._orders.values():
-            if order.status == "filled":
-                filled_orders.append({
-                    "ordId": order.order_id,
-                    "instId": order.symbol,
-                    "side": order.side,
-                    "ordType": order.type,
-                    "sz": str(order.quantity),
-                    "filledSz": str(order.filled_quantity),
-                    "px": str(order.price),
-                    "state": order.status,
-                    "ts": str(int(order.timestamp.timestamp() * 1000))
-                })
+            if state and order.status != state:
+                continue
+            filled_orders.append({
+                "ordId": order.order_id,
+                "instId": order.symbol,
+                "side": order.side,
+                "ordType": order.type,
+                "sz": str(order.quantity),
+                "filledSz": str(order.filled_quantity),
+                "px": str(order.price),
+                "state": order.status,
+                "ts": str(int(order.create_time.timestamp() * 1000))
+            })
         return filled_orders[-limit:]
 
     def set_leverage(self, symbol: str, leverage: int) -> Optional[Dict[str, Any]]:

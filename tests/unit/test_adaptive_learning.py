@@ -28,7 +28,10 @@ from app.services.adaptive_learning.parameter_adaptor import (
     ParameterAdaptor,
 )
 from app.services.adaptive_learning.market_regime_detector import (
+    HMMRegimeClassifier,
     MarketRegime,
+    MarketRegimeDetector,
+    MultiTimeframeRegime,
     RegimeTransitionPredictor,
 )
 from app.services.adaptive_learning.performance_feedback import (
@@ -384,6 +387,340 @@ class TestParameterAdaptorUpdateObservationOrder:
 
 
 # ═══════════════════════════════════════════════════════════════
+# P0: HMM 后验过滤与隐藏状态语义映射
+# ═══════════════════════════════════════════════════════════════
+
+class TestHMMRegimeClassifier:
+    def test_sequence_posterior_uses_transition_matrix(self):
+        classifier = HMMRegimeClassifier(n_states=2, n_features=1)
+        classifier._trained = True
+        classifier._state_to_regime = {
+            0: MarketRegime.TRENDING_UP,
+            1: MarketRegime.TRENDING_DOWN,
+        }
+        classifier.pi = [1.0, 0.0]
+        classifier.A = [[0.0, 1.0], [0.0, 1.0]]
+        classifier.means = [[0.0], [0.0]]
+        classifier.vars = [[1.0], [1.0]]
+
+        posterior = classifier.predict_proba_sequence([[0.0], [0.0]])
+
+        assert posterior[MarketRegime.TRENDING_UP] == pytest.approx(0.0)
+        assert posterior[MarketRegime.TRENDING_DOWN] == pytest.approx(1.0)
+
+    def test_state_mapping_is_unique_and_uses_volatility_mean(self):
+        classifier = HMMRegimeClassifier()
+        classifier.means = [[0.0] * classifier.n_features for _ in range(classifier.n_states)]
+        classifier.vars = [[1.0] * classifier.n_features for _ in range(classifier.n_states)]
+        for state in range(classifier.n_states):
+            classifier.means[state][0] = state / 6
+            classifier.means[state][1] = 0.1
+            classifier.vars[state][1] = 0.9 if state == 6 else 0.01
+        classifier.means[3][1] = 0.95
+
+        classifier._map_states_to_regimes()
+
+        assert len(classifier._state_to_regime) == classifier.n_states
+        assert len(set(classifier._state_to_regime.values())) == classifier.n_states
+        assert classifier._state_to_regime[3] == MarketRegime.HIGH_VOLATILITY
+
+    def test_transition_matrix_is_reordered_to_regime_indices(self):
+        classifier = HMMRegimeClassifier(n_states=2, n_features=1)
+        classifier._state_to_regime = {
+            0: MarketRegime.TRENDING_DOWN,
+            1: MarketRegime.TRENDING_UP,
+        }
+        classifier.A = [[0.0, 1.0], [1.0, 0.0]]
+
+        matrix = classifier.get_regime_transition_matrix()
+
+        assert matrix[0][1] == pytest.approx(1.0)
+        assert matrix[1][0] == pytest.approx(1.0)
+
+    def test_prediction_feature_sequence_does_not_pollute_cache(self):
+        timeframe = "short"
+        mtf = MultiTimeframeRegime()
+        mtf._trained[timeframe] = True
+        classifier = mtf._classifiers[timeframe]
+        classifier._trained = True
+        classifier._state_to_regime = {
+            state: regime for state, regime in enumerate([
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.RANGING,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.LOW_VOLATILITY,
+                MarketRegime.BREAKOUT,
+                MarketRegime.REVERSAL,
+            ])
+        }
+        classifier.pi = [1.0 / classifier.n_states] * classifier.n_states
+        classifier.A = [[1.0 / classifier.n_states] * classifier.n_states for _ in range(classifier.n_states)]
+        classifier.means = [[0.0] * classifier.n_features for _ in range(classifier.n_states)]
+        classifier.vars = [[1.0] * classifier.n_features for _ in range(classifier.n_states)]
+        ohlcv = [
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0 + i, "vol": 10.0}
+            for i in range(40)
+        ]
+
+        mtf.predict(timeframe, ohlcv)
+
+        assert all(not values for values in mtf._extractors[timeframe]._feature_cache.values())
+
+
+class TestMarketRegimeDetectorIsolation:
+    def test_reversal_direction_requires_prior_trend_and_multiple_confirming_bars(self, tmp_path):
+        detector = MarketRegimeDetector({
+            "market_regime_detector": {
+                "persist_dir": str(tmp_path),
+                "auto_train": False,
+            }
+        })
+
+        def candles(closes):
+            return [
+                {"close": close, "timestamp": index}
+                for index, close in enumerate(closes)
+            ]
+
+        bearish_then_bullish = [100.0, 99.5, 99.0, 98.5, 98.0, 97.5, 97.0, 96.5, 96.0, 96.4, 96.9, 97.5]
+        bullish_then_bearish = [96.0, 96.5, 97.0, 97.5, 98.0, 98.5, 99.0, 99.5, 100.0, 99.6, 99.1, 98.5]
+        one_bar_bounce = [100.0, 99.5, 99.0, 98.5, 98.0, 97.5, 97.0, 96.5, 96.0, 96.0, 96.0, 97.0]
+        flat_prior = [100.0] * 9 + [100.2, 100.4, 100.6]
+        flat_confirmation = [96.0, 96.5, 97.0, 97.5, 98.0, 98.5, 99.0, 99.5, 100.0, 100.0, 100.0, 99.0]
+
+        assert detector._infer_reversal_direction(candles(bearish_then_bullish)) == "long"
+        assert detector._infer_reversal_direction(candles(bullish_then_bearish)) == "short"
+        assert detector._infer_reversal_direction(candles(one_bar_bounce)) is None
+        assert detector._infer_reversal_direction(candles(flat_prior)) is None
+        assert detector._infer_reversal_direction(candles(flat_confirmation)) is None
+
+    def test_explicit_timeframes_train_independently_before_ensemble(self, tmp_path, monkeypatch):
+        detector = MarketRegimeDetector({
+            "market_regime_detector": {
+                "persist_dir": str(tmp_path),
+                "auto_train": True,
+                "train_min_samples": 2,
+            }
+        })
+        symbol = "BTC-USDT-SWAP"
+        mtf = detector._get_symbol_mtf(symbol)
+        train_calls = []
+        ensemble_inputs = {}
+        prediction = {
+            "regime": MarketRegime.RANGING,
+            "probabilities": {MarketRegime.RANGING.value: 0.8},
+        }
+
+        def train(timeframe, candles, n_iterations=50):
+            train_calls.append((timeframe, candles))
+            mtf._trained[timeframe] = True
+            return {}
+
+        def predict_ensemble(candles_by_timeframe):
+            ensemble_inputs.update(candles_by_timeframe)
+            return prediction
+
+        monkeypatch.setattr(mtf, "train", train)
+        monkeypatch.setattr(mtf, "predict", lambda timeframe, candles: prediction)
+        monkeypatch.setattr(mtf, "predict_ensemble", predict_ensemble)
+        monkeypatch.setattr(
+            detector._get_symbol_feature_extractor(symbol),
+            "extract_latest",
+            lambda candles: [0.0] * 10,
+        )
+        monkeypatch.setattr(
+            detector._strategy_mapper,
+            "get_optimal_strategies",
+            lambda regime, probabilities: {},
+        )
+        medium = [{"close": 10.0}, {"close": 11.0}]
+        long = [{"close": 20.0}, {"close": 21.0}]
+
+        result = _run(detector.detect_regime(
+            medium,
+            symbol,
+            timeframe="medium",
+            timeframe_data={"medium": medium, "long": long},
+        ))
+
+        assert train_calls == [("medium", medium), ("long", long)]
+        assert ensemble_inputs == {"medium": medium, "long": long}
+        assert result["regime"] == MarketRegime.RANGING.value
+
+    def test_detector_hysteresis_requires_distinct_confirming_snapshots(self, tmp_path, monkeypatch):
+        detector = MarketRegimeDetector({
+            "market_regime_detector": {
+                "persist_dir": str(tmp_path),
+                "auto_train": False,
+                "min_stable_updates": 3,
+            }
+        })
+        symbol = "BTC-USDT-SWAP"
+        mtf = detector._get_symbol_mtf(symbol)
+        mtf._trained["short"] = True
+        monkeypatch.setattr(
+            mtf,
+            "predict",
+            lambda timeframe, data: {
+                "regime": MarketRegime.RANGING,
+                "probabilities": {MarketRegime.RANGING.value: 0.9},
+            },
+        )
+        monkeypatch.setattr(
+            detector._get_symbol_feature_extractor(symbol),
+            "extract_latest",
+            lambda data: [0.0] * 10,
+        )
+        monkeypatch.setattr(
+            detector._strategy_mapper,
+            "get_optimal_strategies",
+            lambda regime, probabilities: {},
+        )
+        detector._current_regimes[symbol] = {
+            "regime": MarketRegime.TRENDING_UP.value,
+            "regime_consecutive_updates": 3,
+            "stable": True,
+        }
+
+        def candles(timestamp):
+            return [{"timestamp": timestamp, "close": 100.0}]
+
+        first = _run(detector.detect_regime(candles(1000), symbol, timeframe="short"))
+        duplicate = _run(detector.detect_regime(candles(1000), symbol, timeframe="short"))
+        second = _run(detector.detect_regime(candles(2000), symbol, timeframe="short"))
+        third = _run(detector.detect_regime(candles(3000), symbol, timeframe="short"))
+
+        assert first["regime"] == MarketRegime.TRENDING_UP.value
+        assert first["pending_regime_updates"] == 1
+        assert duplicate["pending_regime_updates"] == 1
+        assert second["regime"] == MarketRegime.TRENDING_UP.value
+        assert third["regime"] == MarketRegime.RANGING.value
+        assert third["regime_consecutive_updates"] == 1
+
+    def test_detect_regime_ensembles_only_explicit_timeframe_data(self, tmp_path, monkeypatch):
+        detector = MarketRegimeDetector({
+            "market_regime_detector": {"persist_dir": str(tmp_path), "auto_train": False}
+        })
+        symbol = "BTC-USDT-SWAP"
+        mtf = detector._get_symbol_mtf(symbol)
+        mtf._trained.update({"short": True, "medium": True})
+        observed = {}
+        expected_prediction = {
+            "regime": MarketRegime.RANGING,
+            "probabilities": {MarketRegime.RANGING.value: 1.0},
+        }
+
+        def predict_ensemble(data):
+            observed.update(data)
+            return expected_prediction
+
+        monkeypatch.setattr(mtf, "predict", lambda timeframe, data: expected_prediction)
+        monkeypatch.setattr(mtf, "predict_ensemble", predict_ensemble)
+        monkeypatch.setattr(
+            detector._get_symbol_feature_extractor(symbol),
+            "extract_latest",
+            lambda data: [0.0] * 10,
+        )
+        def candle(timestamp):
+            return [{
+                "timestamp": timestamp,
+                "open": 1,
+                "high": 2,
+                "low": 0.5,
+                "close": 1.5,
+                "vol": 10,
+            }]
+
+        short_data = [{"close": 1.0}]
+        medium_data = [{"close": 2.0}]
+
+        result = _run(detector.detect_regime(
+            candle(1000),
+            symbol,
+            timeframe="short",
+            timeframe_data={"short": short_data, "medium": medium_data, "long": candle(1000)},
+        ))
+        second_result = _run(detector.detect_regime(
+            candle(1000),
+            symbol,
+            timeframe="short",
+            timeframe_data={"short": short_data, "medium": medium_data},
+        ))
+        third_result = _run(detector.detect_regime(
+            candle(2000),
+            symbol,
+            timeframe="short",
+            timeframe_data={"short": short_data, "medium": medium_data},
+        ))
+        fourth_result = _run(detector.detect_regime(
+            candle(3000),
+            symbol,
+            timeframe="short",
+            timeframe_data={"short": short_data, "medium": medium_data},
+        ))
+
+        assert observed == {"short": short_data, "medium": medium_data}
+        assert result["regime"] == MarketRegime.RANGING.value
+        assert result["stable"] is False
+        assert result["confidence"] == pytest.approx(0.7)
+        assert second_result["stable"] is False
+        assert second_result["regime_consecutive_updates"] == 1
+        assert third_result["stable"] is False
+        assert fourth_result["stable"] is True
+        assert fourth_result["confidence"] == pytest.approx(1.0)
+
+    def test_symbol_models_and_feature_caches_are_isolated(self, tmp_path):
+        detector = MarketRegimeDetector({
+            "market_regime_detector": {"persist_dir": str(tmp_path), "auto_train": False}
+        })
+
+        btc_model = detector._get_symbol_mtf("BTC-USDT-SWAP")
+        eth_model = detector._get_symbol_mtf("ETH-USDT-SWAP")
+        btc_features = detector._get_symbol_feature_extractor("BTC-USDT-SWAP")
+        eth_features = detector._get_symbol_feature_extractor("ETH-USDT-SWAP")
+        btc_transitions = detector._get_symbol_transition_predictor("BTC-USDT-SWAP")
+        eth_transitions = detector._get_symbol_transition_predictor("ETH-USDT-SWAP")
+
+        assert btc_model is not eth_model
+        assert btc_features is not eth_features
+        assert btc_transitions is not eth_transitions
+
+    def test_symbol_models_persist_and_reload_independently(self, tmp_path):
+        async def persist_symbol_model():
+            detector = MarketRegimeDetector({
+                "market_regime_detector": {"persist_dir": str(tmp_path), "auto_train": False}
+            })
+            detector._get_symbol_mtf("BTC-USDT-SWAP")._trained["short"] = True
+            await detector._persist()
+            return MarketRegimeDetector({
+                "market_regime_detector": {"persist_dir": str(tmp_path), "auto_train": False}
+            })
+
+        restored = _run(persist_symbol_model())
+
+        assert restored._symbol_mtfs["BTC-USDT-SWAP"].is_trained("short")
+        assert "ETH-USDT-SWAP" not in restored._symbol_mtfs
+
+    def test_timeframe_uses_timestamp_interval_or_configured_fallback(self, tmp_path):
+        detector = MarketRegimeDetector({
+            "market_regime_detector": {
+                "persist_dir": str(tmp_path),
+                "fallback_timeframe": "short",
+            }
+        })
+
+        one_minute = [{"timestamp": 1_800_000_000_000 + i * 60_000} for i in range(40)]
+        one_hour = [{"timestamp": 1_800_000_000_000 + i * 3_600_000} for i in range(40)]
+        six_hours = [{"timestamp": 1_800_000_000_000 + i * 21_600_000} for i in range(40)]
+        without_timestamps = [{"close": 1.0} for _ in range(500)]
+
+        assert detector._estimate_timeframe(one_minute) == "short"
+        assert detector._estimate_timeframe(one_hour) == "medium"
+        assert detector._estimate_timeframe(six_hours) == "long"
+        assert detector._estimate_timeframe(without_timestamps) == "short"
+
+
 # P0: RegimeTransitionPredictor.predict_next_regime 使用 HMM 转移矩阵
 # ═══════════════════════════════════════════════════════════════
 

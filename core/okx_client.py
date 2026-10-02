@@ -3,6 +3,7 @@ import asyncio
 import json
 import hmac
 import hashlib
+import math
 import base64
 import os
 import random
@@ -98,7 +99,31 @@ class OKXClient:
         self.ws_public_url = config["okx"]["websocket_url"]
         self.ws_private_url = config["okx"]["websocket_private_url"]
         self.proxy = config["okx"].get("proxy")
-        
+        # 境内直连被墙时关闭直连回退：代理失败仅切换/重试代理，不切直连、不临时禁用全部代理
+        self.allow_direct_fallback = bool(config["okx"].get("allow_direct_fallback", False))
+
+        # ── 多代理源自动切换 ──
+        # proxy_list 优先级 > proxy 单值；为空时无代理（直连）
+        _proxy_list_raw = config["okx"].get("proxy_list")
+        if _proxy_list_raw and isinstance(_proxy_list_raw, list):
+            self._proxy_list = [p.strip() for p in _proxy_list_raw
+                                if p and isinstance(p, str) and p.strip()]
+        elif self.proxy:
+            self._proxy_list = [self.proxy]
+        else:
+            self._proxy_list = []
+        # 兼容旧字段：self.proxy 始终指向当前活跃代理（供日志/外部读取）
+        self.proxy = self._proxy_list[0] if self._proxy_list else None
+        # 每个代理独立的失败计数 / 禁用截止时间 / 退避周期
+        self._proxy_states: Dict[str, Dict[str, float]] = {
+            p: {"fail_count": 0, "disabled_until": 0.0, "disable_cycle": 0}
+            for p in self._proxy_list
+        }
+        self._current_proxy_idx = 0  # 当前活跃代理在 _proxy_list 中的索引
+        self._proxy_fail_threshold = 3  # 单代理连续失败次数阈值，超过则禁用该代理并切换
+        self._proxy_disable_duration = 60.0  # 单代理禁用基础时长（秒）
+        self._proxy_max_disable = 600.0  # 单代理禁用上限（秒）
+
         self._session = requests.Session()
         self._async_session: Optional[aiohttp.ClientSession] = None
         self._async_session_direct: Optional[aiohttp.ClientSession] = None  # 直连备用 async session（代理故障降级）
@@ -111,11 +136,6 @@ class OKXClient:
         self._session_direct = requests.Session()
         self._session_direct.proxies = {"http": None, "https": None}
         self._session_direct.trust_env = False  # 禁用系统代理环境变量
-        # 代理健康管理
-        self._proxy_fail_count = 0
-        self._proxy_disabled_until: float = 0.0  # 代理临时禁用截止时间戳
-        self._proxy_disable_duration = 60.0  # 代理连续失败后禁用60秒
-        self._proxy_disable_cycle = 0  # 代理禁用周期计数（递进式退避）
         # 代理恢复探测：代理被禁用后主动探测其是否恢复，避免半死代理被盲目重连
         self._proxy_probe_path = "/api/v5/public/time"  # 轻量探测端点（OKX服务器时间）
         self._proxy_probe_interval = 30.0  # 代理禁用期间每隔30秒探测一次
@@ -142,6 +162,8 @@ class OKXClient:
         self._subscribed_public_channels: List[Dict[str, Any]] = []
         self._subscribed_private_channels: List[Dict[str, Any]] = []
         self._subscribed_symbols: List[str] = []
+        self._books_last_sequence: Dict[str, int] = {}
+        self._books_resync_pending: set = set()
 
         # 连接状态跟踪
         self._ws_public_connected = False
@@ -218,6 +240,29 @@ class OKXClient:
         self._ticker_cache: Dict[str, Dict[str, Any]] = {}  # {symbol: {"data": ticker, "ts": timestamp}}
         self._ticker_cache_ttl_normal = 2.0  # 正常2秒
         self._ticker_cache_ttl_degraded = 30.0  # 降级30秒
+        self._ticker_max_server_age_seconds = max(
+            0.0,
+            float(config.get("market_data", {}).get("ticker_max_server_age_seconds", 5.0)),
+        )
+        market_data_config = config.get("market_data", {})
+        self._funding_rate_cache: Dict[str, Dict[str, Any]] = {}
+        self._funding_rate_cache_ttl = max(
+            0.0, float(market_data_config.get("funding_rate_cache_ttl_seconds", 60.0))
+        )
+        self._funding_rate_settlement_window = max(
+            0.0, float(market_data_config.get("funding_rate_settlement_window_seconds", 120.0))
+        )
+        self._funding_rate_settlement_ttl = max(
+            0.0, float(market_data_config.get("funding_rate_settlement_ttl_seconds", 10.0))
+        )
+        self._funding_rate_stale_fallback_ttl = max(
+            self._funding_rate_cache_ttl,
+            float(market_data_config.get("funding_rate_stale_fallback_ttl_seconds", 300.0)),
+        )
+        self._orderbook_min_depth = max(
+            1,
+            int(config.get("market_data", {}).get("orderbook_min_depth", 1)),
+        )
 
     def _get_current_keys(self) -> Dict[str, str]:
         """获取当前使用的API密钥（支持密钥池）"""
@@ -261,7 +306,131 @@ class OKXClient:
             if elapsed < self._network_degraded_cooldown:
                 return True
         return False
-    
+
+    # ──────────────────────────────────────────────────────────
+    # 多代理源自动切换：代理获取 / 失败标记 / 成功标记
+    # 设计原则：代理获取、失败判定、回退策略解耦；回退（切换代理）只在编排层发生。
+    # ──────────────────────────────────────────────────────────
+
+    def _get_active_proxy(self) -> Optional[str]:
+        """返回当前可用的代理 URL（跳过被禁用的代理，轮询切换）。
+
+        规则：
+        - 无代理列表 → 返回 None（直连）
+        - 从当前索引开始轮询，返回第一个未被禁用的代理
+        - 若全部被禁用：
+          * allow_direct_fallback=True → 返回 None（直连兜底）
+          * allow_direct_fallback=False → 返回列表第一个代理（强制走代理，让上层重试）
+        """
+        if not self._proxy_list:
+            return None
+        n = len(self._proxy_list)
+        now = time.time()
+        for offset in range(n):
+            idx = (self._current_proxy_idx + offset) % n
+            proxy_url = self._proxy_list[idx]
+            state = self._proxy_states.get(proxy_url, {})
+            disabled_until = state.get("disabled_until", 0.0)
+            if now >= disabled_until:
+                # 冷却期已过（且之前确实被冷却过）：重置失败计数和冷却时间，给代理重新评估的机会
+                # disabled_until == 0 表示从未被冷却，不重置 fail_count（让失败计数正常累加）
+                if disabled_until > 0 and state.get("fail_count", 0) > 0:
+                    state["fail_count"] = 0
+                    state["disabled_until"] = 0.0
+                # 找到可用代理，更新当前索引
+                if idx != self._current_proxy_idx:
+                    self._current_proxy_idx = idx
+                    self.proxy = proxy_url
+                    logger.info(f"Proxy switched to: {proxy_url}")
+                return proxy_url
+        # 全部被禁用
+        if self.allow_direct_fallback:
+            return None
+        # 不允许直连：返回第一个代理（上层会重试，等待禁用到期或探测恢复）
+        first = self._proxy_list[0]
+        self._current_proxy_idx = 0
+        self.proxy = first
+        return first
+
+    @staticmethod
+    def _is_connection_refused(exc) -> bool:
+        """判断代理连接异常是否为「连接被拒」（目标端口无监听，永久死）而非「超时」（半死）。
+
+        区分意义：无监听的代理（如 Clash 实例未启动）短时间内不会恢复，应直接拉满冷却，
+        避免在死代理上反复空转并产生噪音；半死代理（TCP 可连但握手挂起）则维持指数退避，
+        等待其自行恢复。异常可能被 urllib3/aiohttp/websockets 多层包装，需沿
+        __cause__/__context__ 链下钻到最底层原因。
+        """
+        if exc is None:
+            return False
+        cur = exc
+        seen = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if type(cur).__name__ == "ConnectionRefusedError":
+                return True
+            # 注意：urllib3 的 ProxyError 对超时与拒绝的 message 都是 "Cannot connect to proxy."，
+            # 不能据此判断；必须下钻到底层（TimeoutError vs NewConnectionError/ConnectionRefusedError）。
+            msg = (str(cur) + " " + repr(cur)).lower()
+            if ("connection refused" in msg or "actively refused" in msg or "10061" in msg):
+                return True
+            # errno.ECONNREFUSED：Windows 10061 / Linux 111
+            errno = getattr(cur, "errno", None)
+            if errno in (10061, 111):
+                return True
+            cur = cur.__cause__ or cur.__context__
+        return False
+
+    def _mark_proxy_failed(self, proxy_url: Optional[str], hard_fail: bool = False) -> None:
+        """标记某个代理失败。连续失败达阈值后禁用该代理并自动切换到下一个。
+
+        仅禁用单个代理，不影响其他代理；不会触发全局代理禁用（消除死亡螺旋）。
+        若该代理已处于禁用冷却期，则不再累加失败计数和退避周期（避免 allow_direct_fallback=False
+        时强制复用被禁用代理导致退避周期在数秒内飙到上限）。
+
+        hard_fail=True 表示「连接被拒」（目标无监听，永久死），冷却直接拉满 _proxy_max_disable，
+        避免在死代理上反复重试；否则维持指数退避（适用于半死/超时类软故障）。
+        """
+        if not proxy_url or proxy_url not in self._proxy_states:
+            return
+        state = self._proxy_states[proxy_url]
+        now = time.time()
+        # 已在冷却期内：不再累加，避免退避周期指数飙升
+        if now < state.get("disabled_until", 0.0):
+            return
+        state["fail_count"] = state.get("fail_count", 0) + 1
+        if state["fail_count"] >= self._proxy_fail_threshold:
+            state["disable_cycle"] = state.get("disable_cycle", 0) + 1
+            if hard_fail:
+                backoff = self._proxy_max_disable
+            else:
+                backoff = min(
+                    self._proxy_max_disable,
+                    self._proxy_disable_duration * (2 ** (state["disable_cycle"] - 1)),
+                )
+            state["disabled_until"] = now + backoff
+            logger.warning(
+                f"Proxy {proxy_url} disabled for {backoff}s "
+                f"(cycle={state['disable_cycle']}, fail_count={state['fail_count']}, "
+                f"hard_fail={hard_fail}), switching to next proxy"
+            )
+            # 切换到下一个代理索引
+            n = len(self._proxy_list)
+            if n > 1:
+                self._current_proxy_idx = (self._current_proxy_idx + 1) % n
+                self.proxy = self._proxy_list[self._current_proxy_idx]
+
+    def _mark_proxy_success(self, proxy_url: Optional[str]) -> None:
+        """标记某个代理成功：重置其失败计数和禁用状态。"""
+        if not proxy_url or proxy_url not in self._proxy_states:
+            return
+        state = self._proxy_states[proxy_url]
+        if state.get("fail_count", 0) > 0 or state.get("disabled_until", 0.0) > 0:
+            state["fail_count"] = 0
+            state["disable_cycle"] = 0
+            state["disabled_until"] = 0.0
+            logger.info(f"Proxy {proxy_url} health restored (fail_count reset)")
+
     def _on_network_failure(self):
         """网络断连告警：统一失败计数，连续 N 次失败时写入醒目告警。
 
@@ -301,7 +470,10 @@ class OKXClient:
             self._cancel_all_orders_after_disconnect()
 
     def _cancel_all_orders_after_disconnect(self):
-        """断连恢复后撤销所有挂单（等位挂单暴露保护）。
+        """断连恢复后撤销普通挂单（等位挂单暴露保护）。
+
+        仅撤销普通限价/等位挂单，不撤销 algo 条件单（TP/SL 保护单）。
+        断连恢复不应破坏持仓的保护单体系；TP/SL 由 heartbeat 自动维护。
 
         用 _disconnect_cancel_in_progress 标志隔离撤单过程中的网络失败，
         避免撤单请求再次触发 _on_network_failure 造成告警抖动/重复撤单。
@@ -310,10 +482,27 @@ class OKXClient:
             return
         self._disconnect_cancel_in_progress = True
         try:
-            result = self.cancel_all_orders()
+            cancelled_orders = 0
+            errors: list = []
+            # 仅撤销普通挂单，不撤销 algo 条件单（TP/SL 保护单）
+            try:
+                pending = self.get_orders()
+                for order in pending:
+                    inst_id = order.get("instId", "")
+                    ord_id = order.get("ordId", "")
+                    if not inst_id or not ord_id:
+                        continue
+                    if self.cancel_order(inst_id, ord_id) is not None:
+                        cancelled_orders += 1
+                    else:
+                        errors.append(f"撤单失败: {inst_id} {ord_id}")
+            except Exception as e:
+                errors.append(f"撤销普通挂单异常: {e}")
+
             logger.warning(
-                f"[DISCONNECT-CANCEL] 网络恢复后撤销挂单："
-                f"普通单 {result.get('cancelled_orders', 0)}，条件单 {result.get('cancelled_algos', 0)}"
+                f"[DISCONNECT-CANCEL] 网络恢复后撤销普通挂单 {cancelled_orders} 单"
+                f"（algo 条件单已跳过，保护持仓 TP/SL 不受影响）"
+                + (f"，错误: {errors}" if errors else "")
             )
         except Exception as e:
             logger.error(f"[DISCONNECT-CANCEL] 撤单异常: {e}")
@@ -321,10 +510,10 @@ class OKXClient:
             self._disconnect_cancel_in_progress = False
 
     def _probe_proxy_recovery(self) -> bool:
-        """代理恢复探测（同步）：代理被禁用期间主动探测其是否恢复。
+        """代理恢复探测（同步）：代理被禁用期间主动探测当前活跃代理是否恢复。
 
         用极短超时通过代理请求 OKX 轻量端点 /api/v5/public/time，
-        成功则判定代理恢复并重置禁用状态，失败保持禁用并延长下次探测。
+        成功则判定代理恢复并重置该代理的禁用状态，失败保持禁用。
         仅在代理被禁用且到达探测间隔时调用，返回 True 表示可切回代理。
         """
         now = time.time()
@@ -335,11 +524,15 @@ class OKXClient:
         self._proxy_last_probe_ts = now
         self._proxy_probe_in_progress = True
         try:
+            current_proxy = self._get_active_proxy()
+            if not current_proxy:
+                return False
             url = f"{self.rest_url}{self._proxy_probe_path}"
             resp = self._session.get(
                 url,
                 headers={"Content-Type": "application/json"},
                 timeout=(self._proxy_probe_timeout, self._proxy_probe_timeout),
+                proxies={"http": current_proxy, "https": current_proxy},
             )
             if resp.status_code < 400:
                 try:
@@ -347,10 +540,8 @@ class OKXClient:
                 except Exception:
                     data = {}
                 if data.get("code") == "0" or resp.status_code == 200:
-                    self._proxy_fail_count = 0
-                    self._proxy_disable_cycle = 0
-                    self._proxy_disabled_until = 0.0
-                    logger.info("[PROXY-RECOVERED] 代理恢复探测成功，切回代理通道。")
+                    self._mark_proxy_success(current_proxy)
+                    logger.info(f"[PROXY-RECOVERED] 代理 {current_proxy} 恢复探测成功。")
                     return True
             logger.debug(f"Proxy probe failed: HTTP {resp.status_code}")
             return False
@@ -370,20 +561,21 @@ class OKXClient:
         self._proxy_last_probe_ts = now
         self._proxy_probe_in_progress = True
         try:
+            current_proxy = self._get_active_proxy()
+            if not current_proxy:
+                return False
             url = f"{self.rest_url}{self._proxy_probe_path}"
             timeout = aiohttp.ClientTimeout(total=self._proxy_probe_timeout)
             async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as s:
-                async with s.get(url, proxy=self.proxy) as resp:
+                async with s.get(url, proxy=current_proxy) as resp:
                     if resp.status < 400:
                         try:
                             data = await resp.json()
                         except Exception:
                             data = {}
                         if data.get("code") == "0" or resp.status == 200:
-                            self._proxy_fail_count = 0
-                            self._proxy_disable_cycle = 0
-                            self._proxy_disabled_until = 0.0
-                            logger.info("[PROXY-RECOVERED] 代理恢复探测成功，切回代理通道。")
+                            self._mark_proxy_success(current_proxy)
+                            logger.info(f"[PROXY-RECOVERED] 代理 {current_proxy} 恢复探测成功。")
                             return True
             return False
         except Exception as e:
@@ -600,13 +792,17 @@ class OKXClient:
             reraise=True
         )
         def _do_request():
+            current_proxy = self._get_active_proxy()
+            _proxies = {"http": current_proxy, "https": current_proxy} if current_proxy else None
             if method == "GET":
-                resp = self._session.get(url, headers=headers, timeout=(self._connect_timeout, self._timeout))
+                resp = self._session.get(url, headers=headers, timeout=(self._connect_timeout, self._timeout), proxies=_proxies)
             else:
-                resp = self._session.post(url, headers=headers, data=data, timeout=(self._connect_timeout, self._timeout))
+                resp = self._session.post(url, headers=headers, data=data, timeout=(self._connect_timeout, self._timeout), proxies=_proxies)
             # 5xx 服务端错误重试
             if resp.status_code >= 500:
                 raise requests.ConnectionError(f"Server error {resp.status_code}")
+            if current_proxy:
+                self._mark_proxy_success(current_proxy)
             return resp.json()
 
         try:
@@ -763,14 +959,17 @@ class OKXClient:
         _consecutive_conn_failures = 0
 
         for attempt in range(max_attempts):
-            # ── 代理健康降级：代理禁用时直连（对齐同步 _request 的 use_direct 逻辑）──
-            proxy_disabled = self.proxy and time.time() < self._proxy_disabled_until
-            # ── 代理恢复探测：代理禁用期间主动探测恢复，避免半死代理被盲目重连 ──
+            # ── 多代理源自动切换：获取当前活跃代理（自动跳过被禁用的代理）──
+            current_proxy = self._get_active_proxy()
+            use_direct = current_proxy is None
+            # ── 代理恢复探测：当前代理被禁用期间主动探测恢复 ──
             # 下单/撤单等延迟敏感操作跳过内联探测，避免阻塞交易核心
-            if proxy_disabled and self.proxy and not path.startswith("/api/v5/trade/order"):
-                if await self._probe_proxy_recovery_async():
-                    proxy_disabled = False
-            use_direct = proxy_disabled or not self.proxy
+            if not use_direct and not path.startswith("/api/v5/trade/order"):
+                cur_state = self._proxy_states.get(current_proxy, {})
+                if time.time() < cur_state.get("disabled_until", 0.0):
+                    if await self._probe_proxy_recovery_async():
+                        current_proxy = self._get_active_proxy()
+                        use_direct = current_proxy is None
             session = self._async_session_direct if use_direct else self._async_session
 
             try:
@@ -780,7 +979,7 @@ class OKXClient:
                 _req_start = time.time()
 
                 if method == "GET":
-                    async with session.get(url, headers=headers) as resp:
+                    async with session.get(url, headers=headers, proxy=current_proxy) as resp:
                         _latency_ms = (time.time() - _req_start) * 1000
                         if resp.status == 429:
                             logger.warning(f"HTTP 429 rate limited on {path}, backing off")
@@ -792,11 +991,20 @@ class OKXClient:
                             return {"code": "429", "data": {}, "msg": "HTTP 429"}
                         if resp.status >= 400:
                             error_body = await resp.text()
+                            # 403 且走代理：代理节点可能被 OKX 屏蔽，5 分钟去重告警（直连环境无意义降级）
+                            if resp.status == 403 and current_proxy and not use_direct:
+                                _now = time.time()
+                                if _now - getattr(self, "_last_proxy_403_warn_ts", 0.0) > 300:
+                                    self._last_proxy_403_warn_ts = _now
+                                    logger.warning(
+                                        f"HTTP 403 from {path}: 代理节点 {current_proxy} 可能被 OKX 屏蔽，"
+                                        f"建议更换节点或检查代理配置"
+                                    )
                             logger.debug(f"HTTP {resp.status} from {path}: {error_body[:200]}")
                             return {"code": str(resp.status), "data": {}, "msg": f"HTTP {resp.status}"}
                         data = await resp.json()
                 else:
-                    async with session.post(url, headers=headers, data=body) as resp:
+                    async with session.post(url, headers=headers, data=body, proxy=current_proxy) as resp:
                         _latency_ms = (time.time() - _req_start) * 1000
                         if resp.status == 429:
                             logger.warning(f"HTTP 429 rate limited on {path}, backing off")
@@ -808,6 +1016,15 @@ class OKXClient:
                             return {"code": "429", "data": {}, "msg": "HTTP 429"}
                         if resp.status >= 400:
                             error_body = await resp.text()
+                            # 403 且走代理：代理节点可能被 OKX 屏蔽，5 分钟去重告警（直连环境无意义降级）
+                            if resp.status == 403 and current_proxy and not use_direct:
+                                _now = time.time()
+                                if _now - getattr(self, "_last_proxy_403_warn_ts", 0.0) > 300:
+                                    self._last_proxy_403_warn_ts = _now
+                                    logger.warning(
+                                        f"HTTP 403 from {path}: 代理节点 {current_proxy} 可能被 OKX 屏蔽，"
+                                        f"建议更换节点或检查代理配置"
+                                    )
                             logger.debug(f"HTTP {resp.status} from {path}: {error_body[:200]}")
                             return {"code": str(resp.status), "data": {}, "msg": f"HTTP {resp.status}"}
                         data = await resp.json()
@@ -836,22 +1053,19 @@ class OKXClient:
                         logger.warning(f"所有API密钥均触发限流: {path}")
                         return data
 
+                # 代理成功：重置该代理的失败计数
+                if current_proxy:
+                    self._mark_proxy_success(current_proxy)
                 self._on_network_success()
                 return data
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 self._on_network_failure()
-                # ── 代理故障降级：计数 + 递进退避 + 立即直连重试一次（对齐同步 _request 906-922 行）──
-                if not use_direct and self.proxy:
-                    self._proxy_fail_count += 1
-                    if self._proxy_fail_count >= 3:
-                        self._proxy_disable_cycle += 1
-                        backoff = min(600, self._proxy_disable_duration * (2 ** (self._proxy_disable_cycle - 1)))
-                        self._proxy_disabled_until = time.time() + backoff
-                        logger.warning(
-                            f"Async proxy disabled for {backoff}s (cycle={self._proxy_disable_cycle}) "
-                            f"after {self._proxy_fail_count} consecutive failures"
-                        )
-                    # 立即尝试直连一次（trust_env=False，绕过代理）
+                # ── 代理故障：标记当前代理失败（达阈值后禁用该代理并自动切换下一个）──
+                if current_proxy and not use_direct:
+                    self._mark_proxy_failed(current_proxy, hard_fail=self._is_connection_refused(e))
+                # allow_direct_fallback=True 时立即直连重试一次
+                if current_proxy and not use_direct and self.allow_direct_fallback:
+                    logger.warning(f"Proxy {current_proxy} failed for {path}: {e}, retrying direct...")
                     try:
                         _direct_session = self._async_session_direct
                         if _direct_session is None or _direct_session.closed:
@@ -869,7 +1083,6 @@ class OKXClient:
                                 if resp.status < 400:
                                     data = await resp.json()
                                     if data.get("code") == "0":
-                                        self._proxy_fail_count = 0
                                         self._on_network_success()
                                         return data
                         else:
@@ -877,7 +1090,6 @@ class OKXClient:
                                 if resp.status < 400:
                                     data = await resp.json()
                                     if data.get("code") == "0":
-                                        self._proxy_fail_count = 0
                                         self._on_network_success()
                                         return data
                         logger.warning(f"Async direct connection also failed for {path}")
@@ -952,15 +1164,19 @@ class OKXClient:
         if self._is_rate_limited():
             max_attempts = 1
         for attempt in range(max_attempts):
-            # 决定使用代理还是直连
-            proxy_disabled = self.proxy and time.time() < self._proxy_disabled_until
-            # ── 代理恢复探测：代理禁用期间主动探测恢复，避免半死代理被盲目重连 ──
+            # ── 多代理源自动切换：获取当前活跃代理（自动跳过被禁用的代理）──
+            current_proxy = self._get_active_proxy()
+            use_direct = current_proxy is None
+            # ── 代理恢复探测：当前代理被禁用期间主动探测恢复 ──
             # 下单/撤单等延迟敏感操作跳过内联探测，避免阻塞交易核心
-            if proxy_disabled and self.proxy and not path.startswith("/api/v5/trade/order"):
-                if self._probe_proxy_recovery():
-                    proxy_disabled = False
-            use_direct = proxy_disabled or not self.proxy
+            if not use_direct and not path.startswith("/api/v5/trade/order"):
+                cur_state = self._proxy_states.get(current_proxy, {})
+                if time.time() < cur_state.get("disabled_until", 0.0):
+                    if self._probe_proxy_recovery():
+                        current_proxy = self._get_active_proxy()
+                        use_direct = current_proxy is None
             session = self._session_direct if use_direct else self._session
+            _proxies = {"http": current_proxy, "https": current_proxy} if current_proxy else None
 
             try:
                 headers = self._get_headers(method, path, body)
@@ -969,17 +1185,13 @@ class OKXClient:
                 _req_start = time.time()
 
                 if method == "GET":
-                    response = session.get(url, headers=headers, timeout=(self._connect_timeout, self._timeout))
+                    response = session.get(url, headers=headers, timeout=(self._connect_timeout, self._timeout), proxies=_proxies)
                 else:
-                    response = session.post(url, headers=headers, data=body, timeout=(self._connect_timeout, self._timeout))
+                    response = session.post(url, headers=headers, data=body, timeout=(self._connect_timeout, self._timeout), proxies=_proxies)
 
-                # ── 代理恢复：成功后重置失败计数和周期 ──
-                if self._proxy_fail_count > 0:
-                    self._proxy_fail_count = 0
-                    if self._proxy_disabled_until > 0:
-                        self._proxy_disable_cycle = 0  # 重置退避周期
-                        logger.info(f"Proxy health restored (request succeeded)")
-                        self._proxy_disabled_until = 0.0
+                # 代理成功：重置该代理的失败计数
+                if current_proxy:
+                    self._mark_proxy_success(current_proxy)
 
                 # 风控埋点：记录API调用延迟和频次
                 _latency_ms = (time.time() - _req_start) * 1000
@@ -1036,22 +1248,12 @@ class OKXClient:
             except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout,
                     requests.exceptions.ConnectionError) as e:
                 self._on_network_failure()
-                # 代理故障计数器（递进式退避）
-                if not use_direct and self.proxy:
-                    self._proxy_fail_count += 1
-                    if self._proxy_fail_count >= 3:
-                        self._proxy_disable_cycle += 1
-                        # 递进式退避：每次禁用周期翻倍（60s → 120s → 240s → 480s → 上限600s）
-                        backoff = min(600, self._proxy_disable_duration * (2 ** (self._proxy_disable_cycle - 1)))
-                        self._proxy_disabled_until = time.time() + backoff
-                        logger.warning(
-                            f"Proxy disabled for {backoff}s (cycle={self._proxy_disable_cycle}) "
-                            f"after {self._proxy_fail_count} consecutive failures"
-                        )
-
-                # 代理故障时自动降级为直连重试
-                if not use_direct and self.proxy:
-                    logger.warning(f"Proxy connection failed for {path}: {e}, retrying without proxy...")
+                # ── 代理故障：标记当前代理失败（达阈值后禁用该代理并自动切换下一个）──
+                if current_proxy and not use_direct:
+                    self._mark_proxy_failed(current_proxy, hard_fail=self._is_connection_refused(e))
+                # allow_direct_fallback=True 时直连重试一次
+                if current_proxy and not use_direct and self.allow_direct_fallback:
+                    logger.warning(f"Proxy {current_proxy} failed for {path}: {e}, retrying without proxy...")
                     try:
                         headers = self._get_headers(method, path, body)
                         url = f"{self.rest_url}{path}"
@@ -1062,7 +1264,6 @@ class OKXClient:
                         if response.status_code < 400:
                             data = response.json()
                             if data.get("code") == "0":
-                                self._proxy_fail_count = 0  # 直连成功，重置计数
                                 return data
                         logger.warning(f"Direct connection also failed for {path}")
                     except Exception as direct_e:
@@ -1079,11 +1280,26 @@ class OKXClient:
 
         return None
 
+    def _is_ticker_server_fresh(self, ticker: Any) -> bool:
+        if not isinstance(ticker, dict):
+            return False
+        try:
+            server_ts = float(ticker["ts"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if server_ts > 1e11:
+            server_ts /= 1000.0
+        return abs(time.time() - server_ts) <= self._ticker_max_server_age_seconds
+
     def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         # P28: Ticker缓存 - 减少网络不稳定时的重复API调用
         ttl = self._ticker_cache_ttl_degraded if not self._network_healthy else self._ticker_cache_ttl_normal
         cache_entry = self._ticker_cache.get(symbol)
-        if cache_entry and time.time() - cache_entry["ts"] < ttl:
+        if (
+            cache_entry
+            and time.time() - cache_entry["ts"] < ttl
+            and self._is_ticker_server_fresh(cache_entry.get("data"))
+        ):
             return cache_entry["data"]
         
         try:
@@ -1091,17 +1307,18 @@ class OKXClient:
             data = self._make_request("GET", path)
             if data and data["code"] == "0":
                 ticker = data["data"][0]
-                self._ticker_cache[symbol] = {"data": ticker, "ts": time.time()}
-                return ticker
+                if self._is_ticker_server_fresh(ticker):
+                    self._ticker_cache[symbol] = {"data": ticker, "ts": time.time()}
+                    return ticker
+                logger.warning(f"Ignoring stale ticker response for {symbol}")
             logger.debug(f"Failed to get ticker for {symbol}: {data.get('msg', '') if data else ''}")
-            # P28: 网络失败时返回过期缓存（如果有）
-            if cache_entry:
+            if cache_entry and self._is_ticker_server_fresh(cache_entry.get("data")):
                 return cache_entry["data"]
             return None
         except Exception as e:
             logger.debug(f"Error getting ticker for {symbol}: {e}")
             # P28: 网络异常时返回过期缓存
-            if cache_entry:
+            if cache_entry and self._is_ticker_server_fresh(cache_entry.get("data")):
                 return cache_entry["data"]
             return None
 
@@ -1110,7 +1327,11 @@ class OKXClient:
         # P28: Ticker缓存 - 减少网络不稳定时的重复API调用
         ttl = self._ticker_cache_ttl_degraded if not self._network_healthy else self._ticker_cache_ttl_normal
         cache_entry = self._ticker_cache.get(symbol)
-        if cache_entry and time.time() - cache_entry["ts"] < ttl:
+        if (
+            cache_entry
+            and time.time() - cache_entry["ts"] < ttl
+            and self._is_ticker_server_fresh(cache_entry.get("data"))
+        ):
             return cache_entry["data"]
         
         try:
@@ -1118,15 +1339,17 @@ class OKXClient:
             data = await self._async_make_request("GET", path)
             if data and data["code"] == "0":
                 ticker = data["data"][0]
-                self._ticker_cache[symbol] = {"data": ticker, "ts": time.time()}
-                return ticker
+                if self._is_ticker_server_fresh(ticker):
+                    self._ticker_cache[symbol] = {"data": ticker, "ts": time.time()}
+                    return ticker
+                logger.warning(f"Ignoring stale ticker response for {symbol}")
             logger.debug(f"Failed to get ticker for {symbol}: {data.get('msg', '') if data else ''}")
-            if cache_entry:
+            if cache_entry and self._is_ticker_server_fresh(cache_entry.get("data")):
                 return cache_entry["data"]
             return None
         except Exception as e:
             logger.debug(f"Error getting ticker for {symbol}: {e}")
-            if cache_entry:
+            if cache_entry and self._is_ticker_server_fresh(cache_entry.get("data")):
                 return cache_entry["data"]
             return None
 
@@ -1235,12 +1458,20 @@ class OKXClient:
                 if data and data.get("code") == "0":
                     self._kline_cache[cache_key] = {"data": data["data"], "ts": time.time()}
                     return data["data"]
-            # P5-1: 429限流响应 - 跳过同步回退，直接使用缓存
-            elif data.get("code") == "429":
-                logger.debug(f"P5-1: Skipping sync fallback for {symbol} (429 rate limited)")
+            # P5-1: 429限流 / 403代理屏蔽 - 跳过同步回退，直接使用缓存
+            elif data.get("code") in ("429", "403"):
                 cached = self._kline_cache.get(cache_key)
-                if cached and (time.time() - cached["ts"]) < 300:  # 5分钟缓存
-                    return cached["data"]
+                if cached:
+                    age = time.time() - cached["ts"]
+                    # 403（代理被屏蔽）恢复较慢，用更长缓存窗口（10分钟）
+                    ttl = 600 if data.get("code") == "403" else 300
+                    if age < ttl:
+                        logger.debug(
+                            f"Using cached kline for {symbol} after {data['code']} "
+                            f"(age={age:.0f}s, ttl={ttl}s)"
+                        )
+                        return cached["data"]
+                logger.debug(f"No valid cache for {symbol} after {data.get('code')}, returning empty")
                 return cached["data"] if cached else []
             logger.error(f"Failed to get kline for {symbol} (interval={interval}): {data}")
             return []
@@ -1271,42 +1502,98 @@ class OKXClient:
             logger.error(f"Error getting klines for {symbol}: {e}")
             return []
 
+    def _funding_rate_ttl(self, funding_rate: Dict[str, Any]) -> float:
+        try:
+            next_funding_ts = float(funding_rate.get("nextFundingTime", 0))
+        except (TypeError, ValueError):
+            return self._funding_rate_cache_ttl
+        if next_funding_ts > 1e11:
+            next_funding_ts /= 1000.0
+        seconds_to_settlement = next_funding_ts - time.time()
+        if abs(seconds_to_settlement) <= self._funding_rate_settlement_window:
+            return self._funding_rate_settlement_ttl
+        return self._funding_rate_cache_ttl
+
+    def _cached_funding_rate(self, symbol: str, max_age: float) -> Optional[Dict[str, Any]]:
+        entry = self._funding_rate_cache.get(symbol)
+        if not entry or time.time() - entry["ts"] > max_age:
+            return None
+        return entry["data"]
+
     def get_funding_rate(self, symbol: str) -> Optional[Dict[str, Any]]:
+        cache_entry = self._funding_rate_cache.get(symbol)
+        if cache_entry and time.time() - cache_entry["ts"] < self._funding_rate_ttl(cache_entry["data"]):
+            return cache_entry["data"]
         try:
             path = f"/api/v5/public/funding-rate?instId={symbol}"
             data = self._make_request("GET", path)
-            if data and data["code"] == "0":
-                return data["data"][0]
+            if data and data.get("code") == "0" and data.get("data"):
+                funding_rate = data["data"][0]
+                self._funding_rate_cache[symbol] = {"data": funding_rate, "ts": time.time()}
+                return funding_rate
             logger.debug(f"Failed to get funding rate for {symbol}: {data.get('msg', '') if data else ''}")
-            return None
         except Exception as e:
             logger.debug(f"Error getting funding rate for {symbol}: {e}")
-            return None
+        return self._cached_funding_rate(symbol, self._funding_rate_stale_fallback_ttl)
 
     async def get_funding_rate_async(self, symbol: str) -> Optional[Dict[str, Any]]:
         """异步获取资金费率"""
+        cache_entry = self._funding_rate_cache.get(symbol)
+        if cache_entry and time.time() - cache_entry["ts"] < self._funding_rate_ttl(cache_entry["data"]):
+            return cache_entry["data"]
         try:
             path = f"/api/v5/public/funding-rate?instId={symbol}"
             data = await self._async_make_request("GET", path)
-            if data and data["code"] == "0":
-                return data["data"][0]
+            if data and data.get("code") == "0" and data.get("data"):
+                funding_rate = data["data"][0]
+                self._funding_rate_cache[symbol] = {"data": funding_rate, "ts": time.time()}
+                return funding_rate
             logger.debug(f"Failed to get funding rate for {symbol}: {data.get('msg', '') if data else ''}")
-            return None
         except Exception as e:
             logger.debug(f"Error getting funding rate for {symbol}: {e}")
-            return None
+        return self._cached_funding_rate(symbol, self._funding_rate_stale_fallback_ttl)
 
     def get_order_book(self, symbol: str, depth: int = 5) -> Optional[Dict[str, Any]]:
         try:
-            path = f"/api/v5/market/books?instId={symbol}&sz={depth}"
+            requested_depth = min(400, max(int(depth), self._orderbook_min_depth))
+            path = f"/api/v5/market/books?instId={symbol}&sz={requested_depth}"
             data = self._make_request("GET", path)
             if data and data["code"] == "0":
-                return data["data"][0]
+                if not data.get("data") or not isinstance(data["data"][0], dict):
+                    logger.warning(f"Empty order book response for {symbol}")
+                    return None
+                orderbook = data["data"][0]
+                if not self._is_valid_orderbook(orderbook):
+                    logger.warning(f"Rejecting incomplete or invalid order book for {symbol}")
+                    return None
+                return orderbook
             logger.error(f"Failed to get order book for {symbol}: {data}")
             return None
         except Exception as e:
             logger.error(f"Error getting order book: {e}")
             return None
+
+    def _is_valid_orderbook(self, orderbook: Dict[str, Any]) -> bool:
+        bids = orderbook.get("bids")
+        asks = orderbook.get("asks")
+        min_depth = self._orderbook_min_depth
+        if not isinstance(bids, list) or not isinstance(asks, list):
+            return False
+        if len(bids) < min_depth or len(asks) < min_depth:
+            return False
+
+        for side in (bids[:min_depth], asks[:min_depth]):
+            for level in side:
+                if not isinstance(level, (list, tuple)) or len(level) < 2:
+                    return False
+                try:
+                    price = float(level[0])
+                    size = float(level[1])
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                if not math.isfinite(price) or not math.isfinite(size) or price <= 0 or size < 0:
+                    return False
+        return True
 
     def get_instrument_info(self, symbol: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
         # 使用缓存避免每次下单都发HTTP请求（加剧API延迟）
@@ -1428,17 +1715,26 @@ class OKXClient:
             logger.debug(f"round_price_to_tick failed for {symbol}: {e}")
             return price
 
-    def get_positions(self) -> List[Dict[str, Any]]:
+    def get_positions_checked(self) -> Optional[List[Dict[str, Any]]]:
+        """查询持仓并保留请求失败与合法空仓之间的区别。"""
         try:
             path = "/api/v5/account/positions"
             data = self._make_request("GET", path)
             if data and data["code"] == "0":
-                return data["data"]
+                positions = data.get("data")
+                if isinstance(positions, list):
+                    return positions
+                logger.error(f"Invalid positions response: {data}")
+                return None
             logger.error(f"Failed to get positions: {data}")
-            return []
+            return None
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
-            return []
+            return None
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        positions = self.get_positions_checked()
+        return positions if positions is not None else []
 
     def _get_position_mgn_mode(self, symbol: str, pos_side: str = "") -> str:
         """查询交易所持仓的实际保证金模式（cross/isolated）。
@@ -1885,8 +2181,11 @@ class OKXClient:
             # 账本一致性（修复4）：条件单与普通单统一「币数→合约张数」转换，再按 lot 取整
             quantity = self.coin_to_contracts(symbol, quantity)
 
-            # 条件单同样需要按 lot size 取整
-            rounded_qty = self.round_quantity_to_lot(symbol, quantity, round_up=reduce_only)
+            # 条件单同样需要按 lot size 取整。
+            # 修复：条件单（TP/SL）为 reduce_only，数量必须 <= 实际持仓。开仓单向下取整（round_up=False），
+            # 若条件单向上取整（round_up=reduce_only=True），当原始数量非 lot_sz 整数倍（如 0.755 张）时，
+            # 开仓成交 0.75 张而 SL 挂 0.76 张，超挂 0.01 张。统一向下取整与开仓一致，避免超挂。
+            rounded_qty = self.round_quantity_to_lot(symbol, quantity, round_up=False)
             if rounded_qty <= 0:
                 logger.warning(
                     f"Skipping conditional order for {symbol}: quantity {quantity} below lot size"
@@ -2050,9 +2349,14 @@ class OKXClient:
             logger.error(f"Error getting pending orders: {e}")
             return []
 
-    def get_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_order_history(self, limit: int = 50, state: str = "filled") -> List[Dict[str, Any]]:
         try:
-            path = f"/api/v5/trade/orders-history?instType=SWAP&limit={limit}&state=filled"
+            params = [f"instType=SWAP", f"limit={limit}"]
+            # state 为空表示不过滤状态，返回全部（含 partially_filled/canceled 带部分成交），
+            # 用于 fill 回执兜底覆盖部分平仓场景；默认仅拉已成交，保持既有调用方语义。
+            if state:
+                params.append(f"state={state}")
+            path = "/api/v5/trade/orders-history?" + "&".join(params)
             data = self._make_request("GET", path)
             if data and data["code"] == "0":
                 return data["data"]
@@ -2176,6 +2480,34 @@ class OKXClient:
             return None
         except Exception as e:
             logger.error(f"Error getting algo orders: {e}")
+            return None
+
+    def get_algo_order_history(self, symbol: str = None, ord_type: str = "conditional",
+                               state: str = None, limit: int = 100) -> Optional[List[Dict[str, Any]]]:
+        """获取算法/条件单历史（含已触发 effective / 已取消 canceled）。
+
+        与 get_algo_orders（orders-algo-pending）互补：条件单从 pending 消失后，需查
+        orders-algo-history 判断是「已触发成交」还是「已取消」。state=effective 表示
+        已触发（其 ordId/ordIdList 指向服务端自动生成的平仓单）。
+
+        注意：该端点必须携带 ordType 参数，否则返回 51000。返回 None 表示查询失败
+        （网络/API 错误），[] 表示成功但无记录，与 get_algo_orders 语义一致。
+        """
+        try:
+            path = "/api/v5/trade/orders-algo-history"
+            params = {"ordType": ord_type, "limit": str(min(limit, 100))}
+            if symbol:
+                params["instId"] = symbol
+            if state:
+                params["state"] = state
+            params_str = "&".join([f"{k}={v}" for k, v in params.items()])
+            data = self._make_request("GET", f"{path}?{params_str}")
+            if data and data["code"] == "0":
+                return data.get("data", [])
+            logger.error(f"Failed to get algo order history: {data}")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting algo order history: {e}")
             return None
 
     def set_leverage(self, symbol: str, leverage: int, pos_side: str = None) -> Optional[Dict[str, Any]]:
@@ -2314,36 +2646,45 @@ class OKXClient:
                     self._ws_public_retry_count = 0
                     logger.info("Public WS retry count reset after 20 attempts, starting fresh cycle")
 
-                # P3-1: 代理禁用时跳过代理尝试
-                proxy_disabled_pub = self.proxy and time.time() < self._proxy_disabled_until
-                use_proxy_pub = self.proxy and not proxy_disabled_pub
+                # ── 多代理源自动切换：获取当前活跃代理（自动跳过被禁用的代理）──
+                current_proxy = self._get_active_proxy()
+                use_proxy_pub = current_proxy is not None
 
                 try:
-                    # 优先尝试直连，代理不可靠时直连更稳定
-                    try:
-                        self._ws_public = await websockets.connect(self.ws_public_url, ping_interval=20, 
-                            close_timeout=5, max_size=2**20)
-                        logger.info("Connected to OKX public WebSocket (direct)")
-                    except Exception as direct_e:
-                        if use_proxy_pub:
-                            try:
-                                from websockets_proxy import Proxy, proxy_connect
-                                proxy = Proxy.from_url(self.proxy)
-                                # P33: 代理连接必须显式超时，否则代理半死（TCP可连但握手挂起）时重连永久阻塞
-                                self._ws_public = await proxy_connect(self.ws_public_url, proxy=proxy, ping_interval=25, proxy_conn_timeout=10)
-                                logger.info("Connected to OKX public WebSocket (via proxy)")
-                            except ImportError:
-                                logger.error("websockets-proxy not installed and direct failed, re-raising")
-                                raise direct_e
-                            except Exception as proxy_e:
+                    # P3-1-FIX: 境内环境必须优先代理（OKX 直连被墙）。配置了代理时先走代理，
+                    # 代理失败才回退直连（境外环境 proxy=None 时直接走直连）。
+                    if use_proxy_pub:
+                        try:
+                            from websockets_proxy import Proxy, proxy_connect
+                            proxy = Proxy.from_url(current_proxy)
+                            # P33: 代理连接必须显式超时，否则代理半死（TCP可连但握手挂起）时重连永久阻塞
+                            self._ws_public = await proxy_connect(self.ws_public_url, proxy=proxy, ping_interval=25, proxy_conn_timeout=10)
+                            self._mark_proxy_success(current_proxy)
+                            logger.info(f"Connected to OKX public WebSocket (via proxy {current_proxy})")
+                        except ImportError:
+                            if self.allow_direct_fallback:
+                                logger.error("websockets-proxy not installed, falling back to direct")
+                                self._ws_public = await websockets.connect(self.ws_public_url, ping_interval=20,
+                                    close_timeout=5, max_size=2**20)
+                                logger.info("Connected to OKX public WebSocket (direct)")
+                            else:
+                                raise
+                        except Exception as proxy_e:
+                            # 标记当前代理失败（达阈值后禁用该代理并自动切换下一个）
+                            self._mark_proxy_failed(current_proxy, hard_fail=self._is_connection_refused(proxy_e))
+                            if self.allow_direct_fallback:
                                 # P3-1: 代理失败时回退直连
                                 logger.warning(f"P3-1: Proxy public WS failed ({proxy_e}), falling back to direct")
-                                self._proxy_fail_count += 1
                                 self._ws_public = await websockets.connect(self.ws_public_url, ping_interval=20,
                                     close_timeout=5, max_size=2**20)
                                 logger.info("P3-1: Connected to OKX public WebSocket (direct after proxy fail)")
-                        else:
-                            raise
+                            else:
+                                logger.warning(f"Public WS proxy connect failed ({proxy_e}), will retry with next proxy")
+                                raise
+                    else:
+                        self._ws_public = await websockets.connect(self.ws_public_url, ping_interval=20,
+                            close_timeout=5, max_size=2**20)
+                        logger.info("Connected to OKX public WebSocket (direct)")
 
                     self._ws_public_connected = True
                     self._ws_public_last_pong = time.time()
@@ -2410,42 +2751,45 @@ class OKXClient:
                 self._ws_private_retry_count += 1
                 self._ws_private_last_retry = time.time()
 
-                # P3-1: 代理禁用时跳过代理尝试
-                proxy_disabled = self.proxy and time.time() < self._proxy_disabled_until
-                use_proxy = self.proxy and not proxy_disabled
+                # ── 多代理源自动切换：获取当前活跃代理（自动跳过被禁用的代理）──
+                current_proxy = self._get_active_proxy()
+                use_proxy = current_proxy is not None
 
                 try:
-                    # 优先尝试直连（P3-1: 代理禁用时直接跳过代理）
-                    try:
-                        self._ws_private = await websockets.connect(self.ws_private_url, ping_interval=None,
-                            close_timeout=5, max_size=2**20)
-                        logger.info("Connected to OKX private WebSocket (direct)")
-                    except Exception as direct_e:
-                        if use_proxy:
-                            try:
-                                from websockets_proxy import Proxy, proxy_connect
-                                proxy = Proxy.from_url(self.proxy)
-                                # P33: 代理连接必须显式超时，否则代理半死时重连永久阻塞
-                                self._ws_private = await proxy_connect(self.ws_private_url, proxy=proxy, ping_interval=25, proxy_conn_timeout=10)
-                                logger.info("Connected to OKX private WebSocket (via proxy)")
-                            except ImportError:
-                                logger.error("websockets-proxy not installed and direct failed")
-                                raise direct_e
-                            except Exception as proxy_e:
-                                # P3-1: 代理失败时标记代理故障并重新尝试直连
+                    # P3-1-FIX: 境内环境必须优先代理（OKX 直连被墙）。配置了代理时先走代理，
+                    # 代理失败才回退直连（境外环境 proxy=None 时直接走直连）。
+                    if use_proxy:
+                        try:
+                            from websockets_proxy import Proxy, proxy_connect
+                            proxy = Proxy.from_url(current_proxy)
+                            # P33: 代理连接必须显式超时，否则代理半死时重连永久阻塞
+                            self._ws_private = await proxy_connect(self.ws_private_url, proxy=proxy, ping_interval=25, proxy_conn_timeout=10)
+                            self._mark_proxy_success(current_proxy)
+                            logger.info(f"Connected to OKX private WebSocket (via proxy {current_proxy})")
+                        except ImportError:
+                            if self.allow_direct_fallback:
+                                logger.error("websockets-proxy not installed, falling back to direct")
+                                self._ws_private = await websockets.connect(self.ws_private_url, ping_interval=None,
+                                    close_timeout=5, max_size=2**20)
+                                logger.info("Connected to OKX private WebSocket (direct)")
+                            else:
+                                raise
+                        except Exception as proxy_e:
+                            # 标记当前代理失败（达阈值后禁用该代理并自动切换下一个）
+                            self._mark_proxy_failed(current_proxy, hard_fail=self._is_connection_refused(proxy_e))
+                            if self.allow_direct_fallback:
+                                # P3-1: 代理失败时回退直连
                                 logger.warning(f"P3-1: Proxy WS failed ({proxy_e}), falling back to direct")
-                                self._proxy_fail_count += 1
-                                if self._proxy_fail_count >= 2:
-                                    backoff_s = min(300, self._proxy_disable_duration * (2 ** max(0, self._proxy_disable_cycle)))
-                                    self._proxy_disabled_until = time.time() + backoff_s
-                                    self._proxy_disable_cycle += 1
-                                    logger.warning(f"P3-1: Proxy disabled for {backoff_s}s after WS failures")
-                                # 重试直连
                                 self._ws_private = await websockets.connect(self.ws_private_url, ping_interval=None,
                                     close_timeout=5, max_size=2**20)
                                 logger.info("P3-1: Connected to OKX private WebSocket (direct after proxy fail)")
-                        else:
-                            raise
+                            else:
+                                logger.warning(f"Private WS proxy connect failed ({proxy_e}), will retry with next proxy")
+                                raise
+                    else:
+                        self._ws_private = await websockets.connect(self.ws_private_url, ping_interval=None,
+                            close_timeout=5, max_size=2**20)
+                        logger.info("Connected to OKX private WebSocket (direct)")
 
                     self._ws_private_connected = True
                     self._ws_private_last_pong = time.time()
@@ -2580,9 +2924,9 @@ class OKXClient:
                     channel = data.get("arg", {}).get("channel", "")
                     symbol = data.get("arg", {}).get("instId", "")
                     if channel == "books" and symbol:
-                        self._ws_public_last_data = time.time()
-                        tick_data = self._parse_tick_data(data, symbol)
+                        tick_data = await self._consume_sequenced_orderbook(data, symbol)
                         if tick_data and self.tick_callback:
+                            self._ws_public_last_data = time.time()
                             asyncio.create_task(self._dispatch_tick_callback(tick_data))
                 except Exception as e:
                     logger.error(f"Error handling public WS message: {e}")
@@ -2603,6 +2947,75 @@ class OKXClient:
                 await result
         except Exception as e:
             logger.error(f"Error in tick callback: {e}")
+
+    async def _consume_sequenced_orderbook(
+        self,
+        message: Dict[str, Any],
+        symbol: str,
+    ) -> Optional[TickData]:
+        """Validate the OKX books snapshot/delta chain before deriving a quote tick."""
+        rows = message.get("data") or []
+        if not rows or not isinstance(rows[0], dict):
+            return None
+        book = rows[0]
+        action = message.get("action")
+
+        if action == "snapshot":
+            try:
+                self._books_last_sequence[symbol] = int(book["seqId"])
+            except (KeyError, TypeError, ValueError):
+                await self._resync_orderbook_stream(symbol, "snapshot_missing_seq_id")
+                return None
+            self._books_resync_pending.discard(symbol)
+            return self._parse_tick_data(message, symbol)
+
+        if action != "update" or symbol in self._books_resync_pending:
+            return None
+
+        try:
+            previous_sequence = int(book["prevSeqId"])
+            sequence = int(book["seqId"])
+        except (KeyError, TypeError, ValueError):
+            await self._resync_orderbook_stream(symbol, "update_missing_sequence")
+            return None
+
+        last_sequence = self._books_last_sequence.get(symbol)
+        if last_sequence is None:
+            await self._resync_orderbook_stream(symbol, "update_before_snapshot")
+            return None
+        if sequence == last_sequence and previous_sequence == last_sequence:
+            return None
+        if previous_sequence != last_sequence or sequence <= previous_sequence:
+            await self._resync_orderbook_stream(symbol, "sequence_gap")
+            return None
+
+        self._books_last_sequence[symbol] = sequence
+        return self._parse_tick_data(message, symbol)
+
+    async def _resync_orderbook_stream(self, symbol: str, reason: str) -> None:
+        self._books_last_sequence.pop(symbol, None)
+        if symbol in self._books_resync_pending:
+            return
+        self._books_resync_pending.add(symbol)
+        logger.warning(f"Orderbook sequence invalid for {symbol}: {reason}; resyncing")
+
+        try:
+            fallback_book = await asyncio.to_thread(self.get_order_book, symbol, 50)
+            if fallback_book:
+                fallback_tick = self._parse_tick_data({"data": [fallback_book]}, symbol)
+                if fallback_tick and self.tick_callback:
+                    asyncio.create_task(self._dispatch_tick_callback(fallback_tick))
+        except Exception as exc:
+            logger.warning(f"REST orderbook fallback failed for {symbol}: {exc}")
+
+        if self._ws_public is None or not self._is_ws_open(self._ws_public):
+            return
+        subscription = {"channel": "books", "instId": symbol}
+        try:
+            await self._ws_public.send(json.dumps({"op": "unsubscribe", "args": [subscription]}))
+            await self._ws_public.send(json.dumps({"op": "subscribe", "args": [subscription]}))
+        except Exception as exc:
+            logger.warning(f"Orderbook resubscribe failed for {symbol}: {exc}")
 
     async def _process_private_ws(self):
         """处理私有WebSocket消息循环，异常时由监控任务触发重连"""
@@ -2883,6 +3296,7 @@ class OKXClient:
             lever = raw_data.get("lever", "1")
             mmr = raw_data.get("mmr", "0")
             notional_usd = raw_data.get("notionalUsd", "0")
+            liq_px = raw_data.get("liqPx", "0")
             
             pos_qty = float(pos) if pos else 0.0
             avg_cost_val = float(avg_px) if avg_px else 0.0
@@ -2890,6 +3304,7 @@ class OKXClient:
             margin_val = float(margin) if margin else 0.0
             leverage_val = int(lever) if lever else 1
             notional_val = float(notional_usd) if notional_usd else 0.0
+            liq_px_val = float(liq_px) if liq_px else 0.0
             
             # 降级方案：如果API返回的margin为0，用名义价值/杠杆估算
             if margin_val == 0 and pos_qty != 0 and leverage_val > 0:
@@ -2912,6 +3327,7 @@ class OKXClient:
                 leverage=leverage_val,
                 maintenance_margin_rate=float(mmr) if mmr else 0.0,
                 notional_usd=notional_val,
+                liquidation_price=liq_px_val,
                 timestamp=datetime.now()
             )
         except Exception as e:

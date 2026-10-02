@@ -17,6 +17,7 @@
 """
 
 import json
+import math
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,17 @@ from analysis.contribution_analyzer import ContributionAnalyzer
 from analysis.historical_analyzer import HistoricalAnalyzer
 from analysis.strategy_optimizer import StrategyOptimizer
 from services.trend_vote import compute_trend_vote
+
+
+def _safe_float(value, default=0.0):
+    """安全转换数值：None/非法/NaN/Inf 返回默认值，用于数值防御。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
 
 
 class IntelligentAnalysisAgent:
@@ -256,13 +268,18 @@ class IntelligentAnalysisAgent:
         for k in klines:
             try:
                 if isinstance(k, dict):
-                    closes.append(float(k.get("close", 0)))
-                    highs.append(float(k.get("high", 0)))
-                    lows.append(float(k.get("low", 0)))
+                    c = float(k.get("close", 0))
+                    h = float(k.get("high", 0))
+                    l = float(k.get("low", 0))
                 else:
-                    closes.append(float(k[4]))
-                    highs.append(float(k[2]))
-                    lows.append(float(k[3]))
+                    c = float(k[4])
+                    h = float(k[2])
+                    l = float(k[3])
+                if not (math.isfinite(c) and math.isfinite(h) and math.isfinite(l)):
+                    continue
+                closes.append(c)
+                highs.append(h)
+                lows.append(l)
             except (IndexError, TypeError, ValueError):
                 continue
         return closes, highs, lows
@@ -525,7 +542,7 @@ class IntelligentAnalysisAgent:
             sig = t.get("entry_signal_type") or t.get("exit_reason") or "unknown"
             bucket = by_signal.setdefault(sig, {"count": 0, "wins": 0, "pnl": 0.0})
             bucket["count"] += 1
-            bucket["pnl"] += t.get("pnl_usdt", 0.0)
+            bucket["pnl"] += _safe_float(t.get("pnl_usdt", 0.0))
             if t.get("win"):
                 bucket["wins"] += 1
 
@@ -608,7 +625,8 @@ class IntelligentAnalysisAgent:
             analysis = self.historical_analyzer.analyze_all_strategies(
                 since=self._analysis_since
             )
-            analysis["available"] = True
+            # 尊重底层 available 判定：数据加载失败时不应被覆盖为 True（fail-closed）
+            analysis.setdefault("available", True)
             return analysis
         except Exception as e:
             logger.warning(f"trade record analysis failed: {e}")
@@ -869,11 +887,17 @@ class IntelligentAnalysisAgent:
 
     @staticmethod
     def _round(value: Any, ndigits: int = 4) -> Any:
-        """安全四舍五入（非数值原样返回）。"""
-        if isinstance(value, float):
-            return round(value, ndigits)
-        if isinstance(value, int):
+        """安全四舍五入（非数值原样返回，NaN/Inf 归一为 None）。"""
+        if isinstance(value, bool):
             return value
+        if isinstance(value, (int, float)):
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return value
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return round(f, ndigits)
         return value
 
     def _round_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:

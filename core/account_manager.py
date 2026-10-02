@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from loguru import logger
 
+from utils.helpers import safe_float
+
 
 class AccountManager:
     def __init__(self, config: Dict[str, Any], okx_client, redis_cache, equity_monitor=None):
@@ -45,6 +47,12 @@ class AccountManager:
         self._long_exposure = 0.0
         self._short_exposure = 0.0
         self._net_exposure = 0.0
+
+        # 逐币种未实现盈亏（供 AGI 逐币种精细杠杆/间距守卫使用）
+        self._symbol_unrealized_pnl: Dict[str, float] = {}
+
+        # 逐币种现货持币余额（供 AGI 现货持有守卫使用）
+        self._spot_holdings: Dict[str, float] = {}
         
         self._last_rebalance_time = datetime.now()
         self._rebalance_interval = timedelta(hours=4)
@@ -82,6 +90,7 @@ class AccountManager:
             
             if account_info:
                 account = self.okx_client._parse_account_info(account_info)
+                self._spot_holdings = self._extract_spot_holdings(account_info)
             
             positions = self.okx_client.get_positions()
             if not positions:
@@ -102,6 +111,7 @@ class AccountManager:
             self._strategy_equity = {}
             self._long_exposure = 0.0
             self._short_exposure = 0.0
+            self._symbol_unrealized_pnl = {}
             open_count = 0
             
             for pos_data in positions:
@@ -116,6 +126,10 @@ class AccountManager:
                     
                     self._strategy_margin[strategy] += position.margin
                     self._strategy_equity[strategy] += position.unrealized_pnl
+                    self._symbol_unrealized_pnl[position.symbol] = (
+                        self._symbol_unrealized_pnl.get(position.symbol, 0.0)
+                        + float(position.unrealized_pnl)
+                    )
                     
                     position_value = float(position.quantity) * position.mark_price
                     if position.side == "long":
@@ -358,6 +372,35 @@ class AccountManager:
     
     def get_total_unrealized_pnl(self) -> float:
         return self._total_unrealized_pnl
+
+    def get_symbol_unrealized_pnl(self) -> Dict[str, float]:
+        """返回逐币种未实现盈亏 {symbol: upl}，供 AGI 逐币种精细杠杆/间距守卫使用。"""
+        return dict(self._symbol_unrealized_pnl)
+
+    @staticmethod
+    def _extract_spot_holdings(account_info: Dict[str, Any]) -> Dict[str, float]:
+        """从 /account/balance 的 details 中提取逐币种现货持币余额（非 USDT、cashBal>0）。
+
+        - 现货持有 = 非 USDT 币种的现货现金余额（cashBal，回退 availBal）。
+        - 逐币种余额为各币种本位数量（BTC/ETH 等），AGI 侧用「持币种类数」做
+          过度分散收敛，不依赖估值（避免引入实时价格与换算复杂度）。
+        """
+        holdings: Dict[str, float] = {}
+        details = account_info.get("details", []) if isinstance(account_info, dict) else []
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            ccy = str(d.get("ccy", "") or "")
+            if not ccy or ccy == "USDT":
+                continue
+            cash = safe_float(d.get("cashBal"), safe_float(d.get("availBal"), 0.0))
+            if cash > 0:
+                holdings[ccy] = cash
+        return holdings
+
+    def get_spot_holdings(self) -> Dict[str, float]:
+        """返回逐币种现货持币余额 {ccy: 余额}，供 AGI 现货持有守卫使用。"""
+        return dict(self._spot_holdings)
     
     def get_current_leverage(self) -> float:
         return self._current_total_leverage

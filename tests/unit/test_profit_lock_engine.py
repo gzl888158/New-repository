@@ -6,14 +6,13 @@
   P0  保本位移：激活 + 回落至成本全平（锁 0 利润）
   P0  部分落袋：浮盈 ≥1.0% 减仓 + 剩余进入紧追踪
   P0  紧追踪：回撤 ≥0.6% 全平
-  P0  反转落袋：评分 ≥0.5 且浮盈 → 全平
   P0  动作冷却去重
   P2  边界：非法价格/方向 / 单 tick 跳变 / prune / reset
 """
 
 import pytest
 
-from core.profit_lock_engine import ProfitLockEngine, ProfitLockDecision
+from core.profit_lock_engine import ProfitLockEngine
 
 
 def _make_engine(**overrides) -> ProfitLockEngine:
@@ -36,7 +35,6 @@ class TestInitialization:
         assert eng._partial_pct == 0.01
         assert eng._partial_ratio == 0.35
         assert eng._trailing_distance_pct == 0.006
-        assert eng._reversal_close_score == 0.5
 
     def test_partial_ratio_clamped(self):
         # 非法比例回退到 (0.05, 0.95) 区间
@@ -144,26 +142,56 @@ class TestPartialAndTrailing:
 
 
 # ═══════════════════════════════════════════════════════════════
-# P0: 反转落袋
+# P0: 保本阶段回撤快速部分落袋（增强收益落袋）
 # ═══════════════════════════════════════════════════════════════
 
-class TestReversal:
-    def test_reversal_full_close(self):
-        eng = _make_engine(cooldown_seconds=0)
-        d = eng.compute("BTC-USDT-SWAP", "long", 100, 100.5, reversal_score=0.8)
-        assert d.action == "full"
-        assert d.exit_reason == "profit_lock_reversal"
+class TestBreakevenRetracePartial:
+    def _eng(self):
+        return _make_engine(
+            breakeven_pct=0.0015, partial_pct=0.004, partial_ratio=0.5,
+            trailing_distance_pct=0.0015, cooldown_seconds=0,
+            breakeven_retrace_partial_enabled=True,
+            breakeven_retrace_partial_ratio=0.4,
+        )
 
-    def test_reversal_requires_profit(self):
-        eng = _make_engine()
-        # 0.1% 浮盈 < reversal_min_profit_pct(0.2%)，不触发反转落袋
-        d = eng.compute("BTC-USDT-SWAP", "long", 100, 100.1, reversal_score=0.9)
+    def test_retrace_in_breakeven_triggers_quick_partial(self):
+        """进入保本后未到 partial 线时回撤，立即部分落袋锁小利。"""
+        eng = self._eng()
+        eng.compute("BTC", "long", 100, 100.0)
+        eng.compute("BTC", "long", 100, 100.3)   # +0.3% 保本激活，未到 0.4% partial
+        # 回撤 0.16%（仍 +0.14% 盈利）→ 快速部分落袋
+        d = eng.compute("BTC", "long", 100, 100.14)
+        assert d.action == "partial"
+        assert abs(d.partial_ratio - 0.4) < 1e-9
+        assert d.exit_reason == "profit_lock_partial"
+        assert d.phase == "trailing"
+
+    def test_no_quick_partial_when_retrace_too_small(self):
+        eng = self._eng()
+        eng.compute("BTC", "long", 100, 100.0)
+        eng.compute("BTC", "long", 100, 100.3)
+        d = eng.compute("BTC", "long", 100, 100.25)  # 回撤 0.05% < 0.15%
         assert d.action == "none"
 
-    def test_reversal_below_score_not_trigger(self):
-        eng = _make_engine()
-        d = eng.compute("BTC-USDT-SWAP", "long", 100, 101.0, reversal_score=0.3)
-        assert d.action == "partial"  # 正常梯度：1% 部分落袋，而非反转全平
+    def test_quick_partial_not_repeated(self):
+        eng = self._eng()
+        eng.compute("BTC", "long", 100, 100.0)
+        eng.compute("BTC", "long", 100, 100.3)
+        d1 = eng.compute("BTC", "long", 100, 100.14)
+        assert d1.action == "partial"
+        # 再次回撤不重复触发 quick partial（已进入 trailing，由 trailing 逻辑接管）
+        d2 = eng.compute("BTC", "long", 100, 100.10)
+        assert d2.action != "partial" or eng.get_state("BTC", "long")["be_retrace_partial_done"] is True
+
+    def test_quick_partial_disabled_when_config_off(self):
+        eng = _make_engine(
+            breakeven_pct=0.0015, partial_pct=0.004, trailing_distance_pct=0.0015,
+            cooldown_seconds=0, breakeven_retrace_partial_enabled=False,
+        )
+        eng.compute("BTC", "long", 100, 100.0)
+        eng.compute("BTC", "long", 100, 100.3)
+        d = eng.compute("BTC", "long", 100, 100.14)
+        assert d.action == "none"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -248,15 +276,66 @@ class TestFeeAwareBreakeven:
 
 class TestGuardrails:
     def test_breakeven_pct_floor(self):
-        assert _make_engine(breakeven_pct=0.0001)._breakeven_pct == 0.002
+        assert _make_engine(breakeven_pct=0.0001)._breakeven_pct == 0.001
 
     def test_partial_pct_floor_and_order(self):
-        # partial_pct 低于下限时回退到 0.5%，且不得低于保本阈值
-        assert _make_engine(partial_pct=0.0001)._partial_pct == 0.005
+        # partial_pct 低于下限时回退到 0.3%，且不得低于保本阈值
+        assert _make_engine(breakeven_pct=0.001, partial_pct=0.0001)._partial_pct == 0.003
         # partial_pct 低于 breakeven_pct 时，提升到 breakeven_pct
         eng = _make_engine(breakeven_pct=0.01, partial_pct=0.006)
         assert eng._partial_pct == 0.01
 
     def test_trailing_distance_floor(self):
-        assert _make_engine(trailing_distance_pct=0.0)._trailing_distance_pct == 0.002
-        assert _make_engine(trailing_distance_pct=-1.0)._trailing_distance_pct == 0.002
+        assert _make_engine(trailing_distance_pct=0.0)._trailing_distance_pct == 0.0015
+        assert _make_engine(trailing_distance_pct=-1.0)._trailing_distance_pct == 0.0015
+
+
+# ═══════════════════════════════════════════════════════════════
+# P0: 跨重启状态持久化（dump_state / restore_state）
+# ═══════════════════════════════════════════════════════════════
+
+class TestPersistence:
+    def test_dump_returns_copy(self):
+        eng = _make_engine(cooldown_seconds=0)
+        eng.compute("BTC-USDT-SWAP", "long", 100, 101.0)  # partial -> trailing
+        dump = eng.dump_state()
+        dump["BTC-USDT-SWAP:long"]["phase"] = "corrupted"
+        # 修改导出副本不应影响引擎内部状态
+        assert eng.get_state("BTC-USDT-SWAP", "long")["phase"] == "trailing"
+
+    def test_roundtrip_restore(self):
+        eng = _make_engine(cooldown_seconds=0)
+        eng.compute("BTC-USDT-SWAP", "long", 100, 101.0)  # partial
+        eng.compute("BTC-USDT-SWAP", "long", 100, 101.5)  # peak 更新
+        dump = eng.dump_state()
+
+        eng2 = _make_engine(cooldown_seconds=0)
+        eng2.restore_state(dump)
+        s = eng2.get_state("BTC-USDT-SWAP", "long")
+        assert s["phase"] == "trailing"
+        assert s["partial_done"] is True
+        assert s["peak"] == 101.5
+
+    def test_restore_skips_invalid_entries(self):
+        eng = _make_engine()
+        eng.restore_state({
+            "BTC-USDT-SWAP:long": {"phase": "breakeven", "peak": 100.5,
+                                   "partial_done": False, "last_action_ts": 0.0},
+            "no-colon": {"phase": "none"},
+            "BTC-USDT-SWAP:sideways": {"phase": "none"},
+            "ETH-USDT-SWAP:short": {"phase": None, "peak": "junk"},  # 非法值回退默认
+            "bad": 123,  # 非 dict
+        })
+        states = eng.get_all_states()
+        assert "BTC-USDT-SWAP:long" in states
+        assert "no-colon" not in states
+        assert "BTC-USDT-SWAP:sideways" not in states
+        assert "ETH-USDT-SWAP:short" in states  # 合法方向，非法字段回退默认
+        assert states["ETH-USDT-SWAP:short"]["phase"] == "none"
+        assert states["ETH-USDT-SWAP:short"]["peak"] == 0.0
+
+    def test_restore_rejects_non_dict(self):
+        eng = _make_engine()
+        eng.restore_state(None)
+        eng.restore_state([])
+        assert eng.get_all_states() == {}

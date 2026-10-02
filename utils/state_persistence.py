@@ -40,14 +40,22 @@ class StatePersistence:
 
     async def save_state(self, state: Dict[str, Any]) -> bool:
         """保存状态到 Redis（首选）和 JSON 文件（兜底），双写保证至少一处成功。"""
+        # 深拷贝调用方 dict，避免 _meta 字段污染调用方数据
+        import copy
+        state_copy = copy.deepcopy(state) if isinstance(state, dict) else {}
         # 加入元数据
-        state['_meta'] = {
+        state_copy['_meta'] = {
             'strategy': self.strategy_name,
             'saved_at': datetime.now().isoformat(),
             'timestamp': time.time(),
             'version': 1,
         }
-        serialized = json.dumps(state, default=str, ensure_ascii=False)
+        # JSON 安全序列化：过滤不可序列化值，default=str 兜底
+        try:
+            serialized = json.dumps(state_copy, default=str, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            logger.error(f"[{self.strategy_name}] 状态序列化失败: {e}")
+            return False
 
         success = False
         # 1. 尝试 Redis

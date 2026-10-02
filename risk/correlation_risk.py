@@ -10,11 +10,36 @@
 6. 提供对冲建议和相关性矩阵可视化数据
 """
 import asyncio
+import math
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from loguru import logger
 import numpy as np
+
+from core.direction_unifier import DirectionUnifier
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _position_side(pos: Any) -> str:
+    """归一化持仓方向：long/short/buy/sell → long/short；net 模式按数量符号推导。"""
+    raw = (getattr(pos, "side", "") or "").strip().lower()
+    try:
+        return DirectionUnifier.normalize(raw)
+    except (ValueError, TypeError):
+        pass
+    qty = _finite(getattr(pos, "quantity", 0.0), 0.0)
+    return "long" if qty >= 0 else "short"
 
 
 @dataclass
@@ -37,6 +62,7 @@ class CorrelationRiskControl:
         self.okx_client = okx_client
         self.redis_cache = redis_cache
         self.order_executor = None  # 延迟注入
+        self.alert_manager = None  # 延迟注入（减仓失败告警）
 
         corr_cfg = config.get("risk", {}).get("correlation", {})
         self._threshold = corr_cfg.get("threshold", 0.7)
@@ -51,23 +77,44 @@ class CorrelationRiskControl:
         self._last_returns: Dict[str, np.ndarray] = {}
 
         self._is_running = False
+        self._tasks: List[asyncio.Task] = []
         self._last_check_result: Dict[str, Any] = {"triggered": False, "detail": ""}
         self._last_positions: List[Any] = []
         self._last_total_equity: float = 0.0
         self._hedge_suggestions: List[Dict[str, Any]] = []
 
+    def set_order_executor(self, executor) -> None:
+        """注入订单执行器。"""
+        self.order_executor = executor
+
+    def set_alert_manager(self, alert_manager) -> None:
+        """注入告警管理器（减仓失败告警）。"""
+        self.alert_manager = alert_manager
+
     async def start(self):
         if self._is_running:
             return
         self._is_running = True
-        asyncio.create_task(self._monitor_loop())
+        self._tasks.append(asyncio.create_task(self._monitor_loop()))
         logger.info(f"CorrelationRiskControl started: threshold={self._threshold}, "
                     f"max_concentration={self._max_concentration}, lookback={self._lookback_bars}")
+
+    async def stop(self):
+        self._is_running = False
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("CorrelationRiskControl stopped")
 
     async def _monitor_loop(self):
         while self._is_running:
             try:
                 await self._check_correlation_risk()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error in correlation risk loop: {e}")
             await asyncio.sleep(self._check_interval)
@@ -86,8 +133,11 @@ class CorrelationRiskControl:
 
         parsed = []
         for pos_raw in positions_raw:
-            pos = self.okx_client._parse_position(pos_raw)
-            if pos and abs(float(pos.quantity)) > 0 and pos.margin > 0:
+            try:
+                pos = self.okx_client._parse_position(pos_raw)
+            except Exception:
+                pos = None
+            if pos and abs(_finite(pos.quantity, 0.0)) > 0 and _finite(pos.margin, 0.0) > 0:
                 parsed.append(pos)
 
         self._last_positions = parsed
@@ -98,9 +148,9 @@ class CorrelationRiskControl:
 
         try:
             account_info = self.okx_client.get_account_info()
-            total_equity = float(account_info.get("totalEq", 0)) if account_info else 0
+            total_equity = _finite(account_info.get("totalEq", 0), 0.0) if account_info else 0.0
         except Exception:
-            total_equity = sum(p.margin for p in parsed)
+            total_equity = sum(_finite(p.margin, 0.0) for p in parsed)
 
         self._last_total_equity = total_equity
 
@@ -124,7 +174,9 @@ class CorrelationRiskControl:
                 if r is None:
                     continue
 
-                same_direction = (p_a.side == p_b.side) and p_a.side in ("long", "short")
+                side_a = _position_side(p_a)
+                side_b = _position_side(p_b)
+                same_direction = side_a == side_b and side_a in ("long", "short")
 
                 if abs(r) >= self._threshold:
                     risk_level = "high"
@@ -144,22 +196,22 @@ class CorrelationRiskControl:
                     symbol_b=p_b.symbol,
                     correlation=round(r, 4),
                     direction=direction,
-                    margin_a=p_a.margin,
-                    margin_b=p_b.margin,
+                    margin_a=_finite(p_a.margin, 0.0),
+                    margin_b=_finite(p_b.margin, 0.0),
                     risk_level=risk_level,
                 )
                 all_pairs.append(pair)
 
                 if same_direction and abs(r) >= self._threshold:
-                    pair_margin = p_a.margin + p_b.margin
+                    pair_margin = _finite(p_a.margin, 0.0) + _finite(p_b.margin, 0.0)
                     high_corr_margin += pair_margin
                     high_corr_pairs.append({
                         "symbol_a": p_a.symbol,
                         "symbol_b": p_b.symbol,
-                        "side": p_a.side,
+                        "side": side_a,
                         "correlation": round(r, 3),
-                        "margin_a": round(p_a.margin, 2),
-                        "margin_b": round(p_b.margin, 2),
+                        "margin_a": round(_finite(p_a.margin, 0.0), 2),
+                        "margin_b": round(_finite(p_b.margin, 0.0), 2),
                         "risk_level": risk_level,
                     })
 
@@ -198,11 +250,20 @@ class CorrelationRiskControl:
                 klines = self.okx_client.get_kline(symbol, interval=self._kline_bar, limit=self._lookback_bars + 1)
                 if not klines or len(klines) < 10:
                     continue
-                closes = list(reversed([float(k[4]) for k in klines if len(k) >= 5]))
+                closes = []
+                for k in reversed(klines):
+                    if not isinstance(k, (list, tuple)) or len(k) < 5:
+                        continue
+                    c = _finite(k[4], None)
+                    if c is None:
+                        continue
+                    closes.append(c)
                 if len(closes) < 10:
                     continue
                 arr = np.array(closes, dtype=float)
-                rets = np.diff(arr) / arr[:-1]
+                # 防止收盘价为 0 导致除零产生 Inf/NaN
+                safe_prev = np.where(arr[:-1] == 0, np.nan, arr[:-1])
+                rets = np.diff(arr) / safe_prev
                 rets = np.nan_to_num(rets, nan=0.0, posinf=0.0, neginf=0.0)
                 returns[symbol] = rets
             except Exception as e:
@@ -248,11 +309,11 @@ class CorrelationRiskControl:
         """生成对冲建议"""
         suggestions = []
 
-        long_positions = [p for p in positions if p.side == "long"]
-        short_positions = [p for p in positions if p.side == "short"]
+        long_positions = [p for p in positions if _position_side(p) == "long"]
+        short_positions = [p for p in positions if _position_side(p) == "short"]
 
-        long_margin = sum(p.margin for p in long_positions)
-        short_margin = sum(p.margin for p in short_positions)
+        long_margin = sum(_finite(p.margin, 0.0) for p in long_positions)
+        short_margin = sum(_finite(p.margin, 0.0) for p in short_positions)
         net_exposure = long_margin - short_margin
         net_exposure_pct = net_exposure / total_equity if total_equity > 0 else 0
 
@@ -307,7 +368,7 @@ class CorrelationRiskControl:
                 for other in positions:
                     if other.symbol == pos.symbol:
                         continue
-                    if other.side != pos.side:
+                    if _position_side(other) != _position_side(pos):
                         continue
                     key = tuple(sorted([pos.symbol, other.symbol]))
                     r = corr_matrix.get(key, 0)
@@ -318,40 +379,54 @@ class CorrelationRiskControl:
                 if not is_high_corr:
                     continue
 
-                side = "sell" if pos.side == "long" else "buy"
-                reduce_qty = abs(float(pos.quantity)) * self._reduce_ratio
+                norm_side = _position_side(pos)
+                side = "sell" if norm_side == "long" else "buy"
+                raw_side = (getattr(pos, "side", "") or "").strip().lower()
+                pos_side = raw_side if raw_side in ("long", "short", "net") else norm_side
+                reduce_qty = abs(_finite(pos.quantity, 0.0)) * self._reduce_ratio
                 if reduce_qty <= 0:
                     continue
 
                 try:
                     # 优先通过 order_executor 下单（经过五层风控），回退到直接 API
-                    if self.order_executor and hasattr(self.order_executor, 'handle_signal'):
-                        signal = {
-                            "symbol": pos.symbol,
-                            "strategy_name": "correlation_risk",
-                            "signal_type": "correlation_reduce",
-                            "direction": "close",
-                            "side": side,
-                            "quantity": reduce_qty,
-                            "price": 0,
-                            "leverage": pos.leverage,
-                            "pos_side": pos.side,
-                            "order_type": "market",
-                            "reduce_only": True,
-                            "priority": 10,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                        await self.order_executor.handle_signal(signal)
-                    else:
-                        self.okx_client.place_order(
-                            symbol=pos.symbol,
-                            side=side,
-                            order_type="market",
-                            quantity=reduce_qty,
-                            leverage=pos.leverage,
-                            reduce_only=True,
-                            pos_side=pos.side,
-                        )
+                    last_err: Optional[Exception] = None
+                    for _attempt in range(3):
+                        try:
+                            if self.order_executor and hasattr(self.order_executor, 'handle_signal'):
+                                signal = {
+                                    "symbol": pos.symbol,
+                                    "strategy_name": "correlation_risk",
+                                    "signal_type": "correlation_reduce",
+                                    "direction": "close",
+                                    "side": side,
+                                    "quantity": reduce_qty,
+                                    "price": 0,
+                                    "leverage": pos.leverage,
+                                    "pos_side": pos_side,
+                                    "order_type": "market",
+                                    "reduce_only": True,
+                                    "priority": 10,
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                                await self.order_executor.handle_signal(signal)
+                            else:
+                                self.okx_client.place_order(
+                                    symbol=pos.symbol,
+                                    side=side,
+                                    order_type="market",
+                                    quantity=reduce_qty,
+                                    leverage=pos.leverage,
+                                    reduce_only=True,
+                                    pos_side=pos_side,
+                                )
+                            last_err = None
+                            break
+                        except Exception as retry_err:
+                            last_err = retry_err
+                            if _attempt < 2:
+                                await asyncio.sleep(0.5 * (_attempt + 1))
+                    if last_err is not None:
+                        raise last_err
                     logger.warning(
                         f"Correlation risk: reduced {pos.symbol} ({pos.side}) by "
                         f"{self._reduce_ratio*100:.0f}% (qty={reduce_qty:.4f})"
@@ -361,7 +436,17 @@ class CorrelationRiskControl:
                     if reduced_count >= 2:
                         break
                 except Exception as e:
-                    logger.error(f"Failed to reduce {pos.symbol} for correlation risk: {e}")
+                    logger.error(f"Failed to reduce {pos.symbol} for correlation risk after retries: {e}")
+                    if self.alert_manager:
+                        try:
+                            await self.alert_manager.send_alert(
+                                "correlation_reduce_failed",
+                                f"相关性减仓失败 {pos.symbol}: {e}",
+                                severity="WARNING",
+                                symbol=pos.symbol,
+                            )
+                        except Exception:
+                            pass
 
             logger.info(f"Correlation risk reduction done: {reduced_count} positions reduced")
         except Exception as e:
@@ -392,10 +477,10 @@ class CorrelationRiskControl:
         for pos in self._last_positions:
             positions_info.append({
                 "symbol": pos.symbol,
-                "side": pos.side,
-                "quantity": float(pos.quantity),
-                "margin": round(pos.margin, 2),
-                "unrealized_pnl": round(pos.unrealized_pnl, 2) if hasattr(pos, 'unrealized_pnl') else 0,
+                "side": _position_side(pos),
+                "quantity": _finite(pos.quantity, 0.0),
+                "margin": round(_finite(pos.margin, 0.0), 2),
+                "unrealized_pnl": round(_finite(getattr(pos, 'unrealized_pnl', 0), 0.0), 2),
             })
 
         return {
@@ -423,3 +508,47 @@ class CorrelationRiskControl:
             "positions_count": len(self._last_positions),
             "hedge_suggestions_count": len(self._hedge_suggestions),
         }
+
+    def can_open_position(self, symbol: str, side: str, margin: float) -> Tuple[bool, str]:
+        """开仓前相关性风控检查：如果新开仓会导致同向高相关集中度过高，拒绝。
+
+        Args:
+            symbol: 待开仓品种
+            side: "long" / "short"
+            margin: 预计保证金（USDT）
+
+        Returns:
+            (allowed, reason) — allowed=False 时 reason 说明拒绝原因
+        """
+        if not self._last_positions or margin <= 0:
+            return True, ""
+
+        total_equity = self._last_total_equity
+        if total_equity <= 0:
+            return True, ""
+
+        # 计算加入新仓位后的同向高相关保证金
+        new_high_corr_margin = 0.0
+        for pos in self._last_positions:
+            pos_side = _position_side(pos)
+            if pos_side != side:
+                continue
+            key = tuple(sorted([symbol, pos.symbol]))
+            r = self._corr_cache.get(key)
+            if r is None:
+                continue
+            if abs(r) >= self._threshold:
+                new_high_corr_margin += _finite(pos.margin, 0.0)
+
+        new_high_corr_margin += margin
+        new_concentration = new_high_corr_margin / total_equity
+
+        if new_concentration > self._max_concentration:
+            reason = (
+                f"相关性集中度超限: 新开仓后 {new_concentration:.2%} > "
+                f"{self._max_concentration:.2%}"
+            )
+            logger.warning(f"[CORR_RISK] 拒绝开仓 {symbol} {side}: {reason}")
+            return False, reason
+
+        return True, ""

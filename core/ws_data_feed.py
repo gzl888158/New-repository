@@ -212,6 +212,8 @@ class WebSocketManager:
         # ─── 数据缓冲 ───
         self._tick_buffer = DataBuffer(max_size=self.DEFAULT_BUFFER_SIZE)
         self._book_buffer = DataBuffer(max_size=self.DEFAULT_BUFFER_SIZE)
+        self._book_sequence_ids: Dict[str, int] = {}
+        self._book_resync_pending: Set[str] = set()
         self._trade_buffer = DataBuffer(max_size=self.DEFAULT_BUFFER_SIZE)
         self._position_buffer = DataBuffer(max_size=1000)
         self._order_buffer = DataBuffer(max_size=5000)
@@ -551,15 +553,107 @@ class WebSocketManager:
         if channel == "tickers":
             for item in data_list:
                 self._tick_buffer.push(item)
-        elif channel in ("books", "books5"):
+        elif channel == "books5":
             for item in data_list:
-                self._book_buffer.push(item)
+                self._book_buffer.push({**item, "_channel": channel, "_sequence_valid": None})
+        elif channel == "books":
+            for item in data_list:
+                await self._route_sequenced_book(data, item)
         elif channel == "trades":
             for item in data_list:
                 self._trade_buffer.push(item)
         elif channel == "mark-price":
             for item in data_list:
                 self._tick_buffer.push({**item, "_channel": "mark-price"})
+
+    async def _route_sequenced_book(self, envelope: Dict[str, Any], item: Dict[str, Any]) -> None:
+        symbol = str(item.get("instId") or envelope.get("arg", {}).get("instId") or "")
+        if not symbol:
+            return
+
+        action = envelope.get("action")
+        if action == "snapshot":
+            try:
+                sequence_id = int(item["seqId"])
+            except (KeyError, TypeError, ValueError):
+                await self._resync_orderbook(symbol, "snapshot_missing_seq_id")
+                return
+            self._book_sequence_ids[symbol] = sequence_id
+            self._book_resync_pending.discard(symbol)
+            self._book_buffer.push({
+                **item,
+                "_channel": "books",
+                "_sequence_valid": True,
+                "_source": "websocket",
+            })
+            return
+
+        if action != "update" or symbol in self._book_resync_pending:
+            return
+
+        try:
+            previous_sequence_id = int(item["prevSeqId"])
+            sequence_id = int(item["seqId"])
+        except (KeyError, TypeError, ValueError):
+            await self._resync_orderbook(symbol, "update_missing_sequence")
+            return
+
+        last_sequence_id = self._book_sequence_ids.get(symbol)
+        if last_sequence_id is None or previous_sequence_id != last_sequence_id or sequence_id <= last_sequence_id:
+            await self._resync_orderbook(symbol, "sequence_gap")
+            return
+
+        self._book_sequence_ids[symbol] = sequence_id
+        self._book_buffer.push({
+            **item,
+            "_channel": "books",
+            "_sequence_valid": True,
+            "_source": "websocket",
+        })
+
+    async def _resync_orderbook(self, symbol: str, reason: str) -> None:
+        """Invalidate a gapped stream, publish a marked REST fallback, and await a new WS snapshot."""
+        self._book_sequence_ids.pop(symbol, None)
+        already_pending = symbol in self._book_resync_pending
+        self._book_resync_pending.add(symbol)
+        if already_pending:
+            return
+
+        rest_book = None
+        get_order_book = getattr(self._okx_client, "get_order_book", None)
+        if callable(get_order_book):
+            try:
+                rest_book = await asyncio.to_thread(get_order_book, symbol, 50)
+            except Exception as exc:
+                logger.warning(f"Orderbook REST resync failed for {symbol}: {exc}")
+
+        if isinstance(rest_book, dict) and rest_book.get("bids") and rest_book.get("asks"):
+            self._book_buffer.push({
+                **rest_book,
+                "instId": symbol,
+                "action": "snapshot",
+                "_channel": "books",
+                "_sequence_valid": False,
+                "_source": "rest_fallback",
+                "_resync_reason": reason,
+            })
+        else:
+            self._book_buffer.push({
+                "instId": symbol,
+                "action": "invalidated",
+                "_channel": "books",
+                "_sequence_valid": False,
+                "_source": "websocket",
+                "_resync_reason": reason,
+            })
+
+        if self._public_ws is not None:
+            subscribe_arg = {"channel": "books", "instId": symbol}
+            try:
+                await self._public_ws.send(json.dumps({"op": "unsubscribe", "args": [subscribe_arg]}))
+                await self._public_ws.send(json.dumps({"op": "subscribe", "args": [subscribe_arg]}))
+            except Exception as exc:
+                logger.warning(f"Orderbook resubscribe failed for {symbol}: {exc}")
 
     # ═══════════════════════════════════════════════════════════════
     # 私有频道主循环

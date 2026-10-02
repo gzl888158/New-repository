@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from strategies.trend_sub_strategies import _atr
+from strategies.trend_sub_strategies import _atr, _safe_int, _safe_float
 
 
 def evaluate_volatility_breakout(
@@ -35,10 +35,10 @@ def evaluate_volatility_breakout(
     三者同时满足且方向一致时 confirmed=True，作为 A/B 信号增强。
     """
     params = params or {}
-    squeeze_period = int(params.get("squeeze_period", 20))
-    squeeze_compare = int(params.get("squeeze_compare", 60))
-    squeeze_ratio = float(params.get("squeeze_ratio_threshold", 0.6))
-    volume_ratio = float(params.get("volume_ratio_threshold", 1.5))
+    squeeze_period = _safe_int(params.get("squeeze_period", 20), 20)
+    squeeze_compare = _safe_int(params.get("squeeze_compare", 60), 60)
+    squeeze_ratio = _safe_float(params.get("squeeze_ratio_threshold", 0.6), 0.6)
+    volume_ratio = _safe_float(params.get("volume_ratio_threshold", 1.5), 1.5)
 
     closes = np.asarray(closes, dtype=float)
     highs = np.asarray(highs, dtype=float)
@@ -106,11 +106,12 @@ class VolatilityBreakoutFilter:
         cfg = self.config.get("strategies", {}).get("volatility_breakout_filter", {})
         self.enabled = bool(cfg.get("enabled", True))
         self.require_confirmation = bool(cfg.get("require_confirmation", False))
+        # safe coerce：配置值可能为 None/字符串，避免 int()/float() 在 init 时崩溃
         self.params = {
-            "squeeze_period": int(cfg.get("squeeze_period", 20)),
-            "squeeze_compare": int(cfg.get("squeeze_compare", 60)),
-            "squeeze_ratio_threshold": float(cfg.get("squeeze_ratio_threshold", 0.6)),
-            "volume_ratio_threshold": float(cfg.get("volume_ratio_threshold", 1.5)),
+            "squeeze_period": _safe_int(cfg.get("squeeze_period", 20), 20),
+            "squeeze_compare": _safe_int(cfg.get("squeeze_compare", 60), 60),
+            "squeeze_ratio_threshold": _safe_float(cfg.get("squeeze_ratio_threshold", 0.6), 0.6),
+            "volume_ratio_threshold": _safe_float(cfg.get("volume_ratio_threshold", 1.5), 1.5),
         }
 
     def evaluate(self, closes, highs, lows, volumes, direction: str) -> Dict[str, Any]:

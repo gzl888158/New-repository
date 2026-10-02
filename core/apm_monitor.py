@@ -17,7 +17,7 @@ from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
 from enum import Enum
 from loguru import logger
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 # ==================== 性能指标 ====================
@@ -637,6 +637,144 @@ class TradeFlowTrace:
     def __exit__(self, exc_type, exc, tb):
         self.finish(SpanStatus.ERROR if exc_type else SpanStatus.OK)
         return False
+
+
+# ==================== 端到端延迟追踪仪表板 ====================
+
+class PipelineLatencyTracker:
+    """交易管线端到端延迟追踪器。
+
+    将每个信号处理周期的各阶段延迟记录到滑动窗口，
+    提供 per-stage P50/P95/P99 统计和整体管线健康摘要，
+    供仪表板 API 直接消费。
+
+    用法::
+
+        tracker = get_pipeline_latency_tracker()
+        ctx = tracker.start_cycle(symbol="BTC-USDT-SWAP", strategy="trend")
+        ctx.record_stage("validation", 2.3)
+        ctx.record_stage("risk_check", 15.1)
+        ctx.finish()
+    """
+
+    _STAGES = [
+        "validation",
+        "anomaly_detection",
+        "dedup_check",
+        "quality_assessment",
+        "risk_check",
+        "decision_engine",
+        "sizing",
+        "execution",
+    ]
+
+    def __init__(self, window_size: int = 500):
+        self._window_size = window_size
+        self._stage_samples: Dict[str, deque] = {
+            s: deque(maxlen=window_size) for s in self._STAGES
+        }
+        self._cycle_total_samples: deque = deque(maxlen=window_size)
+        self._slow_cycles: int = 0
+        self._total_cycles: int = 0
+        self._slow_threshold_ms: float = 500.0
+
+    def start_cycle(self, symbol: str = "", strategy: str = "") -> "_PipelineCycle":
+        return _PipelineCycle(self, symbol, strategy)
+
+    def _record_stage(self, stage: str, ms: float):
+        if stage in self._stage_samples:
+            self._stage_samples[stage].append(ms)
+
+    def _finish_cycle(self, total_ms: float):
+        self._cycle_total_samples.append(total_ms)
+        self._total_cycles += 1
+        if total_ms > self._slow_threshold_ms:
+            self._slow_cycles += 1
+
+    def get_summary(self) -> Dict[str, Any]:
+        stages = {}
+        for name, samples in self._stage_samples.items():
+            stages[name] = self._percentiles(samples)
+
+        total_pcts = self._percentiles(self._cycle_total_samples)
+        slow_pct = (
+            self._slow_cycles / self._total_cycles * 100
+            if self._total_cycles > 0 else 0.0
+        )
+
+        bottleneck = max(
+            stages.items(),
+            key=lambda kv: kv[1].get("p50", 0),
+            default=(None, {}),
+        )
+
+        return {
+            "stages": stages,
+            "total_cycle": total_pcts,
+            "total_cycles": self._total_cycles,
+            "slow_cycles": self._slow_cycles,
+            "slow_pct": round(slow_pct, 2),
+            "slow_threshold_ms": self._slow_threshold_ms,
+            "bottleneck_stage": bottleneck[0],
+            "bottleneck_p50_ms": bottleneck[1].get("p50", 0),
+        }
+
+    @staticmethod
+    def _percentiles(d: deque) -> Dict[str, float]:
+        if not d:
+            return {"p50": 0, "p95": 0, "p99": 0, "min": 0, "max": 0, "count": 0}
+        s = sorted(d)
+        n = len(s)
+        return {
+            "p50": round(s[int(n * 0.5)], 2),
+            "p95": round(s[min(int(n * 0.95), n - 1)], 2),
+            "p99": round(s[min(int(n * 0.99), n - 1)], 2),
+            "min": round(s[0], 2),
+            "max": round(s[-1], 2),
+            "count": n,
+        }
+
+
+class _PipelineCycle:
+    """单次信号处理管线的延迟记录上下文。"""
+
+    def __init__(self, tracker: PipelineLatencyTracker, symbol: str, strategy: str):
+        self._tracker = tracker
+        self._symbol = symbol
+        self._strategy = strategy
+        self._t0 = time.perf_counter()
+        self._stage_starts: Dict[str, float] = {}
+
+    def begin_stage(self, name: str):
+        self._stage_starts[name] = time.perf_counter()
+
+    def end_stage(self, name: str):
+        start = self._stage_starts.pop(name, None)
+        if start is None:
+            return
+        ms = (time.perf_counter() - start) * 1000
+        self._tracker._record_stage(name, ms)
+
+    def record_stage(self, name: str, ms: float):
+        self._tracker._record_stage(name, ms)
+
+    def finish(self):
+        total_ms = (time.perf_counter() - self._t0) * 1000
+        self._tracker._finish_cycle(total_ms)
+        return total_ms
+
+
+_pipeline_tracker: Optional[PipelineLatencyTracker] = None
+
+
+def get_pipeline_latency_tracker(config: Dict[str, Any] = None) -> PipelineLatencyTracker:
+    global _pipeline_tracker
+    if _pipeline_tracker is None:
+        window = 500
+        if config:
+            window = int(config.get("pipeline_latency_window", 500))
+        _pipeline_tracker = PipelineLatencyTracker(window_size=window)
+    return _pipeline_tracker
 
 
 # ==================== 全局单例 ====================

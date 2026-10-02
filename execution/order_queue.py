@@ -17,6 +17,9 @@ class TokenBucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self):
+        if self._rate <= 0:
+            # fail-closed：无效限流配置（rate<=0）拒绝放行，避免除零导致无限等待/崩溃
+            raise RuntimeError(f"TokenBucket rate must be > 0, got {self._rate}")
         while True:
             async with self._lock:
                 now = datetime.now().timestamp()
@@ -62,19 +65,34 @@ class OrderQueue:
 
     async def add_order(self, order_data: Dict[str, Any]) -> str:
         async with self._lock:
-            signal_type = order_data.get("signal_type", "")
+            signal_type = (order_data.get("signal_type") or "")
             strategy_name = order_data.get("strategy_name", "grid")
             symbol = order_data.get("symbol", "")
             
             # 止损/平仓订单去重：同一symbol+strategy已有pending止损的，跳过
             is_stop_order = "stop" in signal_type.lower() or "loss" in signal_type.lower()
             if is_stop_order:
+                # 1) 队列中仍排队的止损单（None 防御：跳过非 dict 项）
                 for _, _, oid, cached_data in self._queue:
-                    cached_sig = cached_data.get("signal_type", "")
+                    if not isinstance(cached_data, dict):
+                        continue
+                    cached_sig = (cached_data.get("signal_type") or "")
                     if (cached_data.get("symbol") == symbol and
                         cached_data.get("strategy_name") == strategy_name and
                         ("stop" in cached_sig.lower() or "loss" in cached_sig.lower())):
                         logger.debug(f"Stop loss dedup: {symbol} {strategy_name} already has pending stop loss")
+                        return oid
+                # 2) 已从队列取出、正在执行的止损单（仅查 queue 会漏掉 cache 中的 executing 单）
+                for oid, cached in self._order_cache.items():
+                    if not isinstance(cached, dict):
+                        continue
+                    if cached.get("status") not in ("queued", "executing"):
+                        continue
+                    cached_sig = (cached.get("signal_type") or "")
+                    if (cached.get("symbol") == symbol and
+                        cached.get("strategy_name") == strategy_name and
+                        ("stop" in cached_sig.lower() or "loss" in cached_sig.lower())):
+                        logger.debug(f"Stop loss dedup: {symbol} {strategy_name} already has active stop loss")
                         return oid
             
             # 队列接近满载时，清理超过60秒的旧订单腾出空间
@@ -163,6 +181,7 @@ class OrderQueue:
             return False
     
     async def update_order_status(self, order_id: str, status: str):
+        moved_to_dead_letter = False
         async with self._lock:
             if order_id in self._order_cache:
                 self._order_cache[order_id]["status"] = status
@@ -173,10 +192,13 @@ class OrderQueue:
                     if attempts >= self._max_retries:
                         self._move_to_dead_letter_locked(order_id, f"max retries exceeded ({attempts})")
                         self._order_cache.pop(order_id, None)
-                        return
+                        moved_to_dead_letter = True
                 # 终态订单清理：executed/failed/cancelled 状态从缓存移除，防止内存泄漏
                 if status in ("executed", "failed", "cancelled", "stale_removed"):
                     self._order_cache.pop(order_id, None)
+        # 落盘在锁外执行（同步 I/O 不阻塞其它协程；单线程事件循环内读 _dead_letter 是原子的）
+        if moved_to_dead_letter:
+            self._save_dead_letter()
     
     async def get_order_status(self, order_id: str) -> Optional[str]:
         async with self._lock:
@@ -203,11 +225,11 @@ class OrderQueue:
 
     # ===================== 死信队列 =====================
 
-    def _move_to_dead_letter_locked(self, order_id: str, reason: str):
-        """将订单移入死信队列（需在锁内调用）"""
+    def _move_to_dead_letter_locked(self, order_id: str, reason: str) -> bool:
+        """将订单移入死信队列（需在锁内调用）。返回是否成功移入；落盘由调用方在锁外执行。"""
         entry = self._order_cache.get(order_id)
         if not entry:
-            return
+            return False
         dl_entry = {
             **entry,
             "order_id": order_id,
@@ -217,8 +239,8 @@ class OrderQueue:
         self._dead_letter.append(dl_entry)
         if len(self._dead_letter) > self._dead_letter_max:
             self._dead_letter = self._dead_letter[-self._dead_letter_max:]
-        self._save_dead_letter()
         logger.warning(f"Order moved to dead-letter queue: {order_id} ({reason})")
+        return True
 
     async def mark_dead_letter(self, order_id: str, reason: str) -> bool:
         """显式将订单移入死信队列"""
@@ -227,7 +249,8 @@ class OrderQueue:
                 return False
             self._move_to_dead_letter_locked(order_id, reason)
             self._order_cache.pop(order_id, None)
-            return True
+        self._save_dead_letter()
+        return True
 
     async def get_dead_letter_orders(self, limit: int = 100) -> List[Dict[str, Any]]:
         async with self._lock:
@@ -239,11 +262,11 @@ class OrderQueue:
 
     async def requeue_dead_letter(self, order_id: str) -> bool:
         """将死信订单重新放回队列（人工确认后重放）"""
+        found = False
         async with self._lock:
             for i, entry in enumerate(self._dead_letter):
                 if entry.get("order_id") == order_id:
                     dl_entry = self._dead_letter.pop(i)
-                    self._save_dead_letter()
                     priority = self._priority_order.get(dl_entry.get("strategy_name", "grid"), 3)
                     self._order_id_counter += 1
                     heapq.heappush(self._queue, (priority, self._order_id_counter, order_id, dl_entry))
@@ -254,8 +277,11 @@ class OrderQueue:
                         "attempts": dl_entry.get("attempts", 0),
                     }
                     logger.info(f"Dead-letter order requeued: {order_id}")
-                    return True
-            return False
+                    found = True
+                    break
+        if found:
+            self._save_dead_letter()
+        return found
 
     # ===================== 死信队列持久化 =====================
 
@@ -271,6 +297,20 @@ class OrderQueue:
         if isinstance(obj, (str, int, float, bool)) or obj is None:
             return obj
         return str(obj)
+
+    @staticmethod
+    def _from_json_safe(obj):
+        """递归恢复 JSON 加载后的类型（isoformat 字符串 → datetime，与 _to_json_safe 对称）。"""
+        if isinstance(obj, dict):
+            return {k: OrderQueue._from_json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [OrderQueue._from_json_safe(v) for v in obj]
+        if isinstance(obj, str):
+            try:
+                return datetime.fromisoformat(obj)
+            except ValueError:
+                return obj
+        return obj
 
     def _save_dead_letter(self):
         if not self._dl_persistence_enabled:
@@ -293,7 +333,7 @@ class OrderQueue:
             payload = json.loads(path.read_text(encoding="utf-8"))
             items = payload.get("dead_letter", []) if isinstance(payload, dict) else []
             if isinstance(items, list):
-                self._dead_letter = items[:self._dead_letter_max]
+                self._dead_letter = self._from_json_safe(items)[:self._dead_letter_max]
                 logger.info(f"Loaded {len(self._dead_letter)} dead-letter orders from {path}")
         except Exception as e:
             logger.warning(f"Failed to load dead-letter queue: {e}")

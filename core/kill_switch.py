@@ -72,9 +72,10 @@ class KillSwitch:
                     f"KillSwitch restored as ENABLED from disk (fail-closed): {self._reason}"
                 )
         except Exception as e:
-            # 读取失败时保守兜底：不因解析异常导致系统误以为安全
-            logger.error(f"Failed to load KillSwitch state, defaulting to disabled: {e}")
-            self._enabled = False
+            # 读取失败时保守兜底（fail-closed）：宁可禁开仓，也不因状态未知而误放行
+            logger.error(f"Failed to load KillSwitch state, defaulting to ENABLED (fail-closed): {e}")
+            self._enabled = True
+            self._reason = f"状态加载失败，保守禁开仓: {e}"
 
     def _append_history(self, action: str, reason: str, by: str) -> None:
         """追加一次触发/解除历史（FIFO 截断，防无限膨胀）。"""

@@ -1,5 +1,7 @@
 """
 交易系统异常检测模块，识别价格、成交量、延迟与信号频率等异常。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
 """
 from enum import Enum
 from datetime import datetime, timedelta

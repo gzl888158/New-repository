@@ -5,7 +5,7 @@ import os
 import json
 import yaml
 from dotenv import load_dotenv
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -36,6 +36,8 @@ class OKXConfig(BaseModel):
     websocket_url: str
     websocket_private_url: str
     proxy: Optional[str] = None
+    proxy_list: Optional[List[str]] = None
+    allow_direct_fallback: bool = False
     api_keys: Optional[List[Dict[str, str]]] = None
 
 
@@ -379,6 +381,7 @@ class TierSettings(BaseModel):
 
 
 class CurrenciesConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
     tier1_symbols: List[str]
     tier1_settings: TierSettings
     tier2_symbols: List[str]
@@ -589,6 +592,9 @@ class ExecutionConfig(BaseModel):
     order_synchronizer: Optional[Dict[str, Any]] = None
     manual_intervention: Optional[Dict[str, Any]] = None
     orphan_position_auto_close: bool = False
+    orphan_stop_loss_enabled: bool = True
+    orphan_stop_loss_pct: float = Field(default=0.03, gt=0, le=1)
+    orphan_stop_loss_failure_auto_close: bool = False
 
 
 class NotificationsConfig(BaseModel):
@@ -1203,13 +1209,18 @@ def _resolve_env_vars(config: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = value
     return result
 
+def _extract_base_symbol(symbol: str) -> str:
+    """从合约/现货标的串中提取基础币种（如 ARB-USDT-SWAP → ARB）。"""
+    return symbol.replace("-USDT", "").replace("USDT-", "").replace("-SWAP", "")
+
+
 def get_currency_tier(symbol: str, config: Dict[str, Any]) -> str:
     tier1 = config["currencies"]["tier1_symbols"]
     tier2 = config["currencies"]["tier2_symbols"]
     tier3 = config["currencies"]["tier3_symbols"]
-    
-    base_symbol = symbol.replace("-USDT", "").replace("USDT-", "").replace("-SWAP", "")
-    
+
+    base_symbol = _extract_base_symbol(symbol)
+
     if base_symbol in tier1:
         return "tier1"
     elif base_symbol in tier2:
@@ -1218,9 +1229,50 @@ def get_currency_tier(symbol: str, config: Dict[str, Any]) -> str:
         return "tier3"
     return "tier3"
 
+
 def get_symbol_config(symbol: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """返回某标的的「有效」参数（tier 设置 + symbol_overrides 逐项覆盖）。
+
+    用于 ARB 等主流币种在 tier 默认参数之上单独定制更精细的杠杆/间距/滑点。
+    返回 dict 拷贝，调用方安全，不会污染共享 tier 设置。
+    """
     tier = get_currency_tier(symbol, config)
-    return config["currencies"][f"{tier}_settings"]
+    base_symbol = _extract_base_symbol(symbol)
+    tier_settings = dict(config["currencies"][f"{tier}_settings"])
+    overrides = (config.get("currencies", {}).get("symbol_overrides", {}) or {}).get(base_symbol, {})
+    if isinstance(overrides, dict) and overrides:
+        tier_settings.update(overrides)
+    return tier_settings
+
+
+def get_symbol_leverage(symbol: str, config: Dict[str, Any]) -> float:
+    """返回某标的的有效默认杠杆（含 symbol_overrides 覆盖）。"""
+    return float(get_symbol_config(symbol, config).get("leverage_default", 1.0))
+
+
+def get_symbol_leverage_range(symbol: str, config: Dict[str, Any]) -> Tuple[float, float]:
+    """返回某标的的有效杠杆区间 (min, max)（含 symbol_overrides 覆盖）。
+
+    供 AGI/风控层按币种精细夹紧杠杆：下调时不得低于 leverage_min，
+    上调时不得高于 leverage_max。
+    """
+    sc = get_symbol_config(symbol, config)
+    lo = float(sc.get("leverage_min", 1.0))
+    hi = float(sc.get("leverage_max", 1.0))
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def get_symbol_grid_spacing(symbol: str, config: Dict[str, Any]) -> Tuple[float, float]:
+    """返回某标的的有效网格间距区间 (min, max)（含 symbol_overrides 覆盖）。"""
+    sc = get_symbol_config(symbol, config)
+    lo = float(sc.get("grid_spacing_min", 0.0))
+    hi = float(sc.get("grid_spacing_max", 0.0))
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
 
 def get_all_symbols(config: Dict[str, Any]) -> List[str]:
     symbols = []

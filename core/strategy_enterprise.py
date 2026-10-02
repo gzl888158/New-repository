@@ -86,6 +86,7 @@ class EnterpriseStrategyMixin:
             return None
 
     def _record_metric(self, name: str, value: float, labels: Optional[Dict[str, str]] = None):
+        self._record_signal_filter_metric(name, labels)
         pipeline = self._get_metrics()
         if pipeline is None:
             return
@@ -95,6 +96,7 @@ class EnterpriseStrategyMixin:
             logger.debug(f"Metric record failed ({name}): {e}")
 
     def _increment_metric(self, name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None):
+        self._record_signal_filter_metric(name, labels)
         pipeline = self._get_metrics()
         if pipeline is None:
             return
@@ -102,6 +104,31 @@ class EnterpriseStrategyMixin:
             pipeline.increment(name, value, labels)
         except Exception as e:
             logger.debug(f"Metric increment failed ({name}): {e}")
+
+    @staticmethod
+    def _record_signal_filter_metric(name: str, labels: Optional[Dict[str, str]] = None):
+        suffixes = (
+            ("_filter_total", "strategy_filter"),
+            ("_signal_rejected_total", "strategy_filter"),
+            ("_gate_rejected_total", "strategy_gate"),
+        )
+        for suffix, layer in suffixes:
+            if name.endswith(suffix):
+                strategy = name[:-len(suffix)].removesuffix("_")
+                reason = str(
+                    (labels or {}).get("reason")
+                    or (labels or {}).get("gate")
+                    or name
+                )
+                try:
+                    from core.signal_flow_stats import record_signal_flow_event
+                    record_signal_flow_event(
+                        "source_rejected", strategy=strategy,
+                        layer=layer, reason=reason,
+                    )
+                except Exception as e:
+                    logger.debug(f"Signal flow source rejection metric failed: {e}")
+                return
 
     def _record_latency(self, name: str, latency_ms: float, labels: Optional[Dict[str, str]] = None):
         pipeline = self._get_metrics()

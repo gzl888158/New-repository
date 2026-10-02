@@ -100,7 +100,7 @@ class TestRiskReward:
 
     def test_risk_reward_ratio_zero_risk(self):
         ratio = calculate_risk_reward_ratio(100, 120, 100, "long")
-        assert ratio == float("inf")
+        assert ratio == 0.0
 
     def test_risk_reward_ratio_invalid_direction(self):
         with pytest.raises(ValueError):

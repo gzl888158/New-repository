@@ -205,14 +205,22 @@ class LogAnalyzer:
     
     def analyze_errors(self, hours: int = 24) -> Dict[str, Any]:
         """分析错误日志"""
-        error_log = os.path.join(self.log_dir, "error.log")
-        
-        if not os.path.exists(error_log):
+        # 日志文件按日期轮转：error_YYYY-MM-DD.log，兼容旧 error.log
+        today_file = os.path.join(self.log_dir, f"error_{datetime.now().strftime('%Y-%m-%d')}.log")
+        legacy_file = os.path.join(self.log_dir, "error.log")
+
+        error_log = None
+        if os.path.exists(today_file):
+            error_log = today_file
+        elif os.path.exists(legacy_file):
+            error_log = legacy_file
+
+        if not error_log:
             return {"errors": [], "total": 0}
-        
+
         errors = []
         cutoff_time = datetime.now().timestamp() - hours * 3600
-        
+
         try:
             with open(error_log, "r", encoding="utf-8") as f:
                 for line in f:
@@ -224,15 +232,15 @@ class LogAnalyzer:
                             })
                     except Exception:
                         continue
-            
+
             errors = [e for e in errors if e.get("timestamp")]
-            
+
             return {
                 "errors": errors[-100:],
                 "total": len(errors),
                 "last_24h": len([e for e in errors if e.get("timestamp", 0) >= cutoff_time]),
             }
-            
+
         except Exception as e:
             return {"errors": [], "total": 0, "error": str(e)}
     

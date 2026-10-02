@@ -11,8 +11,11 @@
   P2  边界（空因子、未知状态、自定义迟滞幅度）
 """
 
-import pytest
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import pytest
 
 from services.market_regime_engine import (
     MarketRegime,
@@ -62,6 +65,45 @@ def _apply_transition(eng: MarketRegimeEngine, new_regime: MarketRegime):
     """
     eng._track_regime_transition(new_regime)
     eng._current_regime = new_regime
+
+
+class TestPositionAdjustmentFusion:
+    def test_adjustment_uses_fused_reversal_not_native_trend(self):
+        engine = _make_engine()
+        engine._current_regime = MarketRegime.TREND_BULLISH
+        engine._current_strength = 0.8
+        engine._current_subtype = MarketSubtype.STRONG
+        engine.set_regime_arbiter(SimpleNamespace(arbitrate=lambda symbol=None: {
+            "regime": "reversal",
+            "strength": 0.9,
+            "confidence": 0.8,
+        }))
+
+        adjustment = engine.get_position_adjustment()
+        recommendation = engine.get_strategy_recommendation("grid")
+
+        assert adjustment["overall"] == pytest.approx(0.6)
+        assert adjustment["grid"] == pytest.approx(0.5)
+        assert recommendation["regime"] == "reversal"
+        assert recommendation["adjustment_factor"] == pytest.approx(0.5)
+        assert "reversal" in recommendation["reason"].lower()
+
+    @pytest.mark.parametrize(
+        ("regime", "expected"),
+        [
+            (MarketRegime.BREAKOUT, {"overall": 0.9, "trend": 1.1, "grid": 0.6, "spot_grid": 0.6, "spot_martingale": 0.4}),
+            (MarketRegime.BREAKDOWN, {"overall": 0.8, "trend": 1.0, "grid": 0.5, "spot_grid": 0.5, "spot_martingale": 0.3}),
+            (MarketRegime.REVERSAL, {"overall": 0.6, "trend": 0.7, "grid": 0.5, "spot_grid": 0.5, "spot_martingale": 0.3}),
+        ],
+    )
+    def test_special_regimes_have_conservative_strategy_adjustments(self, regime, expected):
+        engine = _make_engine()
+        engine._current_regime = regime
+
+        adjustment = engine.get_position_adjustment()
+
+        for strategy, factor in expected.items():
+            assert adjustment[strategy] == pytest.approx(factor)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -166,6 +208,16 @@ class TestApplySmoothing:
 # ═══════════════════════════════════════════════════════════════
 
 class TestResolveRegimeHysteresis:
+    def test_directional_factor_weights_change_regime(self):
+        scores = _neutral_scores({"trend": 0.4, "momentum": -0.8})
+        default_regime, *_ = _make_engine()._resolve_regime(scores)
+        momentum_weighted_regime, *_ = _make_engine(
+            factor_weights={"trend": 0.1, "momentum": 0.8, "sentiment": 0.05}
+        )._resolve_regime(scores)
+
+        assert default_regime == MarketRegime.RANGE_BOUND
+        assert momentum_weighted_regime == MarketRegime.BREAKDOWN
+
     def test_volatility_enter_requires_higher_threshold(self):
         eng = _make_engine()  # hyst=0.08，进入阈值 0.68
         regime, *_ = eng._resolve_regime(_neutral_scores({"volatility": 0.55}))
@@ -250,6 +302,26 @@ class TestResolveRegimeHysteresis:
         eng = _make_engine()
         regime, *_ = eng._resolve_regime(_neutral_scores({"volatility": 0.7}))
         assert regime == MarketRegime.EXTREME_VOLATILITY
+
+    def test_breakout_detected_when_trend_and_momentum_converge(self):
+        eng = _make_engine()
+        regime, subtype, strength, confidence, _ = eng._resolve_regime(
+            _neutral_scores({"trend": 0.8, "momentum": 0.9})
+        )
+        assert regime == MarketRegime.BREAKOUT
+        assert subtype in {MarketSubtype.STRONG, MarketSubtype.MODERATE}
+        assert strength > 0.0
+        assert confidence > 0.7
+
+    def test_reversal_detected_when_direction_conflicts_with_momentum(self):
+        eng = _make_engine()
+        regime, subtype, strength, confidence, _ = eng._resolve_regime(
+            _neutral_scores({"trend": 0.2, "momentum": -0.8})
+        )
+        assert regime == MarketRegime.REVERSAL
+        assert subtype == MarketSubtype.REVERSAL
+        assert strength > 0.5
+        assert confidence > 0.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -341,6 +413,52 @@ class TestGetRegimeAge:
 # ═══════════════════════════════════════════════════════════════
 
 class TestUpdateRegimeIntegration:
+    async def test_fresh_funding_cache_allows_temporary_empty_response(self):
+        eng = _make_engine()
+        detector_calls = []
+
+        async def detect_regime(ohlcv_data, symbol, timeframe=None, timeframe_data=None):
+            detector_calls.append((ohlcv_data, symbol, timeframe, timeframe_data))
+            return {"regime": "ranging"}
+
+        eng.set_detector(SimpleNamespace(detect_regime=detect_regime))
+        eng.okx_client = SimpleNamespace(
+            get_ticker_async=AsyncMock(return_value={"last": "100", "bidPx": "99", "askPx": "101"}),
+            get_funding_rate_async=AsyncMock(return_value=None),
+            get_kline_async=AsyncMock(return_value=[{"timestamp": 1, "close": "100"}]),
+        )
+        eng._funding_cache["BTC-USDT-SWAP"] = {"funding_rate": 0.0}
+        eng._funding_cache_time["BTC-USDT-SWAP"] = datetime.now()
+
+        collected = await eng._collect_symbol_data("BTC-USDT-SWAP")
+
+        assert collected is True
+        assert len(detector_calls) == 1
+        bars, symbol, timeframe, timeframe_data = detector_calls[0]
+        assert symbol == "BTC-USDT-SWAP"
+        assert timeframe == "medium"
+        assert timeframe_data == {"medium": bars, "long": bars}
+        eng.okx_client.get_kline_async.assert_any_await("BTC-USDT-SWAP", "4H", limit=60)
+
+    async def test_incomplete_collection_keeps_previous_regime_and_timestamp(self):
+        eng = _make_engine()
+        eng.okx_client = object()
+        eng._current_regime = MarketRegime.TREND_BULLISH
+        eng._data_collection_ok = {"BTC-USDT-SWAP": True}
+
+        async def fail_collection():
+            eng._data_collection_ok["BTC-USDT-SWAP"] = False
+
+        eng._collect_factor_data = AsyncMock(side_effect=fail_collection)
+        eng._calculate_factor_scores = AsyncMock(return_value=_neutral_scores())
+
+        await eng._update_regime()
+
+        assert eng._current_regime == MarketRegime.TREND_BULLISH
+        assert eng._last_update is None
+        assert eng._data_stale is True
+        eng._calculate_factor_scores.assert_not_awaited()
+
     async def test_first_update_discounts_confidence(self):
         eng = _make_engine()
         eng._collect_factor_data = AsyncMock()

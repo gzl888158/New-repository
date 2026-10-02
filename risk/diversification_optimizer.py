@@ -13,13 +13,28 @@
 纯Python实现，不依赖scipy；所有优化算法手动实现。
 """
 import asyncio
+import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 from loguru import logger
+
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """将任意输入安全转换为有限浮点数；None/NaN/Inf/非法值回退 default。"""
+    try:
+        if value is None:
+            return default
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -62,15 +77,25 @@ class OptimizationResult:
 # ═══════════════════════════════════════════════════════════════
 
 def _safe_divide(a: float, b: float, default: float = 0.0) -> float:
-    """安全除法"""
-    if abs(b) < 1e-14:
+    """安全除法：None/NaN/Inf/除零一律返回 default。"""
+    a = _safe_float(a)
+    b = _safe_float(b)
+    if a is None or b is None or abs(b) < 1e-14:
         return default
-    return a / b
+    result = a / b
+    if math.isnan(result) or math.isinf(result):
+        return default
+    return result
 
 
 def _project_onto_simplex(v: np.ndarray, max_w: float = 1.0, min_w: float = 0.0) -> np.ndarray:
     """将向量投影到单纯形上: sum(w) = 1, min_w <= w_i <= max_w"""
     n = len(v)
+    if n == 0:
+        return np.array([], dtype=float)
+    v = np.asarray(v, dtype=float)
+    if not np.all(np.isfinite(v)):
+        return np.ones(n) / n
     # 先裁剪到 [min_w, max_w]
     w = np.clip(v, min_w, max_w)
     s = float(np.sum(w))
@@ -565,8 +590,15 @@ class RiskBudgetOptimizer:
         if target_rc is None:
             target_rc = np.ones(n) / n
 
-        # 确保 target_rc 归一化
-        target_rc = target_rc / np.sum(target_rc)
+        # 确保 target_rc 归一化（并防御零和/NaN）
+        target_rc = np.asarray(target_rc, dtype=float)
+        if not np.all(np.isfinite(target_rc)):
+            target_rc = np.ones(n) / n
+        target_sum = float(np.sum(target_rc))
+        if abs(target_sum) < 1e-14:
+            target_rc = np.ones(n) / n
+        else:
+            target_rc = target_rc / target_sum
 
         # 初始权重：1/σ 归一化
         indiv_vols = np.sqrt(np.diag(cov_matrix))
@@ -717,6 +749,9 @@ class MinimumCVaROptimizer:
             (optimal_weights, cvar_value, var_value)
         """
         n_assets, n_periods = returns_matrix.shape
+        alpha = _safe_float(alpha, 0.95)
+        if not (0.0 < alpha < 1.0):
+            alpha = 0.95
         constraints = constraints or {}
         max_single = constraints.get("max_single_weight", 0.30)
         min_single = constraints.get("min_single_weight", 0.05)
@@ -978,6 +1013,10 @@ class DiversificationOptimizer:
         self._last_result: Optional[OptimizationResult] = None
         self._last_frontier: List[Dict[str, Any]] = []
         self._optimization_count: int = 0
+        self._data_dir = div_cfg.get("data_dir", "./data")
+
+        # 重启恢复：加载上次优化权重
+        self._load_state()
 
         logger.info(
             f"DiversificationOptimizer initialized: "
@@ -1022,6 +1061,7 @@ class DiversificationOptimizer:
             elapsed = time.perf_counter() - time.perf_counter()  # 由调用方决定
             self._last_result = result
             self._optimization_count += 1
+            self._save_state()
             logger.info(f"Optimization [{method}]: "
                         f"sharpe={result.sharpe_ratio:.4f}, "
                         f"div_ratio={result.diversification_ratio:.2f}, "
@@ -1206,6 +1246,7 @@ class DiversificationOptimizer:
             )
 
             self._last_frontier = frontier
+            self._save_state()
             return frontier
 
     async def optimize_max_diversification(
@@ -1260,12 +1301,13 @@ class DiversificationOptimizer:
             if not strategy_names:
                 return {"error": "No return data"}
 
+            current_weights = current_weights or {}
             cov_matrix = _compute_covariance_matrix(returns_array)
 
             # 对齐权重
             aligned_weights: Dict[str, float] = {}
             for name in strategy_names:
-                aligned_weights[name] = current_weights.get(name, 0.0)
+                aligned_weights[name] = _safe_float(current_weights.get(name), 0.0) or 0.0
 
             # 归一化
             total = sum(aligned_weights.values())
@@ -1317,6 +1359,10 @@ class DiversificationOptimizer:
         比较当前权重与最优权重，计算需要调整的方向和幅度。
         """
         async with self._lock:
+            current_weights = current_weights or {}
+            current_weights = {
+                k: _safe_float(v, 0.0) or 0.0 for k, v in current_weights.items()
+            }
             # 使用内部分发避免重复加锁
             optimal_weights: Dict[str, Dict[str, float]] = {}
             for method, name in [
@@ -1387,6 +1433,61 @@ class DiversificationOptimizer:
             "max_div_converged": self._max_div_optimizer.has_converged() if self._optimization_count > 0 else None,
         }
 
+    # ── 状态持久化 ─────────────────────────────────────────
+
+    def _save_state(self) -> None:
+        """持久化最近一次优化权重，重启后可恢复。"""
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            state_path = os.path.join(self._data_dir, "diversification_optimizer_state.json")
+            state = {
+                "last_updated": datetime.now().isoformat(),
+                "optimization_count": self._optimization_count,
+                "last_result": self._last_result.to_dict() if self._last_result else None,
+                "last_frontier": self._last_frontier,
+            }
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            logger.debug(f"Diversification optimizer state saved to {state_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save diversification optimizer state: {e}")
+
+    def _load_state(self) -> bool:
+        """加载持久化的优化状态；任何异常都不影响启动。"""
+        try:
+            state_path = os.path.join(self._data_dir, "diversification_optimizer_state.json")
+            if not os.path.exists(state_path):
+                return False
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self._optimization_count = int(_safe_float(state.get("optimization_count"), 0.0) or 0)
+            last = state.get("last_result")
+            if isinstance(last, dict) and isinstance(last.get("weights"), dict):
+                self._last_result = OptimizationResult(
+                    weights={k: _safe_float(v, 0.0) or 0.0 for k, v in last["weights"].items()},
+                    expected_return=_safe_float(last.get("expected_return"), 0.0) or 0.0,
+                    expected_risk=_safe_float(last.get("expected_risk"), 0.0) or 0.0,
+                    sharpe_ratio=_safe_float(last.get("sharpe_ratio"), 0.0) or 0.0,
+                    diversification_ratio=_safe_float(last.get("diversification_ratio"), 0.0) or 0.0,
+                    effective_n=_safe_float(last.get("effective_n"), 0.0) or 0.0,
+                    concentration_ratio=_safe_float(last.get("concentration_ratio"), 0.0) or 0.0,
+                    optimization_method=str(last.get("optimization_method", "")),
+                    constraints_satisfied=list(last.get("constraints_satisfied", [])),
+                    risk_contributions={
+                        k: _safe_float(v, 0.0) or 0.0
+                        for k, v in (last.get("risk_contributions") or {}).items()
+                    },
+                    timestamp=str(last.get("timestamp", "")),
+                )
+            frontier = state.get("last_frontier")
+            if isinstance(frontier, list):
+                self._last_frontier = frontier
+            logger.info(f"Diversification optimizer state restored: count={self._optimization_count}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load diversification optimizer state: {e}")
+            return False
+
     # ── 内部辅助方法 ─────────────────────────────────────────
 
     def _prepare_returns(
@@ -1395,27 +1496,36 @@ class DiversificationOptimizer:
         """准备收益率数据
 
         对齐所有策略的收益率序列长度，返回 (names, array)。
-
-        Returns:
-            (strategy_names, returns_matrix)  where matrix is (n_strategies, T)
+        对 None/NaN/Inf/非法值逐点过滤，避免污染协方差计算。
         """
         if not returns:
             return [], np.array([])
 
+        clean: Dict[str, List[float]] = {}
+        for name, series in returns.items():
+            if not series:
+                continue
+            vals: List[float] = []
+            for x in series:
+                v = _safe_float(x)
+                if v is not None:
+                    vals.append(v)
+            if len(vals) >= 5:
+                clean[name] = vals
+
+        if not clean:
+            return [], np.array([])
+
         # 找到最短序列长度
-        min_len = min(len(r) for r in returns.values() if r) if returns else 0
+        min_len = min(len(r) for r in clean.values())
         if min_len < 5:
             return [], np.array([])
 
-        # 提取并对齐
-        strategy_names = list(returns.keys())
+        strategy_names = list(clean.keys())
         aligned = []
         for name in strategy_names:
-            r = returns[name]
-            if len(r) >= min_len:
-                aligned.append(r[-min_len:])
-            else:
-                aligned.append(r)
+            r = clean[name]
+            aligned.append(r[-min_len:])
 
         return strategy_names, np.array(aligned, dtype=float)
 

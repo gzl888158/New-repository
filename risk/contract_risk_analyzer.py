@@ -13,6 +13,7 @@
 """
 
 import time
+import math
 import psutil
 import asyncio
 import numpy as np
@@ -22,6 +23,17 @@ from collections import deque
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from loguru import logger
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default，避免 float(None) 抛 TypeError。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
 
 
 # ============================================================
@@ -103,6 +115,11 @@ class MarketRiskDetector:
 
     def check_spike(self, symbol: str, current_price: float, prev_price: float = 0) -> Optional[RiskAlert]:
         """极端插针检测：短时间内价格剧烈变化"""
+        current_price = _finite(current_price, 0.0)
+        prev_price = _finite(prev_price, 0.0)
+        if current_price <= 0:
+            return None
+
         now = time.time()
         if symbol not in self._price_history:
             self._price_history[symbol] = deque(maxlen=200)
@@ -113,7 +130,7 @@ class MarketRiskDetector:
             history = self._price_history[symbol]
             if len(history) < 2:
                 return None
-            prev_price = history[-2][1]
+            prev_price = _finite(history[-2][1], 0.0)
 
         if prev_price <= 0:
             return None
@@ -151,6 +168,7 @@ class MarketRiskDetector:
         if now_utc not in self._low_liq_hours:
             return None
 
+        volume_24h = _finite(volume_24h, 0.0)
         if volume_24h > 0 and volume_24h < self._min_volume_24h:
             alert_key = f"low_liq:{symbol}"
             now = time.time()
@@ -179,6 +197,12 @@ class MarketRiskDetector:
             volume_24h: 24小时成交量（原始数量，非USD）
             prev_price: 上一帧价格（可选，自动从历史获取）
         """
+        current_price = _finite(current_price, 0.0)
+        prev_price = _finite(prev_price, 0.0)
+        volume_24h = _finite(volume_24h, 0.0)
+        if current_price <= 0:
+            return None
+
         now = time.time()
 
         # 从价格历史获取上一帧价格
@@ -190,7 +214,7 @@ class MarketRiskDetector:
             history = self._price_history[symbol]
             if len(history) < 2:
                 return None
-            prev_price = history[-2][1]
+            prev_price = _finite(history[-2][1], 0.0)
 
         if prev_price <= 0:
             return None
@@ -233,6 +257,7 @@ class MarketRiskDetector:
         
         P0: 新增position_direction参数，区分仓位方向
         """
+        funding_rate = _finite(funding_rate, 0.0)
         if symbol not in self._funding_history:
             self._funding_history[symbol] = deque(maxlen=20)
 
@@ -379,9 +404,18 @@ class TechnicalRiskDetector:
         if not self._latency_history:
             return None
 
-        recent = list(self._latency_history)[-20:]
+        recent = []
+        for v in list(self._latency_history)[-20:]:
+            val = _finite(v, None)
+            if val is not None and val >= 0:
+                recent.append(val)
+        if not recent:
+            return None
+
         avg_latency = np.mean(recent)
         p99_latency = np.percentile(recent, 99) if len(recent) >= 5 else max(recent)
+        if math.isnan(avg_latency) or math.isnan(p99_latency):
+            return None
 
         if p99_latency >= self._latency_critical_ms:
             return RiskAlert(
@@ -432,7 +466,8 @@ class TechnicalRiskDetector:
 
         # API错误率
         if len(self._api_total) >= 10:
-            error_rate = sum(self._api_errors) / sum(self._api_total)
+            total_calls = sum(self._api_total)
+            error_rate = (sum(self._api_errors) / total_calls) if total_calls > 0 else 0.0
             if error_rate >= self._error_rate_threshold:
                 return RiskAlert(
                     timestamp=datetime.now(),
@@ -693,29 +728,30 @@ class ContractRiskAnalyzer:
                     # 获取当前行情
                     ticker = self._okx_client.get_ticker(symbol)
                     if ticker:
-                        last = float(ticker.get("last", 0))
+                        last = _finite(ticker.get("last"), 0.0)
 
-                        # 插针检测（传 prev=0，由 check_spike 内部从 _price_history 取上一帧）
-                        alert = self._market.check_spike(symbol, last, 0)
-                        if alert:
-                            alerts.append(alert)
+                        if last > 0:
+                            # 插针检测（传 prev=0，由 check_spike 内部从 _price_history 取上一帧）
+                            alert = self._market.check_spike(symbol, last, 0)
+                            if alert:
+                                alerts.append(alert)
 
-                        # 低流动性检测
-                        vol_24h = float(ticker.get("vol24h", 0)) * last  # 粗估USD
-                        alert = self._market.check_low_liquidity(symbol, vol_24h)
-                        if alert:
-                            alerts.append(alert)
+                            # 低流动性检测
+                            vol_24h = _finite(ticker.get("vol24h"), 0.0) * last  # 粗估USD
+                            alert = self._market.check_low_liquidity(symbol, vol_24h)
+                            if alert:
+                                alerts.append(alert)
 
-                        # 大额砸盘检测
-                        vol_24h_raw = float(ticker.get("vol24h", 0))
-                        alert = self._market.check_whale_activity(symbol, last, vol_24h_raw)
-                        if alert:
-                            alerts.append(alert)
+                            # 大额砸盘检测
+                            vol_24h_raw = _finite(ticker.get("vol24h"), 0.0)
+                            alert = self._market.check_whale_activity(symbol, last, vol_24h_raw)
+                            if alert:
+                                alerts.append(alert)
 
                     # 资金费率检测
                     funding = self._okx_client.get_funding_rate(symbol)
                     if funding:
-                        rate = float(funding.get("fundingRate", 0))
+                        rate = _finite(funding.get("fundingRate"), 0.0)
                         alert = self._market.check_funding_rate(symbol, rate)
                         if alert:
                             alerts.append(alert)
@@ -762,13 +798,17 @@ class ContractRiskAnalyzer:
 
         # 基于持仓的检查
         if positions:
-            total_position_value = sum(abs(float(p.get("notionalUsd", 0))) for p in positions)
+            total_position_value = 0.0
+            for p in positions:
+                total_position_value += abs(_finite(p.get("notionalUsd"), 0.0))
             position_count = len(positions)
 
             for pos in positions:
                 symbol = pos.get("instId", "")
-                leverage = int(float(pos.get("lever", 1)))
-                notional = abs(float(pos.get("notionalUsd", 0)))
+                leverage = int(_finite(pos.get("lever"), 1.0))
+                if leverage <= 0:
+                    leverage = 1
+                notional = abs(_finite(pos.get("notionalUsd"), 0.0))
                 position_ratio = notional / total_position_value if total_position_value > 0 else 0
 
                 # 高杠杆重仓检测（传入持仓数，单持仓时跳过集中度判定）

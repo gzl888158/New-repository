@@ -257,6 +257,10 @@ class RealTimeRiskMonitor:
         self._okx_client = okx_client
         self._position_manager = position_manager
         self._risk_gate = risk_gate
+        if position_manager is not None and risk_gate is not None:
+            set_position_manager = getattr(risk_gate, "set_position_manager", None)
+            if callable(set_position_manager):
+                set_position_manager(position_manager)
         self._circuit_breaker = circuit_breaker
         self._account_manager = account_manager
         self._capital_manager = capital_manager

@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional, List
 from loguru import logger
 
 from core.models import TickData, BarData, Position, AccountInfo
+from utils.helpers import safe_float, safe_int
 
 class RedisCache:
     def __init__(self, config: Dict[str, Any]):
@@ -70,6 +71,37 @@ class RedisCache:
     def set_signal_callback(self, callback):
         self._signal_callback = callback
 
+    def _mark_redis_unavailable(self, operation: str, error: Exception = None) -> None:
+        """统一处理 Redis 操作失败：置可用标志为 False，仅在「可用→不可用」状态切换时
+        记录一次 warning，避免连续失败刷屏。fail-closed：Redis 降级必须可观测，而非静默吞掉。
+        """
+        was_available = self._redis_available
+        self._redis_available = False
+        if was_available:
+            logger.warning(f"Redis {operation} failed, degrading to memory cache: {error}")
+        else:
+            logger.debug(f"Redis {operation} failed (already degraded): {error}")
+
+    def _invoke_signal_callback(self, signal_data: Dict[str, Any]) -> bool:
+        """以一致方式调用信号回调，兼容事件循环运行中/未运行两种场景。
+
+        返回 True 表示回调已成功调度/执行，False 表示无回调或执行失败。
+        """
+        if not self._signal_callback:
+            return False
+        import asyncio
+        try:
+            signal_payload = signal_data.get("data", signal_data)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self._signal_callback(signal_payload))
+            else:
+                loop.run_until_complete(self._signal_callback(signal_payload))
+            return True
+        except Exception as e:
+            logger.error(f"Signal callback error: {e}")
+            return False
+
     def set_tick(self, tick: TickData, ttl_seconds: int = 120):
         key = f"{self._tick_prefix}{tick.symbol}"
         now = time.time()
@@ -88,8 +120,8 @@ class RedisCache:
             try:
                 self._redis.hset(key, mapping=data)
                 self._redis.expire(key, ttl_seconds)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_tick", e)
 
         with self._cache_lock:
             self._memory_cache[key] = data
@@ -104,8 +136,8 @@ class RedisCache:
         if self._redis_available:
             try:
                 pipe = self._redis.pipeline()
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_ticks.pipeline", e)
 
         with self._cache_lock:
             for tick in ticks:
@@ -128,8 +160,8 @@ class RedisCache:
         if pipe is not None:
             try:
                 pipe.execute()
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_ticks.execute", e)
 
     def get_tick(self, symbol: str, max_age_seconds: float = 120.0) -> Optional[TickData]:
         key = f"{self._tick_prefix}{symbol}"
@@ -138,8 +170,8 @@ class RedisCache:
         if self._redis_available:
             try:
                 data = self._redis.hgetall(key)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("get_tick", e)
 
         if not data:
             with self._cache_lock:
@@ -149,19 +181,19 @@ class RedisCache:
             return None
 
         try:
-            received_at = float(data.get("received_at", 0))
+            received_at = safe_float(data.get("received_at", 0))
             if max_age_seconds > 0 and time.time() - received_at > max_age_seconds:
                 logger.debug(f"Tick data for {symbol} is stale (age={time.time()-received_at:.1f}s)")
                 return None
 
             return TickData(
                 symbol=symbol,
-                price=float(data["price"]),
-                volume=float(data["volume"]),
-                bid_price=float(data["bid_price"]),
-                bid_volume=float(data["bid_volume"]),
-                ask_price=float(data["ask_price"]),
-                ask_volume=float(data["ask_volume"]),
+                price=safe_float(data.get("price")),
+                volume=safe_float(data.get("volume")),
+                bid_price=safe_float(data.get("bid_price")),
+                bid_volume=safe_float(data.get("bid_volume")),
+                ask_price=safe_float(data.get("ask_price")),
+                ask_volume=safe_float(data.get("ask_volume")),
                 timestamp=datetime.fromisoformat(data["timestamp"])
             )
         except Exception as e:
@@ -174,14 +206,14 @@ class RedisCache:
         if self._redis_available:
             try:
                 data = self._redis.hgetall(key)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("is_tick_fresh", e)
         if not data:
             with self._cache_lock:
                 data = self._memory_cache.get(key)
         if not data:
             return False
-        received_at = float(data.get("received_at", 0))
+        received_at = safe_float(data.get("received_at", 0))
         return time.time() - received_at <= max_age_seconds
 
     def set_bar(self, bar: BarData):
@@ -199,8 +231,8 @@ class RedisCache:
             try:
                 self._redis.hset(key, mapping=data)
                 self._redis.expire(key, 86400)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_bar", e)
 
         with self._cache_lock:
             self._memory_cache[key] = data
@@ -216,14 +248,14 @@ class RedisCache:
                         symbol=symbol,
                         interval=interval,
                         timestamp=datetime.fromisoformat(data["timestamp"]),
-                        open=float(data["open"]),
-                        high=float(data["high"]),
-                        low=float(data["low"]),
-                        close=float(data["close"]),
-                        volume=float(data["volume"])
+                        open=safe_float(data.get("open")),
+                        high=safe_float(data.get("high")),
+                        low=safe_float(data.get("low")),
+                        close=safe_float(data.get("close")),
+                        volume=safe_float(data.get("volume"))
                     )
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("get_bar", e)
 
         with self._cache_lock:
             data = self._memory_cache.get(key)
@@ -234,11 +266,11 @@ class RedisCache:
             symbol=symbol,
             interval=interval,
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            open=float(data["open"]),
-            high=float(data["high"]),
-            low=float(data["low"]),
-            close=float(data["close"]),
-            volume=float(data["volume"])
+            open=safe_float(data.get("open")),
+            high=safe_float(data.get("high")),
+            low=safe_float(data.get("low")),
+            close=safe_float(data.get("close")),
+            volume=safe_float(data.get("volume"))
         )
 
     def set_position(self, position: Position):
@@ -252,6 +284,9 @@ class RedisCache:
             "unrealized_pnl": position.unrealized_pnl,
             "margin": position.margin,
             "leverage": position.leverage,
+            "maintenance_margin_rate": position.maintenance_margin_rate,
+            "notional_usd": position.notional_usd,
+            "liquidation_price": position.liquidation_price,
             "timestamp": position.timestamp.isoformat()
         }
 
@@ -259,8 +294,8 @@ class RedisCache:
             try:
                 self._redis.hset(key, mapping=data)
                 self._redis.expire(key, 30)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_position", e)
 
         with self._cache_lock:
             self._memory_cache[key] = data
@@ -275,16 +310,19 @@ class RedisCache:
                     return Position(
                         symbol=data["symbol"],
                         side=data["side"],
-                        quantity=float(data["quantity"]),
-                        avg_cost=float(data["avg_cost"]),
-                        mark_price=float(data["mark_price"]),
-                        unrealized_pnl=float(data["unrealized_pnl"]),
-                        margin=float(data["margin"]),
-                        leverage=int(data["leverage"]),
+                        quantity=safe_float(data.get("quantity")),
+                        avg_cost=safe_float(data.get("avg_cost")),
+                        mark_price=safe_float(data.get("mark_price")),
+                        unrealized_pnl=safe_float(data.get("unrealized_pnl")),
+                        margin=safe_float(data.get("margin")),
+                        leverage=safe_int(data.get("leverage")),
+                        maintenance_margin_rate=safe_float(data.get("maintenance_margin_rate")),
+                        notional_usd=safe_float(data.get("notional_usd")),
+                        liquidation_price=safe_float(data.get("liquidation_price")),
                         timestamp=datetime.fromisoformat(data["timestamp"])
                     )
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("get_position", e)
 
         with self._cache_lock:
             data = self._memory_cache.get(key)
@@ -294,12 +332,15 @@ class RedisCache:
         return Position(
             symbol=data["symbol"],
             side=data["side"],
-            quantity=float(data["quantity"]),
-            avg_cost=float(data["avg_cost"]),
-            mark_price=float(data["mark_price"]),
-            unrealized_pnl=float(data["unrealized_pnl"]),
-            margin=float(data["margin"]),
-            leverage=int(data["leverage"]),
+            quantity=safe_float(data.get("quantity")),
+            avg_cost=safe_float(data.get("avg_cost")),
+            mark_price=safe_float(data.get("mark_price")),
+            unrealized_pnl=safe_float(data.get("unrealized_pnl")),
+            margin=safe_float(data.get("margin")),
+            leverage=safe_int(data.get("leverage")),
+            maintenance_margin_rate=safe_float(data.get("maintenance_margin_rate")),
+            notional_usd=safe_float(data.get("notional_usd")),
+            liquidation_price=safe_float(data.get("liquidation_price")),
             timestamp=datetime.fromisoformat(data["timestamp"])
         )
 
@@ -317,8 +358,8 @@ class RedisCache:
             try:
                 self._redis.hset(self._account_key, mapping=data)
                 self._redis.expire(self._account_key, 60)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_account_info", e)
 
         with self._cache_lock:
             self._memory_cache[self._account_key] = data
@@ -329,15 +370,15 @@ class RedisCache:
                 data = self._redis.hgetall(self._account_key)
                 if data:
                     return AccountInfo(
-                        total_equity=float(data["total_equity"]),
-                        available_balance=float(data["available_balance"]),
-                        used_margin=float(data["used_margin"]),
-                        unrealized_pnl=float(data["unrealized_pnl"]),
-                        margin_rate=float(data["margin_rate"]),
+                        total_equity=safe_float(data.get("total_equity")),
+                        available_balance=safe_float(data.get("available_balance")),
+                        used_margin=safe_float(data.get("used_margin")),
+                        unrealized_pnl=safe_float(data.get("unrealized_pnl")),
+                        margin_rate=safe_float(data.get("margin_rate")),
                         timestamp=datetime.fromisoformat(data["timestamp"])
                     )
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("get_account_info", e)
 
         with self._cache_lock:
             data = self._memory_cache.get(self._account_key)
@@ -345,45 +386,60 @@ class RedisCache:
             return None
 
         return AccountInfo(
-            total_equity=float(data["total_equity"]),
-            available_balance=float(data["available_balance"]),
-            used_margin=float(data["used_margin"]),
-            unrealized_pnl=float(data["unrealized_pnl"]),
-            margin_rate=float(data["margin_rate"]),
+            total_equity=safe_float(data.get("total_equity")),
+            available_balance=safe_float(data.get("available_balance")),
+            used_margin=safe_float(data.get("used_margin")),
+            unrealized_pnl=safe_float(data.get("unrealized_pnl")),
+            margin_rate=safe_float(data.get("margin_rate")),
             timestamp=datetime.fromisoformat(data["timestamp"])
         )
 
-    def publish_signal(self, signal_data: Dict[str, Any]):
-        if self._signal_callback and not self._redis_available:
-            import asyncio
-            try:
-                signal_payload = signal_data.get("data", signal_data)
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(self._signal_callback(signal_payload))
-                else:
-                    loop.run_until_complete(self._signal_callback(signal_payload))
-            except Exception as e:
-                logger.error(f"Direct signal callback error: {e}")
-            return
-        
+    def publish_signal(self, signal_data: Dict[str, Any]) -> bool:
+        """发布信号：优先 Redis pub/sub，不可用时降级为直接回调。
+
+        fail-closed：返回 True 表示信号已成功发布/回调，False 表示信号被丢弃
+        （Redis 不可用且无回调），调用方据此可观测到信号丢失而非静默吞掉。
+        """
+        strategy = str(signal_data.get("strategy_name", signal_data.get("strategy", "")) or "")
+        from core.signal_flow_stats import record_signal_flow_event
+        record_signal_flow_event("candidate", strategy=strategy)
+
+        # Redis 不可用时直接走回调（无 pub/sub 通道）
+        if not self._redis_available:
+            published = self._invoke_signal_callback(signal_data)
+            record_signal_flow_event(
+                "published" if published else "publish_failed",
+                strategy=strategy,
+                reason="callback" if published else "redis_unavailable_no_callback",
+            )
+            return published
+
         channel = f"{self._signal_prefix}trading"
-        message = json.dumps(signal_data)
-        
-        if self._redis_available:
-            try:
-                self._redis.publish(channel, message)
-            except Exception:
-                self._redis_available = False
-                if self._signal_callback:
-                    import asyncio
-                    try:
-                        signal_payload = signal_data.get("data", signal_data)
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            asyncio.create_task(self._signal_callback(signal_payload))
-                    except Exception as e:
-                        logger.error(f"Fallback signal callback error: {e}")
+        try:
+            message = json.dumps(signal_data)
+        except Exception as e:
+            record_signal_flow_event(
+                "publish_failed",
+                strategy=strategy,
+                reason="serialization_error",
+            )
+            logger.error(f"Signal serialization failed: {e}")
+            return False
+
+        try:
+            self._redis.publish(channel, message)
+            record_signal_flow_event("published", strategy=strategy, reason="redis")
+            return True
+        except Exception as e:
+            self._mark_redis_unavailable("publish_signal", e)
+            # 发布失败，尝试直接回调兜底
+            published = self._invoke_signal_callback(signal_data)
+            record_signal_flow_event(
+                "published" if published else "publish_failed",
+                strategy=strategy,
+                reason="callback_fallback" if published else "redis_and_callback_failed",
+            )
+            return published
 
     def subscribe_signals(self):
         if self._redis_available:
@@ -391,8 +447,8 @@ class RedisCache:
                 pubsub = self._redis.pubsub()
                 pubsub.subscribe(f"{self._signal_prefix}trading")
                 return pubsub
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("subscribe_signals", e)
         
         return None
 
@@ -413,10 +469,10 @@ class RedisCache:
             if self._redis_available:
                 try:
                     self._redis.set(key, json.dumps(signal_data), ex=300)
-                except Exception:
-                    self._redis_available = False
+                except Exception as e:
+                    self._mark_redis_unavailable("cache_signal", e)
         except Exception as e:
-            logger.debug(f"cache_signal error: {e}")
+            logger.warning(f"cache_signal error: {e}")
 
     def set_risk_limit(self, key: str, value: float):
         risk_key = f"{self._risk_prefix}{key}"
@@ -425,8 +481,8 @@ class RedisCache:
             try:
                 self._redis.set(risk_key, value)
                 self._redis.expire(risk_key, 3600)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_risk_limit", e)
 
         with self._cache_lock:
             self._memory_cache[risk_key] = value
@@ -438,12 +494,12 @@ class RedisCache:
             try:
                 value = self._redis.get(risk_key)
                 if value is not None:
-                    return float(value)
-            except Exception:
-                self._redis_available = False
+                    return safe_float(value)
+            except Exception as e:
+                self._mark_redis_unavailable("get_risk_limit", e)
 
         with self._cache_lock:
-            return self._memory_cache.get(risk_key, default)
+            return safe_float(self._memory_cache.get(risk_key, default), default)
 
     def incr_risk_counter(self, key: str) -> int:
         counter_key = f"{self._risk_prefix}counter:{key}"
@@ -451,8 +507,8 @@ class RedisCache:
         if self._redis_available:
             try:
                 return int(self._redis.incr(counter_key))
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("incr_risk_counter", e)
 
         with self._cache_lock:
             current = self._memory_cache.get(counter_key, 0)
@@ -466,8 +522,8 @@ class RedisCache:
         if self._redis_available:
             try:
                 self._redis.delete(counter_key)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("reset_risk_counter", e)
 
         with self._cache_lock:
             self._memory_cache.pop(counter_key, None)
@@ -480,8 +536,8 @@ class RedisCache:
             try:
                 self._redis.set(key, data)
                 self._redis.expire(key, 3600)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("set_strategy_state", e)
 
         with self._cache_lock:
             self._memory_cache[key] = data
@@ -494,8 +550,8 @@ class RedisCache:
                 data = self._redis.get(key)
                 if data:
                     return json.loads(data)
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("get_strategy_state", e)
 
         with self._cache_lock:
             data = self._memory_cache.get(key)
@@ -512,8 +568,8 @@ class RedisCache:
             try:
                 self._redis.ping()
                 return True
-            except Exception:
-                self._redis_available = False
+            except Exception as e:
+                self._mark_redis_unavailable("health_check", e)
 
         # 即使 _redis_available=False 也主动尝试重连
         if self._try_reconnect():

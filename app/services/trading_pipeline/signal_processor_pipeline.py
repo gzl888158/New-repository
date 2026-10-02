@@ -1,5 +1,7 @@
 """
 信号处理流水线，对交易信号进行去重、冷却与质量/市场状态过滤。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional

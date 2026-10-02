@@ -152,8 +152,8 @@ class BenchmarkRunner:
                 median_time_ms=statistics.median(times),
                 p95_time_ms=self._percentile(sorted_times, 95),
                 p99_time_ms=self._percentile(sorted_times, 99),
-                ops_per_second=len(times) / (total_time / 1000),
-                success_rate=success_count / config.test_iterations,
+                ops_per_second=len(times) / (total_time / 1000) if total_time > 0 else 0.0,
+                success_rate=success_count / config.test_iterations if config.test_iterations > 0 else 0.0,
                 errors=errors,
             )
         

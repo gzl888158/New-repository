@@ -9,6 +9,8 @@ from enum import Enum
 from typing import Dict, Any, Optional, List, Set, Tuple
 from loguru import logger
 
+from utils.helpers import safe_float, safe_finite, safe_div
+
 
 class StrategyState(Enum):
     """策略运行状态"""
@@ -187,7 +189,7 @@ class StrategyCoordinator:
                     }
                 
                 side = pos.get("side", "long")
-                quantity = abs(float(pos.get("quantity", 0)))
+                quantity = abs(safe_float(pos.get("quantity"), 0.0))
                 
                 if side == "long":
                     unified[symbol]["total_long"] += quantity
@@ -327,35 +329,35 @@ class StrategyCoordinator:
         resolved_signal = dict(signal_data)
         
         for conflict in conflicts:
-            ctype = conflict["type"]
-            severity = conflict["severity"]
+            ctype = conflict.get("type", "")
+            severity = conflict.get("severity", "low")
             
             if ctype == ConflictType.OPPOSITE_DIRECTION.value and severity == "high":
                 # 高严重度反方向冲突：拒绝
-                logger.warning(f"Conflict rejected: {conflict['message']}")
+                logger.warning(f"Conflict rejected: {conflict.get('message', '')}")
                 return False, resolved_signal
             
             elif ctype == ConflictType.SAME_DIRECTION_OVERLAP.value and severity == "high":
                 # 同向重叠冲突：拒绝，防止同一币种同一方向双重暴露
-                logger.warning(f"Same-direction overlap rejected: {conflict['message']}")
+                logger.warning(f"Same-direction overlap rejected: {conflict.get('message', '')}")
                 return False, resolved_signal
             
             elif ctype == ConflictType.EXCESSIVE_EXPOSURE.value:
                 # 过度暴露：降低仓位
-                current_qty = resolved_signal.get("quantity", 0)
+                current_qty = safe_float(resolved_signal.get("quantity"), 0.0)
                 if current_qty > 0:
                     resolved_signal["quantity"] = current_qty * 0.5
                     logger.info(f"Conflict resolved: reduced quantity by 50% for {strategy_name} {resolved_signal.get('symbol')}")
             
             elif ctype == ConflictType.TIMING_COLLISION.value:
                 # 时间碰撞：轻微降低仓位
-                current_qty = resolved_signal.get("quantity", 0)
+                current_qty = safe_float(resolved_signal.get("quantity"), 0.0)
                 if current_qty > 0:
                     resolved_signal["quantity"] = current_qty * 0.8
             
             elif ctype == ConflictType.REGIME_INCOMPATIBLE.value:
                 # 状态不兼容：拒绝
-                logger.warning(f"Regime conflict rejected: {conflict['message']}")
+                logger.warning(f"Regime conflict rejected: {conflict.get('message', '')}")
                 return False, resolved_signal
         
         return True, resolved_signal
@@ -420,7 +422,7 @@ class StrategyCoordinator:
     # ===================== 组合风险评估 =====================
 
     def _recalculate_portfolio_risk(self):
-        """重新计算组合风险"""
+        """重新计算组合风险（输出全部 finite，JSON 安全）。"""
         unified = self.get_unified_position_view()
         
         total_long = 0.0
@@ -428,35 +430,38 @@ class StrategyCoordinator:
         symbol_exposure = {}
         
         for symbol, info in unified.items():
-            total_long += info["total_long"]
-            total_short += info["total_short"]
+            long_qty = safe_float(info.get("total_long"), 0.0)
+            short_qty = safe_float(info.get("total_short"), 0.0)
+            net_exp = safe_float(info.get("net_exposure"), 0.0)
+            total_long += long_qty
+            total_short += short_qty
             
-            exposure = abs(info["net_exposure"])
+            exposure = abs(net_exp)
             symbol_exposure[symbol] = {
-                "net": info["net_exposure"],
-                "long": info["total_long"],
-                "short": info["total_short"],
-                "gross": info["total_long"] + info["total_short"],
+                "net": safe_finite(net_exp, 0.0),
+                "long": safe_finite(long_qty, 0.0),
+                "short": safe_finite(short_qty, 0.0),
+                "gross": safe_finite(long_qty + short_qty, 0.0),
             }
         
-        total_exposure = total_long + total_short
-        net_exposure = total_long - total_short
+        total_exposure = safe_finite(total_long + total_short, 0.0)
+        net_exposure = safe_finite(total_long - total_short, 0.0)
         
         # 计算方向集中度
-        direction_exposure = {"long": total_long, "short": total_short}
+        direction_exposure = {"long": safe_finite(total_long, 0.0), "short": safe_finite(total_short, 0.0)}
         
         # 简单估算最大回撤（基于净暴露）
-        max_dd_estimate = abs(net_exposure) / max(total_exposure, 1.0) if total_exposure > 0 else 0.0
+        max_dd_estimate = safe_div(abs(net_exposure), total_exposure, 0.0) if total_exposure > 0 else 0.0
         
         # 相关性风险：标的相关性高的组合风险更大
-        correlation_risk = self._estimate_correlation_risk(unified)
+        correlation_risk = safe_finite(self._estimate_correlation_risk(unified), 0.0)
         
         self._portfolio_risk = {
-            "total_exposure": total_exposure,
-            "net_exposure": net_exposure,
+            "total_exposure": safe_finite(total_exposure, 0.0),
+            "net_exposure": safe_finite(net_exposure, 0.0),
             "symbol_exposure": symbol_exposure,
             "direction_exposure": direction_exposure,
-            "max_drawdown_estimate": max_dd_estimate,
+            "max_drawdown_estimate": safe_finite(max_dd_estimate, 0.0),
             "correlation_risk": correlation_risk,
             "last_update": datetime.now().isoformat(),
         }
@@ -519,11 +524,25 @@ class StrategyCoordinator:
         for callback in callbacks:
             try:
                 if asyncio.iscoroutinefunction(callback):
-                    asyncio.create_task(callback(message))
+                    task = asyncio.create_task(callback(message))
+                    task.add_done_callback(
+                        lambda completed_task: self._log_callback_task_error(
+                            completed_task, message_type
+                        )
+                    )
                 else:
                     callback(message)
-            except Exception as e:
-                logger.debug(f"Message callback error: {e}")
+            except Exception:
+                logger.exception(f"Message callback error for {message_type}")
+
+    @staticmethod
+    def _log_callback_task_error(task: asyncio.Task, message_type: str):
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception(f"Message callback error for {message_type}")
 
     def subscribe(self, message_type: str, callback: callable):
         """订阅消息"""
@@ -689,13 +708,18 @@ class StrategyCoordinator:
     def get_strategy_consensus_score(self, symbol: str, direction: str) -> float:
         """计算策略共识分数：0-1，越高代表越多策略同向"""
         result = self.check_cross_strategy_confirmation(symbol, direction)
-        if not result["agreeing_strategies"]:
+        agreeing = result.get("agreeing_strategies", [])
+        if not agreeing:
             return 0.0
 
-        avg_conf = sum(s.get("confidence", 0) for s in result["agreeing_strategies"]) / len(result["agreeing_strategies"])
-        consensus = result["agree_ratio"] * 0.6 + avg_conf * 0.4
+        avg_conf = safe_finite(
+            sum(safe_float(s.get("confidence"), 0.0) for s in agreeing) / max(len(agreeing), 1),
+            0.0,
+        )
+        agree_ratio = safe_finite(result.get("agree_ratio"), 0.0)
+        consensus = agree_ratio * 0.6 + avg_conf * 0.4
 
-        return min(1.0, max(0.0, consensus))
+        return min(1.0, max(0.0, safe_finite(consensus, 0.0)))
 
     # ===================== 强化：策略健康自愈 =====================
 
@@ -923,13 +947,14 @@ class StrategyCoordinator:
     # ===================== 强化：动态策略权重协调 =====================
 
     def calculate_dynamic_strategy_weights(self) -> Dict[str, float]:
-        """动态计算策略权重：基于近期表现+健康状态+市场适配度"""
+        """动态计算策略权重：基于近期表现+健康状态+市场适配度（归一化，JSON 安全）。"""
         try:
             weights = {}
-            base_weight = 1.0 / len(self._strategies) if self._strategies else 0.25
+            n = len(self._strategies)
+            base_weight = safe_div(1.0, n, 0.25) if n > 0 else 0.25
 
             for name in self._strategies:
-                weight = base_weight
+                weight = safe_finite(base_weight, 0.0)
 
                 state = self._strategy_states.get(name, StrategyState.STOPPED)
                 if state == StrategyState.RUNNING:
@@ -942,20 +967,26 @@ class StrategyCoordinator:
                 signals = self._strategy_signals.get(name, [])
                 if signals:
                     recent = signals[-20:]
-                    avg_conf = sum(s.get("confidence", 0) for s in recent) / len(recent)
+                    avg_conf = safe_finite(
+                        sum(safe_float(s.get("confidence"), 0.0) for s in recent) / max(len(recent), 1),
+                        0.0,
+                    )
                     weight *= (0.7 + avg_conf * 0.6)
 
-                weights[name] = weight
+                weights[name] = safe_finite(weight, 0.0)
 
             total = sum(weights.values())
             if total > 0:
                 for k in weights:
-                    weights[k] /= total
+                    weights[k] = safe_div(weights[k], total, 0.0)
 
             return weights
         except Exception as e:
             logger.debug(f"Dynamic weight calculation error: {e}")
-            return {name: 1.0 / len(self._strategies) for name in self._strategies} if self._strategies else {}
+            n = len(self._strategies)
+            if not n:
+                return {}
+            return {name: safe_div(1.0, n, 0.0) for name in self._strategies}
 
     def get_strategy_summary(self, strategy_name: str) -> Optional[Dict[str, Any]]:
         """获取策略摘要"""

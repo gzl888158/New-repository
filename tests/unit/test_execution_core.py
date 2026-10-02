@@ -4,26 +4,28 @@
 覆盖：订单执行引擎（幂等键/指数退避/部分成交）+ 仓位管理系统（实时追踪/风险联动/动态调整）
 """
 
+import asyncio
+import json
 import os
 import sys
-import json
 import time
-import asyncio
 import unittest
-from unittest.mock import Mock, MagicMock, patch, AsyncMock
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from execution.order_executor import (
-    OrderExecutor, RetryableError, PartialFillAction
-)
 from core.position_manager import (
-    PositionManager, PositionSnapshot, PositionSide,
-    PositionStatus, RiskLevel, AccountRiskSnapshot, RiskEvent
+    AccountRiskSnapshot,
+    PositionManager,
+    PositionSide,
+    PositionSnapshot,
+    PositionStatus,
+    RiskEvent,
+    RiskLevel,
 )
-
+from execution.order_executor import OrderExecutor, PartialFillAction, RetryableError
 
 # ═══════════════════════════════════════════════════════════════
 # 测试辅助
@@ -76,6 +78,9 @@ class MockOKXClient:
             }
             for (symbol, side), (qty, avg, mark, pnl, margin, lev, liq, mgn) in self._positions.items()
         ]
+
+    def get_positions_checked(self):
+        return self.get_positions()
 
     def _parse_position(self, pos_data):
         """模拟解析持仓"""
@@ -381,6 +386,212 @@ class TestOrderExecutorPartialFill(unittest.TestCase):
         self.assertIn("test_clord_002", self.executor._partial_fill_tracker)
         print(f"  [PASS] test_10: partial fill high ratio (80%) waits for completion")
 
+    def test_cancel_failure_keeps_partial_fill_pending(self):
+        """撤单未确认时保留跟踪状态，不宣告部分成交已解决。"""
+        self.mock_client.cancel_order = Mock(return_value=None)
+        order_info = {
+            "symbol": "BTC-USDT",
+            "strategy_name": "grid",
+            "signal_type": "open",
+            "direction": "long",
+            "quantity": 1.0,
+            "clOrdId": "cancel_failed",
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.executor._handle_partial_fill(
+                    "ord_cancel_failed", order_info, 0.3, 1.0, 100.0
+                )
+            )
+        finally:
+            loop.close()
+
+        self.assertFalse(result)
+        self.assertIn("cancel_failed", self.executor._partial_fill_tracker)
+        self.assertEqual(self.executor.get_execution_stats()["partial_fill_resolved"], 0)
+
+    def test_cancel_failure_market_closes_verified_terminal_close_remainder(self):
+        """平仓撤单未确认后，仅在交易所确认原单终态时市价平已核实余量。"""
+        self.mock_client.cancel_order = Mock(return_value=None)
+        self.mock_client.get_order = Mock(
+            return_value={
+                "state": "canceled",
+                "sz": "1.0",
+                "accFillSz": "0.4",
+                "avgPx": "101.0",
+            }
+        )
+        self.executor._execute_order = AsyncMock()
+        order_info = {
+            "symbol": "BTC-USDT",
+            "strategy_name": "grid",
+            "signal_type": "close",
+            "direction": "sell",
+            "quantity": 1.0,
+            "leverage": 2,
+            "clOrdId": "close_terminal_after_cancel_failure",
+        }
+
+        result = asyncio.run(
+            self.executor._handle_partial_fill(
+                "ord_close_terminal_after_cancel_failure",
+                order_info,
+                0.5,
+                1.0,
+                100.0,
+            )
+        )
+
+        self.assertTrue(result)
+        self.mock_client.get_order.assert_called_once_with(
+            "BTC-USDT", "ord_close_terminal_after_cancel_failure"
+        )
+        self.executor._execute_order.assert_awaited_once()
+        close_order = self.executor._execute_order.await_args.args[0]
+        self.assertEqual(close_order["quantity"], 0.6)
+        self.assertEqual(close_order["price"], 101.0)
+        self.assertTrue(close_order["reduce_only"])
+        self.assertEqual(
+            self.executor.get_execution_stats()["partial_fill_resolved"], 1
+        )
+        self.assertNotIn(
+            "close_terminal_after_cancel_failure",
+            self.executor._partial_fill_tracker,
+        )
+
+    def test_cancel_failure_does_not_market_close_live_order(self):
+        """撤单失败且原单仍挂单时不得提交重复市价单。"""
+        self.mock_client.cancel_order = Mock(return_value=None)
+        self.mock_client.get_order = Mock(
+            return_value={
+                "state": "partially_filled",
+                "sz": "1.0",
+                "accFillSz": "0.5",
+            }
+        )
+        self.executor._execute_order = AsyncMock()
+        order_info = {
+            "symbol": "BTC-USDT",
+            "strategy_name": "grid",
+            "signal_type": "close",
+            "direction": "sell",
+            "quantity": 1.0,
+            "clOrdId": "close_still_live",
+        }
+
+        result = asyncio.run(
+            self.executor._handle_partial_fill(
+                "ord_close_still_live", order_info, 0.5, 1.0, 100.0
+            )
+        )
+
+        self.assertFalse(result)
+        self.executor._execute_order.assert_not_awaited()
+        self.assertIn("close_still_live", self.executor._partial_fill_tracker)
+
+    def test_cancel_failure_blocks_resubmission(self):
+        """旧单撤单未确认时不得重提剩余数量。"""
+        self.executor._partial_fill_action = PartialFillAction.RESUBMIT_REMAINING
+        self.mock_client.cancel_order = Mock(return_value=None)
+        self.executor._execute_order = AsyncMock()
+        order_info = {
+            "symbol": "BTC-USDT",
+            "strategy_name": "grid",
+            "signal_type": "open",
+            "direction": "long",
+            "quantity": 1.0,
+            "clOrdId": "resubmit_cancel_failed",
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.executor._handle_partial_fill(
+                    "ord_resubmit_failed", order_info, 0.8, 1.0, 100.0
+                )
+            )
+        finally:
+            loop.close()
+
+        self.assertFalse(result)
+        self.executor._execute_order.assert_not_awaited()
+        self.assertIn("resubmit_cancel_failed", self.executor._partial_fill_tracker)
+
+    def test_cancel_failure_blocks_partial_close_market_order(self):
+        """平仓剩余单撤单未确认时不得再发市价平仓单。"""
+        self.executor._partial_fill_action = PartialFillAction.MARKET_CLOSE
+        self.mock_client.cancel_order = Mock(return_value=None)
+        self.mock_client.get_order = Mock(
+            return_value={
+                "state": "partially_filled",
+                "sz": "1.0",
+                "accFillSz": "0.5",
+            }
+        )
+        self.executor._execute_order = AsyncMock()
+        order_info = {
+            "symbol": "BTC-USDT",
+            "strategy_name": "grid",
+            "signal_type": "close",
+            "direction": "sell",
+            "quantity": 1.0,
+            "clOrdId": "close_cancel_failed",
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.executor._handle_partial_fill(
+                    "ord_close_failed", order_info, 0.5, 1.0, 100.0
+                )
+            )
+        finally:
+            loop.close()
+
+        self.assertFalse(result)
+        self.executor._execute_order.assert_not_awaited()
+        self.assertIn("close_cancel_failed", self.executor._partial_fill_tracker)
+
+    def test_reconciliation_aborts_before_mutating_local_records_on_query_failure(self):
+        """持仓对账查询失败时不清理或改写本地交易记录。"""
+        self.executor._get_positions_checked = Mock(return_value=None)
+        self.executor.sqlite_storage = Mock()
+        self.executor.redis_cache = Mock()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.executor._reconcile_positions())
+        finally:
+            loop.close()
+
+        self.executor.sqlite_storage.get_trade_records_by_status.assert_not_called()
+        self.executor.sqlite_storage.save_position_history.assert_not_called()
+        self.executor.redis_cache.set_position.assert_not_called()
+
+    def test_lifecycle_timeout_requires_exchange_cancel_confirmation(self):
+        """生命周期超时需查询交易所并确认撤单后才能终结。"""
+        self.mock_client.get_order = Mock(
+            side_effect=[{"state": "live"}, {"state": "canceled"}]
+        )
+        self.mock_client.cancel_order = Mock(return_value={"sCode": "0"})
+        order = {
+            "symbol": "BTC-USDT",
+            "exchange_order_id": "exchange_123",
+            "clOrdId": "client_123",
+            "trace_id": "trace_123",
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            confirmed = loop.run_until_complete(
+                self.executor._confirm_lifecycle_timeout(order)
+            )
+        finally:
+            loop.close()
+
+        self.assertTrue(confirmed)
+        self.mock_client.cancel_order.assert_called_once_with(
+            "BTC-USDT", "exchange_123"
+        )
+        self.assertEqual(self.mock_client.get_order.call_count, 2)
+
     def test_11_execution_stats(self):
         """测试执行统计"""
         stats = self.executor.get_execution_stats()
@@ -457,6 +668,58 @@ class TestPositionManagerSync(unittest.TestCase):
         positions = self.pm.get_all_positions()
         self.assertEqual(len(positions), 0)
         print(f"  [PASS] test_14: position removal: {len(positions)} positions")
+
+    def test_position_query_failure_preserves_local_snapshot(self):
+        """查询失败不得被当作空仓并清除本地快照。"""
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.pm._sync_positions())
+            self.assertEqual(self.pm.get_position_count(), 2)
+
+            self.mock_client.get_positions_checked = Mock(return_value=None)
+            result = loop.run_until_complete(self.pm._sync_positions())
+        finally:
+            loop.close()
+
+        self.assertFalse(result)
+        self.assertEqual(self.pm.get_position_count(), 2)
+
+    def test_consecutive_position_sync_failures_degrade_and_recover(self):
+        """连续查询失败冻结新开仓状态，查询恢复后清除降级标记。"""
+        self.pm._sync_failure_threshold = 2
+        self.mock_client.get_positions_checked = Mock(return_value=None)
+        loop = asyncio.new_event_loop()
+        try:
+            self.assertFalse(loop.run_until_complete(self.pm._sync_positions()))
+            self.assertEqual(self.pm.sync_fail_streak, 1)
+            self.assertFalse(self.pm.sync_degraded)
+
+            self.assertFalse(loop.run_until_complete(self.pm._sync_positions()))
+            self.assertEqual(self.pm.sync_fail_streak, 2)
+            self.assertTrue(self.pm.sync_degraded)
+
+            self.mock_client.get_positions_checked.return_value = []
+            self.assertTrue(loop.run_until_complete(self.pm._sync_positions()))
+        finally:
+            loop.close()
+
+        self.assertEqual(self.pm.sync_fail_streak, 0)
+        self.assertFalse(self.pm.sync_degraded)
+
+    def test_invalid_position_record_preserves_local_snapshot(self):
+        """单条持仓记录无法解析时不得部分更新或清除本地快照。"""
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.pm._sync_positions())
+            self.mock_client.get_positions_checked = Mock(
+                return_value=[{"instId": "BTC-USDT", "pos": "invalid"}]
+            )
+            result = loop.run_until_complete(self.pm._sync_positions())
+        finally:
+            loop.close()
+
+        self.assertFalse(result)
+        self.assertEqual(self.pm.get_position_count(), 2)
 
     def test_15_ws_position_update(self):
         """测试WebSocket仓位更新"""
@@ -764,6 +1027,7 @@ class TestConfigLoading(unittest.TestCase):
         self.assertTrue(pm_cfg.get("enabled", False))
         self.assertGreater(pm_cfg.get("max_total_positions", 0), 0)
         self.assertGreater(pm_cfg.get("sync_interval_sec", 0), 0)
+        self.assertGreater(pm_cfg.get("sync_failure_threshold", 0), 0)
         rl = pm_cfg.get("risk_linkage", {})
         self.assertGreater(rl.get("drawdown_trigger", 0), 0)
         self.assertGreater(rl.get("margin_ratio_warning", 0), 0)

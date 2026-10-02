@@ -1,12 +1,34 @@
 """
 盈利优化器：复利机制、凯利仓位、手续费控制、资金费率计算
 """
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Set
 from datetime import datetime, timedelta
 from loguru import logger
 import numpy as np
 import json
 import sqlite3
+import math
+
+from core.direction_unifier import DirectionUnifier
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default，避免 float(None) 抛 TypeError。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _normalize_direction(direction: Any) -> str:
+    """方向归一化：long/short/buy/sell → long/short；非法值按原语义回退（非 long 即 short）。"""
+    try:
+        return DirectionUnifier.normalize(direction)
+    except (ValueError, TypeError):
+        return "long" if (str(direction or "").strip().lower()) == "long" else "short"
 
 
 class ProfitOptimizer:
@@ -18,22 +40,22 @@ class ProfitOptimizer:
 
         # 复利配置
         self._compound_enabled = trading_cfg.get("compound_enabled", True)
-        self._compound_reinvest_ratio = trading_cfg.get("compound_reinvest_ratio", 0.6)
-        self._initial_capital = trading_cfg.get("total_capital", 100)
+        self._compound_reinvest_ratio = _finite(trading_cfg.get("compound_reinvest_ratio", 0.6), 0.6)
+        self._initial_capital = _finite(trading_cfg.get("total_capital", 100), 100.0)
 
         # 仓位配置
-        self._risk_per_trade = trading_cfg.get("risk_per_trade", 0.015)
-        self._target_return = trading_cfg.get("target_return", 1.15)
-        self._min_margin = trading_cfg.get("min_margin_per_trade", 0.5)
+        self._risk_per_trade = _finite(trading_cfg.get("risk_per_trade", 0.015), 0.015)
+        self._target_return = _finite(trading_cfg.get("target_return", 1.15), 1.15)
+        self._min_margin = _finite(trading_cfg.get("min_margin_per_trade", 0.5), 0.5)
 
         # 手续费配置
-        self._taker_fee = trading_cfg.get("taker_fee_rate", 0.0005)
-        self._maker_fee = trading_cfg.get("maker_fee_rate", 0.0002)
-        self._max_slippage = trading_cfg.get("max_slippage_pct", 0.002)
+        self._taker_fee = _finite(trading_cfg.get("taker_fee_rate", 0.0005), 0.0005)
+        self._maker_fee = _finite(trading_cfg.get("maker_fee_rate", 0.0002), 0.0002)
+        self._max_slippage = _finite(trading_cfg.get("max_slippage_pct", 0.002), 0.002)
 
         # 资金费率
         self._funding_check = trading_cfg.get("funding_rate_check", True)
-        self._funding_min_hold = trading_cfg.get("funding_rate_min_hold", 0.0003)
+        self._funding_min_hold = _finite(trading_cfg.get("funding_rate_min_hold", 0.0003), 0.0003)
 
         # 历史交易统计（用于凯利公式）
         self._trade_history: List[Dict[str, float]] = []
@@ -76,17 +98,23 @@ class ProfitOptimizer:
 
     def update_equity(self, equity: float):
         """更新当前权益，计算复利因子"""
+        equity = _finite(equity, self._current_equity)
         self._current_equity = equity
         if equity > self._peak_equity:
             self._peak_equity = equity
 
         if self._compound_enabled and self._initial_capital > 0:
             # 复利因子 = (当前权益/初始资金) ^ 再投资比例
-            growth = equity / self._initial_capital
-            self._compound_factor = max(0.5, min(3.0, growth ** self._compound_reinvest_ratio))
+            if equity <= 0:
+                # 权益非正（极端穿仓）时取最保守下限，避免负底数开方产生复数/异常
+                self._compound_factor = 0.5
+            else:
+                growth = equity / self._initial_capital
+                self._compound_factor = max(0.5, min(3.0, growth ** self._compound_reinvest_ratio))
 
     def record_trade_result(self, pnl: float, strategy: str = ""):
         """记录交易结果，更新胜率统计"""
+        pnl = _finite(pnl, 0.0)
         self._total_pnl += pnl
 
         self._trade_history.append({
@@ -185,6 +213,11 @@ class ProfitOptimizer:
 
     def get_optimal_position_size(self, base_margin: float, leverage: int) -> float:
         """计算最优仓位大小（融合复利+凯利+回撤保护+最小仓位过滤）"""
+        base_margin = _finite(base_margin, 0.0)
+        if base_margin <= 0:
+            # fail-closed：基础保证金缺失/非法时不下单，而非静默放行
+            return 0.0
+
         # 复利因子
         compound = self._compound_factor if self._compound_enabled else 1.0
 
@@ -242,6 +275,22 @@ class ProfitOptimizer:
         Args:
             direction: 'long'或'short'，用于资金费率方向计算
         """
+        position_value = _finite(position_value, 0.0)
+        hold_hours = _finite(hold_hours, 0.0)
+        funding_rate = _finite(funding_rate, 0.0)
+        direction = _normalize_direction(direction)
+
+        if position_value <= 0:
+            return {
+                "open_fee": 0.0,
+                "close_fee": 0.0,
+                "slippage_cost": 0.0,
+                "funding_cost": 0.0,
+                "total_cost": 0.0,
+                "cost_pct": 0.0,
+                "funding_direction": "receiving",
+            }
+
         # 开仓手续费（taker）
         open_fee = position_value * self._taker_fee
         # 平仓手续费（taker）
@@ -274,6 +323,7 @@ class ProfitOptimizer:
                             leverage: int, hold_hours: float = 0,
                             funding_rate: float = 0) -> Tuple[bool, str]:
         """判断交易是否盈利（扣除所有成本后）"""
+        expected_profit = _finite(expected_profit, 0.0)
         costs = self.calculate_total_cost(position_value, leverage, hold_hours, funding_rate)
 
         net_profit = expected_profit - costs["total_cost"]
@@ -281,9 +331,10 @@ class ProfitOptimizer:
         if net_profit <= 0:
             return False, f"不盈利: 预期收益{expected_profit:.4f} < 总成本{costs['total_cost']:.4f} (费用{costs['cost_pct']:.4%})"
 
-        # 收益成本比至少1.5:1
-        if expected_profit / costs["total_cost"] < 1.5:
-            return False, f"收益成本比过低: {expected_profit / costs['total_cost']:.2f}"
+        # 收益成本比至少1.5:1（成本为0时直接判盈利，避免除零）
+        if costs["total_cost"] > 0:
+            if expected_profit / costs["total_cost"] < 1.5:
+                return False, f"收益成本比过低: {expected_profit / costs['total_cost']:.2f}"
 
         return True, f"盈利: 净收益{net_profit:.4f}, 成本{costs['cost_pct']:.4%}"
 
@@ -292,6 +343,11 @@ class ProfitOptimizer:
         """判断是否因资金费率而平仓"""
         if not self._funding_check:
             return False, ""
+
+        position_value = _finite(position_value, 0.0)
+        funding_rate = _finite(funding_rate, 0.0)
+        unrealized_pnl = _finite(unrealized_pnl, 0.0)
+        hold_hours = _finite(hold_hours, 0.0)
 
         # 资金费率成本
         funding_periods = hold_hours / 8.0
@@ -309,6 +365,7 @@ class ProfitOptimizer:
         负资金费率：做多方收钱 -> 偏空
         但反向持仓收益更高（收取资金费率）
         """
+        funding_rate = _finite(funding_rate, 0.0)
         if funding_rate > self._funding_min_hold:
             return "short"  # 做空收取资金费率
         elif funding_rate < -self._funding_min_hold:
@@ -409,9 +466,15 @@ class EnhancedStopLoss:
             quantity: 持仓数量（必填），为0时止盈系统静默失效
         """
         # P0: quantity为0时记录严重警告，避免静默失效
+        quantity = _finite(quantity, 0.0)
+        entry_price = _finite(entry_price, 0.0)
+        direction = _normalize_direction(direction)
         if quantity <= 0:
             logger.error(f"init_position_stop called with quantity=0 for {symbol}, stop-loss/take-profit system will be disabled!")
-        if entry_time is None:
+        if entry_price <= 0:
+            logger.error(f"init_position_stop called with entry_price=0 for {symbol}, stop-loss/take-profit system will be disabled!")
+            return 0.0
+        if entry_time is None or not isinstance(entry_time, datetime):
             entry_time = datetime.now()
 
         # 企业级：若该 symbol 已存在持久化状态（重启后由 _load_state 恢复），
@@ -491,9 +554,15 @@ class EnhancedStopLoss:
             return 0.0, "no_position"
 
         state = self._position_stops[symbol]
-        entry = state["entry_price"]
-        direction = state["direction"]
-        current_stop = state["current_stop"]
+        entry = _finite(state.get("entry_price"), 0.0)
+        direction = _normalize_direction(state.get("direction"))
+        current_stop = _finite(state.get("current_stop"), 0.0)
+        current_price = _finite(current_price, 0.0)
+        atr = _finite(atr, 0.0)
+
+        if entry <= 0 or current_price <= 0:
+            # fail-closed：入场价/现价缺失时保持原止损，不做无效更新
+            return current_stop, "no_price"
 
         if direction == "long":
             profit_pct = (current_price - entry) / entry
@@ -615,8 +684,12 @@ class EnhancedStopLoss:
             return False
 
         state = self._position_stops[symbol]
-        direction = state["direction"]
-        stop = state["current_stop"]
+        direction = _normalize_direction(state.get("direction"))
+        stop = _finite(state.get("current_stop"), 0.0)
+        current_price = _finite(current_price, 0.0)
+
+        if current_price <= 0 or stop <= 0:
+            return False
 
         if direction == "long" and current_price <= stop:
             return True
@@ -634,7 +707,10 @@ class EnhancedStopLoss:
             return []
 
         state = self._position_stops[symbol]
-        direction = state["direction"]
+        direction = _normalize_direction(state.get("direction"))
+        current_price = _finite(current_price, 0.0)
+        if current_price <= 0:
+            return []
         actions = []
 
         # TP1: 近端止盈（40%仓位）
@@ -697,13 +773,19 @@ class EnhancedStopLoss:
             return None
 
         state = self._position_stops[symbol]
-        entry_time = state["entry_time"]
+        entry_time = state.get("entry_time")
+        if not isinstance(entry_time, datetime):
+            # 入场时间缺失（脏数据/旧持久化）时无法计算持有时长，跳过时间止盈（不误平仓）
+            return None
         now = datetime.now()
         hold_hours = (now - entry_time).total_seconds() / 3600.0
 
-        direction = state["direction"]
-        entry = state["entry_price"]
-        remaining_qty = state["quantity"] - state["total_closed_qty"]
+        direction = _normalize_direction(state.get("direction"))
+        entry = _finite(state.get("entry_price"), 0.0)
+        current_price = _finite(current_price, 0.0)
+        if entry <= 0 or current_price <= 0:
+            return None
+        remaining_qty = _finite(state.get("quantity"), 0.0) - _finite(state.get("total_closed_qty"), 0.0)
         if remaining_qty <= 0:
             return None
 
@@ -751,11 +833,12 @@ class EnhancedStopLoss:
         state = self._position_stops[symbol]
 
         # 冷却期内不重复触发
-        if state.get("vol_lockout_until") and datetime.now() < state["vol_lockout_until"]:
+        lockout_until = state.get("vol_lockout_until")
+        if isinstance(lockout_until, datetime) and datetime.now() < lockout_until:
             return None
 
-        last_atr = state.get("last_atr", 0)
-        avg_atr = state.get("avg_atr", 0)
+        last_atr = _finite(state.get("last_atr"), 0.0)
+        avg_atr = _finite(state.get("avg_atr"), 0.0)
         if last_atr <= 0 or avg_atr <= 0:
             return None
 
@@ -769,8 +852,8 @@ class EnhancedStopLoss:
             state["vol_lockout_until"] = datetime.now() + timedelta(minutes=self._volatility_lockout_minutes)
             self._persist(symbol)
 
-            direction = state["direction"]
-            remaining_qty = state["quantity"] - state["total_closed_qty"]
+            direction = _normalize_direction(state.get("direction"))
+            remaining_qty = _finite(state.get("quantity"), 0.0) - _finite(state.get("total_closed_qty"), 0.0)
             if remaining_qty <= 0:
                 return None
 
@@ -788,7 +871,9 @@ class EnhancedStopLoss:
     def record_partial_close(self, symbol: str, quantity: float):
         """记录部分减仓，更新累计已平仓量"""
         if symbol in self._position_stops:
-            self._position_stops[symbol]["total_closed_qty"] += quantity
+            quantity = _finite(quantity, 0.0)
+            self._position_stops[symbol]["total_closed_qty"] = \
+                _finite(self._position_stops[symbol].get("total_closed_qty"), 0.0) + quantity
             self._persist(symbol)
 
     def get_all_stops(self) -> Dict[str, Dict[str, Any]]:
@@ -956,12 +1041,56 @@ class EnhancedStopLoss:
         for row in rows:
             try:
                 state = self._deserialize_state(row["state_json"])
+                state["direction"] = _normalize_direction(state.get("direction"))
                 self._position_stops[row["symbol"]] = state
                 loaded += 1
             except Exception as e:
                 logger.warning(f"Failed to restore stop-loss state for {row['symbol']}: {e}")
         if loaded > 0:
             logger.info(f"Loaded {loaded} persisted stop-loss state(s) for strategy={self.strategy_name}")
+
+    def reconcile_with_active_positions(self, active_symbols: Set[str]) -> int:
+        """启动对账：清理已无真实持仓的止损状态（内存 + 持久化），防止幽灵状态恢复。
+
+        active_symbols 为当前交易所真实持仓的 symbol 集合（instId）。凡是不在该集合
+        内的 symbol 状态都会被清除 —— 这些是平仓时未走 remove_position 的残留（例如
+        方向反转、手动平仓、recovered_close），重启后若被 _load_state 恢复会污染状态。
+
+        返回清理条数。调用方（OrderExecutor/scheduler）负责传入真实持仓并保证在
+        API 明确返回持仓列表时才调用（API 失败返回空时应跳过，避免误删全部状态）。
+        """
+        active_symbols = set(active_symbols or [])
+        cleaned = 0
+        # 1. 清理内存态
+        for symbol in list(self._position_stops.keys()):
+            if symbol not in active_symbols:
+                self._position_stops.pop(symbol, None)
+                cleaned += 1
+        # 2. 清理持久化态（DB 中可能残留内存里已没有的 symbol）
+        if self._persistence_enabled:
+            conn = None
+            try:
+                conn = sqlite3.connect(self._db_path)
+                rows = conn.execute(
+                    "SELECT symbol FROM stop_loss_state WHERE strategy_name = ?",
+                    (self.strategy_name,),
+                ).fetchall()
+                for (symbol,) in rows:
+                    if symbol not in active_symbols:
+                        conn.execute(
+                            "DELETE FROM stop_loss_state WHERE strategy_name = ? AND symbol = ?",
+                            (self.strategy_name, symbol),
+                        )
+                        cleaned += 1
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"Failed to reconcile stop-loss state for {self.strategy_name}: {e}")
+            finally:
+                if conn:
+                    conn.close()
+        if cleaned > 0:
+            logger.info(f"Reconciled {cleaned} stale stop-loss state(s) for strategy={self.strategy_name}")
+        return cleaned
 
     def _recompute_tp_prices(self, state: Dict[str, Any]):
         """基于最新 entry_price 重算止盈目标/分级价格，保留 tp1/tp2 filled 进度。"""

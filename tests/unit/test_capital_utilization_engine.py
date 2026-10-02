@@ -1345,6 +1345,15 @@ class TestForceRebalance:
         action = eng._determine_action(0.5, UtilizationTier.OPTIMAL, 0.0, 0.10)
         assert action == UtilizationAction.HOLD
 
+    def test_no_trigger_when_efficiency_data_is_unavailable(self):
+        eng = _make_engine("small")
+        eng._equity_mode = "normal"
+        action = eng._determine_action(
+            0.5, UtilizationTier.OPTIMAL, 0.0, 0.0, 150.0,
+            efficiency_is_valid=False,
+        )
+        assert action == UtilizationAction.HOLD
+
     def test_emergency_overrides_force_rebalance(self):
         eng = _make_engine("small")
         eng._equity_mode = "emergency"

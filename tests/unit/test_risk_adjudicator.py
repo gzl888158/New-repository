@@ -211,6 +211,48 @@ class TestRiskAdjudicatorRiskGateIntegration:
 
         assert result.blocked_layer != RiskLayer.L0_KILL_SWITCH
 
+    def test_degraded_position_sync_blocks_open_but_allows_close(self):
+        rg = RiskGate(config={})
+        rg._kill_switch = type(
+            "DisabledKillSwitch", (), {"is_enabled": lambda self: False}
+        )()
+        passing_result = RiskCheckResult(
+            RiskLayer.L5_EMERGENCY, True, RiskAction.PASS, "ok"
+        )
+        rg._l5.check = lambda signal: passing_result
+        rg._l4.check = lambda signal: RiskCheckResult(
+            RiskLayer.L4_DAILY, True, RiskAction.PASS, "ok"
+        )
+        rg._l1.check = lambda signal: RiskCheckResult(
+            RiskLayer.L1_PRE_TRADE, True, RiskAction.PASS, "ok"
+        )
+        rg._l2.check = lambda signal, market_data: RiskCheckResult(
+            RiskLayer.L2_IN_TRADE, True, RiskAction.PASS, "ok"
+        )
+        rg._l3.check = lambda signal: []
+        rg.set_position_manager(
+            type("DegradedPositionManager", (), {
+                "sync_degraded": True,
+                "sync_fail_streak": 3,
+            })()
+        )
+
+        open_result = rg.validate(
+            {"symbol": "BTC-USDT-SWAP", "signal_type": "open_long"}
+        )
+        close_result = rg.validate(
+            {
+                "symbol": "BTC-USDT-SWAP",
+                "signal_type": "stop_loss",
+                "reduce_only": True,
+            }
+        )
+
+        assert open_result.passed is False
+        assert open_result.blocked_layer == RiskLayer.L1_PRE_TRADE
+        assert open_result.results[0].details["position_sync_degraded"] is True
+        assert close_result.passed is True
+
 
 class TestAdjudicationResult:
     def test_to_dict(self):

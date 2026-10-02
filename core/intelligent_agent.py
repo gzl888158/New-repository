@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from typing import Dict, Any, Optional, List, Tuple, Set
 from dataclasses import dataclass, field, asdict
@@ -50,6 +51,50 @@ _MIN_PROFIT_FEE_MULTIPLIER = {
 }
 
 from core.strategy_audit import get_strategy_audit_logger
+
+
+# ── 类型安全工具层（企业级：NaN/Inf/非法输入统一防护，JSON 序列化安全） ──
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """None / NaN / Inf / 非法字符串 → default。"""
+    if value is None:
+        return default
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v or v in (float("inf"), float("-inf")):
+        return default
+    return v
+
+
+def _safe_finite(value: Any, default: float = 0.0) -> float:
+    """确保有限，NaN/Inf → default。"""
+    return _safe_float(value, default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """None / 非法值 → default；float 可降级截断，bool 保留原值。"""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+
+def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    """权重归一化 + NaN/Inf 清洗，确保总和=1、无 NaN，JSON 安全。"""
+    cleaned: Dict[str, float] = {}
+    for k, v in (weights or {}).items():
+        cleaned[k] = max(0.0, _safe_finite(v, 0.0))
+    total = sum(cleaned.values())
+    if total <= 0:
+        n = len(cleaned)
+        return {k: (1.0 / n if n > 0 else 0.0) for k in cleaned}
+    return {k: v / total for k, v in cleaned.items()}
 
 
 class MarketRegime(Enum):
@@ -145,6 +190,7 @@ class IntelligentTradingAgent:
         # 状态持久化路径
         data_dir = self._config.get("data_dir", "./data")
         self._state_path = Path(data_dir) / self.STATE_FILENAME
+        self._save_in_progress = False  # P2b: 防止 deferred save 并发堆积
 
         # 市场状态
         self._market_regimes: Dict[str, MarketRegime] = {}
@@ -164,6 +210,7 @@ class IntelligentTradingAgent:
 
         # 指标流水线（可选注入；用于把决策动作/拒绝率/学习质量/自愈动作外发到统一观测面）
         self._metrics_pipeline = None
+        self._learning_memory = None
 
         # 决策历史
         self._decision_history: deque = deque(maxlen=1000)
@@ -186,6 +233,9 @@ class IntelligentTradingAgent:
         # P2-12: 策略永久退出（不再自动恢复）
         self._strategy_exit: Dict[str, Dict] = {}  # {strategy_name: {reason, exited_at, cumulative_pnl, recovery_count}}
         self._strategy_recovery_count: Dict[str, int] = {}  # 自动恢复次数
+        # P2-12: 恢复观察期（grace 期），期间跳过永久退出判定，避免 reinstate 后立即再退出
+        self._reinstate_grace_until: Dict[str, datetime] = {}
+        self._reinstate_grace_hours = self._config.get("reinstate_grace_hours", 24)
         self._max_recovery_attempts = self._config.get("max_recovery_attempts", 3)  # 最多自动恢复3次
         self._exit_cumulative_pnl_threshold = self._config.get("exit_cumulative_pnl_threshold", -50)  # 累计亏损阈值
         self._exit_min_win_rate = self._config.get("exit_min_win_rate", 0.05)  # 退出胜率阈值
@@ -214,6 +264,7 @@ class IntelligentTradingAgent:
         # 报警状态
         self._active_alerts: Dict[str, Dict] = {}
         self._alert_cooldowns: Dict[str, float] = {}
+        self._alert_manager = None
 
         # P12: 决策统计
         self._decision_stats = DecisionStats()
@@ -356,6 +407,14 @@ class IntelligentTradingAgent:
         self._metrics_pipeline = pipeline
         logger.info("MetricsPipeline injected into IntelligentTradingAgent")
 
+    def set_learning_memory(self, memory) -> None:
+        """注入共享的跨 agent 决策与结果记忆。"""
+        self._learning_memory = memory
+
+    def set_alert_manager(self, alert_manager) -> None:
+        """注入 AlertManager，使 raise_alert 的 CRITICAL/WARNING 告警可实时推送至运营通道。"""
+        self._alert_manager = alert_manager
+
     def _record_metric(self, name: str, value: float, labels: Dict[str, str] = None) -> None:
         """安全埋点：将单个指标写入 MetricsPipeline，异常时仅 debug 日志不抛出。"""
         pipeline = self._metrics_pipeline
@@ -400,14 +459,26 @@ class IntelligentTradingAgent:
         regime_str = data.get("regime")
         if not regime_str or regime_str == "unknown":
             return None
-        trend_strength = float(data.get("trend_strength", 0.0))
+        trend_strength = _safe_float(data.get("trend_strength"), 0.0)
+        # ADX/DI 趋势明细（单边检测/背离/逆势确认的统一数据源，从 MarketRegimeEngine 取用）
+        detail = None
+        if hasattr(engine, "get_symbol_trend_detail"):
+            try:
+                detail = engine.get_symbol_trend_detail(symbol)
+            except Exception as e:
+                logger.debug(f"Trend detail unavailable for {symbol}: {e}")
+        detail = detail or {}
         return {
             "regime_str": regime_str,
             "local_regime": self._map_engine_regime_to_local(regime_str, trend_strength),
             "trend_strength": trend_strength,
-            "volatility": float(data.get("volatility", 0.0)),
-            "strength": float(data.get("strength", 0.0)),
-            "confidence": float(data.get("confidence", 0.0)),
+            "volatility": _safe_float(data.get("volatility"), 0.0),
+            "strength": _safe_float(data.get("strength"), 0.0),
+            "confidence": _safe_float(data.get("confidence"), 0.0),
+            "adx": _safe_float(detail.get("adx"), 0.0),
+            "adx_strength": _safe_float(detail.get("adx_strength"), 0.0),
+            "trend_direction": _safe_float(detail.get("direction"), 0.0),
+            "di_dir": _safe_float(detail.get("di_dir"), 0.0),
         }
 
     def get_market_regime(self, symbol: str) -> MarketRegime:
@@ -417,16 +488,42 @@ class IntelligentTradingAgent:
             return fused["local_regime"]
         return self._market_regimes.get(symbol, MarketRegime.UNKNOWN)
 
+    def get_symbol_volatility_amplitude(self, symbol: str) -> Optional[float]:
+        """返回币种真实 24h 振幅（(high24-low24)/last），不可靠时返回 None。
+
+        区别于 _get_volatility_for_symbol（返回波动率得分 -1~1，用于防抖动冷却），
+        本方法返回量纲为振幅百分比（0~0.5）的真实值，用于开仓前震荡磨损可行性校验。
+        币种未被监控或缓存缺失时融合数据会回退为波动率得分，故此处只信任合理振幅区间。
+        """
+        fused = self._get_fused_regime_data(symbol)
+        if fused is None:
+            return None
+        try:
+            vol = _safe_float(fused.get("volatility"), 0.0)
+            if 0.0 < vol <= 0.5:
+                return vol
+        except (TypeError, ValueError):
+            pass
+        return None
+
     # P32: 策略自动切换引擎
     def _select_active_strategies(self, symbol: str, atr: float = 0, adx: float = 0) -> Dict[str, float]:
-        """基于市场状态动态选择策略权重
+        """基于市场状态动态选择策略权重（fail-closed 包装）。
 
         优先使用 MarketRegimeEngine 的多因子融合结果（regime + trend_strength），
-        回退到旧版 ADX/ATR 近似。Returns: 策略名称 -> 权重
+        回退到旧版 ADX/ATR 近似。Returns: 策略名称 -> 权重（归一化，总和=1）。
+        内部异常时回退保守默认权重，绝不因裁决器故障放行激进敞口。
         """
+        try:
+            return self._select_active_strategies_impl(symbol, atr=atr, adx=adx)
+        except Exception as e:
+            logger.error(f"Strategy selection failed (fail-closed): {e}", exc_info=True)
+            return _normalize_weights(dict(self._strategy_weights))
+
+    def _select_active_strategies_impl(self, symbol: str, atr: float = 0, adx: float = 0) -> Dict[str, float]:
         now = datetime.now()
         if (now - self._last_strategy_switch).total_seconds() < self._strategy_switch_cooldown:
-            return self._strategy_weights  # 冷却期内不切换
+            return _normalize_weights(dict(self._strategy_weights))  # 冷却期内不切换
 
         # 默认权重
         weights = {"grid": 0.35, "trend": 0.30, "scalping": 0.20, "arbitrage": 0.15}
@@ -457,40 +554,41 @@ class IntelligentTradingAgent:
                 weights = {"grid": 0.40, "trend": 0.10, "scalping": 0.35, "arbitrage": 0.15}
                 logger.info(f"P32: Strategy switch -> GRID+SCALP for {symbol} (|trend|={abs_trend:.2f})")
 
-            self._strategy_weights = weights
+            self._strategy_weights = _normalize_weights(weights)
             self._strategy_active = active
             self._last_strategy_switch = now
-            return weights
+            return self._strategy_weights
 
         # 回退：旧版 ADX/ATR 近似（regime_engine 未注入或无数据时）
         snapshots = self._market_snapshots.get(symbol)
         if not snapshots or len(snapshots) < 5:
-            return weights
+            return _normalize_weights(weights)
 
         prices = [s.price for s in list(snapshots)[-20:] if s.price > 0]
         if len(prices) < 5:
-            return weights
+            return _normalize_weights(weights)
 
         # 计算ATR比例（如果没有传入ATR）
         if atr <= 0:
-            avg_price = sum(prices) / len(prices)
-            price_range = max(prices) - min(prices)
-            atr_ratio = price_range / avg_price if avg_price > 0 else 0
+            avg_price = _safe_finite(sum(prices) / len(prices), 0.0)
+            price_range = _safe_finite(max(prices) - min(prices), 0.0)
+            atr_ratio = _safe_finite(price_range / avg_price, 0.0) if avg_price > 0 else 0.0
         else:
-            avg_price = prices[-1]
-            atr_ratio = atr / avg_price if avg_price > 0 else 0
+            avg_price = _safe_finite(prices[-1], 0.0)
+            atr_ratio = _safe_finite(atr / avg_price, 0.0) if avg_price > 0 else 0.0
 
         # 使用ADX判断趋势（如果没有传入ADX，使用价格方向变化率）
         if adx <= 0:
             if len(prices) >= 10:
-                first_half = sum(prices[:len(prices)//2]) / (len(prices)//2)
-                second_half = sum(prices[len(prices)//2:]) / (len(prices) - len(prices)//2)
-                price_change = (second_half - first_half) / first_half if first_half > 0 else 0
-                adx_proxy = min(100, abs(price_change) * 500)  # 近似ADX
+                half = len(prices) // 2
+                first_half = _safe_finite(sum(prices[:half]) / half, 0.0)
+                second_half = _safe_finite(sum(prices[half:]) / (len(prices) - half), 0.0)
+                price_change = _safe_finite((second_half - first_half) / first_half, 0.0) if first_half > 0 else 0.0
+                adx_proxy = min(100.0, abs(price_change) * 500.0)  # 近似ADX
             else:
-                adx_proxy = 20
+                adx_proxy = 20.0
         else:
-            adx_proxy = adx
+            adx_proxy = _safe_finite(adx, 20.0)
 
         # 策略切换逻辑
         if adx_proxy > 25:
@@ -531,18 +629,18 @@ class IntelligentTradingAgent:
             # 过渡状态：保持当前权重
             pass
 
-        self._strategy_weights = weights
+        self._strategy_weights = _normalize_weights(weights)
         self._strategy_active = active
         self._last_strategy_switch = now
-        return weights
+        return self._strategy_weights
 
     def get_active_strategies(self) -> Dict[str, bool]:
         """获取当前活跃策略"""
         return dict(self._strategy_active)
 
     def get_strategy_weights(self) -> Dict[str, float]:
-        """获取当前策略权重"""
-        return dict(self._strategy_weights)
+        """获取当前策略权重（归一化，JSON 安全）。"""
+        return _normalize_weights(dict(self._strategy_weights))
 
     def refresh_strategy_weights(self, symbol: str, atr: float = 0, adx: float = 0) -> Dict[str, float]:
         """供调度器周期性调用，驱动策略切换引擎（优先融合真实多因子 regime）。"""
@@ -639,7 +737,7 @@ class IntelligentTradingAgent:
                 # 黑名单已过期，自动清除
                 del self._symbol_blacklist[key]
                 logger.info(f"P11-1: {key} blacklist expired, auto-cleared")
-                self._save_state()
+                self._deferred_save_state()
 
         # P11-2: 维度0.5 - 策略自动暂停检查
         if strategy_name in self._strategy_pause:
@@ -660,7 +758,7 @@ class IntelligentTradingAgent:
             elif pause_info["until"] <= datetime.now():
                 del self._strategy_pause[strategy_name]
                 logger.info(f"P11-2: {strategy_name} auto-pause expired, strategy resumed")
-                self._save_state()
+                self._deferred_save_state()
 
         # 维度1: 置信度检查（自适应阈值）
         adaptive_threshold = self._get_adaptive_confidence_threshold(strategy_name)
@@ -959,6 +1057,9 @@ class IntelligentTradingAgent:
         # 维度2.5：趋势方向一致性
         state["trend_alignment"] = self._resolve_trend_alignment(symbol, direction)
 
+        # 维度2.5b：趋势确认因子（ADX/单边检测/背离，统一口径）
+        state["trend_confirmation"] = self._pack_trend_confirmation(symbol)
+
         # 维度3：连续亏损
         perf = self._strategy_performance.get(strategy_name, {})
         state["consecutive_losses"] = perf.get("consecutive_losses", 0)
@@ -1031,6 +1132,41 @@ class IntelligentTradingAgent:
             or (regime_str == "trend_bullish" and direction == "short")
         )
         return {"opposing": opposing, "regime_str": regime_str, "strength": strength}
+
+    def _pack_trend_confirmation(self, symbol):
+        """趋势确认因子（ADX/单边检测/背离）——框架层过滤链统一口径数据源。
+
+        - one_sided：ADX 强且方向一致（单边行情），均值回归/区间类信号在此环境下失效。
+        - divergence：综合方向（EMA+斜率+结构+DI）与 DI 方向符号相反，市场结构不一致需谨慎。
+        """
+        fused = self._get_fused_regime_data(symbol)
+        if fused is None:
+            return {
+                "adx": 0.0, "adx_strength": 0.0,
+                "trend_direction": 0.0, "di_dir": 0.0,
+                "one_sided": False, "divergence": False,
+            }
+        adx = _safe_float(fused.get("adx"), 0.0)
+        adx_strength = _safe_float(fused.get("adx_strength"), 0.0)
+        trend_direction = _safe_float(fused.get("trend_direction"), 0.0)
+        di_dir = _safe_float(fused.get("di_dir"), 0.0)
+
+        # ADX 调制：震荡市 direction 发散（|direction|>=0.5 达 63%）会被低 adx_strength 压回 0，
+        # 用调制后的有效方向做单边/背离判定，避免方向发散放大 one_sided/divergence 误判。
+        effective_direction = trend_direction * adx_strength
+
+        one_sided = adx_strength >= 0.5 and abs(effective_direction) >= 0.25
+        # 背离：有效方向足够明确 且 与 DI 方向符号相反（adx_strength 非负，调制不改变符号方向）
+        divergence = (
+            abs(effective_direction) >= 0.15
+            and di_dir != 0.0
+            and (effective_direction * di_dir < 0.0)
+        )
+        return {
+            "adx": adx, "adx_strength": adx_strength,
+            "trend_direction": trend_direction, "di_dir": di_dir,
+            "one_sided": one_sided, "divergence": divergence,
+        }
 
     def _pack_wear_type(self, symbol, strategy_name, price, quantity):
         is_wear, reason = self._check_wear_type_trade(symbol, strategy_name, price, quantity)
@@ -1379,7 +1515,7 @@ class IntelligentTradingAgent:
         # 学习参数双向 clamp 到 [min_confidence_threshold, cap]，允许下调而非只升不降
         learned = self._learned_params.get(f"{strategy_name}_min_confidence_threshold")
         if learned is not None:
-            return min(max(float(learned), self.min_confidence_threshold), self._adaptive_conf_cap)
+            return min(max(_safe_float(learned, base_threshold), self.min_confidence_threshold), self._adaptive_conf_cap)
         return base_threshold
 
     # P11-3: 时段风险等级
@@ -1413,10 +1549,16 @@ class IntelligentTradingAgent:
         """获取当前品种的波动率（用于 AntiDebounceEngine 自适应冷却）。"""
         try:
             if self._regime_engine is not None:
-                regime = self._regime_engine.get_regime(symbol)
-                if regime and hasattr(regime, 'factor_scores') and regime.factor_scores:
-                    vol_score = regime.factor_scores.get('volatility', 0.0)
-                    return max(0.0, min(float(vol_score), 1.0))
+                regime = self._regime_engine.get_symbol_regime(symbol)
+                if isinstance(regime, dict):
+                    factor_scores = regime.get("factor_scores", {})
+                    if not isinstance(factor_scores, dict):
+                        factor_scores = {}
+                    vol_score = regime.get(
+                        "volatility_percentile",
+                        factor_scores.get("volatility", regime.get("volatility", 0.0)),
+                    )
+                    return max(0.0, min(_safe_float(vol_score, 0.0), 1.0))
         except Exception:
             pass
         return 0.0
@@ -1656,10 +1798,10 @@ class IntelligentTradingAgent:
         now = datetime.now()
         cutoff_7d = now - timedelta(days=7)
 
-        min_trades = int(self._config.get("whitelist_min_trades", 5))
-        min_win_rate = float(self._config.get("whitelist_min_win_rate", 0.40))
-        min_profit_factor = float(self._config.get("whitelist_min_profit_factor", 1.2))
-        max_consecutive_losses = int(self._config.get("whitelist_max_consecutive_losses", 5))
+        min_trades = _safe_int(self._config.get("whitelist_min_trades"), 5)
+        min_win_rate = _safe_float(self._config.get("whitelist_min_win_rate"), 0.40)
+        min_profit_factor = _safe_float(self._config.get("whitelist_min_profit_factor"), 1.2)
+        max_consecutive_losses = _safe_int(self._config.get("whitelist_max_consecutive_losses"), 5)
 
         # 按 symbol 聚合近 7 天交易统计
         symbol_stats: Dict[str, Dict] = {}
@@ -1673,7 +1815,7 @@ class IntelligentTradingAgent:
                 symbol = tr.get("symbol", "")
                 if not symbol:
                     continue
-                pnl = float(tr.get("pnl_usdt", 0) or 0)
+                pnl = _safe_float(tr.get("pnl_usdt"), 0.0)
                 win = bool(tr.get("win", False))
 
                 s = symbol_stats.setdefault(symbol, {
@@ -1724,7 +1866,7 @@ class IntelligentTradingAgent:
                         "count": s["count"],
                         "win_rate": win_rate,
                         "total_pnl": s["total_pnl"],
-                        "profit_factor": profit_factor,
+                        "profit_factor": None if profit_factor == float("inf") else profit_factor,
                     },
                     "seeded": False,
                 }
@@ -1839,6 +1981,10 @@ class IntelligentTradingAgent:
         if strategy_name in self._strategy_exit:
             exited_info = self._strategy_exit.pop(strategy_name)
             self._strategy_recovery_count.pop(strategy_name, None)
+            # P2-12: 恢复后进入观察期，期间跳过永久退出判定，让新交易有机会积累正向统计
+            self._reinstate_grace_until[strategy_name] = (
+                datetime.now() + timedelta(hours=self._reinstate_grace_hours)
+            )
             logger.warning(
                 f"P2-12: Strategy '{strategy_name}' MANUALLY REINSTATED "
                 f"(was exited since {exited_info['exited_at'].isoformat()}, "
@@ -1858,6 +2004,22 @@ class IntelligentTradingAgent:
     def is_strategy_exited(self, strategy_name: str) -> bool:
         """检查策略是否已被永久退出"""
         return strategy_name in self._strategy_exit
+
+    def is_in_reinstate_grace(self, strategy_name: str) -> bool:
+        """检查策略是否处于恢复观察期（grace 期），期间跳过永久退出判定。
+
+        reinstate 后旧 24h 窗口内仍残留亏损成交，若立即重新判定会再次触发永久退出；
+        观察期内跳过 exit 判定，让新交易积累正向统计后再恢复正常的退出监控。
+        """
+        until = self._reinstate_grace_until.get(strategy_name)
+        if until is None:
+            return False
+        if until > datetime.now():
+            return True
+        # 观察期已过，清理过期标记
+        self._reinstate_grace_until.pop(strategy_name, None)
+        return False
+
 
     def get_exited_strategies(self) -> Dict[str, Dict]:
         """获取已退出策略列表"""
@@ -2257,8 +2419,8 @@ class IntelligentTradingAgent:
                     "win_rate": win_rate,
                 })
 
-            # P2-12: 检查策略退出条件
-            if strategy not in self._strategy_exit:
+            # P2-12: 检查策略退出条件（恢复观察期内跳过判定，避免 reinstate 后立即再退出）
+            if strategy not in self._strategy_exit and not self.is_in_reinstate_grace(strategy):
                 cumulative_pnl = stats.get("total_pnl", 0.0)
                 trade_count = stats.get("count", 0)
                 gross_profit = stats.get("gross_profit", 0.0)
@@ -2460,6 +2622,32 @@ class IntelligentTradingAgent:
         }.get(severity, logger.warning)
 
         log_func(f"[AGENT-{severity.value.upper()}] {message}")
+
+        # 推送至 AlertManager（WARNING 及以上级别实时通知运营）
+        if self._alert_manager and severity in (
+            AlertSeverity.WARNING, AlertSeverity.CRITICAL, AlertSeverity.EMERGENCY
+        ):
+            try:
+                import asyncio
+                severity_map = {
+                    AlertSeverity.WARNING: "WARNING",
+                    AlertSeverity.CRITICAL: "CRITICAL",
+                    AlertSeverity.EMERGENCY: "CRITICAL",
+                }
+                loop = asyncio.get_running_loop()
+                # 提取 symbol 和 metadata，其余作为 metadata 传入
+                alert_details = details or {}
+                symbol = alert_details.pop("symbol", "")
+                loop.create_task(self._alert_manager.send_alert(
+                    alert_type=f"agent_{alert_id}",
+                    message=message,
+                    severity=severity_map.get(severity, "WARNING"),
+                    symbol=symbol,
+                    metadata=alert_details,
+                ))
+            except Exception:
+                pass
+
         return True
 
     def clear_alert(self, alert_id: str):
@@ -2627,6 +2815,12 @@ class IntelligentTradingAgent:
                     for name, info in self._strategy_exit.items()
                 },
                 "strategy_recovery_count": dict(self._strategy_recovery_count),
+                # P2-12: 恢复观察期（grace 期），仅持久化未过期项
+                "reinstate_grace_until": {
+                    name: until.isoformat()
+                    for name, until in self._reinstate_grace_until.items()
+                    if until > datetime.now()
+                },
             }
 
             # 确保目录存在
@@ -2646,6 +2840,27 @@ class IntelligentTradingAgent:
         except Exception as e:
             logger.error(f"P12: Failed to save agent state: {e}")
             return False
+
+    def _deferred_save_state(self) -> None:
+        """P2b: 非阻塞状态持久化 —— 在后台守护线程中执行 _save_state，避免阻塞调用方。
+
+        使用 _save_in_progress 标志防止多个 deferred save 并发堆积（文件原子写入本身是安全的，
+        但序列化大字典会浪费 CPU）。上一次 save 仍在运行时直接跳过，下次 audit_signal 触发时会重试。
+        """
+        if self._save_in_progress:
+            return
+        self._save_in_progress = True
+
+        def _bg_save():
+            try:
+                self._save_state()
+            except Exception as e:
+                logger.debug(f"Deferred save_state failed (non-critical): {e}")
+            finally:
+                self._save_in_progress = False
+
+        t = threading.Thread(target=_bg_save, daemon=True, name="agent-deferred-save")
+        t.start()
 
     def _load_state(self) -> bool:
         """从磁盘加载持久化状态"""
@@ -2778,6 +2993,15 @@ class IntelligentTradingAgent:
 
             # P2-12: 恢复自动恢复计数
             self._strategy_recovery_count = state.get("strategy_recovery_count", {})
+
+            # P2-12: 恢复观察期（grace 期），仅加载未过期项
+            for name, until_str in state.get("reinstate_grace_until", {}).items():
+                try:
+                    until = datetime.fromisoformat(until_str)
+                    if until > datetime.now():
+                        self._reinstate_grace_until[name] = until
+                except (ValueError, TypeError):
+                    pass
 
             logger.info(f"P12: State loaded: {len(self._symbol_blacklist)} blacklist, "
                         f"{len(self._strategy_pause)} paused, "
@@ -3045,6 +3269,29 @@ class IntelligentTradingAgent:
         self._decision_history.append(decision)
         if decision.action == "reject":
             self._rejected_decisions.append(decision)
+
+        if self._learning_memory is not None:
+            try:
+                regime = decision.details.get("regime", decision.details.get("regime_str", ""))
+                if not regime and self._regime_engine is not None:
+                    regime_data = self._regime_engine.get_symbol_regime(symbol)
+                    regime = regime_data.get("regime", "") if isinstance(regime_data, dict) else ""
+                self._learning_memory.record(
+                    agent="intelligent_agent",
+                    kind="signal_decision",
+                    trace_id=decision.decision_id,
+                    context={
+                        "symbol": symbol,
+                        "strategy": strategy_name,
+                        "regime": regime,
+                        "confidence": confidence,
+                    },
+                    decision=decision.action,
+                    outcome={"reason": decision.reason[:200], "source": decision.source},
+                    veto=decision.action == "reject",
+                )
+            except Exception as exc:
+                logger.debug(f"Shared decision memory write failed: {exc}")
 
         # 必要时持久化
         if stats.total_audits % 50 == 0:

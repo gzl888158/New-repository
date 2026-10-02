@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -12,6 +13,32 @@ from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from loguru import logger
 import numpy as np
+
+
+def _finite_values(values) -> List[float]:
+    """过滤出有限的浮点数值，丢弃 None、NaN、Inf 及不可转换项。"""
+    out: List[float] = []
+    for v in values:
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            out.append(f)
+    return out
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """将值安全转换为有限浮点数，失败或非有限时返回默认值。"""
+    if value is None:
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
 
 
 @dataclass
@@ -159,8 +186,9 @@ class ABTestingFramework:
             engine = BacktestEngine(self.config)
 
             # 从 variant.params 读取均线参数，传给回测引擎
-            fast_period = int(variant.params.get("fast_period", 5))
-            slow_period = int(variant.params.get("slow_period", 20))
+            params = variant.params or {}
+            fast_period = int(params.get("fast_period", 5))
+            slow_period = int(params.get("slow_period", 20))
 
             # 调用回测引擎（engine 内部会拉取数据，不传 klines）
             bt_result = engine.run(
@@ -203,12 +231,19 @@ class ABTestingFramework:
                 win_rate=0, profit_factor=0, avg_win=0, avg_loss=0, max_win=0, max_loss=0
             )
 
-        pnls = [t.get("pnl", 0) for t in trades]
+        pnls = _finite_values([t.get("pnl") if isinstance(t, dict) else None for t in trades])
+        if not pnls:
+            return TestResult(
+                variant_name=variant_name, total_trades=0, winning_trades=0,
+                losing_trades=0, total_pnl=0, max_drawdown=0, sharpe_ratio=0,
+                win_rate=0, profit_factor=0, avg_win=0, avg_loss=0, max_win=0, max_loss=0
+            )
+
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p < 0]
 
         total_pnl = sum(pnls)
-        total_trades = len(trades)
+        total_trades = len(pnls)
         winning_trades = len(wins)
         losing_trades = len(losses)
         win_rate = winning_trades / total_trades if total_trades > 0 else 0
@@ -218,7 +253,8 @@ class ABTestingFramework:
         max_win = max(wins) if wins else 0
         max_loss = abs(min(losses)) if losses else 0
 
-        profit_factor = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else float('inf')
+        # 无亏损时不使用 999.0 哨兵，统一返回 0.0（fail-closed，避免夸大无亏损策略）
+        profit_factor = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else 0.0
 
         # 最大回撤
         equity_curve = [0]
@@ -251,7 +287,7 @@ class ABTestingFramework:
             max_drawdown=round(max_dd, 4),
             sharpe_ratio=round(sharpe_annualized, 3),
             win_rate=round(win_rate, 4),
-            profit_factor=round(profit_factor, 3) if profit_factor != float('inf') else 999.0,
+            profit_factor=round(profit_factor, 3),
             avg_win=round(avg_win, 4),
             avg_loss=round(avg_loss, 4),
             max_win=round(max_win, 4),
@@ -262,8 +298,17 @@ class ABTestingFramework:
     def _simple_backtest(self, variant: TestVariant, klines: List[List]) -> TestResult:
         """简化回退：基于K线生成模拟交易（当backtest_engine不可用时）"""
         variant_name = variant.name
-        fast_period = int(variant.params.get("fast_period", 5))
-        slow_period = int(variant.params.get("slow_period", 20))
+        params = variant.params or {}
+        try:
+            fast_period = int(params.get("fast_period", 5))
+            slow_period = int(params.get("slow_period", 20))
+        except (TypeError, ValueError):
+            fast_period = 5
+            slow_period = 20
+        fast_period = max(1, fast_period)
+        slow_period = max(2, slow_period)
+        if fast_period >= slow_period:
+            slow_period = fast_period + 1
 
         min_len = slow_period + 1
         if len(klines) < min_len:
@@ -274,7 +319,16 @@ class ABTestingFramework:
             )
 
         # 用简单的均线交叉策略生成模拟交易
-        closes = [float(k[4]) for k in klines if len(k) >= 5]
+        closes: List[float] = []
+        for k in klines:
+            if not isinstance(k, (list, tuple)) or len(k) < 5:
+                continue
+            try:
+                c = float(k[4])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(c):
+                closes.append(c)
         if len(closes) < min_len:
             return TestResult(
                 variant_name=variant_name, total_trades=0, winning_trades=0,
@@ -308,6 +362,8 @@ class ABTestingFramework:
         Returns:
             t_statistic, p_value, degrees_of_freedom
         """
+        a = _finite_values(a)
+        b = _finite_values(b)
         if len(a) < 2 or len(b) < 2:
             return {"t_statistic": 0.0, "p_value": 1.0, "df": 0.0}
 
@@ -334,8 +390,10 @@ class ABTestingFramework:
 
     def _two_tailed_p_value(self, t_stat: float, df: float) -> float:
         """计算双尾p值（使用近似公式，避免scipy依赖）"""
-        if df <= 0:
+        if df <= 0 or not math.isfinite(df):
             return 1.0
+        if not math.isfinite(t_stat):
+            return 0.0 if math.isinf(t_stat) else 1.0
         t_abs = abs(t_stat)
         x = df / (df + t_abs ** 2)
 
@@ -373,6 +431,8 @@ class ABTestingFramework:
         Returns:
             {"lower": ..., "upper": ..., "mean_diff": ...}
         """
+        a = _finite_values(a)
+        b = _finite_values(b)
         if len(a) < 2 or len(b) < 2:
             return {"lower": 0.0, "upper": 0.0, "mean_diff": 0.0}
 
@@ -387,7 +447,15 @@ class ABTestingFramework:
         for _ in range(n_bootstrap):
             sample_a = np.random.choice(a_arr, size=len(a_arr), replace=True)
             sample_b = np.random.choice(b_arr, size=len(b_arr), replace=True)
-            boot_diffs.append(float(stat_func(sample_a, sample_b)))
+            try:
+                val = float(stat_func(sample_a, sample_b))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if math.isfinite(val):
+                boot_diffs.append(val)
+
+        if not boot_diffs:
+            return {"lower": 0.0, "upper": 0.0, "mean_diff": 0.0}
 
         boot_diffs.sort()
         alpha = 1 - ci_level
@@ -416,7 +484,7 @@ class ABTestingFramework:
         """
         significance_results = []
 
-        valid_results = [r for r in results if r.total_trades >= 5 and len(r.trade_pnls) >= 5]
+        valid_results = [r for r in results if r.total_trades >= 5 and len(_finite_values(r.trade_pnls)) >= 5]
         if len(valid_results) < 2:
             return significance_results
 
@@ -425,8 +493,8 @@ class ABTestingFramework:
                 a = valid_results[i]
                 b = valid_results[j]
 
-                pnls_a = a.trade_pnls
-                pnls_b = b.trade_pnls
+                pnls_a = _finite_values(a.trade_pnls)
+                pnls_b = _finite_values(b.trade_pnls)
 
                 t_result = self.welch_t_test(pnls_a, pnls_b)
                 boot_result = self.bootstrap_confidence_interval(pnls_a, pnls_b)
@@ -478,13 +546,18 @@ class ABTestingFramework:
 
         def score(r: TestResult) -> float:
             # 综合评分：盈利能力 + 风险调整收益 + 胜率 + 交易次数（太少不靠谱）
-            if r.total_trades < 3:
+            total_trades = int(_safe_float(r.total_trades))
+            if total_trades < 3:
                 return -999
+            total_pnl = _safe_float(r.total_pnl)
+            sharpe = _safe_float(r.sharpe_ratio)
+            profit_factor = _safe_float(r.profit_factor)
+            win_rate = _safe_float(r.win_rate)
             return (
-                r.total_pnl * 0.4
-                + r.sharpe_ratio * 5
-                + (r.profit_factor if r.profit_factor < 10 else 10) * 10
-                + r.win_rate * 50
+                total_pnl * 0.4
+                + sharpe * 5
+                + (profit_factor if profit_factor < 10 else 10) * 10
+                + win_rate * 50
             )
 
         winner = max(results, key=score)
@@ -505,9 +578,12 @@ class ABTestingFramework:
         if significance:
             sig_count = sum(1 for s in significance if s.get("is_significant"))
             sig_part = f" | {sig_count}/{len(significance)} pairs statistically significant"
+        total_pnl = _safe_float(winner.get("total_pnl"))
+        sharpe = _safe_float(winner.get("sharpe_ratio"))
+        win_rate = _safe_float(winner.get("win_rate"))
         return (f"Tested {len(results)} variants. Winner: {winner['variant_name']} "
-                f"(score={winner['score']}, pnl={winner['total_pnl']:.2f}, "
-                f"sharpe={winner['sharpe_ratio']}, win_rate={winner['win_rate']:.2%}){sig_part}")
+                f"(score={winner.get('score')}, pnl={total_pnl:.2f}, "
+                f"sharpe={sharpe}, win_rate={win_rate:.2%}){sig_part}")
 
     def _result_to_dict(self, r: TestResult) -> Dict[str, Any]:
         return {
@@ -526,8 +602,8 @@ class ABTestingFramework:
             "max_loss": r.max_loss,
         }
 
-    def _persist_report(self, symbol: str, report: Dict[str, Any]):
-        """持久化测试报告"""
+    def _persist_report(self, symbol: str, report: Dict[str, Any]) -> bool:
+        """持久化测试报告（fail-closed：成功返回 True，失败返回 False）"""
         try:
             safe_symbol = symbol.replace("/", "_").replace("-", "_")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -535,8 +611,10 @@ class ABTestingFramework:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
             logger.info(f"A/B test report saved: {filepath}")
+            return True
         except Exception as e:
             logger.error(f"Failed to persist A/B test report: {e}")
+            return False
 
     def list_reports(self) -> List[Dict[str, Any]]:
         """列出所有历史测试报告"""
@@ -550,16 +628,20 @@ class ABTestingFramework:
                     try:
                         with open(fpath, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                        reports.append({
-                            "filename": fname,
-                            "timestamp": datetime.fromtimestamp(mtime).isoformat(),
-                            "symbol": data.get("symbol", ""),
-                            "days": data.get("days", 0),
-                            "winner": data.get("winner", {}).get("variant_name", "") if data.get("winner") else "",
-                            "variants_count": len(data.get("variants", [])),
-                        })
                     except Exception:
                         continue
+                    try:
+                        ts = datetime.fromtimestamp(mtime).isoformat()
+                    except (OSError, OverflowError, ValueError, TypeError):
+                        ts = ""
+                    reports.append({
+                        "filename": fname,
+                        "timestamp": ts,
+                        "symbol": data.get("symbol", ""),
+                        "days": data.get("days", 0),
+                        "winner": data.get("winner", {}).get("variant_name", "") if data.get("winner") else "",
+                        "variants_count": len(data.get("variants", [])),
+                    })
         except Exception as e:
             logger.error(f"Error listing reports: {e}")
         return reports

@@ -1,4 +1,5 @@
 """负责策略级风控：加仓层数、回撤与每日交易次数限制。"""
+import math
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from loguru import logger
@@ -30,6 +31,17 @@ class StrategyRiskControl:
 
     def set_global_risk(self, global_risk):
         self._global_risk = global_risk
+
+    @staticmethod
+    def _finite(value) -> Optional[float]:
+        """安全转换数值：None/非法/NaN/Inf 返回 None，用于 fail-closed 校验。"""
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
 
     def check_addition_limit(self, strategy_name: str, symbol: str, current_additions: int) -> bool:
         if strategy_name == "grid":
@@ -118,10 +130,14 @@ class StrategyRiskControl:
         
         slippage_tolerance = base_slippage * 2 if is_stop_loss else base_slippage
         
-        if expected_price == 0:
-            return True
+        exp = self._finite(expected_price)
+        act = self._finite(actual_price)
+        # fail-closed：无法确认预期/实际价格时拒绝，避免滑点检查被静默跳过
+        if exp is None or act is None or exp <= 0:
+            logger.warning(f"Slippage check unavailable (expected={expected_price!r}, actual={actual_price!r}), rejecting (fail-closed)")
+            return False
         
-        slippage = abs(actual_price - expected_price) / expected_price
+        slippage = abs(act - exp) / exp
         
         if slippage > slippage_tolerance:
             logger.warning(f"Slippage {slippage:.4%} exceeds tolerance {slippage_tolerance:.4%} for {symbol}")
@@ -159,9 +175,14 @@ class StrategyRiskControl:
             return True
         
         strategy_name = signal_data.get("strategy_name", "grid")
-        quantity = signal_data["quantity"]
-        price = signal_data["price"]
-        leverage = signal_data["leverage"]
+        quantity = self._finite(signal_data.get("quantity"))
+        price = self._finite(signal_data.get("price"))
+        leverage = self._finite(signal_data.get("leverage"))
+        
+        # fail-closed：数量/价格/杠杆非法或杠杆<=0时拒绝，避免保证金计算被静默跳过
+        if quantity is None or price is None or leverage is None or leverage <= 0:
+            logger.warning(f"Invalid margin fields for {signal_data.get('symbol')} (qty={quantity}, price={price}, lev={leverage}), rejecting (fail-closed)")
+            return False
         
         margin_required = quantity * price / leverage
         
@@ -179,12 +200,24 @@ class StrategyRiskControl:
         position_limit = tier_settings["position_limit"]
         
         trading_capital = self.config["trading"]["total_capital"] * self.config["trading"]["trading_capital_ratio"]
-        max_position_value = trading_capital * position_limit
+        max_margin = trading_capital * position_limit
         
-        position_value = signal_data["quantity"] * signal_data["price"]
+        quantity = self._finite(signal_data.get("quantity"))
+        price = self._finite(signal_data.get("price"))
+        # fail-closed：数量/价格非法时拒绝，避免仓位限额检查被静默跳过
+        if quantity is None or price is None:
+            logger.warning(f"Invalid position fields for {signal_data.get('symbol')}, rejecting (fail-closed)")
+            return False
         
-        if position_value > max_position_value:
-            logger.warning(f"Position {position_value:.2f} exceeds limit {max_position_value:.2f} for {signal_data['symbol']}")
+        # position_limit 是保证金占交易资金的比例上限（与策略仓位计算 base_position = trading_capital * position_limit 对齐）
+        # 策略生成 quantity = base_position * leverage / price，因此 margin = quantity * price / leverage
+        leverage = self._finite(signal_data.get("leverage"), 1.0)
+        if leverage <= 0:
+            leverage = 1.0
+        margin = quantity * price / leverage
+        
+        if margin > max_margin:
+            logger.warning(f"Position margin {margin:.2f} exceeds limit {max_margin:.2f} for {signal_data['symbol']}")
             return False
         
         return True
@@ -200,7 +233,11 @@ class StrategyRiskControl:
         leverage_max = tier_settings["leverage_max"]
         leverage_min = tier_settings["leverage_min"]
         
-        leverage = signal_data["leverage"]
+        leverage = self._finite(signal_data.get("leverage"))
+        # fail-closed：杠杆非法时拒绝，避免杠杆限额检查被静默跳过
+        if leverage is None:
+            logger.warning(f"Invalid leverage for {signal_data.get('symbol')}, rejecting (fail-closed)")
+            return False
         
         if leverage > leverage_max or leverage < leverage_min:
             logger.warning(f"Leverage {leverage} outside allowed range [{leverage_min}, {leverage_max}] for {signal_data['symbol']}")
@@ -209,9 +246,16 @@ class StrategyRiskControl:
         return True
 
     def check_confidence_threshold(self, signal_data: Dict[str, Any]) -> bool:
-        confidence = signal_data.get("confidence", 0.0)
+        confidence = self._finite(signal_data.get("confidence", 0.0))
+        # fail-closed：置信度非法时拒绝，避免置信度阈值检查被静默跳过
+        if confidence is None:
+            logger.warning(f"Invalid confidence for {signal_data.get('symbol')}, rejecting (fail-closed)")
+            return False
         # 阈值改为可配置（之前硬编码0.3导致低置信度信号被全量拒绝，与 adaptive_controller 的阈值放宽机制冲突）
-        threshold = float(self.config.get("trading", {}).get("min_signal_confidence", 0.15))
+        try:
+            threshold = float(self.config.get("trading", {}).get("min_signal_confidence", 0.15))
+        except (TypeError, ValueError):
+            threshold = 0.15
 
         if confidence < threshold:
             logger.warning(f"Signal confidence {confidence:.2f} below threshold {threshold}")
@@ -234,6 +278,12 @@ class StrategyRiskControl:
         return True
 
     def update_trade_result(self, strategy_name: str, symbol: str, pnl: float):
+        pnl = self._finite(pnl)
+        # fail-closed：PnL 非法时不更新统计，避免污染连续亏损/复利因子
+        if pnl is None:
+            logger.warning(f"Invalid PnL for {strategy_name} {symbol}, skipping stats update")
+            return
+        
         key = f"{strategy_name}:{symbol}"
         if pnl >= 0:
             self._consecutive_losses[key] = 0
@@ -298,6 +348,12 @@ class StrategyRiskControl:
         return max(0.05, min(0.30, kelly))
     
     def calculate_position_size(self, strategy_name: str, symbol: str, price: float, leverage: int) -> float:
+        p = self._finite(price)
+        # fail-closed：价格非法/<=0时返回0，避免除零/负仓位
+        if p is None or p <= 0:
+            logger.warning(f"calculate_position_size: invalid price {price!r}, returning 0")
+            return 0.0
+        
         tier = get_currency_tier(symbol, self.config)
         tier_settings = self.config["currencies"][f"{tier}_settings"]
         
@@ -308,10 +364,10 @@ class StrategyRiskControl:
         position_limit = tier_settings["position_limit"]
         
         base_position = trading_capital * min(allocation, position_limit) * kelly_fraction * self._compound_factor
-        quantity = base_position / price
+        quantity = base_position / p
         
         min_quantity = 0.0001
-        max_quantity = (trading_capital * min(allocation, position_limit)) / price
+        max_quantity = (trading_capital * min(allocation, position_limit)) / p
         
         return max(min_quantity, min(max_quantity, quantity))
     

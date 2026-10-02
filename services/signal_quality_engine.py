@@ -104,19 +104,90 @@ class SignalQualityEngine:
         """注入AccountManager"""
         self._account_manager = manager
 
+    def _resolve_strategy_weights(self, strategy_name: str) -> Dict[str, float]:
+        """按策略类型调整权重，使质量评分不再纯通用，而是绑定到策略语义。"""
+        strategy = (strategy_name or "").lower()
+        base = dict(self._factor_weights)
+
+        profiles = {
+            "trend": {
+                "trend_alignment": 1.5,
+                "regime_compatibility": 1.4,
+                "divergence_detection": 1.3,
+                "market_structure": 1.2,
+                "rsi_condition": 1.1,
+            },
+            "arbitrage": {
+                "market_structure": 1.4,
+                "timing_quality": 1.3,
+                "liquidity_risk": 1.3,
+                "volume_confirmation": 1.2,
+                "order_book_depth": 1.2,
+            },
+            "grid": {
+                "rsi_condition": 1.5,
+                "bollinger_band": 1.5,
+                "volatility_adaptation": 1.4,
+                "liquidity_risk": 1.2,
+                "atr_quality": 1.2,
+            },
+            "scalping": {
+                "timing_quality": 1.5,
+                "volatility_adaptation": 1.4,
+                "liquidity_risk": 1.3,
+                "order_book_depth": 1.3,
+                "rsi_condition": 1.1,
+            },
+            "spot_grid": {
+                "rsi_condition": 1.5,
+                "bollinger_band": 1.4,
+                "volatility_adaptation": 1.4,
+                "liquidity_risk": 1.2,
+                "confidence_consistency": 1.1,
+            },
+            "spot_martingale": {
+                "account_health": 1.5,
+                "liquidity_risk": 1.4,
+                "timing_quality": 1.3,
+                "funding_impact": 1.2,
+                "correlation_risk": 1.2,
+            },
+            "breakout": {
+                "trend_alignment": 1.6,
+                "market_structure": 1.6,
+                "volume_confirmation": 1.5,
+                "timing_quality": 1.3,
+                "regime_compatibility": 1.2,
+            },
+            "reversal": {
+                "divergence_detection": 1.7,
+                "rsi_condition": 1.5,
+                "macd_alignment": 1.4,
+                "bollinger_band": 1.3,
+                "market_structure": 1.2,
+            },
+        }
+        selected = profiles.get(strategy, {})
+        adjusted = {}
+        for factor, weight in base.items():
+            multiplier = selected.get(factor, 1.0)
+            adjusted[factor] = max(0.01, weight * multiplier)
+        return adjusted
+
     def evaluate_signal(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         """评估信号质量，返回评分和解释"""
         try:
             factor_scores = self._calculate_factor_scores(signal_data)
-            
+            strategy_weights = self._resolve_strategy_weights(signal_data.get("strategy_name", ""))
+
             self._update_adaptive_weights(factor_scores, signal_data)
-            
-            overall_score = self._compute_overall_score(factor_scores)
-            
+
+            overall_score = self._compute_overall_score(factor_scores, strategy_weights)
+
             quality = self._map_score_to_quality(overall_score)
-            
+
             explanation = self._generate_explanation(signal_data, factor_scores, overall_score)
-            
+
             breakdown = {
                 "overall_score": overall_score,
                 "quality": quality.value,
@@ -127,14 +198,12 @@ class SignalQualityEngine:
                 "strategy": signal_data.get("strategy_name", ""),
                 "symbol": signal_data.get("symbol", ""),
                 "side": signal_data.get("side", ""),
-                "factor_weights": dict(self._factor_weights),
+                "factor_weights": strategy_weights,
+                "strategy_profile": (signal_data.get("strategy_name", "") or "").lower(),
             }
-            
-            # P0: 追踪最后一条信号的原始置信度，供 _record_score 使用
+
             self._last_signal_confidence = signal_data.get("confidence", 0.5)
-            
             self._record_score(breakdown)
-            
             return breakdown
         except Exception as e:
             logger.error(f"Signal quality evaluation failed: {e}, returning default FAIR rating")
@@ -179,24 +248,39 @@ class SignalQualityEngine:
 
     def _score_trend_alignment(self, signal_data: Dict[str, Any]) -> float:
         """趋势对齐得分：信号方向与大趋势的一致性"""
-        signal_side = signal_data.get("side", "").lower()
+        signal_side = str(signal_data.get("direction") or signal_data.get("side", "")).lower()
         timeframe = signal_data.get("timeframe", "1H")
         
         if not self._regime_engine:
             return 0.5
         
         regime = self._regime_engine.get_regime()
+        regime_name = str(regime.get("regime", "unknown")).lower()
+        strength = max(0.0, min(1.0, float(regime.get("strength", 0.0) or 0.0)))
+        bullish_side = signal_side in ("buy", "long")
+        bearish_side = signal_side in ("sell", "short")
+
+        if regime_name == "breakout":
+            return min(1.0, 0.7 + strength * 0.3) if bullish_side else (
+                max(0.1, 0.3 - strength * 0.2) if bearish_side else 0.5
+            )
+        if regime_name == "breakdown":
+            return min(1.0, 0.7 + strength * 0.3) if bearish_side else (
+                max(0.1, 0.3 - strength * 0.2) if bullish_side else 0.5
+            )
+        if regime_name == "reversal":
+            return 0.35
         
-        if regime["regime"] == "trend_bullish":
-            if signal_side == "buy" or signal_side == "long":
-                return min(1.0, 0.7 + regime["strength"] * 0.3)
+        if regime_name == "trend_bullish":
+            if bullish_side:
+                return min(1.0, 0.7 + strength * 0.3)
             else:
-                return max(0.1, 0.3 - regime["strength"] * 0.2)
-        elif regime["regime"] == "trend_bearish":
-            if signal_side == "sell" or signal_side == "short":
-                return min(1.0, 0.7 + regime["strength"] * 0.3)
+                return max(0.1, 0.3 - strength * 0.2)
+        elif regime_name == "trend_bearish":
+            if bearish_side:
+                return min(1.0, 0.7 + strength * 0.3)
             else:
-                return max(0.1, 0.3 - regime["strength"] * 0.2)
+                return max(0.1, 0.3 - strength * 0.2)
         else:
             return 0.5
 
@@ -351,15 +435,20 @@ class SignalQualityEngine:
         else:
             return 0.6
 
-    def _compute_overall_score(self, factor_scores: Dict[str, float]) -> float:
-        """计算综合得分"""
-        total_weight = sum(self._factor_weights.values())
+    def _compute_overall_score(
+        self,
+        factor_scores: Dict[str, float],
+        strategy_weights: Optional[Dict[str, float]] = None,
+    ) -> float:
+        """计算综合得分。默认使用通用权重；若指定 strategy_weights，则按策略类型裁剪。"""
+        weights = strategy_weights or self._factor_weights
+        total_weight = sum(weights.values())
         overall = 0.0
-        
+
         for factor, score in factor_scores.items():
-            weight = self._factor_weights.get(factor, 0)
-            overall += score * weight / total_weight
-        
+            weight = weights.get(factor, 0.0)
+            overall += score * weight / total_weight if total_weight > 0 else 0.0
+
         return round(overall, 4)
 
     def _map_score_to_quality(self, score: float) -> SignalQuality:

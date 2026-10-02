@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +23,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
+
+from core.direction_unifier import DirectionUnifier
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """将任意输入安全转换为有限浮点数；None/NaN/Inf/非法值回退 default。"""
+    try:
+        if value is None:
+            return default
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -164,6 +180,10 @@ class RebalanceBand:
         Returns:
             (breached, effective_threshold, band_type_used)
         """
+        current_weight = _safe_float(current_weight, 0.0)
+        target_weight = _safe_float(target_weight, 0.0)
+        market_volatility = _safe_float(market_volatility, 0.02)
+
         effective = self._effective_threshold(strategy_name, target_weight, market_volatility)
         drift = abs(current_weight - target_weight)
 
@@ -314,8 +334,8 @@ class RebalanceTriggerDetector:
         breached_drifts: List[DriftStatus] = []
 
         for name in all_strategies:
-            cur = current_weights.get(name, 0.0)
-            tgt = target_weights.get(name, 0.0)
+            cur = _safe_float(current_weights.get(name, 0.0), 0.0)
+            tgt = _safe_float(target_weights.get(name, 0.0), 0.0)
             drift_val = cur - tgt
             drift_rel = (drift_val / tgt) if abs(tgt) > 1e-10 else 0.0
 
@@ -388,8 +408,8 @@ class RebalanceTriggerDetector:
         target_weight: float,
     ) -> int:
         """计算策略再平衡优先级 1~4。"""
-        magnitude = abs(drift_val)
-        importance = self._importance_map.get(name, 1.0)
+        magnitude = abs(_safe_float(drift_val, 0.0))
+        importance = _safe_float(self._importance_map.get(name, 1.0), 1.0)
 
         score = magnitude * importance
 
@@ -445,7 +465,8 @@ class RebalanceTriggerDetector:
         """过滤低于最小交易规模的交易。"""
         filtered = []
         for t in trades:
-            amount = abs(t.get("amount_usdt", t.get("amount", 0.0)))
+            amount = _safe_float(t.get("amount_usdt", t.get("amount", 0.0)), 0.0)
+            amount = abs(amount)
             if amount >= self._min_trade_size_usdt:
                 filtered.append(t)
             else:
@@ -502,6 +523,19 @@ class TradeListGenerator:
             }
         """
         prices = prices or {}
+        total_equity = _safe_float(total_equity, 0.0)
+        if total_equity <= 0:
+            logger.warning("TradeListGenerator: total_equity <= 0, cannot generate rebalance plan")
+            return {
+                "trades": [],
+                "net_trades": [],
+                "batches": [],
+                "estimated_cost": 0.0,
+                "estimated_benefit": 0.0,
+                "cost_benefit_ratio": 0.0,
+                "should_execute": False,
+                "rejected_trades": [],
+            }
         raw_trades = self._generate_raw_trades(current_weights, target_weights, total_equity, prices)
         net_trades = self._net_off_trades(raw_trades)
         rounded_trades = self._round_to_lot_sizes(net_trades)
@@ -540,14 +574,14 @@ class TradeListGenerator:
         trades = []
         # 策略名到资产的映射：简单起见，策略名即资产名；可从 prices keys 推断
         for name in sorted(all_strategies):
-            cur = current_weights.get(name, 0.0)
-            tgt = target_weights.get(name, 0.0)
+            cur = _safe_float(current_weights.get(name, 0.0), 0.0)
+            tgt = _safe_float(target_weights.get(name, 0.0), 0.0)
             drift = cur - tgt
             if abs(drift) < 1e-8:
                 continue
             amount_usdt = abs(drift) * total_equity
             side = "sell" if drift > 0 else "buy"
-            price = prices.get(name, 1.0)
+            price = _safe_float(prices.get(name), 1.0)
             quantity = amount_usdt / price if price > 0 else 0.0
 
             trades.append({
@@ -560,6 +594,7 @@ class TradeListGenerator:
                 "target_weight": tgt,
                 "drift": drift,
                 "asset": name,
+                "reduce_only": side == "sell",
             })
         return trades
 
@@ -611,6 +646,7 @@ class TradeListGenerator:
                 "strategies_buy": g["strategies_buy"],
                 "strategies_sell": g["strategies_sell"],
                 "net_amount": net_amount,
+                "reduce_only": side == "sell",
             })
         return net_trades
 
@@ -680,7 +716,10 @@ class TradeListGenerator:
         benefit_total = error_reduction * total_equity * 0.01  # 1% per unit error reduction
         per_trade = {}
         for t in trades:
-            share = abs(t.get("drift", t.get("net_amount", 0.0) / max(total_equity, 1)))
+            drift_val = t.get("drift")
+            if drift_val is None:
+                drift_val = t.get("net_amount", 0.0) / total_equity if total_equity > 0 else 0.0
+            share = abs(_safe_float(drift_val, 0.0))
             per_trade[t["asset"]] = benefit_total * share / max(len(trades), 1)
             t["estimated_benefit"] = per_trade[t["asset"]]
 
@@ -698,7 +737,10 @@ class TradeListGenerator:
         keys = set(list(current.keys()) + list(target.keys()))
         if not keys:
             return 0.0
-        total = sum(abs(current.get(k, 0.0) - target.get(k, 0.0)) for k in keys)
+        total = sum(
+            abs(_safe_float(current.get(k, 0.0), 0.0) - _safe_float(target.get(k, 0.0), 0.0))
+            for k in keys
+        )
         return total / len(keys)
 
     def _cost_benefit_filter(
@@ -908,8 +950,11 @@ class ExecutionScheduler:
                 exec_result = self._executor(trade)
                 if asyncio.iscoroutine(exec_result):
                     exec_result = await exec_result
-                result["filled_amount"] = exec_result.get("filled", 0.0)
-                result["status"] = "filled" if result["filled_amount"] > 0 else "failed"
+                if not isinstance(exec_result, dict):
+                    exec_result = {}
+                filled = _safe_float(exec_result.get("filled", 0.0), 0.0)
+                result["filled_amount"] = filled
+                result["status"] = "filled" if filled > 0 else "failed"
                 result["execution_details"] = exec_result
             except Exception as e:
                 logger.error(f"Execute {asset} {side} failed: {e}")
@@ -919,6 +964,7 @@ class ExecutionScheduler:
             # 模拟执行
             fill_ratio = np.random.normal(0.98, 0.02)
             fill_ratio = min(1.0, max(0.0, fill_ratio))
+            amount = _safe_float(amount, 0.0)
             result["filled_amount"] = amount * fill_ratio
             result["status"] = "filled" if fill_ratio > 0.5 else "partial"
 
@@ -970,6 +1016,10 @@ class RebalanceHistory:
 
     async def record(self, event: RebalanceEvent) -> None:
         async with self._lock:
+            # 幂等去重：同一 event_id 不重复记录
+            if any(e.event_id == event.event_id for e in self._events):
+                logger.debug(f"Rebalance event {event.event_id} already recorded, skip")
+                return
             self._events.append(event)
             if len(self._events) > self._max_size:
                 self._events = self._events[-self._max_size:]
@@ -1104,6 +1154,7 @@ class RebalanceAuditLogger:
         async with self._lock:
             self._entry_counter += 1
             entry_id = f"audit_{self._entry_counter:06d}"
+            ts = time.time()
 
             prev_hash = ""
             if self._entries:
@@ -1112,7 +1163,7 @@ class RebalanceAuditLogger:
             # 构建内容哈希
             content_str = json.dumps({
                 "entry_id": entry_id,
-                "timestamp": time.time(),
+                "timestamp": ts,
                 "trigger": trigger,
                 "pre_weights": pre_weights,
                 "post_weights": post_weights,
@@ -1127,7 +1178,7 @@ class RebalanceAuditLogger:
 
             entry = AuditEntry(
                 entry_id=entry_id,
-                timestamp=time.time(),
+                timestamp=ts,
                 trigger=trigger,
                 pre_weights=pre_weights,
                 post_weights=post_weights,
@@ -1190,10 +1241,16 @@ class RebalanceAuditLogger:
         async with self._lock:
             data = []
             for e in self._entries:
+                dt_str = None
+                ts = _safe_float(e.timestamp, 0.0)
+                try:
+                    dt_str = datetime.fromtimestamp(ts).isoformat()
+                except (OSError, ValueError, OverflowError):
+                    dt_str = None
                 data.append({
                     "entry_id": e.entry_id,
-                    "timestamp": e.timestamp,
-                    "datetime": datetime.fromtimestamp(e.timestamp).isoformat(),
+                    "timestamp": ts,
+                    "datetime": dt_str,
                     "trigger": e.trigger,
                     "pre_weights": e.pre_weights,
                     "post_weights": e.post_weights,
@@ -1309,23 +1366,37 @@ class PortfolioRebalancer:
         self._auto_interval = rebalancer_cfg.get("auto_check_interval", 60.0)
         self._target_weights: Dict[str, float] = {}
         self._total_equity: float = 0.0
+        self._event_counter: int = 0
+        self._data_dir = rebalancer_cfg.get("data_dir", "./data")
+
+        # 重启恢复：加载持久化的再平衡目标与权益
+        self._load_state()
+
+        # P1: 组合总敞口硬限制 —— 多策略并发开仓时防止总敞口超限
+        # max_total_exposure_pct: 总敞口占权益的最大倍数（默认 3.0 = 300%，即最大 3x 杠杆）
+        self._max_total_exposure_pct = _safe_float(
+            rebalancer_cfg.get("max_total_exposure_pct", 3.0), 3.0
+        )
+        self._current_gross_exposure: float = 0.0
 
     async def start(self) -> None:
+        if self._running:
+            return
         logger.info("PortfolioRebalancer starting")
         self._running = True
-        if self._auto_interval > 0:
+        if self._auto_interval > 0 and (self._loop_task is None or self._loop_task.done()):
             self._loop_task = asyncio.create_task(self._auto_loop())
 
     async def stop(self) -> None:
+        if not self._running and (self._loop_task is None or self._loop_task.done()):
+            return
         logger.info("PortfolioRebalancer stopping")
         self._running = False
-        if self._loop_task:
+        if self._loop_task is not None and not self._loop_task.done():
             self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except asyncio.CancelledError:
-                pass
-            self._loop_task = None
+        if self._loop_task is not None:
+            await asyncio.gather(self._loop_task, return_exceptions=True)
+        self._loop_task = None
 
     async def _auto_loop(self) -> None:
         """自动定期检查循环。"""
@@ -1342,10 +1413,13 @@ class PortfolioRebalancer:
                         if plan.get("should_execute"):
                             await self.execute_rebalance(plan)
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
                 logger.error(f"Auto loop error: {e}")
-            await asyncio.sleep(self._auto_interval)
+            try:
+                await asyncio.sleep(self._auto_interval)
+            except asyncio.CancelledError:
+                raise
 
     async def _fetch_current_weights(self) -> Dict[str, float]:
         """获取当前权重（可被子类重写以对接真实数据源）。"""
@@ -1385,8 +1459,11 @@ class PortfolioRebalancer:
                 f"should_execute={plan['should_execute']}"
             )
             # 存储供 auto loop 使用
-            self._target_weights = target_weights
-            self._total_equity = total_equity
+            self._target_weights = {
+                k: _safe_float(v, 0.0) for k, v in target_weights.items()
+            }
+            self._total_equity = _safe_float(total_equity, 0.0)
+            self._save_state()
             return plan
 
     async def execute_rebalance(
@@ -1422,8 +1499,9 @@ class PortfolioRebalancer:
 
             # 记录历史
             trades_list = plan.get("net_trades", plan.get("trades", []))
+            self._event_counter += 1
             event = RebalanceEvent(
-                event_id=f"evt_{int(time.time()*1000)}",
+                event_id=f"evt_{int(time.time()*1000)}_{self._event_counter}",
                 timestamp=time.time(),
                 trigger_reason=f"breached {len(trades_list)} strategies",
                 trigger_type=self._band.band_type.value,
@@ -1452,6 +1530,7 @@ class PortfolioRebalancer:
             )
 
             logger.info(f"Rebalance executed: status={result['status']}, duration={exec_duration:.2f}s")
+            self._save_state()
             return result
 
     async def estimate_rebalance_cost(
@@ -1556,15 +1635,19 @@ class PortfolioRebalancer:
         post = dict(pre_weights)
         for r in results:
             asset = r.get("asset", "")
-            filled = r.get("filled_amount", 0.0)
-            side = r.get("side", "buy")
+            filled = _safe_float(r.get("filled_amount", 0.0), 0.0)
+            raw_side = r.get("side", "buy")
+            try:
+                side = DirectionUnifier.to_side(str(raw_side))
+            except (ValueError, TypeError):
+                side = "buy"
             if asset not in post:
                 post[asset] = 0.0
             # 简化：方向性调整
             if side == "buy":
-                post[asset] = post[asset] + (filled / 10000.0)  # 归一化近似
+                post[asset] = _safe_float(post.get(asset, 0.0), 0.0) + (filled / 10000.0)  # 归一化近似
             else:
-                post[asset] = max(0.0, post[asset] - (filled / 10000.0))
+                post[asset] = max(0.0, _safe_float(post.get(asset, 0.0), 0.0) - (filled / 10000.0))
 
         # 归一化
         total = sum(post.values())
@@ -1572,18 +1655,111 @@ class PortfolioRebalancer:
             post = {k: v / total for k, v in post.items()}
         return post
 
+    # ── 状态持久化 ────────────────────────────────────────
+
+    def _save_state(self) -> None:
+        """持久化再平衡目标权重与总权益，重启后可恢复。"""
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            state_path = os.path.join(self._data_dir, "portfolio_rebalancer_state.json")
+            state = {
+                "last_updated": datetime.now().isoformat(),
+                "target_weights": {k: _safe_float(v, 0.0) for k, v in self._target_weights.items()},
+                "total_equity": _safe_float(self._total_equity, 0.0),
+            }
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            logger.debug(f"Portfolio rebalancer state saved to {state_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save portfolio rebalancer state: {e}")
+
+    def _load_state(self) -> bool:
+        """加载持久化的再平衡状态；任何异常都不影响启动。"""
+        try:
+            state_path = os.path.join(self._data_dir, "portfolio_rebalancer_state.json")
+            if not os.path.exists(state_path):
+                return False
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            raw_weights = state.get("target_weights", {})
+            if isinstance(raw_weights, dict):
+                self._target_weights = {
+                    str(k): _safe_float(v, 0.0) for k, v in raw_weights.items()
+                }
+            self._total_equity = _safe_float(state.get("total_equity"), 0.0)
+            logger.info(f"Portfolio rebalancer state restored: {len(self._target_weights)} targets, equity={self._total_equity}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load portfolio rebalancer state: {e}")
+            return False
+
+    # ── P1: 总敞口硬限制 ────────────────────────────────────
+
+    def update_gross_exposure(self, gross_notional: float) -> None:
+        """更新当前总名义敞口（由调度器/持仓管理器定期同步）。"""
+        self._current_gross_exposure = _safe_float(gross_notional, 0.0)
+
+    def check_exposure_limit(
+        self, additional_notional: float, equity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """检查新增敞口是否会突破组合总敞口硬限制。
+
+        Returns:
+            {"allowed": bool, "current_exposure": float, "max_exposure": float,
+             "projected_exposure": float, "headroom": float, "reason": str}
+        """
+        eq = _safe_float(equity, self._total_equity)
+        max_exposure = eq * self._max_total_exposure_pct
+        current = self._current_gross_exposure
+        additional = _safe_float(additional_notional, 0.0)
+        projected = current + additional
+        headroom = max_exposure - current
+
+        if max_exposure <= 0:
+            return {
+                "allowed": True,
+                "current_exposure": current,
+                "max_exposure": max_exposure,
+                "projected_exposure": projected,
+                "headroom": headroom,
+                "reason": "no_equity_no_limit",
+            }
+
+        if projected > max_exposure:
+            return {
+                "allowed": False,
+                "current_exposure": current,
+                "max_exposure": max_exposure,
+                "projected_exposure": projected,
+                "headroom": headroom,
+                "reason": f"exposure_limit_exceeded: projected {projected:.2f} > max {max_exposure:.2f}",
+            }
+
+        return {
+            "allowed": True,
+            "current_exposure": current,
+            "max_exposure": max_exposure,
+            "projected_exposure": projected,
+            "headroom": headroom,
+            "reason": "within_limit",
+        }
+
     # ── 便捷方法 ──────────────────────────────────────────
 
     async def update_target_weights(self, target_weights: Dict[str, float]) -> None:
         """更新目标权重。"""
         async with self._lock:
-            self._target_weights = dict(target_weights)
+            self._target_weights = {
+                k: _safe_float(v, 0.0) for k, v in target_weights.items()
+            }
+            self._save_state()
             logger.info(f"Target weights updated: {len(self._target_weights)} strategies")
 
     async def update_total_equity(self, total_equity: float) -> None:
         """更新总权益。"""
         async with self._lock:
-            self._total_equity = total_equity
+            self._total_equity = _safe_float(total_equity, 0.0)
+            self._save_state()
 
     async def reset_cooldown(self) -> None:
         """重置冷却期。"""

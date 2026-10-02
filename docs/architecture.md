@@ -170,6 +170,15 @@ OKX 量化交易系统是一个多策略并行运行的自动化加密货币交�
 | settings.py | Pydantic 配置校验，环境变量解析，多密钥池 |
 | config_validator.py | 配置合法性校验 |
 
+### 3.10 自治协调器 (core/)
+
+| 模块 | 职责 |
+|------|------|
+| QuantAGIOrchestrator | 汇总市场状态、策略贡献和资金分配结果，运行资金侧自治闭环 |
+| TopLevelAGICoordinator | 汇总资金、信号感知、运维自愈和自动寻优状态，生成跨闭环诊断与排序计划 |
+
+顶层协调器输出分阶段分析、证据摘要和按优先级排序的 `decision_plan`。计划仅供人工审核，不会自动执行交易、参数修改或策略暂停；当资金健康度为 D/F 或运维建议暂停寻优时，会将冲突的寻优建议延期，并在报告中说明阻断原因。可通过 `top_level_agi.enabled` 控制是否装配。
+
 ---
 
 ## 4. 核心数据流
@@ -243,6 +252,23 @@ ProfitOptimizer (Kelly 公式 + 复利因子 + 回撤保护)
                                        ▼
                               各策略仓位计算
 ```
+
+### 4.4 自治分析与决策计划
+
+```
+资金 / 感知 / 运维 / 寻优状态
+               │
+               ▼
+       Gather → Diagnose
+               │
+               ▼
+风险冲突门控 → 优先级排序 → 人工审核计划
+               │
+               ▼
+         报告与状态观测
+```
+
+报告包含 `analysis` 阶段（观测、诊断、冲突处理、计划）及 `decision_plan.steps`。每个建议附有观测证据和原因，明确标记 `auto_execute: false` 与 `requires_human_approval: true`；被风险门控延期的建议保留在 `deferred_actions` 中，不计入已生成的联动动作统计。
 
 ---
 

@@ -62,8 +62,10 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
             status = self._adaptive_controller.get_risk_budget_status()
             if status.get("streak_lock_active"):
                 quality += self._risk_lock_quality_boost
-        except Exception:
-            pass
+        except Exception as e:
+            # fail-closed：风险锁状态查询失败时保守收紧阈值，避免在风控状态未知时放行
+            logger.debug(f"[{self._strategy_name}] risk budget status query failed, tightening min quality: {e}")
+            quality += self._risk_lock_quality_boost
         return quality
 
     def _record_filter(self, symbol: str, reason: str):

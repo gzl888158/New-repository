@@ -580,9 +580,9 @@ class DerivedMetricsEngine:
         return wins / total if total > 0 else 0.0
 
     @staticmethod
-    def compute_profit_factor(gross_profit: float, gross_loss: float) -> float:
-        """计算盈亏比"""
-        return abs(gross_profit / gross_loss) if gross_loss != 0 else float('inf')
+    def compute_profit_factor(gross_profit: float, gross_loss: float) -> Optional[float]:
+        """计算盈亏比；无亏损时返回 None（JSON null），避免 Infinity 污染输出。"""
+        return abs(gross_profit / gross_loss) if gross_loss != 0 else None
 
     @staticmethod
     def compute_expectancy(avg_win: float, avg_loss: float, win_rate: float) -> float:

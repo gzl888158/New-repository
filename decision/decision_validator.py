@@ -1,4 +1,7 @@
-"""决策校验器：基于风控限额、合约规格与凯利准则校验交易决策的合法性。"""
+"""决策校验器：基于风控限额、合约规格与凯利准则校验交易决策的合法性。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
+"""
 import time
 from collections import deque
 from enum import Enum

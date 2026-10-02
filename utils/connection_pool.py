@@ -70,11 +70,13 @@ class ConnectionPool:
         health_check_interval_seconds: float = 60,
     ):
         self.name = name
-        self.max_connections = max_connections
-        self.min_connections = min_connections
-        self.max_idle_time_seconds = max_idle_time_seconds
-        self.connection_timeout_seconds = connection_timeout_seconds
-        self.health_check_interval_seconds = health_check_interval_seconds
+        # 安全转换配置值，防止非法输入导致后续崩溃
+        self.max_connections = max(1, int(max_connections) if max_connections and int(max_connections) > 0 else 10)
+        self.min_connections = max(0, min(self.max_connections,
+                                          int(min_connections) if min_connections is not None and int(min_connections) >= 0 else 2))
+        self.max_idle_time_seconds = float(max_idle_time_seconds) if max_idle_time_seconds and float(max_idle_time_seconds) > 0 else 300.0
+        self.connection_timeout_seconds = float(connection_timeout_seconds) if connection_timeout_seconds and float(connection_timeout_seconds) > 0 else 30.0
+        self.health_check_interval_seconds = float(health_check_interval_seconds) if health_check_interval_seconds and float(health_check_interval_seconds) > 0 else 60.0
         
         self._connections: Dict[str, ConnectionInfo] = {}
         self._available: asyncio.Queue = None

@@ -25,6 +25,7 @@ from .historical_loader import HistoricalLoader
 from .symbol_data_pool import SymbolDataPoolManager
 from .quality_monitor import DataCleaningEngine
 from .tick_persistence import TickPersistence
+from services.market_data_service import DataQualityChecker
 
 
 class DataMode(Enum):
@@ -45,6 +46,7 @@ class MarketDataManager:
         self._historical_loader = HistoricalLoader(okx_client=okx_client, config=self.config.get("historical", {}))
         self._data_pool = SymbolDataPoolManager(config=self.config.get("data_pool", {}))
         self._quality_engine = DataCleaningEngine(config=self.config.get("quality", {}))
+        self._series_quality_checker = DataQualityChecker(self.config)
         self._tick_persistence = TickPersistence(config=self.config.get("persistence", {}))
 
         # OKX 客户端
@@ -516,7 +518,7 @@ class MarketDataManager:
         # 直接调用底层数据池同步方法，避免与 async 版本同名导致无限递归
         klines = self._data_pool.get_klines(symbol, timeframe, limit)
         if klines:
-            return klines
+            return self._validate_kline_series(symbol, timeframe, klines)
 
         if self._okx_client:
             try:
@@ -529,15 +531,32 @@ class MarketDataManager:
                         HistoricalLoader.__new__(HistoricalLoader),
                         klines_raw, symbol, timeframe
                     )
+                    cleaned_klines = []
                     for k in normalized:
                         cleaned = self._quality_engine.clean_and_validate_kline(k)
                         if cleaned:
-                            self._data_pool.update_kline(cleaned, timeframe)
-                    return normalized if normalized else None
+                            cleaned_klines.append(cleaned)
+                    validated = self._validate_kline_series(symbol, timeframe, cleaned_klines)
+                    if validated:
+                        for kline in validated:
+                            self._data_pool.update_kline(kline, timeframe)
+                    return validated
             except Exception as e:
                 logger.debug(f"get_klines fallback failed for {symbol}: {e}")
 
         return None
+
+    def _validate_kline_series(
+        self,
+        symbol: str,
+        timeframe: str,
+        klines: List[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        report = self._series_quality_checker.check_kline_series(symbol, klines, timeframe)
+        if not report["valid"]:
+            logger.warning(f"Rejecting invalid kline series: {report}")
+            return None
+        return klines
 
     async def get_multiple_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
         """兼容旧接口：批量获取行情"""

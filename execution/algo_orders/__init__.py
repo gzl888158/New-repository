@@ -1,6 +1,10 @@
 """
 算法订单执行系统 (Algorithmic Order Execution System)
 
+.. deprecated::
+    实验性模块，未接入生产交易链路。
+    实际订单执行通过 order_executor.py 直接下单。
+
 提供智能订单路由和高级算法执行能力：
   - SmartOrderRouter: 智能订单路由，多场所最佳执行
   - AlgoExecutionEngine: 算法执行引擎，管理算法订单生命周期

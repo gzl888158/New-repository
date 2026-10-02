@@ -99,10 +99,10 @@ class HealthChecker:
     用法:
         checker = HealthChecker(name="trading-engine", version="2.0.0")
 
-        # 注册依赖检查
-        checker.register_dependency("okx_api", check_okx_api)
-        checker.register_dependency("database", check_db)
-        checker.register_dependency("redis", check_redis)
+        # 注册依赖检查（critical=True 表示关键依赖，失败时阻断交易）
+        checker.register_dependency("okx_api", check_okx_api, critical=True)
+        checker.register_dependency("database", check_db, critical=True)
+        checker.register_dependency("redis", check_redis, critical=False)  # 非关键：降级运行
 
         # 运行检查
         health = checker.run_all()
@@ -137,6 +137,7 @@ class HealthChecker:
         # 依赖检查函数注册表
         self._dependency_checks: Dict[str, Callable[[], DependencyStatus]] = {}
         self._dependency_weights: Dict[str, float] = dict(self.DEFAULT_DEPENDENCY_WEIGHTS)
+        self._dependency_critical: Set[str] = set()  # 关键依赖：失败时阻断交易
 
         # 自定义探针
         self._liveness_probes: List[Callable[[], HealthProbeResult]] = []
@@ -178,12 +179,22 @@ class HealthChecker:
     # ── 依赖注册 ──
 
     def register_dependency(self, name: str, check_fn: Callable[[], DependencyStatus],
-                            weight: float = None):
-        """注册依赖检查函数"""
+                            weight: float = None, critical: bool = False):
+        """注册依赖检查函数
+        
+        Args:
+            name: 依赖名称
+            check_fn: 检查函数
+            weight: 权重（用于健康分数计算）
+            critical: 是否为关键依赖（关键依赖失败时阻断交易，非关键仅告警）
+        """
         self._dependency_checks[name] = check_fn
         if weight is not None:
             self._dependency_weights[name] = weight
-        logger.debug(f"HealthChecker: registered dependency '{name}' (weight={self._dependency_weights.get(name, 'default')})")
+        if critical:
+            self._dependency_critical.add(name)
+        logger.debug(f"HealthChecker: registered dependency '{name}' "
+                    f"(weight={self._dependency_weights.get(name, 'default')}, critical={critical})")
 
     def set_dependency_weight(self, name: str, weight: float):
         """设置依赖权重"""
@@ -295,22 +306,35 @@ class HealthChecker:
 
             # 检查所有依赖
             unhealthy_deps = []
+            unhealthy_critical = []
             for name, check_fn in self._dependency_checks.items():
                 dep = self._check_single_dependency(name, check_fn)
                 if dep.status == HealthStatus.UNHEALTHY:
                     unhealthy_deps.append(dep)
                     suggestions.append(f"Check dependency '{name}': {dep.error or 'unknown error'}")
+                    if name in self._dependency_critical:
+                        unhealthy_critical.append(dep)
+                    else:
+                        logger.warning(f"Non-critical dependency '{name}' unhealthy: {dep.error}")
 
-            if unhealthy_deps:
+            # 仅关键依赖失败时阻断交易
+            if unhealthy_critical:
                 return HealthProbeResult(
                     name="readiness",
                     status=HealthStatus.UNHEALTHY,
                     probe_type=ProbeType.READINESS,
                     latency_ms=(time.time() - t0) * 1000,
-                    message=f"Unhealthy dependencies: {[d.name for d in unhealthy_deps]}",
-                    details={"unhealthy_dependencies": [d.name for d in unhealthy_deps]},
+                    message=f"Critical dependencies unhealthy: {[d.name for d in unhealthy_critical]}",
+                    details={
+                        "critical_unhealthy": [d.name for d in unhealthy_critical],
+                        "non_critical_unhealthy": [d.name for d in unhealthy_deps if d.name not in self._dependency_critical],
+                    },
                     suggestions=suggestions,
                 )
+            
+            # 非关键依赖失败：降级但允许运行
+            if unhealthy_deps:
+                logger.info(f"Readiness degraded: {len(unhealthy_deps)} non-critical dependencies unhealthy")
 
             # 运行自定义就绪探针
             if self._readiness_probes:

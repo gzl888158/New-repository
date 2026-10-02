@@ -1,6 +1,8 @@
 """
 TWAP 执行器 (Time-Weighted Average Price)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 将父订单拆分为等时等量的子订单，最小化市场冲击：
   - 线性调度：总时间/切片数 = 每切片间隔
   - 自适应调度：根据市场流动性动态调整切片大小和执行速度
@@ -12,12 +14,14 @@ import asyncio
 import math
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Callable
 import numpy as np
 from loguru import logger
 
+from core.direction_unifier import DirectionUnifier
 from execution.algo_orders.algo_execution_engine import (
     AlgoOrderConfig, AlgoExecutionResult, ExecutionSlice,
     AlgoOrderStatus,
@@ -91,10 +95,13 @@ class TWAPExecutor:
 
     def compute_schedule(self, total_quantity: float, start_time: datetime,
                           end_time: datetime, num_slices: int,
-                          jitter: bool = True) -> List[TWAPSlice]:
+                          jitter: bool = True,
+                          slice_id_prefix: Optional[str] = None) -> List[TWAPSlice]:
         """计算 TWAP 等时间隔切片计划"""
         if num_slices <= 0:
             return []
+
+        prefix = slice_id_prefix or f"twap_{uuid.uuid4().hex[:8]}"
 
         duration = (end_time - start_time).total_seconds()
         if duration <= 0:
@@ -129,7 +136,7 @@ class TWAPExecutor:
             scheduled = start_time + timedelta(seconds=(i + 0.5) * base_interval)
 
             slices.append(TWAPSlice(
-                slice_id=f"twap_{i:03d}",
+                slice_id=f"{prefix}_{i:03d}",
                 sequence=i,
                 scheduled_time=scheduled,
                 quantity=round(qty, 6),
@@ -199,6 +206,7 @@ class TWAPExecutor:
             end_time=end_time,
             num_slices=config.num_slices,
             jitter=True,
+            slice_id_prefix=f"twap_{config.order_id}",
         )
 
         result = AlgoExecutionResult(
@@ -257,12 +265,28 @@ class TWAPExecutor:
             # 执行切片
             if config.executor_fn and slc.quantity > 0:
                 try:
+                    limit_price = self._calc_limit_price(config)
+                    if limit_price is None or limit_price <= 0:
+                        # fail-closed：限价不可得（行情缺失/异常）时拒绝该切片
+                        logger.warning(f"TWAP {config.order_id}: limit price unavailable for slice "
+                                       f"{slc.slice_id}, fail-closed - skipping slice")
+                        es = ExecutionSlice(
+                            slice_id=slc.slice_id, sequence=slc.sequence,
+                            quantity=slc.quantity, status="rejected",
+                            error_message="limit price unavailable (fail-closed)",
+                        )
+                        if on_slice_filled:
+                            await on_slice_filled(config.order_id, es)
+                        continue
+
                     order_params = {
                         "symbol": config.symbol,
                         "side": config.side,
+                        "pos_side": DirectionUnifier.to_pos_side(config.side),
                         "quantity": slc.quantity,
                         "order_type": "limit",
-                        "price": self._calc_limit_price(config),
+                        "price": limit_price,
+                        "trace_id": f"algo_{config.order_id}_{uuid.uuid4().hex[:8]}",
                     }
                     fill = config.executor_fn(order_params)
                     if hasattr(fill, '__await__'):
@@ -284,7 +308,7 @@ class TWAPExecutor:
                         # 滑点
                         if slc.avg_price > 0 and result.arrival_price > 0:
                             slc.slippage_bps = (slc.avg_price - result.arrival_price) / result.arrival_price * 10000
-                            if config.side == "sell":
+                            if DirectionUnifier.is_short(config.side):
                                 slc.slippage_bps *= -1
 
                         es = ExecutionSlice(
@@ -320,8 +344,10 @@ class TWAPExecutor:
                 order_params = {
                     "symbol": config.symbol,
                     "side": config.side,
+                    "pos_side": DirectionUnifier.to_pos_side(config.side),
                     "quantity": remaining,
                     "order_type": "market",
+                    "trace_id": f"algo_{config.order_id}_{uuid.uuid4().hex[:8]}",
                 }
                 fill = config.executor_fn(order_params)
                 if hasattr(fill, '__await__'):
@@ -359,13 +385,18 @@ class TWAPExecutor:
         try:
             market = config.market_data_fn(config.symbol)
             if market:
-                mid = float(market.get("mid", market.get("last", 0)))
+                raw = market.get("mid", market.get("last"))
+                if raw is None:
+                    return None
+                mid = float(raw)
+                if mid <= 0 or math.isnan(mid):
+                    return None
                 offset = mid * self._limit_offset_bps / 10000.0
-                if config.side == "buy":
+                if DirectionUnifier.is_long(config.side):
                     return mid + offset
                 else:
                     return mid - offset
-        except Exception:
+        except (TypeError, ValueError):
             pass
         return None
 
@@ -379,11 +410,11 @@ class TWAPExecutor:
                 if market:
                     mid = float(market.get("mid", 0))
                     vwap = float(market.get("vwap", mid))
-                    if config.side == "buy":
+                    if DirectionUnifier.is_long(config.side):
                         return mid < vwap  # 买方：低于VWAP有利
                     else:
                         return mid > vwap  # 卖方：高于VWAP有利
-        except Exception:
+        except (TypeError, ValueError):
             pass
         return False
 

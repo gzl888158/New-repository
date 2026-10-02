@@ -89,6 +89,12 @@ class HMMRegimeClassifier:
         exponent = -0.5 * ((x - mean) ** 2) / var
         return (1.0 / math.sqrt(2 * math.pi * var)) * math.exp(exponent)
 
+    def _log_gaussian_pdf(self, x: float, mean: float, var: float) -> float:
+        """单变量Gaussian对数概率密度（避免exp下溢）"""
+        if var <= 0:
+            var = 1e-6
+        return -0.5 * (math.log(2 * math.pi * var) + ((x - mean) ** 2) / var)
+
     def _emission_prob(self, obs: List[float], state: int) -> float:
         """计算给定状态下的观测发射概率（各特征独立Gaussian乘积）"""
         prob = 1.0
@@ -96,6 +102,23 @@ class HMMRegimeClassifier:
             p = self._gaussian_pdf(obs[j], self.means[state][j], self.vars[state][j])
             prob *= max(p, 1e-300)
         return prob
+
+    def _log_emission_prob(self, obs: List[float], state: int) -> float:
+        """计算给定状态下的观测对数发射概率（各特征独立Gaussian对数和）"""
+        log_prob = 0.0
+        for j in range(min(len(obs), self.n_features)):
+            log_prob += self._log_gaussian_pdf(obs[j], self.means[state][j], self.vars[state][j])
+        return log_prob
+
+    @staticmethod
+    def _log_sum_exp(log_values: List[float]) -> float:
+        """数值稳定的log-sum-exp：log(sum(exp(log_values)))"""
+        if not log_values:
+            return float('-inf')
+        max_log = max(log_values)
+        if max_log == float('-inf'):
+            return float('-inf')
+        return max_log + math.log(sum(math.exp(lv - max_log) for lv in log_values))
 
     def _forward(self, observations: List[List[float]]) -> Tuple[List[List[float]], List[float]]:
         """前向算法: 计算alpha和缩放因子"""
@@ -125,86 +148,119 @@ class HMMRegimeClassifier:
         
         return alpha, scale
 
-    def _backward(self, observations: List[List[float]], scale: List[float]) -> List[List[float]]:
-        """后向算法: 计算beta"""
+    def _log_forward(self, observations: List[List[float]]) -> Tuple[List[List[float]], float]:
+        """对数空间前向算法: 计算log_alpha和对数似然（数值稳定）"""
         T = len(observations)
-        beta = [[0.0] * self.n_states for _ in range(T)]
+        log_alpha = [[float('-inf')] * self.n_states for _ in range(T)]
+        log_pi = [math.log(max(p, 1e-300)) for p in self.pi]
+        log_A = [[math.log(max(self.A[i][j], 1e-300)) for j in range(self.n_states)] for i in range(self.n_states)]
         
         # 初始化
         for i in range(self.n_states):
-            beta[T-1][i] = 1.0 / max(scale[T-1], 1e-300)
+            log_alpha[0][i] = log_pi[i] + self._log_emission_prob(observations[0], i)
+        
+        # 递推
+        for t in range(1, T):
+            for j in range(self.n_states):
+                log_terms = [log_alpha[t-1][i] + log_A[i][j] for i in range(self.n_states)]
+                log_alpha[t][j] = self._log_sum_exp(log_terms) + self._log_emission_prob(observations[t], j)
+        
+        # 对数似然 = log(sum(alpha[T-1]))
+        log_likelihood = self._log_sum_exp(log_alpha[T-1])
+        return log_alpha, log_likelihood
+
+    def _log_backward(self, observations: List[List[float]]) -> List[List[float]]:
+        """对数空间后向算法: 计算log_beta（数值稳定）"""
+        T = len(observations)
+        log_beta = [[float('-inf')] * self.n_states for _ in range(T)]
+        log_A = [[math.log(max(self.A[i][j], 1e-300)) for j in range(self.n_states)] for i in range(self.n_states)]
+        
+        # 初始化
+        for i in range(self.n_states):
+            log_beta[T-1][i] = 0.0  # log(1) = 0
         
         # 递推
         for t in range(T - 2, -1, -1):
             for i in range(self.n_states):
-                s = 0.0
-                for j in range(self.n_states):
-                    s += self.A[i][j] * self._emission_prob(observations[t+1], j) * beta[t+1][j]
-                beta[t][i] = s / max(scale[t], 1e-300)
+                log_terms = [
+                    log_A[i][j] + self._log_emission_prob(observations[t+1], j) + log_beta[t+1][j]
+                    for j in range(self.n_states)
+                ]
+                log_beta[t][i] = self._log_sum_exp(log_terms)
         
-        return beta
+        return log_beta
 
     def _baum_welch_step(self, observations: List[List[float]]) -> float:
-        """一步Baum-Welch更新，返回对数似然"""
+        """一步Baum-Welch更新，返回对数似然（使用对数空间避免下溢）"""
         T = len(observations)
         if T < 2:
             return 0.0
         
-        alpha, scale = self._forward(observations)
-        beta = self._backward(observations, scale)
+        log_alpha, log_likelihood = self._log_forward(observations)
+        log_beta = self._log_backward(observations)
         
-        # 计算gamma和xi
-        gamma = [[0.0] * self.n_states for _ in range(T)]
-        xi = [[[0.0] * self.n_states for _ in range(self.n_states)] for _ in range(T - 1)]
+        # 计算log_gamma和log_xi（对数空间）
+        log_gamma = [[float('-inf')] * self.n_states for _ in range(T)]
+        log_xi = [[[float('-inf')] * self.n_states for _ in range(self.n_states)] for _ in range(T - 1)]
         
+        log_A = [[math.log(max(self.A[i][j], 1e-300)) for j in range(self.n_states)] for i in range(self.n_states)]
+        
+        # 计算gamma
         for t in range(T):
-            denom = 0.0
+            log_terms = [log_alpha[t][i] + log_beta[t][i] for i in range(self.n_states)]
+            log_norm = self._log_sum_exp(log_terms)
             for i in range(self.n_states):
-                denom += alpha[t][i] * beta[t][i]
-            if denom > 0:
-                for i in range(self.n_states):
-                    gamma[t][i] = (alpha[t][i] * beta[t][i]) / denom
+                log_gamma[t][i] = log_alpha[t][i] + log_beta[t][i] - log_norm
         
+        # 计算xi
         for t in range(T - 1):
-            denom = 0.0
+            log_terms_flat = []
             for i in range(self.n_states):
                 for j in range(self.n_states):
-                    xi[t][i][j] = alpha[t][i] * self.A[i][j] * self._emission_prob(observations[t+1], j) * beta[t+1][j]
-                    denom += xi[t][i][j]
-            if denom > 0:
-                for i in range(self.n_states):
-                    for j in range(self.n_states):
-                        xi[t][i][j] /= denom
+                    log_val = (log_alpha[t][i] + log_A[i][j] + 
+                              self._log_emission_prob(observations[t+1], j) + log_beta[t+1][j])
+                    log_terms_flat.append(log_val)
+            log_norm = self._log_sum_exp(log_terms_flat)
+            idx = 0
+            for i in range(self.n_states):
+                for j in range(self.n_states):
+                    log_xi[t][i][j] = (log_alpha[t][i] + log_A[i][j] + 
+                                       self._log_emission_prob(observations[t+1], j) + log_beta[t+1][j] - log_norm)
+                    idx += 1
         
         # 更新pi
         for i in range(self.n_states):
-            self.pi[i] = gamma[0][i]
+            self.pi[i] = math.exp(log_gamma[0][i])
         
         # 更新A
         for i in range(self.n_states):
-            sum_gamma = sum(gamma[t][i] for t in range(T - 1))
+            log_sum_gamma = self._log_sum_exp([log_gamma[t][i] for t in range(T - 1)])
             for j in range(self.n_states):
-                if sum_gamma > 0:
-                    self.A[i][j] = sum(xi[t][i][j] for t in range(T - 1)) / sum_gamma
+                if log_sum_gamma > float('-inf'):
+                    log_xi_sum = self._log_sum_exp([log_xi[t][i][j] for t in range(T - 1)])
+                    self.A[i][j] = math.exp(log_xi_sum - log_sum_gamma)
                 else:
                     self.A[i][j] = 1.0 / self.n_states
         
         # 更新Gaussian参数
         for i in range(self.n_states):
-            sum_gamma_i = sum(gamma[t][i] for t in range(T))
-            if sum_gamma_i > 1e-6:
-                for k in range(self.n_features):
-                    # mean
-                    self.means[i][k] = sum(gamma[t][i] * observations[t][k] for t in range(T)) / sum_gamma_i
-                    # variance
-                    self.vars[i][k] = sum(
-                        gamma[t][i] * (observations[t][k] - self.means[i][k]) ** 2
-                        for t in range(T)
-                    ) / sum_gamma_i
-                    self.vars[i][k] = max(self.vars[i][k], 1e-6)
+            log_sum_gamma_i = self._log_sum_exp([log_gamma[t][i] for t in range(T)])
+            if log_sum_gamma_i > math.log(1e-6):
+                # 转换回概率空间用于加权平均（此时gamma已归一化，不会下溢）
+                gamma_i = [math.exp(log_gamma[t][i] - log_sum_gamma_i) for t in range(T)]
+                sum_gamma_i = sum(gamma_i)
+                if sum_gamma_i > 1e-6:
+                    for k in range(self.n_features):
+                        # mean
+                        self.means[i][k] = sum(gamma_i[t] * observations[t][k] for t in range(T)) / sum_gamma_i
+                        # variance
+                        self.vars[i][k] = sum(
+                            gamma_i[t] * (observations[t][k] - self.means[i][k]) ** 2
+                            for t in range(T)
+                        ) / sum_gamma_i
+                        self.vars[i][k] = max(self.vars[i][k], 1e-6)
         
-        # 对数似然
-        log_likelihood = sum(math.log(max(s, 1e-300)) for s in scale)
+        # 对数似然（已从log_forward返回）
         return log_likelihood
 
     def fit(self, observations: List[List[float]], n_iterations: int = 50,
@@ -266,34 +322,37 @@ class HMMRegimeClassifier:
             # 趋势 = 平均收益率特征 (index 0)
             mean_trend[i] = self.means[i][0] if self.n_features > 0 else 0.0
             # 波动 = 平均波动率特征 (index 1)
-            mean_vol[i] = self.vars[i][1] if self.n_features > 1 else 1.0
-        
-        # 按趋势排序
-        trend_sorted = sorted(range(self.n_states), key=lambda x: mean_trend[x])
-        # 按波动排序
-        vol_sorted = sorted(range(self.n_states), key=lambda x: mean_vol[x])
+            mean_vol[i] = self.means[i][1] if self.n_features > 1 else 1.0
         
         n = self.n_states
         if n >= 7:
-            # 清晰映射: trending_up(高趋势), trending_down(低趋势), 
-            # ranging(中等趋势+中等波动), high_vol(高波动), low_vol(低波动),
-            # breakout(高趋势+高波动), reversal(趋势转折)
-            self._state_to_regime[trend_sorted[-1]] = MarketRegime.TRENDING_UP
-            self._state_to_regime[trend_sorted[0]] = MarketRegime.TRENDING_DOWN
-            self._state_to_regime[vol_sorted[-1]] = MarketRegime.HIGH_VOLATILITY
-            self._state_to_regime[vol_sorted[0]] = MarketRegime.LOW_VOLATILITY
-            
-            assigned = {trend_sorted[-1], trend_sorted[0], vol_sorted[-1], vol_sorted[0]}
-            remaining = [s for s in range(n) if s not in assigned]
-            
-            if len(remaining) >= 3:
-                self._state_to_regime[remaining[0]] = MarketRegime.RANGING
-                self._state_to_regime[remaining[1]] = MarketRegime.BREAKOUT
-                self._state_to_regime[remaining[2]] = MarketRegime.REVERSAL
-            else:
-                for s in remaining:
-                    if s not in self._state_to_regime:
-                        self._state_to_regime[s] = MarketRegime.RANGING
+            available = set(range(n))
+
+            def assign(regime: MarketRegime, score, maximize: bool = True) -> None:
+                if not available:
+                    return
+                if maximize:
+                    state = max(available, key=lambda candidate: (score(candidate), -candidate))
+                else:
+                    state = min(available, key=lambda candidate: (score(candidate), candidate))
+                self._state_to_regime[state] = regime
+                available.remove(state)
+
+            assign(MarketRegime.TRENDING_UP, lambda state: mean_trend[state])
+            assign(MarketRegime.TRENDING_DOWN, lambda state: mean_trend[state], maximize=False)
+            assign(MarketRegime.HIGH_VOLATILITY, lambda state: mean_vol[state])
+            assign(MarketRegime.LOW_VOLATILITY, lambda state: mean_vol[state], maximize=False)
+            assign(
+                MarketRegime.BREAKOUT,
+                lambda state: mean_vol[state] + abs(mean_trend[state] - 0.5),
+            )
+            acceleration_index = 9 if self.n_features > 9 else 0
+            assign(
+                MarketRegime.REVERSAL,
+                lambda state: abs(self.means[state][acceleration_index] - 0.5),
+            )
+            for state in available:
+                self._state_to_regime[state] = MarketRegime.RANGING
         else:
             for i in range(n):
                 if i not in self._state_to_regime:
@@ -316,31 +375,45 @@ class HMMRegimeClassifier:
 
     def predict_proba(self, features: List[float]) -> Dict[MarketRegime, float]:
         """返回各市场状态的概率分布"""
+        return self.predict_proba_sequence([features])
+
+    def predict_proba_sequence(self, observations: List[List[float]]) -> Dict[MarketRegime, float]:
+        """对观测序列执行前向过滤，返回最后时点的市场状态后验概率。"""
         if not self._trained:
             return {r: 0.0 for r in _REGIME_ORDER}
-        
-        # 计算各状态的发射概率作为后验的代理
-        emission_probs = [self._emission_prob(features, i) for i in range(self.n_states)]
-        total = sum(emission_probs)
-        
-        result = {}
-        if total > 0:
-            for i, regime in self._state_to_regime.items():
-                result[regime] = emission_probs[i] / total
-        else:
-            for i, regime in self._state_to_regime.items():
-                result[regime] = 1.0 / len(self._state_to_regime)
-        
-        # 补全未映射的状态
-        for regime in _REGIME_ORDER:
-            if regime not in result:
-                result[regime] = 0.0
-        
+
+        if not observations:
+            return {r: 0.0 for r in _REGIME_ORDER}
+
+        alpha, _ = self._forward(observations)
+        state_probs = alpha[-1]
+        total = sum(state_probs)
+        result = {regime: 0.0 for regime in _REGIME_ORDER}
+        if total > 0.0:
+            for state, regime in self._state_to_regime.items():
+                result[regime] += state_probs[state] / total
+        elif self._state_to_regime:
+            for regime in self._state_to_regime.values():
+                result[regime] += 1.0 / len(self._state_to_regime)
         return result
 
     def get_transition_matrix(self) -> List[List[float]]:
         """获取状态转移矩阵"""
         return [row[:] for row in self.A]
+
+    def get_regime_transition_matrix(self) -> List[List[float]]:
+        """按市场状态枚举顺序返回转移矩阵，而非隐藏状态编号顺序。"""
+        matrix = [[0.0] * _NUM_REGIMES for _ in range(_NUM_REGIMES)]
+        for from_state, from_regime in self._state_to_regime.items():
+            if from_regime not in _REGIME_TO_IDX or from_state >= len(self.A):
+                continue
+            from_index = _REGIME_TO_IDX[from_regime]
+            for to_state, to_regime in self._state_to_regime.items():
+                if to_regime not in _REGIME_TO_IDX or to_state >= len(self.A[from_state]):
+                    continue
+                to_index = _REGIME_TO_IDX[to_regime]
+                matrix[from_index][to_index] += self.A[from_state][to_state]
+        return matrix
 
     def get_state_means(self) -> List[List[float]]:
         """获取各状态均值"""
@@ -407,7 +480,9 @@ class RegimeFeatureExtractor:
         self._feature_cache: Dict[str, List[float]] = {name: [] for name in self._feature_names}
         self._cache_size = self._config.get("feature_cache_size", 1000)
 
-    def extract_features(self, ohlcv_data: List[Dict[str, Any]]) -> List[List[float]]:
+    def extract_features(
+        self, ohlcv_data: List[Dict[str, Any]], cache_features: bool = True
+    ) -> List[List[float]]:
         """从OHLCV序列提取特征向量序列
         
         Args:
@@ -434,7 +509,7 @@ class RegimeFeatureExtractor:
             window_lows = lows[max(0, i-20):i+1]
             window_volumes = volumes[max(0, i-20):i+1]
             
-            feat = self._extract_single(closes, highs, lows, volumes, i)
+            feat = self._extract_single(closes, highs, lows, volumes, i, cache_features=cache_features)
             features.append(feat)
         
         return features
@@ -451,8 +526,10 @@ class RegimeFeatureExtractor:
         
         return self._extract_single(closes, highs, lows, volumes, len(closes) - 1)
 
-    def _extract_single(self, closes: List[float], highs: List[float],
-                        lows: List[float], volumes: List[float], idx: int) -> List[float]:
+    def _extract_single(
+        self, closes: List[float], highs: List[float], lows: List[float],
+        volumes: List[float], idx: int, cache_features: bool = True,
+    ) -> List[float]:
         """提取单个时间点的特征向量"""
         n = idx + 1
         window_20 = max(2, min(20, n))
@@ -531,7 +608,7 @@ class RegimeFeatureExtractor:
             log_return, realized_vol, volume_ratio, price_ma_distance,
             bollinger_position, rsi, atr_ratio, spread_proxy, imbalance_proxy,
             price_acceleration,
-        ])
+        ], cache_features=cache_features)
 
     def _compute_rsi(self, closes: List[float], idx: int, period: int = 14) -> float:
         """计算RSI"""
@@ -573,7 +650,7 @@ class RegimeFeatureExtractor:
         
         return sum(tr_list) / len(tr_list) if tr_list else 0.0
 
-    def _normalize_features(self, features: List[float]) -> List[float]:
+    def _normalize_features(self, features: List[float], cache_features: bool = True) -> List[float]:
         """归一化特征到[0,1]范围 (使用tanh/linear组合)"""
         normalized = []
         # 不同特征使用不同归一化方案
@@ -602,7 +679,8 @@ class RegimeFeatureExtractor:
                 # 通用tanh归一化
                 normalized.append((math.tanh(val) + 1) / 2)
         
-        self._update_cache(normalized)
+        if cache_features:
+            self._update_cache(normalized)
         return normalized
 
     def _update_cache(self, features: List[float]):
@@ -740,10 +818,15 @@ class MultiTimeframeRegime:
         if timeframe not in self._timeframes or not self._trained.get(timeframe, False):
             return {"regime": MarketRegime.UNKNOWN, "probabilities": {}, "timeframe": timeframe}
         
-        features = self._extractors[timeframe].extract_latest(ohlcv_data)
+        feature_sequence = self._extractors[timeframe].extract_features(
+            ohlcv_data, cache_features=False
+        )
+        if not feature_sequence:
+            return {"regime": MarketRegime.UNKNOWN, "probabilities": {}, "timeframe": timeframe}
+
         classifier = self._classifiers[timeframe]
-        regime = classifier.predict(features)
-        probs = classifier.predict_proba(features)
+        probs = classifier.predict_proba_sequence(feature_sequence[-100:])
+        regime = max(probs, key=probs.get) if probs else MarketRegime.UNKNOWN
         
         return {
             "regime": regime,
@@ -1349,12 +1432,15 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
         
         # ── 多时间周期分析 ──
         self._mtf = MultiTimeframeRegime(detector_cfg)
+        self._symbol_mtfs: Dict[str, MultiTimeframeRegime] = {}
         
         # ── 特征提取器 ──
         self._feature_extractor = RegimeFeatureExtractor(detector_cfg)
+        self._symbol_feature_extractors: Dict[str, RegimeFeatureExtractor] = {}
         
         # ── 状态转移预测器 ──
         self._transition_predictor = RegimeTransitionPredictor(detector_cfg)
+        self._symbol_transition_predictors: Dict[str, RegimeTransitionPredictor] = {}
         
         # ── 策略映射器 ──
         self._strategy_mapper = RegimeStrategyMapper(detector_cfg)
@@ -1362,6 +1448,7 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
         # ── 当前状态缓存 ──
         self._current_regimes: Dict[str, Dict[str, Any]] = {}
         self._regime_history: Dict[str, deque] = {}
+        self._last_observation_keys: Dict[str, Any] = {}
         self._max_history = detector_cfg.get("max_history_per_symbol", 200)
         
         # ── 持久化 ──
@@ -1373,6 +1460,13 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
         self._train_min_samples = detector_cfg.get("train_min_samples", 50)
         self._auto_train = detector_cfg.get("auto_train", True)
         self._default_timeframes = detector_cfg.get("timeframes", ["short", "medium", "long"])
+        self._fallback_timeframe = detector_cfg.get("fallback_timeframe", "medium")
+        if self._fallback_timeframe not in ("short", "medium", "long"):
+            self._fallback_timeframe = "medium"
+        self._min_stable_updates = max(1, int(detector_cfg.get("min_stable_updates", 3)))
+        self._stability_confidence_discount = max(
+            0.0, min(1.0, float(detector_cfg.get("stability_confidence_discount", 0.7)))
+        )
         
         # ── 线程安全 ──
         self._lock = asyncio.Lock()
@@ -1396,55 +1490,203 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
 
     # ===================== 核心检测 =====================
 
+    def _get_symbol_mtf(self, symbol: str) -> MultiTimeframeRegime:
+        if symbol not in self._symbol_mtfs:
+            self._symbol_mtfs[symbol] = MultiTimeframeRegime(self._config.get("market_regime_detector", {}))
+        return self._symbol_mtfs[symbol]
+
+    def _get_symbol_feature_extractor(self, symbol: str) -> RegimeFeatureExtractor:
+        if symbol not in self._symbol_feature_extractors:
+            self._symbol_feature_extractors[symbol] = RegimeFeatureExtractor(
+                self._config.get("market_regime_detector", {})
+            )
+        return self._symbol_feature_extractors[symbol]
+
+    def _get_symbol_transition_predictor(self, symbol: str) -> RegimeTransitionPredictor:
+        if symbol not in self._symbol_transition_predictors:
+            self._symbol_transition_predictors[symbol] = RegimeTransitionPredictor(
+                self._config.get("market_regime_detector", {})
+            )
+        return self._symbol_transition_predictors[symbol]
+
+    @staticmethod
+    def _observation_key(ohlcv_data: List[Dict[str, Any]]):
+        if not ohlcv_data or not isinstance(ohlcv_data[-1], dict):
+            return None
+        latest = ohlcv_data[-1]
+        for timestamp_key in ("timestamp", "ts", "time"):
+            if latest.get(timestamp_key) is not None:
+                return (timestamp_key, str(latest[timestamp_key]))
+        candle_values = tuple(
+            (key, str(latest[key]))
+            for key in ("open", "high", "low", "close", "vol", "volume")
+            if key in latest
+        )
+        return (len(ohlcv_data), candle_values)
+
+    def _infer_reversal_direction(self, ohlcv_data: List[Dict[str, Any]]) -> Optional[str]:
+        """Require a prior directional leg and a multi-candle move against it."""
+        detector_cfg = self._config.get("market_regime_detector", {})
+        trend_lookback = max(3, int(detector_cfg.get("reversal_direction_lookback", 8)))
+        confirmation_bars = max(
+            2, int(detector_cfg.get("reversal_direction_confirmation_bars", 3))
+        )
+        min_trend_return = max(
+            0.0, float(detector_cfg.get("reversal_direction_min_trend_pct", 0.004))
+        )
+        min_confirmation_return = max(
+            0.0, float(detector_cfg.get("reversal_direction_min_confirm_pct", 0.0015))
+        )
+
+        required_candles = trend_lookback + confirmation_bars + 1
+        if not isinstance(ohlcv_data, list) or len(ohlcv_data) < required_candles:
+            return None
+
+        try:
+            closes = [float(candle["close"]) for candle in ohlcv_data[-required_candles:]]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(close <= 0 for close in closes):
+            return None
+
+        prior_start = closes[0]
+        prior_end = closes[trend_lookback]
+        confirmation_start = prior_end
+        confirmation_closes = closes[trend_lookback:]
+        prior_return = prior_end / prior_start - 1.0
+        confirmation_return = confirmation_closes[-1] / confirmation_start - 1.0
+        confirmation_changes = [
+            right - left
+            for left, right in zip(confirmation_closes, confirmation_closes[1:])
+        ]
+        required_direction_bars = (confirmation_bars * 2 + 2) // 3
+
+        if (
+            prior_return <= -min_trend_return
+            and confirmation_return >= min_confirmation_return
+            and sum(change > 0 for change in confirmation_changes) >= required_direction_bars
+        ):
+            return "long"
+        if (
+            prior_return >= min_trend_return
+            and confirmation_return <= -min_confirmation_return
+            and sum(change < 0 for change in confirmation_changes) >= required_direction_bars
+        ):
+            return "short"
+        return None
+
     async def detect_regime(self, ohlcv_data: List[Dict[str, Any]],
-                             symbol: str) -> Dict[str, Any]:
+                             symbol: str, timeframe: Optional[str] = None,
+                             timeframe_data: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
         """检测单个币种的市场状态
         
         Args:
             ohlcv_data: OHLCV数据列表
             symbol: 交易对符号
+            timeframe: 明确的周期类型（short/medium/long）；不提供时由K线时间戳间隔推断
+            timeframe_data: 可选的按周期分组OHLCV数据；至少两个已训练周期有效时启用集成
         
         Returns:
             市场状态检测结果
         """
         async with self._lock:
-            # 自动训练HMM
-            if self._auto_train and len(ohlcv_data) >= self._train_min_samples:
-                # 确定时间周期（基于数据量估算）
-                tf = self._estimate_timeframe(len(ohlcv_data))
-                if not self._mtf.is_trained(tf):
-                    result = self._mtf.train(tf, ohlcv_data, n_iterations=30)
-                    logger.debug(f"Auto-trained HMM for {symbol} ({tf}): {result}")
-            
-            # 多时间周期预测（当前仅用单周期，当多周期数据可用时集成）
-            # 默认使用估计的时间周期
-            tf = self._estimate_timeframe(len(ohlcv_data))
-            prediction = self._mtf.predict(tf, ohlcv_data)
+            mtf = self._get_symbol_mtf(symbol)
+            feature_extractor = self._get_symbol_feature_extractor(symbol)
+            transition_predictor = self._get_symbol_transition_predictor(symbol)
+            tf = timeframe if timeframe in ("short", "medium", "long") else self._estimate_timeframe(ohlcv_data)
+
+            # Train each timeframe from its own candle sequence; never reuse one interval as another.
+            training_inputs = {tf: ohlcv_data}
+            if isinstance(timeframe_data, dict):
+                training_inputs.update({
+                    bucket: candles
+                    for bucket, candles in timeframe_data.items()
+                    if bucket in self._default_timeframes and isinstance(candles, list)
+                })
+            if self._auto_train:
+                for train_tf, candles in training_inputs.items():
+                    if len(candles) >= self._train_min_samples and not mtf.is_trained(train_tf):
+                        result = mtf.train(train_tf, candles, n_iterations=30)
+                        logger.debug(f"Auto-trained HMM for {symbol} ({train_tf}): {result}")
+
+            prediction = mtf.predict(tf, ohlcv_data)
+            if isinstance(timeframe_data, dict):
+                ensemble_inputs = {
+                    time_bucket: candles
+                    for time_bucket, candles in timeframe_data.items()
+                    if time_bucket in self._default_timeframes
+                    and mtf.is_trained(time_bucket)
+                    and isinstance(candles, list)
+                    and candles
+                }
+                if len(ensemble_inputs) >= 2:
+                    prediction = mtf.predict_ensemble(ensemble_inputs)
+
+            candidate_regime = prediction["regime"]
+            previous_regime = self._current_regimes.get(symbol, {})
+            observation_key = self._observation_key(ohlcv_data)
+            is_new_observation = (
+                observation_key is not None
+                and self._last_observation_keys.get(symbol) != observation_key
+            )
+            previous_regime_name = previous_regime.get("regime")
+            pending_regime_name = previous_regime.get("pending_regime")
+            pending_regime_updates = previous_regime.get("pending_regime_updates", 0)
+            immediate_regimes = {
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.REVERSAL,
+            }
+
+            if previous_regime_name and candidate_regime == MarketRegime.UNKNOWN:
+                regime = MarketRegime(previous_regime_name)
+                pending_regime_name = None
+                pending_regime_updates = 0
+            elif (
+                previous_regime_name
+                and candidate_regime.value != previous_regime_name
+                and candidate_regime not in immediate_regimes
+            ):
+                if pending_regime_name == candidate_regime.value:
+                    if is_new_observation:
+                        pending_regime_updates += 1
+                else:
+                    pending_regime_name = candidate_regime.value
+                    pending_regime_updates = 1
+
+                if pending_regime_updates < self._min_stable_updates:
+                    regime = MarketRegime(previous_regime_name)
+                else:
+                    regime = candidate_regime
+                    pending_regime_name = None
+                    pending_regime_updates = 0
+            else:
+                regime = candidate_regime
+                pending_regime_name = None
+                pending_regime_updates = 0
             
             # 提取最新特征
-            latest_features = self._feature_extractor.extract_latest(ohlcv_data)
+            latest_features = feature_extractor.extract_latest(ohlcv_data)
             
             # 更新转移预测器
-            regime = prediction["regime"]
-            self._transition_predictor.update_history(regime)
+            transition_predictor.update_history(regime)
             
             # 检测早期预警信号
             features_history = []
-            for feat_list in self._feature_extractor._feature_cache.values():
+            for feat_list in feature_extractor._feature_cache.values():
                 if feat_list:
                     break
-            if self._feature_extractor._feature_cache.get("log_return"):
-                n_entries = min(40, len(self._feature_extractor._feature_cache["log_return"]))
+            if feature_extractor._feature_cache.get("log_return"):
+                n_entries = min(40, len(feature_extractor._feature_cache["log_return"]))
                 for i in range(-n_entries, 0):
                     entry = {}
-                    for name in self._feature_extractor._feature_names:
-                        cache = self._feature_extractor._feature_cache[name]
+                    for name in feature_extractor._feature_names:
+                        cache = feature_extractor._feature_cache[name]
                         if len(cache) + i >= 0:
                             entry[name] = cache[i]
                     if entry:
                         features_history.append(entry)
             
-            warnings = self._transition_predictor.detect_early_warnings(
+            warnings = transition_predictor.detect_early_warnings(
                 features_history[-40:] if features_history else []
             )
             
@@ -1459,20 +1701,44 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
             optimal_strategies = self._strategy_mapper.get_optimal_strategies(
                 regime, regime_probs
             )
+
+            if previous_regime.get("regime") == regime.value:
+                consecutive_updates = previous_regime.get("regime_consecutive_updates", 1)
+                if is_new_observation:
+                    consecutive_updates += 1
+            else:
+                consecutive_updates = 1
+            self._last_observation_keys[symbol] = observation_key
+            stable = consecutive_updates >= self._min_stable_updates
+            confidence = float(probs.get(regime.value, 0.0))
+            if not stable:
+                confidence *= self._stability_confidence_discount
             
             # 缓存结果
             result = {
                 "symbol": symbol,
                 "regime": regime.value,
                 "probabilities": probs,
+                "confidence": confidence,
+                "stable": stable,
+                "regime_consecutive_updates": consecutive_updates,
+                "pending_regime": pending_regime_name,
+                "pending_regime_updates": pending_regime_updates,
+                "reversal_direction": (
+                    self._infer_reversal_direction(ohlcv_data)
+                    if regime == MarketRegime.REVERSAL
+                    else None
+                ),
                 "features": {
                     name: latest_features[i] if i < len(latest_features) else 0.0
-                    for i, name in enumerate(self._feature_extractor._feature_names)
+                    for i, name in enumerate(feature_extractor._feature_names)
                 },
                 "optimal_strategies": optimal_strategies,
                 "early_warnings": warnings,
                 "timeframe": tf,
                 "detected_at": datetime.now().isoformat(),
+                "candidate_regime": prediction.get("candidate_regime", regime.value),
+                "transition_pending": pending_regime_name is not None,
             }
             
             self._current_regimes[symbol] = result
@@ -1489,20 +1755,36 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
             
             return result
 
-    def _estimate_timeframe(self, n_samples: int) -> str:
-        """根据样本数量估计时间周期类型"""
-        if n_samples <= 0:
+    def _estimate_timeframe(self, ohlcv_data: List[Dict[str, Any]]) -> str:
+        """从K线时间戳间隔推断周期；缺少有效时间戳时使用明确配置的回退周期。"""
+        timestamps = []
+        for candle in ohlcv_data if isinstance(ohlcv_data, list) else []:
+            raw_timestamp = candle.get("timestamp", candle.get("ts", candle.get("time")))
+            if raw_timestamp is None:
+                continue
+            try:
+                timestamp = float(raw_timestamp)
+                if timestamp > 1e11:
+                    timestamp /= 1000.0
+            except (TypeError, ValueError):
+                try:
+                    timestamp = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+            timestamps.append(timestamp)
+
+        intervals = sorted(
+            right - left for left, right in zip(timestamps, timestamps[1:]) if right > left
+        )
+        if not intervals:
+            return self._fallback_timeframe
+
+        interval_seconds = intervals[len(intervals) // 2]
+        if interval_seconds <= 15 * 60:
             return "short"
-        # 基于典型K线周期估算
-        # ~48个 = 4h (12 * 4H) ≈ long
-        # ~96个 = 24h (24 * 1H) ≈ medium
-        # ~384个 = 96h (384 * 15m) ≈ short
-        if n_samples <= 60:
-            return "long"
-        elif n_samples <= 200:
+        if interval_seconds <= 4 * 60 * 60:
             return "medium"
-        else:
-            return "short"
+        return "long"
 
     async def detect_all_symbols(self, symbols_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
         """批量检测所有币种的市场状态"""
@@ -1568,10 +1850,12 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
             # 获取HMM转移矩阵
             tf = self._current_regimes[symbol].get("timeframe", "short")
             transition_matrix = None
-            if self._mtf.is_trained(tf):
-                transition_matrix = self._mtf._classifiers[tf].get_transition_matrix()
+            mtf = self._symbol_mtfs.get(symbol)
+            transition_predictor = self._symbol_transition_predictors.get(symbol, self._transition_predictor)
+            if mtf and mtf.is_trained(tf):
+                transition_matrix = mtf._classifiers[tf].get_regime_transition_matrix()
             
-            prediction = self._transition_predictor.predict_next_regime(transition_matrix)
+            prediction = transition_predictor.predict_next_regime(transition_matrix)
             prediction["symbol"] = symbol
             
             return prediction
@@ -1631,8 +1915,20 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
             regime_counts[regime] = regime_counts.get(regime, 0) + 1
             symbol_regimes[symbol] = regime
         
-        # 训练状态
-        trained_tfs = [tf for tf in self._default_timeframes if self._mtf.is_trained(tf)]
+        # 训练状态汇总所有币种模型，同时保留旧的无币种手动训练模型。
+        trained_tfs = sorted({
+            tf for tf in self._default_timeframes
+            if self._mtf.is_trained(tf)
+            or any(mtf.is_trained(tf) for mtf in self._symbol_mtfs.values())
+        })
+        trained_timeframes_by_symbol = {
+            symbol: [tf for tf in self._default_timeframes if mtf.is_trained(tf)]
+            for symbol, mtf in self._symbol_mtfs.items()
+        }
+        all_timeframes_trained = self._mtf.are_all_trained() or any(
+            all(mtf.is_trained(tf) for tf in self._default_timeframes)
+            for mtf in self._symbol_mtfs.values()
+        )
         
         # 转移统计
         transition_stats = {}
@@ -1643,6 +1939,15 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
                 "current_global_regime": current.value,
                 "current_duration": durations.get(current, 0),
             }
+        transition_stats_by_symbol = {}
+        for symbol, predictor in self._symbol_transition_predictors.items():
+            if not predictor._state_history:
+                continue
+            current = predictor._state_history[-1]["regime"]
+            transition_stats_by_symbol[symbol] = {
+                "current_regime": current.value,
+                "current_duration": predictor._compute_durations().get(current, 0),
+            }
         
         return {
             "timestamp": datetime.now().isoformat(),
@@ -1650,9 +1955,15 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
             "regime_distribution": regime_counts,
             "dominant_regime": max(regime_counts, key=lambda k: regime_counts[k]) if any(v > 0 for v in regime_counts.values()) else MarketRegime.UNKNOWN.value,
             "trained_timeframes": trained_tfs,
-            "all_timeframes_trained": len(trained_tfs) == 3,
+            "trained_timeframes_by_symbol": trained_timeframes_by_symbol,
+            "all_timeframes_trained": all_timeframes_trained,
             "transition_stats": transition_stats,
+            "transition_stats_by_symbol": transition_stats_by_symbol,
             "feature_stats": self._feature_extractor.get_rolling_statistics(),
+            "feature_stats_by_symbol": {
+                symbol: extractor.get_rolling_statistics()
+                for symbol, extractor in self._symbol_feature_extractors.items()
+            },
             "persist_dir": self._persist_dir,
             "running": self._running,
         }
@@ -1664,7 +1975,14 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
         try:
             data = {
                 "mtf": self._mtf.to_dict(),
+                "mtf_by_symbol": {
+                    symbol: mtf.to_dict() for symbol, mtf in self._symbol_mtfs.items()
+                },
                 "transition_predictor": self._transition_predictor.to_dict(),
+                "transition_predictors_by_symbol": {
+                    symbol: predictor.to_dict()
+                    for symbol, predictor in self._symbol_transition_predictors.items()
+                },
                 "strategy_mapper": self._strategy_mapper.to_dict(),
                 "persisted_at": datetime.now().isoformat(),
             }
@@ -1691,13 +2009,24 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
             
             if "mtf" in data:
                 self._mtf = MultiTimeframeRegime.from_dict(data["mtf"], self._config)
+            self._symbol_mtfs = {
+                symbol: MultiTimeframeRegime.from_dict(mtf_data, self._config)
+                for symbol, mtf_data in data.get("mtf_by_symbol", {}).items()
+            }
             if "transition_predictor" in data:
                 self._transition_predictor = RegimeTransitionPredictor.from_dict(data["transition_predictor"])
+            self._symbol_transition_predictors = {
+                symbol: RegimeTransitionPredictor.from_dict(predictor_data)
+                for symbol, predictor_data in data.get("transition_predictors_by_symbol", {}).items()
+            }
             if "strategy_mapper" in data:
                 self._strategy_mapper = RegimeStrategyMapper.from_dict(data["strategy_mapper"])
-            
+            trained_by_symbol = {
+                symbol: [tf for tf in self._default_timeframes if mtf.is_trained(tf)]
+                for symbol, mtf in self._symbol_mtfs.items()
+            }
             logger.info(f"HMM models loaded from {path} "
-                         f"(trained: {[tf for tf in self._default_timeframes if self._mtf.is_trained(tf)]})")
+                         f"(trained: {trained_by_symbol})")
         except Exception as e:
             self._handle_exception(
                 e, module="MarketRegimeDetector", function="_load",
@@ -1707,10 +2036,11 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
     # ===================== 手动训练与配置 =====================
 
     async def train_timeframe(self, timeframe: str, ohlcv_data: List[Dict[str, Any]],
-                               n_iterations: int = 50) -> Dict[str, Any]:
-        """手动训练指定时间周期的HMM模型"""
+                               n_iterations: int = 50, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """手动训练指定时间周期的HMM模型；提供 symbol 时使用币种专属模型。"""
         async with self._lock:
-            return self._mtf.train(timeframe, ohlcv_data, n_iterations=n_iterations)
+            mtf = self._get_symbol_mtf(symbol) if symbol else self._mtf
+            return mtf.train(timeframe, ohlcv_data, n_iterations=n_iterations)
 
     async def update_strategy_performance(self, strategy: str, symbol: str,
                                             win: bool, pnl: float):
@@ -1739,3 +2069,113 @@ class MarketRegimeDetector(EnterpriseServiceMixin):
                 "by_regime": perf_by_regime,
             }
         return summary
+
+    def verify_regime_accuracy_offline(
+        self,
+        ohlcv_data: List[Dict[str, Any]],
+        symbol: str = "BTC-USDT-SWAP",
+        validation_window: int = 20,
+        step_size: int = 5,
+    ) -> Dict[str, Any]:
+        """离线验证 regime 分类准确率：用历史 K 线滚动预测，再对照后续实际走势判定对错。
+
+        Args:
+            ohlcv_data: 按时间升序的 OHLCV 序列（至少 100 根）
+            validation_window: 预测后等待多少根 K 线再验证
+            step_size: 滚动步长（每 step_size 根采样一次预测）
+        """
+        if len(ohlcv_data) < 100:
+            return {"error": "insufficient data", "min_required": 100, "got": len(ohlcv_data)}
+
+        extractor = RegimeFeatureExtractor(self._config)
+        mtf = self._mtf
+
+        # 找到已训练的 short 周期 HMM
+        hmm = None
+        for tf_key in ("short", "medium", "long"):
+            clf = mtf._classifiers.get(tf_key)
+            if clf and clf._trained:
+                hmm = clf
+                break
+        if hmm is None:
+            return {"error": "no trained HMM model available"}
+
+        predictions = []
+        closes = [float(c.get("close", 0)) for c in ohlcv_data]
+
+        for i in range(50, len(ohlcv_data) - validation_window, step_size):
+            window = ohlcv_data[max(0, i - 60):i + 1]
+            try:
+                features = extractor.extract_features(window, cache_features=False)
+                if not features:
+                    continue
+                last_features = features[-1]
+                regime = hmm.predict(last_features)
+                pred_price = closes[i]
+                if pred_price <= 0:
+                    continue
+
+                future_idx = min(i + validation_window, len(closes) - 1)
+                future_price = closes[future_idx]
+                actual_change = (future_price - pred_price) / pred_price
+
+                correct = self._judge_regime_prediction(regime, actual_change)
+                predictions.append({
+                    "index": i,
+                    "regime": regime.value if isinstance(regime, MarketRegime) else str(regime),
+                    "price": pred_price,
+                    "actual_change": round(actual_change, 6),
+                    "correct": correct,
+                })
+            except Exception:
+                continue
+
+        if not predictions:
+            return {"error": "no valid predictions generated", "data_length": len(ohlcv_data)}
+
+        # 汇总统计
+        total = len(predictions)
+        correct_total = sum(1 for p in predictions if p["correct"])
+        by_regime: Dict[str, Dict[str, Any]] = {}
+        for p in predictions:
+            r = p["regime"]
+            if r not in by_regime:
+                by_regime[r] = {"total": 0, "correct": 0, "avg_actual_change": 0.0, "_changes": []}
+            by_regime[r]["total"] += 1
+            if p["correct"]:
+                by_regime[r]["correct"] += 1
+            by_regime[r]["_changes"].append(abs(p["actual_change"]))
+
+        for r, stats in by_regime.items():
+            stats["accuracy"] = stats["correct"] / stats["total"] if stats["total"] else 0
+            stats["avg_abs_change"] = sum(stats["_changes"]) / len(stats["_changes"]) if stats["_changes"] else 0
+            del stats["_changes"]
+
+        return {
+            "total_predictions": total,
+            "correct": correct_total,
+            "accuracy": correct_total / total if total else 0,
+            "validation_window": validation_window,
+            "by_regime": by_regime,
+        }
+
+    @staticmethod
+    def _judge_regime_prediction(regime, actual_change: float) -> bool:
+        """根据实际价格变化判断 regime 预测是否正确。"""
+        regime_val = regime.value if isinstance(regime, MarketRegime) else str(regime)
+        if regime_val == "trending_up":
+            return actual_change > 0.02
+        elif regime_val == "trending_down":
+            return actual_change < -0.02
+        elif regime_val == "ranging":
+            return abs(actual_change) < 0.03
+        elif regime_val == "breakout":
+            return abs(actual_change) > 0.05
+        elif regime_val == "high_vol":
+            return abs(actual_change) > 0.04
+        elif regime_val == "low_vol":
+            return abs(actual_change) < 0.015
+        elif regime_val == "reversal":
+            return abs(actual_change) > 0.03
+        else:
+            return abs(actual_change) < 0.10

@@ -2,9 +2,10 @@
 行情数据服务，订阅市场行情、回调分发并对数据质量进行校验与监控。
 """
 import asyncio
+import math
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Callable
+from typing import Dict, Any, List, Callable, Optional
 from loguru import logger
 
 from core.models import TickData
@@ -16,6 +17,10 @@ class DataQualityChecker:
     def __init__(self, config: Dict[str, Any]):
         self._max_price_change_pct = config.get("market_data", {}).get("max_price_change_pct", 0.05)
         self._max_data_delay_seconds = config.get("market_data", {}).get("max_data_delay_seconds", 30)
+        self._max_kline_gap_intervals = max(
+            1.0,
+            float(config.get("market_data", {}).get("max_kline_gap_intervals", 1.5)),
+        )
         self._last_prices: Dict[str, float] = {}
         self._last_update_times: Dict[str, float] = {}
         self._violation_counts: Dict[str, int] = {}
@@ -27,22 +32,50 @@ class DataQualityChecker:
         issues = []
         quality_score = 1.0
 
+        numeric_fields = {
+            "price": tick.price,
+            "volume": tick.volume,
+            "bid_price": tick.bid_price,
+            "bid_volume": tick.bid_volume,
+            "ask_price": tick.ask_price,
+            "ask_volume": tick.ask_volume,
+        }
+        invalid_numeric_fields = [
+            name for name, value in numeric_fields.items()
+            if not self._is_finite_number(value)
+        ]
+        if invalid_numeric_fields:
+            issues.append(f"non_finite:{','.join(invalid_numeric_fields)}")
+            quality_score = 0.0
+
         # 基本字段校验
-        if tick.price <= 0:
+        if self._is_finite_number(tick.price) and tick.price <= 0:
             issues.append("invalid_price")
             quality_score = 0.0
 
-        if tick.bid_price <= 0 or tick.ask_price <= 0:
+        if (
+            self._is_finite_number(tick.bid_price)
+            and self._is_finite_number(tick.ask_price)
+            and (tick.bid_price <= 0 or tick.ask_price <= 0)
+        ):
             issues.append("invalid_quote")
             quality_score = max(quality_score, 0.3)
 
-        if tick.bid_price > tick.ask_price:
+        if (
+            self._is_finite_number(tick.bid_price)
+            and self._is_finite_number(tick.ask_price)
+            and tick.bid_price > tick.ask_price
+        ):
             issues.append("inverted_quote")
             quality_score = max(quality_score, 0.5)
 
         # 价格突变检测
         last_price = self._last_prices.get(symbol)
-        if last_price and last_price > 0 and tick.price > 0:
+        if (
+            last_price and last_price > 0
+            and self._is_finite_number(tick.price)
+            and tick.price > 0
+        ):
             change_pct = abs(tick.price - last_price) / last_price
             if change_pct > self._max_price_change_pct:
                 issues.append(f"price_spike:{change_pct:.4f}")
@@ -50,11 +83,21 @@ class DataQualityChecker:
                 self._violation_counts[symbol] = self._violation_counts.get(symbol, 0) + 1
 
         # 时间戳延迟检测
-        tick_ts = tick.timestamp.timestamp()
-        delay = now - tick_ts
+        try:
+            tick_ts = tick.timestamp.timestamp()
+            if not math.isfinite(tick_ts):
+                raise ValueError("non-finite timestamp")
+            delay = now - tick_ts
+        except (AttributeError, OverflowError, OSError, TypeError, ValueError):
+            delay = float("inf")
+            issues.append("invalid_timestamp")
+            quality_score = 0.0
         if delay > self._max_data_delay_seconds:
             issues.append(f"delayed:{delay:.1f}s")
             quality_score = max(quality_score, 0.5)
+
+        if invalid_numeric_fields or "invalid_timestamp" in issues:
+            quality_score = 0.0
 
         # 更新跟踪状态
         if quality_score > 0.5:
@@ -68,6 +111,101 @@ class DataQualityChecker:
             "delay_seconds": round(delay, 2),
             "timestamp": now,
         }
+
+    @staticmethod
+    def _is_finite_number(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    @staticmethod
+    def _parse_kline_timestamp(value: Any) -> Optional[float]:
+        try:
+            timestamp = float(value)
+            if not math.isfinite(timestamp):
+                return None
+            return timestamp / 1000.0 if timestamp > 1e11 else timestamp
+        except (TypeError, ValueError, OverflowError):
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError, OSError):
+                return None
+
+    @staticmethod
+    def _kline_values(kline: Any) -> Optional[tuple]:
+        if isinstance(kline, dict):
+            timestamp = kline.get("timestamp", kline.get("ts", kline.get("time")))
+            values = (
+                kline.get("open"), kline.get("high"), kline.get("low"),
+                kline.get("close"), kline.get("vol", kline.get("volume")),
+            )
+            return (timestamp, values) if timestamp is not None else None
+        if isinstance(kline, (list, tuple)) and len(kline) >= 6:
+            return kline[0], tuple(kline[1:6])
+        return None
+
+    def check_kline_series(
+        self,
+        symbol: str,
+        klines: List[Any],
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """Check finite OHLCV values and timestamp order/gaps without altering bars."""
+        issues = []
+        invalid_rows = []
+        timestamps = []
+        interval_seconds = self._timeframe_seconds(timeframe)
+        for index, kline in enumerate(klines or []):
+            parsed = self._kline_values(kline)
+            if parsed is None:
+                issues.append(f"invalid_format:{index}")
+                invalid_rows.append(index)
+                continue
+            raw_timestamp, values = parsed
+            timestamp = self._parse_kline_timestamp(raw_timestamp)
+            finite = all(self._is_finite_number(value) for value in values)
+            if timestamp is None:
+                issues.append(f"invalid_timestamp:{index}")
+                invalid_rows.append(index)
+            else:
+                timestamps.append((index, timestamp))
+            if not finite:
+                issues.append(f"non_finite_ohlcv:{index}")
+                invalid_rows.append(index)
+
+        missing_bars = 0
+        for (left_index, left_ts), (right_index, right_ts) in zip(timestamps, timestamps[1:]):
+            delta = right_ts - left_ts
+            if delta <= 0:
+                issues.append(f"non_monotonic_timestamp:{left_index}:{right_index}")
+                continue
+            if interval_seconds and delta > interval_seconds * self._max_kline_gap_intervals:
+                gap = max(1, round(delta / interval_seconds) - 1)
+                missing_bars += gap
+                issues.append(f"kline_gap:{left_index}:{right_index}:{gap}")
+
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "valid": not issues,
+            "bar_count": len(klines or []),
+            "missing_bars": missing_bars,
+            "invalid_rows": sorted(set(invalid_rows)),
+            "issues": issues,
+            "checked_at": time.time(),
+        }
+
+    @staticmethod
+    def _timeframe_seconds(timeframe: str) -> Optional[float]:
+        normalized = str(timeframe).strip().lower()
+        if normalized.endswith("m") and normalized[:-1].isdigit():
+            return int(normalized[:-1]) * 60.0
+        if normalized.endswith("h") and normalized[:-1].isdigit():
+            return int(normalized[:-1]) * 3600.0
+        if normalized.endswith("d") and normalized[:-1].isdigit():
+            return int(normalized[:-1]) * 86400.0
+        return None
 
     def is_healthy(self, symbol: str) -> bool:
         """判断某币种数据是否健康"""
@@ -97,6 +235,10 @@ class MarketDataService:
         self._okx_client = okx_client
         self._redis_cache = redis_cache
         self._alert_manager = alert_manager
+        self._rest_fallback_max_concurrency = max(
+            1,
+            int(config.get("market_data", {}).get("rest_fallback_max_concurrency", 5)),
+        )
         self._tick_callbacks: List[Callable] = []
         self._subscribed_symbols = []
         self._quality_checker = DataQualityChecker(config)
@@ -179,9 +321,9 @@ class MarketDataService:
                     _current_backoff = fallback_interval  # 重置退避
                     continue
 
-                for symbol in self._subscribed_symbols:
+                fallback_tickers = await self._fetch_rest_fallback_tickers()
+                for symbol, ticker in fallback_tickers:
                     try:
-                        ticker = self._okx_client.get_ticker(symbol)
                         if not ticker:
                             continue
 
@@ -213,6 +355,27 @@ class MarketDataService:
             except Exception as e:
                 logger.error(f"REST fallback loop error: {e}")
                 await asyncio.sleep(5)
+
+    async def _fetch_rest_fallback_tickers(self):
+        """Fetch subscribed symbols concurrently without blocking the event loop."""
+        symbols = list(self._subscribed_symbols)
+        semaphore = asyncio.Semaphore(self._rest_fallback_max_concurrency)
+
+        async def fetch(symbol):
+            async with semaphore:
+                return await asyncio.to_thread(self._okx_client.get_ticker, symbol)
+
+        results = await asyncio.gather(
+            *(fetch(symbol) for symbol in symbols),
+            return_exceptions=True,
+        )
+        fallback_tickers = []
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                logger.debug(f"REST fallback error for {symbol}: {result}")
+                continue
+            fallback_tickers.append((symbol, result))
+        return fallback_tickers
 
     async def _quality_monitor_loop(self):
         """定期检查数据质量并记录"""

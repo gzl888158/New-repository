@@ -1,6 +1,9 @@
 """
 智能决策核心引擎（Intelligent Decision Engine）
 
+.. deprecated::
+    实验性模块，未接入生产交易链路。保留供架构演进参考。
+
 完善强化的智能决策系统，提供：
   - 多时间框架贝叶斯决策融合（MTF Bayesian Fusion）
   - 决策成本收益分析（Expected Value + Fee/Slippage）
@@ -842,9 +845,12 @@ class IntelligentDecisionEngine:
         base = self._base_confidence_threshold
 
         # 市场状态调整
+        # 注意：regime 名称需与 MarketRegimeEngine 输出一致（trend_bullish/trend_bearish）
         regime_adjustments = {
             "trending_up": -0.05,       # 趋势时降低阈值
+            "trend_bullish": -0.05,
             "trending_down": -0.03,
+            "trend_bearish": -0.03,
             "ranging": 0.0,
             "range_bound": 0.0,         # P5: 添加range_bound市场状态
             "high_volatility": 0.10,    # 高波动提高阈值

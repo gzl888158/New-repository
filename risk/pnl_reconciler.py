@@ -4,9 +4,21 @@ PnL对账模块
 解决历史PnL=0的假数据问题
 """
 import asyncio
+import math
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from loguru import logger
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
 
 
 class PnLReconciler:
@@ -17,8 +29,11 @@ class PnLReconciler:
         self.okx_client = okx_client
         self.sqlite_storage = sqlite_storage
 
-        # 对账周期：每6小时一次
-        self._reconcile_interval = 6 * 3600
+        # 对账周期：持仓对账15分钟，完整对账1小时（P2: 6h→1h，缩短手动平仓后 pnl 显示 0 的窗口）
+        self._position_reconcile_interval = 15 * 60  # 15 min
+        self._full_reconcile_interval = 1 * 3600  # 1 h
+        self._reconcile_interval = self._position_reconcile_interval
+        self._last_full_reconcile: Optional[datetime] = None
         # 最近一次对账时间
         self._last_reconcile: Optional[datetime] = None
         # 对账统计
@@ -41,12 +56,22 @@ class PnLReconciler:
 
     async def start(self):
         """启动对账循环"""
-        logger.info("PnLReconciler started, interval=6h")
+        logger.info("PnLReconciler started, position_interval=15min, full_interval=1h")
         # 启动后先等5分钟再首次执行（避开系统启动高峰）
         await asyncio.sleep(300)
         while True:
             try:
-                await self.reconcile_all()
+                now = datetime.now()
+                # 完整对账：1小时一次
+                if (self._last_full_reconcile is None or
+                    (now - self._last_full_reconcile).total_seconds() >= self._full_reconcile_interval):
+                    await self.reconcile_all()
+                    self._last_full_reconcile = now
+                else:
+                    # 持仓对账：15分钟一次（轻量版）
+                    await self._reconcile_open_positions()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"PnL reconciliation loop error: {e}")
             await asyncio.sleep(self._reconcile_interval)
@@ -57,16 +82,18 @@ class PnLReconciler:
         logger.info("Starting PnL reconciliation with OKX...")
         start_time = datetime.now()
 
-        # 1. 对账已平仓记录（pnl=0或pnl=None的closed记录）
-        closed_result = await self._reconcile_closed_records()
-
-        # 2. 对账open记录是否与OKX实际持仓一致
+        # 1. 先对账 open 记录与 OKX 实际持仓：幽灵持仓标 closed（pnl 暂空）
         open_result = await self._reconcile_open_positions()
+
+        # 2. 再回填已平仓记录 pnl/fees（含刚标记的幽灵仓：平仓账单仍在 7 天窗口内，
+        #    可在同一对账周期内立即回填，避免下一周期 close_time 被清理时刻污染导致漏配）
+        closed_result = await self._reconcile_closed_records()
 
         # 3. 对账账户总盈亏
         account_result = await self._reconcile_account_pnl()
 
         self._last_reconcile = datetime.now()
+        self._last_full_reconcile = self._last_reconcile
         self._stats["last_run"] = self._last_reconcile.isoformat()
         self._stats["total_reconciled"] += 1
 
@@ -135,9 +162,6 @@ class PnLReconciler:
             # 构建平仓账单列表：[(symbol, side, dt, pnl, fee, fill_px, sz), ...]
             close_bills = []
             for bill in okx_bills:
-                pnl = float(bill.get("pnl", "0") or 0)
-                if pnl == 0:
-                    continue
                 try:
                     subtype = int(bill.get("subType", "0") or 0)
                 except (TypeError, ValueError):
@@ -148,18 +172,24 @@ class PnLReconciler:
                     side = "short"
                 else:
                     continue  # 开仓或非平仓账单，跳过
+                pnl = _finite(bill.get("pnl", "0") or 0, 0.0)
+                # 保留 fee 符号：OKX 账单 fee 负值表示支付手续费、正值表示返佣，
+                # 绝对值会丢失方向性导致返佣被误当作成本扣减。
+                fee = _finite(bill.get("fee", "0") or 0, 0.0)
+                # 修复历史缺陷：原实现先按 pnl==0 过滤，误杀「平价平仓、仅剩手续费」的
+                # 剥头皮平仓账单（pnl=0 但 fee<0），导致这类记录的 pnl/fees 永远无法回填，
+                # 污染手续费统计与胜率。仅当 pnl 与 fee 同时为 0 才跳过（无入账价值）。
+                if pnl == 0 and fee == 0:
+                    continue
                 ts = bill.get("ts", "")
                 try:
                     dt = datetime.fromtimestamp(int(ts) / 1000) if ts else None
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     dt = None
                 if not dt:
                     continue
-                # 保留 fee 符号：OKX 账单 fee 负值表示支付手续费、正值表示返佣，
-                # 绝对值会丢失方向性导致返佣被误当作成本扣减。
-                fee = float(bill.get("fee", "0") or 0)
-                fill_px = float(bill.get("fillPx", "0") or 0)
-                sz = abs(float(bill.get("sz", "0") or 0))
+                fill_px = _finite(bill.get("fillPx", "0") or 0, 0.0)
+                sz = abs(_finite(bill.get("sz", "0") or 0, 0.0))
                 close_bills.append((bill.get("instId", ""), side, dt, pnl, fee, fill_px, sz))
 
             logger.info(f"Filtered {len(close_bills)} close bills from {len(okx_bills)} trade bills")
@@ -185,13 +215,15 @@ class PnLReconciler:
                             continue
                         if b_dt > upper:
                             continue
-                        matched.append((b_pnl, b_fee, b_px, b_sz))
+                        matched.append((b_pnl, b_fee, b_px, b_sz, b_dt))
 
                     if matched:
                         # 部分平仓多笔账单聚合：pnl/fee 求和，fill_px 按成交张数(sz)加权
                         total_pnl = sum(b[0] for b in matched)
                         total_fee = sum(b[1] for b in matched)
                         total_sz = sum(b[3] for b in matched)
+                        # 真实平仓时刻取最晚一笔账单（多笔部分平仓时以最后一笔为准）
+                        close_dt = max(b[4] for b in matched)
                         if total_sz > 0:
                             px = sum(b[2] * b[3] for b in matched) / total_sz
                         else:
@@ -203,6 +235,9 @@ class PnLReconciler:
                             updates["filled_price"] = px
                         if abs(total_fee) > 0:
                             updates["fees"] = abs(total_fee)
+                        # 回填真实平仓时间：幽灵仓 close_time 原为清理时刻（now），
+                        # 与真实平仓账单时间错位会导致 7 天可恢复窗口判定与时间归因失真。
+                        updates["close_time"] = close_dt.isoformat(sep=" ")
                         # P1: margin 回填 —— 幽灵仓/sync 记录常缺 margin（=0），用开仓名义价值 / 杠杆反算。
                         #     仅基于开仓价格(rec["price"])与数量，不能用 close 的 filled_price 反算。
                         if not rec.get("margin"):
@@ -219,8 +254,9 @@ class PnLReconciler:
                         # 标签治理：幽灵仓匹配到真实平仓账单 → 说明是「成交回执丢失的真实平仓」，
                         # 从 ghost_close/ghost_cleanup 重标为 recovered_close，恢复绩效归因
                         # （与真正的幽灵关闭（无任何账单匹配）区分开）。
+                        # P1-对账器保留 manual_close：手动平仓标签优先级最高，不被覆盖
                         prev_reason = (rec.get("exit_reason") or "").strip()
-                        if prev_reason in ("ghost_close", "ghost_cleanup", "reconciled", ""):
+                        if prev_reason != "manual_close" and prev_reason in ("ghost_close", "ghost_cleanup", "reconciled", ""):
                             updates["exit_reason"] = "recovered_close"
                         # 记录可能在热表或月份分片，原地回写对应分片
                         shard = rec.get("_shard", "trade_records")
@@ -248,10 +284,19 @@ class PnLReconciler:
         okx_position_symbols = set()
 
         try:
-            # 获取OKX实际持仓
-            okx_positions = self.okx_client.get_positions()
+            # 获取OKX实际持仓。fail-closed：API 失败或返回 None 时绝不动库，
+            # 否则空结果会让所有 open 记录被误判为幽灵持仓并批量关闭。
+            checked_query = getattr(self.okx_client, "get_positions_checked", None)
+            okx_positions = (
+                checked_query()
+                if callable(checked_query)
+                else self.okx_client.get_positions()
+            )
+            if okx_positions is None:
+                logger.error("Failed to fetch OKX positions for reconciliation, abort ghost cleanup")
+                return {"ghost_positions_cleaned": 0, "error": "okx_positions_none"}
             for pos in okx_positions:
-                pos_qty = float(pos.get("pos", 0))
+                pos_qty = _finite(pos.get("pos", 0), 0.0)
                 if pos_qty != 0:
                     okx_position_symbols.add(pos.get("instId", ""))
 
@@ -260,6 +305,9 @@ class PnLReconciler:
 
             for rec in db_open_records:
                 if rec["symbol"] not in okx_position_symbols:
+                    # P1-保留 manual_close：已标记手动平仓的记录不视为幽灵仓
+                    if (rec.get("exit_reason") or "").strip() == "manual_close":
+                        continue
                     # 数据库open但OKX无持仓：幽灵持仓
                     ghost_count += 1
                     logger.warning(f"Ghost position detected: {rec['symbol']} (id={rec['id'][:16]}...)")
@@ -318,13 +366,16 @@ class PnLReconciler:
 
             # OKX账户权益 - 动态基准 = 实际总盈亏（含未实现）
             account = self.okx_client.get_account_info()
-            okx_equity = float(account.get("totalEq", 0)) if account else 0
+            if not account:
+                logger.error("Failed to fetch OKX account info for reconciliation, abort account PnL reconcile")
+                return {"error": "account_info_none"}
+            okx_equity = _finite(account.get("totalEq", 0), 0.0)
             # 未实现盈亏：OKX账户余额接口的 upl 字段（浮盈浮亏）
-            unrealized_pnl = float(account.get("upl", 0) or 0) if account else 0
+            unrealized_pnl = _finite(account.get("upl", 0) or 0, 0.0)
 
             # 动态基准：静态 total_capital 会把出入金也误计入盈亏。改用持久化的
             # 基准权益（首次用配置 total_capital），并在检测到外部资金流动时同步调整基准。
-            config_capital = float(self.config.get("trading", {}).get("total_capital", 100) or 0)
+            config_capital = _finite(self.config.get("trading", {}).get("total_capital", 100) or 0, 0.0)
             prev = self.sqlite_storage.get_latest_pnl_reconciliation()
             baseline = (prev.get("initial_capital") if prev else None) or config_capital
 

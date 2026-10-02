@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
 
+from core.direction_unifier import DirectionUnifier
+
 
 class MarketRegime(Enum):
     """市场行情状态"""
@@ -207,7 +209,13 @@ class SlippageOptimizer:
         """
         if not self._enabled or order_type == "market":
             return reference_price, {"applied": False, "reason": "disabled_or_market"}
-        
+
+        # 方向归一化：long/short/buy/sell → buy/sell（避免 "long" 被误当 sell 处理）
+        try:
+            side = DirectionUnifier.to_side(side)
+        except (ValueError, TypeError):
+            pass
+
         strategy = strategy or self._default_strategy
         state = self._market_states.get(symbol)
         
@@ -234,7 +242,12 @@ class SlippageOptimizer:
             
             total_multiplier = base_multiplier * strategy_multiplier * urgency_multiplier * adaptive_multiplier
             offset = self._base_offset * total_multiplier
-            
+
+            # spread-aware floor: offset must be >= half the current spread so the limit
+            # price lands on the executable side rather than trapped inside the spread
+            spread_floor = state.spread_ratio * 0.5 if state.spread_ratio > 0 else 0.0
+            offset = max(offset, spread_floor)
+
             # 限制在合理范围
             offset = max(self._min_offset, min(self._max_offset, offset))
         
@@ -257,6 +270,7 @@ class SlippageOptimizer:
             "reference_price": reference_price,
             "optimal_price": optimal_price,
             "side": side,
+            "spread_ratio": state.spread_ratio if state else 0.0,
         }
         
         return optimal_price, info
@@ -274,7 +288,7 @@ class SlippageOptimizer:
         side_key = f"avg_slippage_{side}"
         avg_slippage = stats.get(side_key, 0)
         
-        if avg_slippage <= 0:
+        if avg_slippage <= 0 or self._base_offset <= 0:
             return 1.0
         
         # 如果平均滑点 > 基础偏移，说明需要更大偏移才能成交
@@ -311,7 +325,13 @@ class SlippageOptimizer:
         """
         if expected_price <= 0 or filled_price <= 0:
             return
-        
+
+        # 方向归一化：long/short/buy/sell → buy/sell
+        try:
+            side = DirectionUnifier.to_side(side)
+        except (ValueError, TypeError):
+            pass
+
         raw_slippage = (filled_price - expected_price) / expected_price
         abs_slippage = abs(raw_slippage)
         

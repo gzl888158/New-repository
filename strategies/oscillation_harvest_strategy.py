@@ -253,10 +253,6 @@ class OscillationHarvestStrategy(TrendStrategyBase):
         if range_pct < self._min_band_width_pct:
             return {"signal": None, "reason": f"band_too_narrow({range_pct:.4f})"}
 
-        # 区间未获多次触及验证，视为不可靠区间
-        if self._min_band_touch_count > 0 and touch_count < self._min_band_touch_count:
-            return {"signal": None, "reason": f"range_untested(touches={touch_count})"}
-
         price = float(np.asarray(closes, dtype=float)[-1])
         rsi = self._rsi(closes, self._rsi_period)
         atr = _atr(np.asarray(highs, dtype=float), np.asarray(lows, dtype=float),
@@ -271,27 +267,50 @@ class OscillationHarvestStrategy(TrendStrategyBase):
         oversold = rsi < self._rsi_oversold
         overbought = rsi > self._rsi_overbought
 
+        # 区间是否获多次触及验证（min_band_touch_count=0 视为不要求验证）
+        range_verified = self._min_band_touch_count <= 0 or touch_count >= self._min_band_touch_count
+
         # 做多：低点触及 + RSI 超卖；做空：高点触及 + RSI 超买
         direction = None
         band_depth = 0.0
         stop_loss = None
         take_profit = None
+        boll_only = False  # 区间未验证时降级为布林带震荡兜底
 
-        if (near_support or bb_low) and oversold:
-            direction = "long"
-            band_depth = (support - price) / support if support > 0 else 0.0
-            sl_offset = atr * self._atr_sl_mult if atr > 0 else support * self._support_band_pct
-            stop_loss = support - sl_offset
-            take_profit = support + (mid - support) * self._mid_tp_ratio
-        elif (near_resistance or bb_high) and overbought:
-            direction = "short"
-            band_depth = (price - resistance) / resistance if resistance > 0 else 0.0
-            sl_offset = atr * self._atr_sl_mult if atr > 0 else resistance * self._support_band_pct
-            stop_loss = resistance + sl_offset
-            take_profit = resistance - (resistance - mid) * self._mid_tp_ratio
+        if range_verified:
+            if (near_support or bb_low) and oversold:
+                direction = "long"
+                band_depth = (support - price) / support if support > 0 else 0.0
+                sl_offset = atr * self._atr_sl_mult if atr > 0 else support * self._support_band_pct
+                stop_loss = support - sl_offset
+                take_profit = support + (mid - support) * self._mid_tp_ratio
+            elif (near_resistance or bb_high) and overbought:
+                direction = "short"
+                band_depth = (price - resistance) / resistance if resistance > 0 else 0.0
+                sl_offset = atr * self._atr_sl_mult if atr > 0 else resistance * self._support_band_pct
+                stop_loss = resistance + sl_offset
+                take_profit = resistance - (resistance - mid) * self._mid_tp_ratio
+        elif bb is not None:
+            # 区间未验证：降级为布林带震荡兜底（弱震荡市用动态波动边界替代固定支撑/阻力）。
+            # 仅当布林带极值 + RSI 极端双共振时才开仓，且止损置于布林带外侧，止盈回归中轨。
+            if bb_low and oversold:
+                direction = "long"
+                boll_only = True
+                band_depth = (bb["lower"] - price) / bb["lower"] if bb["lower"] > 0 else 0.0
+                sl_offset = atr * self._atr_sl_mult if atr > 0 else bb["lower"] * 0.01
+                stop_loss = bb["lower"] - sl_offset
+                take_profit = bb["mid"]
+            elif bb_high and overbought:
+                direction = "short"
+                boll_only = True
+                band_depth = (price - bb["upper"]) / bb["upper"] if bb["upper"] > 0 else 0.0
+                sl_offset = atr * self._atr_sl_mult if atr > 0 else bb["upper"] * 0.01
+                stop_loss = bb["upper"] + sl_offset
+                take_profit = bb["mid"]
 
         if direction is None:
-            return {"signal": None, "reason": "no_entry", "rsi": rsi,
+            reason = "range_untested(touches={})".format(touch_count) if not range_verified else "no_entry"
+            return {"signal": None, "reason": reason, "rsi": rsi,
                     "support": support, "resistance": resistance,
                     "boll_pct_b": bb["pct_b"] if bb else None}
 
@@ -308,6 +327,9 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             else:
                 boll_score = min(1.0, max(0.0, (bb["pct_b"] - 0.8) * 5.0))
         confidence = 0.40 + depth_score * 0.18 + range_score * 0.12 + regime_conf * 0.15 + boll_score * 0.10
+        if boll_only:
+            # 区间未验证：不确定性更高，置信度折减
+            confidence -= 0.05
         confidence = min(0.85, confidence)
 
         return {
@@ -322,6 +344,7 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "boll_pct_b": bb["pct_b"] if bb else None,
+            "boll_only": boll_only,
         }
 
     # ------------------------------------------------------------------
@@ -495,8 +518,10 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             status = self._adaptive_controller.get_risk_budget_status()
             if status.get("streak_lock_active"):
                 quality += self._risk_lock_quality_boost
-        except Exception:
-            pass
+        except Exception as e:
+            # fail-closed：风险锁状态查询失败时保守收紧阈值，避免在风控状态未知时放行
+            logger.debug(f"[oscillation] risk budget status query failed, tightening min quality: {e}")
+            quality += self._risk_lock_quality_boost
         return quality
 
     def _record_filter(self, symbol: str, reason: str):

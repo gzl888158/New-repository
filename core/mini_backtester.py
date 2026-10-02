@@ -86,7 +86,7 @@ class BacktestResult:
             "min_pnl": round(self.min_pnl, 4),
             "max_drawdown": round(self.max_drawdown, 4),
             "win_rate": round(self.win_rate, 4),
-            "profit_factor": round(self.profit_factor, 4),
+            "profit_factor": (round(self.profit_factor, 4) if np.isfinite(self.profit_factor) else None),
             "avg_trade_pnl": round(self.avg_trade_pnl, 4),
             "sharpe_ratio": round(self.sharpe_ratio, 4),
             "health": self.health.value,

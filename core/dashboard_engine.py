@@ -6,7 +6,7 @@
 
 架构：
 - DashboardEngine: 数据聚合核心，从各模块采集实时数据
-- 四视图数据模型：AccountSnapshot / EquityCurve / StrategyComparison / 
+- 四视图数据模型：AccountSnapshot / EquityCurve / StrategyComparison /
   PositionDistribution / RiskDashboard
 - 支持缓存策略，减少重复计算
 - 自动持久化账户快照到DB，供权益曲线回溯
@@ -29,16 +29,17 @@ v3.0 新增：
 - 市场概览（BTC/ETH价格、市场状态、波动率）
 """
 
+import json
 import math
 import os
-import time
-import json
-import threading
 import sqlite3
+import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
 from loguru import logger
 
 # ─── 数据模型 ───
@@ -61,6 +62,7 @@ class AccountSnapshot:
     margin_ratio: float = 0.0          # 保证金率（越高越安全）
     maintenance_margin: float = 0.0    # 维持保证金
     health_level: str = "normal"       # normal/caution/danger
+    is_stale: bool = False             # 是否为DB回退的陈旧快照（实时API失败时）
 
 
 @dataclass
@@ -285,6 +287,7 @@ class DashboardEngine:
         self._account_manager = None
         self._strategy_manager = None
         self._attrition_analyzer = None
+        self._agi_orchestrator = None
 
         # ─── 缓存 ───
         self._cache: Dict[str, Tuple[float, Any]] = {}
@@ -327,6 +330,7 @@ class DashboardEngine:
         state_manager=None,
         account_manager=None,
         strategy_manager=None,
+        agi_orchestrator=None,
     ):
         """注入外部依赖"""
         self._okx_client = okx_client
@@ -334,6 +338,7 @@ class DashboardEngine:
         self._state_manager = state_manager
         self._account_manager = account_manager
         self._strategy_manager = strategy_manager
+        self._agi_orchestrator = agi_orchestrator
 
         # 从 capital_manager 获取 attrition_analyzer
         if capital_manager and hasattr(capital_manager, 'attrition_analyzer'):
@@ -384,7 +389,7 @@ class DashboardEngine:
                 )
             """)
             conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_account_history_ts 
+                CREATE INDEX IF NOT EXISTS idx_account_history_ts
                 ON account_history(timestamp)
             """)
             conn.commit()
@@ -763,6 +768,10 @@ class DashboardEngine:
                 lever = int(pos.get("lever", 1) or 1)
                 notional = float(pos.get("notionalUsd", 0) or 0)
 
+                # pos 字段是合约张数；前端"数量"需展示币数（与 trade_records 口径一致）。
+                # 线性U本位：币数 = 名义价值 / 标记价，等价于 pos × ctVal，且无需逐币查询 ctVal。
+                coin_qty = abs(notional) / mark_px if mark_px > 0 else abs(qty)
+
                 # 币种基础名
                 symbol_base = symbol.replace("-USDT-SWAP", "").replace("-USDC-SWAP", "")
 
@@ -775,7 +784,7 @@ class DashboardEngine:
 
                 item = PositionItem(
                     symbol=symbol, symbol_base=symbol_base,
-                    side=side, quantity=abs(qty),
+                    side=side, quantity=round(coin_qty, 8),
                     entry_price=avg_px, mark_price=mark_px, liq_price=liq_px,
                     margin=margin, unrealized_pnl=upl,
                     pnl_pct=round(upl / (margin if margin > 0 else (notional if notional > 0 else 1.0)) * 100, 2),
@@ -1221,6 +1230,174 @@ class DashboardEngine:
     # 一站式全量获取
     # ═══════════════════════════════════════════════════════════════
 
+    def get_pnl_projection_panel(self) -> Dict[str, Any]:
+        """AGI 前瞻推算与四维归因面板（V5.0 新增）。
+
+        从注入的 agi_orchestrator 拉取最近一次推算/归因/准确度数据，
+        整理为 JSON 安全的字典供前端渲染。
+        fail-closed：orchestrator 未注入或尚无推算数据 → {"available": False}
+        """
+        orch = self._agi_orchestrator
+        if orch is None:
+            return {"available": False, "reason": "agi_orchestrator not injected"}
+
+        snapshot_getter = getattr(orch, "get_dashboard_snapshot", None)
+        if not callable(snapshot_getter):
+            logger.error("DashboardEngine: injected AGI orchestrator lacks get_dashboard_snapshot")
+            return {"available": False, "reason": "incompatible agi_orchestrator interface"}
+        snapshot = snapshot_getter()
+        if not isinstance(snapshot, dict):
+            logger.error("DashboardEngine: AGI dashboard snapshot is not a dictionary")
+            return {"available": False, "reason": "invalid agi_orchestrator snapshot"}
+
+        last_proj = snapshot.get("projection")
+        last_proj = last_proj if isinstance(last_proj, dict) else {}
+        projection_available = bool(last_proj.get("available"))
+        raw_attribution = snapshot.get("attribution")
+        raw_attribution = raw_attribution if isinstance(raw_attribution, dict) else {}
+        attribution_available = bool(raw_attribution.get("available"))
+        if not projection_available and not attribution_available:
+            return {"available": False, "reason": "no projection or attribution yet"}
+
+        def _safe_float(x, default=0.0):
+            try:
+                v = float(x)
+                return v if v == v and abs(v) < 1e15 else default  # NaN/Inf 守护
+            except (TypeError, ValueError):
+                return default
+
+        # 三场景汇总
+        total_scenarios = {}
+        for case in ("base_case", "bear_case", "bull_case"):
+            total = last_proj.get("total")
+            c = total.get(case) if isinstance(total, dict) else {}
+            c = c if isinstance(c, dict) else {}
+            total_scenarios[case] = {
+                "per_cycle": _safe_float(c.get("per_cycle")),
+                "horizon": _safe_float(c.get("horizon")),
+                "ci_lower": _safe_float(c.get("ci_lower")),
+                "ci_upper": _safe_float(c.get("ci_upper")),
+            }
+
+        # per_strategy 摘要
+        per_strategy = {}
+        raw_per_strategy = last_proj.get("per_strategy")
+        for name, sp in (raw_per_strategy.items() if isinstance(raw_per_strategy, dict) else []):
+            if not isinstance(sp, dict):
+                continue
+            per_strategy[str(name)] = {
+                "base_expect": _safe_float(sp.get("base_expect")),
+                "trend_adjustment": _safe_float(sp.get("trend_adjustment")),
+                "regime_mult": _safe_float(sp.get("regime_mult")),
+                "corrected_expect": _safe_float(sp.get("corrected_expect")),
+                "horizon": _safe_float(sp.get("horizon")),
+                "bear_case_horizon": _safe_float(sp.get("bear_case_horizon")),
+                "confidence": _safe_float(sp.get("confidence")),
+            }
+
+        # regime 条件化校正因子
+        cfbr = snapshot.get("correction_factor_by_regime")
+        correction_by_regime = {
+            str(k): _safe_float(v, 1.0)
+            for k, v in cfbr.items()
+        } if isinstance(cfbr, dict) else {}
+
+        # 准确度历史
+        accuracy_hist = []
+        pa = snapshot.get("projection_accuracy")
+        if isinstance(pa, list):
+            for x in pa[-20:]:
+                if isinstance(x, dict):
+                    accuracy_hist.append({
+                        "cycle": int(_safe_float(x.get("cycle"), 0)),
+                        "projected": _safe_float(x.get("projected")),
+                        "actual": _safe_float(x.get("actual")),
+                        "bias_ratio": _safe_float(x.get("bias_ratio"), 1.0),
+                        "regime": str(x.get("regime", "unknown")),
+                    })
+        bias_history = [item["bias_ratio"] for item in accuracy_hist]
+
+        # PnL attribution by strategy, regime, direction and exit reason.
+        attribution_by_strategy = {}
+        raw_attribution_by_strategy = raw_attribution.get("by_strategy")
+        if isinstance(raw_attribution_by_strategy, dict):
+            for name, item in raw_attribution_by_strategy.items():
+                if not isinstance(item, dict):
+                    continue
+                attribution_by_strategy[str(name)] = {
+                    "pnl": _safe_float(item.get("pnl")),
+                    "share": _safe_float(item.get("share")),
+                    "risk_adjusted_share": _safe_float(item.get("risk_adjusted_share")),
+                    "health_score": _safe_float(item.get("health_score")),
+                    "lifecycle": str(item.get("lifecycle", "unknown")),
+                }
+
+        attribution_by_regime = {}
+        raw_attribution_by_regime = raw_attribution.get("by_regime")
+        if isinstance(raw_attribution_by_regime, dict):
+            for name, item in raw_attribution_by_regime.items():
+                if not isinstance(item, dict):
+                    continue
+                attribution_by_regime[str(name)] = {
+                    "pnl": _safe_float(item.get("pnl")),
+                    "cycles": int(_safe_float(item.get("cycles"), 0)),
+                    "avg_per_cycle": _safe_float(item.get("avg_per_cycle")),
+                    "low_confidence": bool(item.get("low_confidence", False)),
+                }
+
+        direction_data = raw_attribution.get("by_direction")
+        direction_data = direction_data if isinstance(direction_data, dict) else {}
+        attribution_by_direction = {
+            "long_pnl": _safe_float(direction_data.get("long_pnl")),
+            "long_share": _safe_float(direction_data.get("long_share")),
+            "long_trades": int(_safe_float(direction_data.get("long_trades"), 0)),
+            "short_pnl": _safe_float(direction_data.get("short_pnl")),
+            "short_share": _safe_float(direction_data.get("short_share")),
+            "short_trades": int(_safe_float(direction_data.get("short_trades"), 0)),
+            "long_short_ratio": _safe_float(direction_data.get("long_short_ratio"), 0.0),
+        }
+
+        attribution_by_exit_reason = {}
+        raw_attribution_by_exit_reason = raw_attribution.get("by_exit_reason")
+        if isinstance(raw_attribution_by_exit_reason, dict):
+            for reason, item in raw_attribution_by_exit_reason.items():
+                if not isinstance(item, dict):
+                    continue
+                attribution_by_exit_reason[str(reason)] = {
+                    "pnl": _safe_float(item.get("pnl")),
+                    "count": int(_safe_float(item.get("count"), 0)),
+                    "share": _safe_float(item.get("share")),
+                }
+
+        pnl_attribution = {
+            "available": attribution_available,
+            "total_pnl": _safe_float(raw_attribution.get("total_pnl")),
+            "attribution_quality": _safe_float(raw_attribution.get("attribution_quality")),
+            "dominant_strategy": raw_attribution.get("dominant_strategy"),
+            "worst_strategy": raw_attribution.get("worst_strategy"),
+            "by_strategy": attribution_by_strategy,
+            "by_regime": attribution_by_regime,
+            "by_direction": attribution_by_direction,
+            "by_exit_reason": attribution_by_exit_reason,
+            "timestamp": raw_attribution.get("timestamp", ""),
+        }
+
+        return {
+            "available": True,
+            "projection_available": projection_available,
+            "attribution": pnl_attribution,
+            "timestamp": last_proj.get("timestamp", ""),
+            "horizon_cycles": int(_safe_float(last_proj.get("horizon_cycles"), 0)),
+            "regime": str(last_proj.get("regime", "unknown")),
+            "correction_factor": _safe_float(last_proj.get("correction_factor"), 1.0),
+            "correction_factor_by_regime": correction_by_regime,
+            "total_scenarios": total_scenarios,
+            "per_strategy": per_strategy,
+            "accuracy_history": accuracy_hist,
+            "bias_history": bias_history,
+            "projection_cycle": int(_safe_float(last_proj.get("projection_cycle"), 0)),
+        }
+
     def get_dashboard_full(self) -> Dict[str, Any]:
         """一站式获取仪表板全量数据（V3.0 增强版）"""
         return {
@@ -1242,6 +1419,8 @@ class DashboardEngine:
             "grid_adaptive_utilization": self.get_grid_adaptive_utilization(),
             # V4.0 新增：企业级同步健康状态
             "enterprise_sync": self.get_enterprise_sync(),
+            # V5.0 新增：AGI 前瞻推算与四维归因面板
+            "pnl_projection_panel": self.get_pnl_projection_panel(),
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -1296,7 +1475,7 @@ class DashboardEngine:
             except Exception:
                 pass
         try:
-            from dashboard_api import fetch_okx_positions, _okx_circuit_open
+            from dashboard_api import _okx_circuit_open, fetch_okx_positions
             positions = fetch_okx_positions() or []
             # 仅当 API 调用本身失败（熔断打开）时才回退到 DB；
             # 如果 API 正常返回空列表（交易所确实无持仓），直接返回空列表，
@@ -1349,7 +1528,7 @@ class DashboardEngine:
                 "SELECT symbol, side, quantity, avg_cost, mark_price, "
                 "unrealized_pnl, margin, leverage "
                 "FROM position_history "
-                "WHERE timestamp > datetime('now', '-5 minutes') "
+                "WHERE timestamp > datetime('now', 'localtime', '-5 minutes') "
                 "ORDER BY timestamp DESC LIMIT 1000"
             ).fetchall()
             conn.close()
@@ -1521,7 +1700,19 @@ class DashboardEngine:
             "margin_ratio": round(s.margin_ratio, 4),
             "maintenance_margin": round(s.maintenance_margin, 2),
             "health_level": s.health_level,
+            "is_stale": s.is_stale,
+            "data_age_seconds": self._compute_data_age_seconds(s.timestamp),
         }
+
+    def _compute_data_age_seconds(self, timestamp: str) -> Optional[float]:
+        """计算快照时间戳距今的秒数（用于前端标记数据陈旧度）。
+
+        返回 None 表示无法解析时间戳；0 表示刚生成。兼容 "T"/空格两种分隔符。
+        """
+        parsed = self._parse_history_timestamp(timestamp)
+        if parsed is None:
+            return None
+        return max(0.0, (datetime.now() - parsed).total_seconds())
 
     # ═══════════════════════════════════════════════════════════════
     # 新增辅助方法 v2.1
@@ -1632,6 +1823,7 @@ class DashboardEngine:
             s.used_margin = float(row["used_margin"] or 0)
             s.unrealized_pnl = float(row["unrealized_pnl"] or 0)
             s.health_level = "normal"
+            s.is_stale = True
             if s.total_equity > 0:
                 s.margin_utilization = s.used_margin / s.total_equity
                 s.margin_ratio = (s.total_equity - s.used_margin) / s.total_equity
@@ -1921,13 +2113,28 @@ class DashboardEngine:
             # 企业级：每策略资金利用率
             strategy_utilization = {}
             try:
-                from risk.dynamic_allocator import get_dynamic_allocator
-                allocator = get_dynamic_allocator()
-                if allocator and allocator._last_plan:
-                    plan = allocator._last_plan
-                    strategy_utilization = dict(plan.strategy_utilization)
-            except Exception:
-                pass
+                plan_data = {}
+                if self._agi_orchestrator is not None:
+                    snapshot_getter = getattr(
+                        self._agi_orchestrator, "get_dashboard_snapshot", None
+                    )
+                    if callable(snapshot_getter):
+                        agi_snapshot = snapshot_getter()
+                        if isinstance(agi_snapshot, dict):
+                            plan_data = agi_snapshot.get("allocation_plan") or {}
+
+                if not plan_data:
+                    from risk.dynamic_allocator import get_dynamic_allocator
+                    allocator = get_dynamic_allocator()
+                    get_last_plan = getattr(allocator, "get_last_plan", None)
+                    if callable(get_last_plan):
+                        plan_data = get_last_plan() or {}
+                if isinstance(plan_data, dict):
+                    utilization = plan_data.get("strategy_utilization")
+                    if isinstance(utilization, dict):
+                        strategy_utilization = dict(utilization)
+            except Exception as e:
+                logger.warning(f"DashboardEngine: strategy utilization unavailable: {e}")
 
             result = {
                 "total_capital": round(metrics.total_capital, 2),

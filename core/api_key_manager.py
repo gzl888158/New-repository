@@ -75,17 +75,16 @@ class APIKeyManager:
             self._fernet = None
     
     def encrypt_value(self, value: str) -> str:
-        """加密值"""
+        """加密值。加密失败时抛出异常（fail-closed），绝不回退存明文。"""
         if not self._fernet:
-            logger.warning("Encryption not available, storing value in plain text")
-            return value
-        
+            raise RuntimeError("Encryption not available, refusing to store plain text")
+
         try:
             encrypted = self._fernet.encrypt(value.encode())
             return base64.urlsafe_b64encode(encrypted).decode()
         except Exception as e:
             logger.error(f"Failed to encrypt value: {e}")
-            return value
+            raise RuntimeError(f"Encryption failed, refusing to store plain text: {e}") from e
     
     def decrypt_value(self, encrypted_value: str) -> str:
         """解密值"""

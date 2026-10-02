@@ -35,6 +35,7 @@ class TradeRecord:
     funding_cost: float = 0.0    # 资金费率成本（预估入账）
     spread_cost: float = 0.0     # 点差成本（预估入账）
     trace_id: str = ""           # 全链路 traceID：信号→裁决→订单→记账同源追踪
+    confidence: float = 0.0      # 开仓信号置信度（0~1），用于准确率回测分桶
 
 @dataclass
 class PositionSnapshot:
@@ -57,6 +58,7 @@ class PositionSnapshot:
     total_funding_cost: float = 0.0
     total_spread_cost: float = 0.0
     trace_id: str = ""
+    confidence: float = 0.0
 
 @dataclass
 class EquityPoint:
@@ -76,6 +78,7 @@ class TradeJournal:
         self.redis_cache = redis_cache
         self._okx_client = okx_client
         self._event_bus = None
+        self._confidence_calibrator = None
 
         self._trades: Dict[str, TradeRecord] = {}
         self._open_positions: Dict[str, PositionSnapshot] = {}
@@ -129,6 +132,10 @@ class TradeJournal:
     def set_event_bus(self, event_bus):
         """P0-2 记账事件化：注入事件总线，开仓/平仓落账时发布 POSITION_OPENED/TRADE_RECORDED。"""
         self._event_bus = event_bus
+
+    def set_confidence_calibrator(self, calibrator):
+        """注入置信度校准器，平仓时自动喂样 (predicted_confidence, actual_outcome)。"""
+        self._confidence_calibrator = calibrator
 
     def _publish_event(self, event_type: EventType, data: Dict[str, Any]):
         """发布记账事件（带 trace_id）。失败不影响记账主流程（仅 DEBUG 记录）。"""
@@ -218,6 +225,7 @@ class TradeJournal:
             ("funding_cost", "REAL DEFAULT 0"),
             ("spread_cost", "REAL DEFAULT 0"),
             ("trace_id", "TEXT DEFAULT ''"),
+            ("confidence", "REAL DEFAULT 0"),
         ):
             try:
                 conn.execute(text(f"ALTER TABLE trades ADD COLUMN {col} {col_type}"))
@@ -463,6 +471,41 @@ class TradeJournal:
         
         return strategy_stats
 
+    def get_confidence_bucketed_win_rate(self, n_buckets: int = 5) -> Dict[str, Any]:
+        """按信号置信度分桶统计胜率，用于校准曲线和信号准确率回测。"""
+        trades_with_conf = [t for t in self._trades.values() if t.confidence > 0]
+        if not trades_with_conf:
+            return {"buckets": [], "total_samples": 0, "message": "no trades with confidence data"}
+
+        bucket_size = 1.0 / n_buckets
+        buckets = []
+        for i in range(n_buckets):
+            lo = i * bucket_size
+            hi = (i + 1) * bucket_size
+            bucket_trades = [t for t in trades_with_conf if lo <= t.confidence < hi or (i == n_buckets - 1 and t.confidence == hi)]
+            if not bucket_trades:
+                buckets.append({"range": f"{lo:.2f}-{hi:.2f}", "count": 0, "wins": 0, "win_rate": 0.0, "avg_pnl": 0.0})
+                continue
+            wins = sum(1 for t in bucket_trades if t.win)
+            buckets.append({
+                "range": f"{lo:.2f}-{hi:.2f}",
+                "count": len(bucket_trades),
+                "wins": wins,
+                "win_rate": wins / len(bucket_trades),
+                "avg_pnl": sum(t.pnl_usdt for t in bucket_trades) / len(bucket_trades),
+                "avg_confidence": sum(t.confidence for t in bucket_trades) / len(bucket_trades),
+            })
+
+        # Brier score: 置信度预测 vs 实际结果的 MSE
+        brier = sum((t.confidence - (1.0 if t.win else 0.0)) ** 2 for t in trades_with_conf) / len(trades_with_conf)
+
+        return {
+            "buckets": buckets,
+            "total_samples": len(trades_with_conf),
+            "brier_score": round(brier, 4),
+            "overall_win_rate": sum(1 for t in trades_with_conf if t.win) / len(trades_with_conf),
+        }
+
     def check_sl_reset_allowed(self, symbol: str) -> bool:
         if symbol not in self._open_positions:
             return True
@@ -497,6 +540,30 @@ class TradeJournal:
         }
         return direction_map.get(direction.lower(), "long")
 
+    @staticmethod
+    def _infer_exit_reason(signal_type: str) -> str:
+        """从 signal_type 推断标准化退出原因（exit_reason 全链路补全）。
+
+        优先级：止损 > 止盈 > 反转 > 利润锁定 > 移动止损 > 强平 > 退出。
+        无任何线索时返回 "close"（仅在 truly unknown 平仓时兜底）。
+        """
+        sig = (signal_type or "").lower()
+        if "stop_loss" in sig or "stop" in sig:
+            return "stop_loss"
+        if "take_profit" in sig or "tp" in sig:
+            return "take_profit"
+        if "reversal" in sig:
+            return "reversal_partial_exit"
+        if "profit_lock" in sig or "breakeven" in sig:
+            return "profit_lock_breakeven"
+        if "trailing" in sig:
+            return "trailing_stop"
+        if "liquidation" in sig or "margin_call" in sig:
+            return "liquidation"
+        if "exit" in sig:
+            return "exit_signal"
+        return "close"
+
     def record_signal(self, signal_record: Dict[str, Any]):
         """记录策略信号（用于信号审计与去重）。
 
@@ -524,7 +591,11 @@ class TradeJournal:
         # 缺省值从 "manual" 改为 ""，避免平仓 reason 未透传时被误记为"手工平仓"，
         # 下游 _reduce_position/_try_close_from_trade_records 会统一兜底为 "close"
         exit_reason = fill_data.get("exit_reason", "")
+        # 全链路补全：exit_reason 为空时从 signal_type 推断标准化退出原因，禁止静默兜底 "close"
+        if not exit_reason:
+            exit_reason = self._infer_exit_reason(signal_type)
         trace_id = fill_data.get("trace_id", "")
+        confidence = fill_data.get("confidence", 0.0)
         
         if symbol in self._open_positions:
             existing_position = self._open_positions[symbol]
@@ -540,13 +611,13 @@ class TradeJournal:
                 trade_id, symbol, direction, price, quantity, leverage, fees, signal_type, exit_reason, trace_id
             )
             if not close_detected:
-                await self._open_position(trade_id, symbol, strategy_name, direction, price, quantity, leverage, fees, signal_type, trace_id)
+                await self._open_position(trade_id, symbol, strategy_name, direction, price, quantity, leverage, fees, signal_type, trace_id, confidence=confidence)
         
         await self._update_equity_curve()
 
     async def _open_position(self, trade_id: str, symbol: str, strategy_name: str, direction: str,
                             price: float, quantity: float, leverage: int, fees: float, signal_type: str,
-                            trace_id: str = ""):
+                            trace_id: str = "", confidence: float = 0.0):
         margin = quantity * price / leverage
         position_value = quantity * price
 
@@ -575,7 +646,8 @@ class TradeJournal:
             margin=margin,
             leverage=leverage,
             signal_type=signal_type,
-            trace_id=trace_id
+            trace_id=trace_id,
+            confidence=confidence,
         )
 
         self._open_positions[symbol] = snapshot
@@ -836,7 +908,8 @@ class TradeJournal:
             win=aggregated_win,
             entry_signal_type=entry_signal_type,
             exit_reason=exit_reason,
-            trace_id=trace_id
+            trace_id=trace_id,
+            confidence=snapshot.confidence,
         )
 
         self._trades[stable_trade_id] = trade_record
@@ -855,6 +928,14 @@ class TradeJournal:
             else:
                 self._losses += 1
 
+            # 置信度校准器喂样：平仓时用信号置信度 + 实际胜负训练校准模型
+            calibrator = getattr(self, "_confidence_calibrator", None)
+            if calibrator and snapshot.confidence > 0:
+                try:
+                    await calibrator.add_sample(snapshot.confidence, aggregated_win)
+                except Exception as e:
+                    logger.debug(f"Confidence calibrator feed failed: {e}")
+
             self.release_capital_for_strategy(snapshot.strategy_name, snapshot.margin)
             del self._open_positions[symbol]
             logger.info(f"Position fully closed: {snapshot.symbol}, gross: {gross_pnl:.4f}, fee: {fees:.4f}, "
@@ -868,7 +949,7 @@ class TradeJournal:
             logger.info(f"Position partially closed: {snapshot.symbol}, reduced qty: {reduce_qty:.4f}, "
                         f"remaining: {remaining_qty:.4f}, net PnL: {pnl_usdt:.4f} USDT (fee: {fees:.4f})")
 
-    def mark_position_closed(self, symbol: str, strategy_name: str = None, reason: str = "ghost_cleanup"):
+    def mark_position_closed(self, symbol: str, strategy_name: str = None, reason: str = "ghost_close"):
         """将 journal 内存持仓标记为已关闭（幽灵持仓清理）。
 
         与 sqlite_storage.close_open_record 配合，同步清理内存状态，避免
@@ -890,10 +971,10 @@ class TradeJournal:
             INSERT OR REPLACE INTO trades 
             (trade_id, symbol, strategy_name, direction, entry_price, exit_price, quantity, leverage,
              entry_time, exit_time, fees, pnl, pnl_usdt, win, entry_signal_type, exit_reason,
-             slippage_cost, funding_cost, spread_cost, trace_id, created_at)
+             slippage_cost, funding_cost, spread_cost, trace_id, confidence, created_at)
             VALUES (:trade_id, :symbol, :strategy_name, :direction, :entry_price, :exit_price, :quantity, :leverage,
              :entry_time, :exit_time, :fees, :pnl, :pnl_usdt, :win, :entry_signal_type, :exit_reason,
-             :slippage_cost, :funding_cost, :spread_cost, :trace_id, :created_at)
+             :slippage_cost, :funding_cost, :spread_cost, :trace_id, :confidence, :created_at)
         '''), {
             "trade_id": trade.trade_id,
             "symbol": trade.symbol,
@@ -906,7 +987,6 @@ class TradeJournal:
             "entry_time": trade.entry_time.isoformat(),
             "exit_time": trade.exit_time.isoformat(),
             "fees": trade.fees,
-            # trades.pnl 列存的是百分比（dataclass pnl_pct），USDT 净额在 pnl_usdt 列
             "pnl": trade.pnl_pct,
             "pnl_usdt": trade.pnl_usdt,
             "win": int(trade.win),
@@ -916,6 +996,7 @@ class TradeJournal:
             "funding_cost": trade.funding_cost,
             "spread_cost": trade.spread_cost,
             "trace_id": trade.trace_id,
+            "confidence": trade.confidence,
             "created_at": datetime.now().isoformat()
         })
         

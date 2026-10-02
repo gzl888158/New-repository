@@ -27,6 +27,7 @@ from utils.helpers import (
     calculate_stop_loss,
     calculate_take_profit,
     normalize_direction,
+    safe_float,
 )
 
 # 保护态单向棘轮：none → breakeven → trailing，只升不降（新仓位重置）
@@ -34,13 +35,8 @@ _PROTECTION_ORDER = {"none": 0, "breakeven": 1, "trailing": 2}
 
 
 def _f(v, default: float = 0.0) -> float:
-    """安全转 float，None/空串/非法值返回默认值。"""
-    try:
-        if v is None or v == "":
-            return default
-        return float(v)
-    except (ValueError, TypeError):
-        return default
+    """安全转 float，None/空串/NaN/Inf/非法值返回默认值。"""
+    return safe_float(v, default)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -151,6 +147,7 @@ class AdaptiveTpSlEngine:
         返回统一结果字典（含 prices / distances / protection / staged / breakdown）。
         """
         direction = normalize_direction(direction)
+        entry_price = _f(entry_price)
         if entry_price <= 0:
             raise ValueError(f"entry_price must be > 0, got {entry_price}")
 
@@ -159,6 +156,7 @@ class AdaptiveTpSlEngine:
         profit_factor = self.NEUTRAL_PROFIT_FACTOR if profit_factor is None else max(_f(profit_factor), 0.0)
 
         # 1. 基础距离（ATR 优先，回退基础百分比）
+        atr = _f(atr)
         atr_pct = (atr / entry_price) if (atr > 0 and entry_price > 0) else 0.0
         base_sl_pct, base_tp_pct = self._base_distances(atr_pct)
 
@@ -478,7 +476,7 @@ class AdaptiveTpSlEngine:
         return levels
 
     @staticmethod
-    def _risk_reward_ratio(entry_price: float, take_profit: float, stop_loss: float, direction: str) -> float:
+    def _risk_reward_ratio(entry_price: float, take_profit: float, stop_loss: float, direction: str) -> Optional[float]:
         if direction == "long":
             risk = entry_price - stop_loss
             reward = take_profit - entry_price
@@ -486,7 +484,8 @@ class AdaptiveTpSlEngine:
             risk = stop_loss - entry_price
             reward = entry_price - take_profit
         if risk <= 0:
-            return float("inf") if reward > 0 else 0.0
+            # 零/负风险说明止损无效，盈亏比无数学意义，返回 None 避免 Infinity 污染 JSON
+            return None if reward > 0 else 0.0
         return round(reward / risk, 4)
 
     @staticmethod

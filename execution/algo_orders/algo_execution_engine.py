@@ -1,6 +1,8 @@
 """
 算法执行引擎 (Algorithmic Execution Engine)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 统一管理所有算法订单的生命周期：
   - 订单注册与状态机管理
   - 执行切片调度（时间/事件驱动）
@@ -262,6 +264,9 @@ class AlgoExecutionEngine:
             config.order_id = config.order_id or f"algo_{uuid.uuid4().hex[:12]}"
 
             async with self._lock:
+                # 幂等保护：重复 order_id 直接拒绝，避免覆盖活跃订单状态/任务
+                if config.order_id in self._active_orders or config.order_id in self._tasks:
+                    raise ValueError(f"duplicate algo order_id: {config.order_id}")
                 self._active_orders[config.order_id] = config
                 self._order_states[config.order_id] = AlgoOrderState.INITIALIZING
                 self._order_statuses[config.order_id] = AlgoOrderStatus.CREATED
@@ -411,9 +416,16 @@ class AlgoExecutionEngine:
 
     async def cancel_algo_order(self, order_id: str):
         """取消算法订单"""
-        if order_id in self._tasks:
-            self._tasks[order_id].cancel()
-            del self._tasks[order_id]
+        task = self._tasks.pop(order_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                # 等待任务完成清理（释放锁/槽位），CancelledError 属预期结果
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
         if order_id in self._order_statuses:
             self._order_statuses[order_id] = AlgoOrderStatus.CANCELLED
         self._execution_monitor.on_order_cancelled(order_id, "cancelled by user")
@@ -490,3 +502,25 @@ class AlgoExecutionEngine:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"Failed to persist monitor state: {e}")
+
+    def load_monitor_state(self) -> Optional[Dict[str, Any]]:
+        """从 JSON 文件加载持久化的监控状态（供重启恢复/审计读取）"""
+        import json
+        import os
+        try:
+            path = os.path.join(self._persist_dir, "algo_monitor.json")
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 恢复 ISO 时间戳为 datetime 对象
+            ts = data.get("timestamp")
+            if isinstance(ts, str):
+                try:
+                    data["timestamp"] = datetime.fromisoformat(ts)
+                except ValueError:
+                    pass
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to load monitor state: {e}")
+            return None

@@ -4,11 +4,23 @@
 """
 import asyncio
 import time
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 from loguru import logger
+
+
+def _safe_float(value, default=0.0):
+    """安全转换数值：None/非法/NaN/Inf 返回默认值，用于数值防御。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
 
 
 class DataAnalysisEngine:
@@ -21,6 +33,8 @@ class DataAnalysisEngine:
         
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl = 60
+        # 交易数据查询状态（fail-closed）：区分「查询失败」与「空数据」
+        self._trade_query_error: Optional[str] = None
         
         logger.info("DataAnalysisEngine initialized")
 
@@ -69,46 +83,61 @@ class DataAnalysisEngine:
         return results
 
     def _get_trade_records(self, strategy_name: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-        """获取交易记录"""
+        """获取交易记录。
+
+        查询失败会设置 self._trade_query_error（区别于「确实无数据」的空列表），
+        供上层 fail-closed 感知；无 sqlite_storage 视为失败而非空数据。
+        """
         if not self._sqlite_storage:
+            self._trade_query_error = "no sqlite_storage configured"
             return []
-        
+
+        getter = getattr(self._sqlite_storage, "get_trade_records_checked", None)
         try:
-            records = self._sqlite_storage.get_trade_records(
-                strategy_name=strategy_name,
-                limit=1000
-            )
-            
-            filtered = []
-            for r in records:
-                if r.get("status") != "closed":
-                    continue
-                
-                close_time = r.get("close_time", "")
-                if close_time:
-                    try:
-                        if isinstance(close_time, str):
-                            ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
-                        else:
-                            ct = close_time
-                        
-                        if start_date:
-                            sd = datetime.fromisoformat(start_date)
-                            if ct < sd:
-                                continue
-                        if end_date:
-                            ed = datetime.fromisoformat(end_date)
-                            if ct > ed:
-                                continue
-                        
-                        filtered.append(r)
-                    except Exception:
-                        continue
-            
-            return filtered
+            if getter is not None:
+                records, err = getter(strategy_name=strategy_name, limit=1000)
+            else:
+                records, err = self._sqlite_storage.get_trade_records(
+                    strategy_name=strategy_name, limit=1000
+                ), None
         except Exception as e:
-            logger.debug(f"Failed to get trade records: {e}")
+            self._trade_query_error = f"sqlite_storage.get_trade_records failed: {e}"
             return []
+
+        if err:
+            self._trade_query_error = f"sqlite_storage.get_trade_records failed: {err}"
+            return []
+        if records is None:
+            self._trade_query_error = "sqlite_storage.get_trade_records returned None"
+            return []
+
+        filtered = []
+        for r in records:
+            if r.get("status") != "closed":
+                continue
+
+            close_time = r.get("close_time", "")
+            if close_time:
+                try:
+                    if isinstance(close_time, str):
+                        ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                    else:
+                        ct = close_time
+
+                    if start_date:
+                        sd = datetime.fromisoformat(start_date)
+                        if ct < sd:
+                            continue
+                    if end_date:
+                        ed = datetime.fromisoformat(end_date)
+                        if ct > ed:
+                            continue
+
+                    filtered.append(r)
+                except Exception:
+                    continue
+
+        return filtered
 
     def _compute_strategy_metrics(self, records: List[Dict[str, Any]], strategy_name: str) -> Dict[str, Any]:
         """计算策略绩效指标"""
@@ -116,17 +145,17 @@ class DataAnalysisEngine:
             return self._empty_performance(strategy_name)
         
         closed = [r for r in records if r.get("status") == "closed"]
-        wins = [r for r in closed if r.get("pnl", 0) > 0]
-        losses = [r for r in closed if r.get("pnl", 0) < 0]
+        wins = [r for r in closed if _safe_float(r.get("pnl", 0)) > 0]
+        losses = [r for r in closed if _safe_float(r.get("pnl", 0)) < 0]
         
         total_trades = len(closed)
         win_rate = len(wins) / total_trades if total_trades > 0 else 0.5
         
-        total_pnl = sum(r.get("pnl", 0) for r in closed)
+        total_pnl = sum(_safe_float(r.get("pnl", 0)) for r in closed)
         avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
         
-        avg_win = np.mean([r["pnl"] for r in wins]) if wins else 0
-        avg_loss = abs(np.mean([r["pnl"] for r in losses])) if losses else 1
+        avg_win = np.mean([_safe_float(r.get("pnl", 0)) for r in wins]) if wins else 0
+        avg_loss = abs(np.mean([_safe_float(r.get("pnl", 0)) for r in losses])) if losses else 1
         profit_factor = avg_win / avg_loss if avg_loss > 0 else 1.0
         
         equity_curve = self._compute_equity_curve(closed)
@@ -137,8 +166,8 @@ class DataAnalysisEngine:
         
         avg_holding_period = self._calculate_avg_holding_period(closed)
         
-        largest_win = max([r["pnl"] for r in wins], default=0)
-        largest_loss = min([r["pnl"] for r in losses], default=0)
+        largest_win = max([_safe_float(r.get("pnl", 0)) for r in wins], default=0)
+        largest_loss = min([_safe_float(r.get("pnl", 0)) for r in losses], default=0)
         
         consecutive_wins, consecutive_losses = self._calculate_consecutive_streaks(closed)
         
@@ -168,12 +197,12 @@ class DataAnalysisEngine:
         return {
             "strategy": strategy_name,
             "total_trades": 0,
-            "win_rate": 0.5,
+            "win_rate": 0.0,
             "total_pnl": 0,
             "avg_pnl": 0,
             "avg_win": 0,
             "avg_loss": 0,
-            "profit_factor": 1.0,
+            "profit_factor": 0.0,
             "max_drawdown": 0,
             "sharpe_ratio": 0,
             "avg_holding_minutes": 0,
@@ -234,57 +263,73 @@ class DataAnalysisEngine:
         return result
 
     def _get_all_trade_records(self, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-        """获取所有交易记录"""
+        """获取所有交易记录。
+
+        查询失败会设置 self._trade_query_error（区别于「确实无数据」的空列表）。
+        """
         if not self._sqlite_storage:
+            self._trade_query_error = "no sqlite_storage configured"
             return []
-        
+
+        getter = getattr(self._sqlite_storage, "get_trade_records_checked", None)
         try:
-            records = self._sqlite_storage.get_trade_records(limit=5000)
-            
-            filtered = []
-            for r in records:
-                if r.get("status") != "closed":
-                    continue
-                
-                close_time = r.get("close_time", "")
-                if close_time:
-                    try:
-                        if isinstance(close_time, str):
-                            ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
-                        else:
-                            ct = close_time
-                        
-                        if start_date:
-                            sd = datetime.fromisoformat(start_date)
-                            if ct < sd:
-                                continue
-                        if end_date:
-                            ed = datetime.fromisoformat(end_date)
-                            if ct > ed:
-                                continue
-                        
-                        filtered.append(r)
-                    except Exception:
-                        continue
-            
-            return filtered
-        except Exception:
+            if getter is not None:
+                records, err = getter(limit=5000)
+            else:
+                records, err = self._sqlite_storage.get_trade_records(limit=5000), None
+        except Exception as e:
+            self._trade_query_error = f"sqlite_storage.get_trade_records failed: {e}"
             return []
+
+        if err:
+            self._trade_query_error = f"sqlite_storage.get_trade_records failed: {err}"
+            return []
+        if records is None:
+            self._trade_query_error = "sqlite_storage.get_trade_records returned None"
+            return []
+
+        filtered = []
+        for r in records:
+            if r.get("status") != "closed":
+                continue
+
+            close_time = r.get("close_time", "")
+            if close_time:
+                try:
+                    if isinstance(close_time, str):
+                        ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                    else:
+                        ct = close_time
+
+                    if start_date:
+                        sd = datetime.fromisoformat(start_date)
+                        if ct < sd:
+                            continue
+                    if end_date:
+                        ed = datetime.fromisoformat(end_date)
+                        if ct > ed:
+                            continue
+
+                    filtered.append(r)
+                except Exception:
+                    continue
+
+        return filtered
 
     def _compute_trade_overview(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
         """交易概览"""
         closed = [r for r in records if r.get("status") == "closed"]
-        wins = [r for r in closed if r.get("pnl", 0) > 0]
-        losses = [r for r in closed if r.get("pnl", 0) < 0]
+        wins = [r for r in closed if _safe_float(r.get("pnl", 0)) > 0]
+        losses = [r for r in closed if _safe_float(r.get("pnl", 0)) < 0]
         
         return {
             "total_trades": len(closed),
             "winning_trades": len(wins),
             "losing_trades": len(losses),
             "win_rate": round(len(wins) / max(len(closed), 1), 4),
-            "total_pnl": round(sum(r.get("pnl", 0) for r in closed), 4),
-            "total_fees": round(sum(r.get("fees", 0) for r in closed), 4),
-            "net_pnl": round(sum(r.get("pnl", 0) - (r.get("fees", 0) or 0) for r in closed), 4),
+            "total_pnl": round(sum(_safe_float(r.get("pnl", 0)) for r in closed), 4),
+            "total_fees": round(sum(_safe_float(r.get("fees", 0)) for r in closed), 4),
+            "net_pnl": round(sum(_safe_float(r.get("pnl", 0)) - _safe_float(r.get("fees", 0)) for r in closed), 4),
         }
 
     def _compute_daily_stats(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -311,10 +356,10 @@ class DataAnalysisEngine:
                     }
                 
                 daily[date_key]["trades"] += 1
-                daily[date_key]["pnl"] += r.get("pnl", 0)
-                daily[date_key]["fees"] += r.get("fees", 0) or 0
+                daily[date_key]["pnl"] += _safe_float(r.get("pnl", 0))
+                daily[date_key]["fees"] += _safe_float(r.get("fees", 0))
                 
-                if r.get("pnl", 0) > 0:
+                if _safe_float(r.get("pnl", 0)) > 0:
                     daily[date_key]["wins"] += 1
                 else:
                     daily[date_key]["losses"] += 1
@@ -363,9 +408,9 @@ class DataAnalysisEngine:
                     }
                 
                 hourly[hour_key]["trades"] += 1
-                hourly[hour_key]["pnl"] += r.get("pnl", 0)
+                hourly[hour_key]["pnl"] += _safe_float(r.get("pnl", 0))
                 
-                if r.get("pnl", 0) > 0:
+                if _safe_float(r.get("pnl", 0)) > 0:
                     hourly[hour_key]["wins"] += 1
                 else:
                     hourly[hour_key]["losses"] += 1
@@ -404,9 +449,9 @@ class DataAnalysisEngine:
                 }
             
             symbols[symbol]["trades"] += 1
-            symbols[symbol]["pnl"] += r.get("pnl", 0)
+            symbols[symbol]["pnl"] += _safe_float(r.get("pnl", 0))
             
-            if r.get("pnl", 0) > 0:
+            if _safe_float(r.get("pnl", 0)) > 0:
                 symbols[symbol]["wins"] += 1
             else:
                 symbols[symbol]["losses"] += 1
@@ -435,8 +480,8 @@ class DataAnalysisEngine:
         total_pnl = 0
         
         for r in records:
-            total_fees += r.get("fees", 0) or 0
-            total_pnl += r.get("pnl", 0)
+            total_fees += _safe_float(r.get("fees", 0))
+            total_pnl += _safe_float(r.get("pnl", 0))
         
         net_pnl = total_pnl - total_fees
         fee_ratio = total_fees / max(abs(total_pnl), 0.01) if total_pnl != 0 else 0
@@ -477,7 +522,7 @@ class DataAnalysisEngine:
         curve = []
         
         for r in sorted_records:
-            equity += r.get("pnl", 0)
+            equity += _safe_float(r.get("pnl", 0))
             curve.append({
                 "time": r.get("close_time", ""),
                 "equity": round(equity, 4),
@@ -574,7 +619,7 @@ class DataAnalysisEngine:
         cur_losses = 0
 
         for r in sorted_records:
-            pnl = r.get("pnl", 0) or 0
+            pnl = _safe_float(r.get("pnl", 0))
             if pnl > 0:
                 cur_wins += 1
                 cur_losses = 0

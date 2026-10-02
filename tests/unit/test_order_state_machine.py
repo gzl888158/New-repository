@@ -17,6 +17,7 @@ import asyncio
 import os
 import sys
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -30,7 +31,6 @@ from core.order_state_machine import (
     OrderStatus,
     TransitionEffect,
 )
-
 
 # ═══════════════════════════════════════════════════════════════
 # 权威期望值（独立于被测实现，防止迁移表被意外改动）
@@ -396,6 +396,7 @@ class TestLifecycleIntegration:
 
             # 将下单时间回拨，触发超时
             mgr._orders[order_id]["timestamps"]["created"] = datetime.now() - timedelta(seconds=120)
+            mgr.set_timeout_order_handler(AsyncMock(return_value=True))
             await mgr._check_timeouts()
 
             # 状态机裁决为 TIMEOUT，副作用收敛：active/executing 归零、total_timeout +1
@@ -403,6 +404,64 @@ class TestLifecycleIntegration:
             assert mgr.get_execution_summary()["executing"] == 0
             assert mgr.get_execution_summary()["pending"] == 0
             assert mgr.get_execution_summary()["timeout"] == 1
+
+        asyncio.run(run())
+
+    def test_timeout_without_cancel_handler_is_retained_and_escalated(self):
+        async def run():
+            mgr = _make_manager()
+            alert_manager = type("AlertManager", (), {})()
+            alert_manager.send_alert = AsyncMock()
+            mgr.set_alert_manager(alert_manager)
+            order_id = await mgr.create_order(
+                {
+                    "order_id": "ord_timeout_without_handler",
+                    "symbol": "BTC-USDT-SWAP",
+                    "exchange_order_id": "exchange-timeout-1",
+                }
+            )
+            await mgr.update_status(order_id, OrderStatus.VALIDATION)
+            await mgr.update_status(order_id, OrderStatus.EXECUTING)
+            mgr._orders[order_id]["timestamps"]["created"] = (
+                datetime.now() - timedelta(seconds=120)
+            )
+
+            await mgr._check_timeouts()
+
+            assert mgr.get_order_status(order_id)["status"] == "executing"
+            assert mgr.get_execution_summary()["active"] == 1
+            assert mgr.get_execution_summary()["timeout"] == 0
+            alert_manager.send_alert.assert_awaited_once()
+            assert (
+                alert_manager.send_alert.await_args.kwargs["severity"] == "CRITICAL"
+            )
+
+        asyncio.run(run())
+
+    def test_timeout_is_retained_until_exchange_handler_confirms(self):
+        async def run():
+            mgr = _make_manager()
+            order_id = await mgr.create_order({"order_id": "ord_timeout_pending"})
+            await mgr.update_status(order_id, OrderStatus.VALIDATION)
+            await mgr.update_status(order_id, OrderStatus.EXECUTING)
+            mgr._orders[order_id]["timestamps"]["created"] = (
+                datetime.now() - timedelta(seconds=120)
+            )
+
+            async def reject_timeout(order):
+                assert order["order_id"] == order_id
+                return False
+
+            mgr.set_timeout_order_handler(reject_timeout)
+            alert_manager = type("AlertManager", (), {})()
+            alert_manager.send_alert = AsyncMock()
+            mgr.set_alert_manager(alert_manager)
+            await mgr._check_timeouts()
+
+            assert mgr.get_order_status(order_id)["status"] == "executing"
+            assert mgr.get_execution_summary()["active"] == 1
+            assert mgr.get_execution_summary()["timeout"] == 0
+            alert_manager.send_alert.assert_awaited_once()
 
         asyncio.run(run())
 

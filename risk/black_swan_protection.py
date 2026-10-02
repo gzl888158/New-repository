@@ -8,11 +8,36 @@
 - 异常成交量检测
 """
 import asyncio
+import math
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from loguru import logger
 import numpy as np
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _close_side_and_pos_side(pos_side_raw: str, qty: float):
+    """计算平仓方向与 posSide（对齐 okx_client.close_position 的口径）。
+
+    多头卖、空头买；net 模式按数量正负判断。返回 (side, close_pos_side)。
+    """
+    ps = (pos_side_raw or "").strip().lower()
+    if ps == "long":
+        return "sell", "long"
+    if ps == "short":
+        return "buy", "short"
+    return ("sell", "net") if qty > 0 else ("buy", "net")
 
 
 @dataclass
@@ -61,6 +86,7 @@ class BlackSwanProtection:
         ])
 
         self._is_running = False
+        self._tasks: List[asyncio.Task] = []
         self._is_circuit_broken = False
         self._circuit_breaker_end_time: Optional[datetime] = None
         self._circuit_breaker_reason = ""
@@ -92,7 +118,7 @@ class BlackSwanProtection:
         if self._is_running:
             return
         self._is_running = True
-        asyncio.create_task(self._monitor_loop())
+        self._tasks.append(asyncio.create_task(self._monitor_loop()))
         logger.info(
             f"BlackSwanProtection started: monitoring {len(self._monitor_symbols)} symbols, "
             f"flash_crash_threshold={self._btc_flash_crash_pct:.1%}, "
@@ -101,6 +127,12 @@ class BlackSwanProtection:
 
     async def stop(self):
         self._is_running = False
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("BlackSwanProtection stopped")
 
     async def _monitor_loop(self):
@@ -110,6 +142,8 @@ class BlackSwanProtection:
                     await self._check_circuit_breaker_recovery()
                 else:
                     await self._check_black_swan_events()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error in black swan monitor loop: {e}")
             await asyncio.sleep(self._check_interval)
@@ -122,7 +156,7 @@ class BlackSwanProtection:
                 if not ticker:
                     continue
 
-                last_price = float(ticker.get("last", 0))
+                last_price = _finite(ticker.get("last", 0), 0.0)
                 if last_price <= 0:
                     continue
 
@@ -308,21 +342,23 @@ class BlackSwanProtection:
                 try:
                     symbol = pos_data.get("instId", "")
                     pos_side = pos_data.get("posSide", "net")
-                    pos_qty = abs(float(pos_data.get("pos", 0)))
-                    if pos_qty <= 0 or not symbol:
+                    pos_qty = _finite(pos_data.get("pos", 0), 0.0)
+                    if pos_qty == 0 or not symbol:
                         continue
 
-                    side = "sell" if pos_side == "long" else "buy"
+                    # 平仓方向与 posSide：多头卖、空头买；net 模式按数量正负判断，
+                    # 避免 net 模式多头被误下 buy、空头被误下 sell 的反向单。
+                    side, close_pos_side = _close_side_and_pos_side(pos_side, pos_qty)
                     self.okx_client.place_order(
                         symbol=symbol,
                         side=side,
                         order_type="market",
-                        quantity=pos_qty,
+                        quantity=abs(pos_qty),
                         reduce_only=True,
-                        pos_side=pos_side if pos_side != "net" else None,
+                        pos_side=close_pos_side,
                     )
                     closed_count += 1
-                    logger.warning(f"[EMERGENCY] 直接API平仓: {symbol} {pos_side} qty={pos_qty}")
+                    logger.warning(f"[EMERGENCY] 直接API平仓: {symbol} {close_pos_side} qty={abs(pos_qty)}")
                 except Exception as e:
                     logger.error(f"[EMERGENCY] 直接API平仓失败 {symbol}: {e}")
 

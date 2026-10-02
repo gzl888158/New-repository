@@ -166,10 +166,9 @@ def test_allocation_agent_import(config):
     assert agent._dynamic_allocator is not None, "DynamicAllocator 注入失败"
     print("  DynamicAllocator 注入成功")
     
-    # 等权分配
-    weights = agent._allocate_equal()
-    assert len(weights) == len(agent._strategy_names), "等权分配数量不对"
-    print(f"  等权分配: {len(weights)} strategies, each={weights[agent._strategy_names[0]]:.4f}")
+    # 验证策略名称从 config 动态加载（不再硬编码）
+    assert len(agent._strategy_names) > 0, "策略名称列表为空"
+    print(f"  策略名称: {len(agent._strategy_names)} 个 -> {agent._strategy_names}")
     
     print("  AllocationAgent 验证: PASSED")
 

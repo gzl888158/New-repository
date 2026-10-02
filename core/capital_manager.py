@@ -189,6 +189,10 @@ class CapitalPoolController:
             if not pool:
                 return False
             
+            if amount <= 0:
+                logger.warning(f"Invalid allocate amount {amount} for {symbol}, rejected")
+                return False
+
             if pool.available < amount:
                 logger.warning(f"Insufficient funds in {pool_type.value} pool: "
                              f"need {amount:.4f}, available {pool.available:.4f}")
@@ -209,6 +213,9 @@ class CapitalPoolController:
             if not pool:
                 return
             
+            if amount <= 0:
+                return
+
             release_amount = min(amount, pool.used_amount)
             pool.used_amount -= release_amount
             pool.last_updated = datetime.now()
@@ -224,6 +231,9 @@ class CapitalPoolController:
             if not pool or pool.available < amount:
                 return False
             
+            if amount <= 0:
+                return False
+
             pool.locked_amount += amount
             pool.last_updated = datetime.now()
             return True
@@ -236,6 +246,9 @@ class CapitalPoolController:
             if not pool:
                 return
             
+            if amount <= 0:
+                return
+
             pool.locked_amount = max(0, pool.locked_amount - amount)
             pool.last_updated = datetime.now()
 
@@ -247,6 +260,9 @@ class CapitalPoolController:
             if not pool:
                 return
             
+            if amount <= 0:
+                return
+
             pool.locked_amount = max(0, pool.locked_amount - amount)
             pool.used_amount += amount
             pool.last_updated = datetime.now()

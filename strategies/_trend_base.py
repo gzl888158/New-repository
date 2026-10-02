@@ -21,13 +21,14 @@ from loguru import logger
 
 from core.models import Signal
 from core.event_id import EventIDGenerator
-from utils.state_persistence import PersistentStrategy
+from core.direction_unifier import DirectionUnifier
+from strategies.base import StrategyBase
 from strategies.funding_rate_enhancer import FundingRateEnhancer
 from strategies.volatility_breakout_filter import VolatilityBreakoutFilter
 
 
-class TrendStrategyBase(PersistentStrategy):
-    """A/B/E 策略共享基类。子类需设置 STRATEGY_KEY、SYMBOL_SCOPE 并实现 _check_signals。"""
+class TrendStrategyBase(StrategyBase):
+    """A/B/E 共享基类；子类需设置策略标识并实现信号与持仓管理接口。"""
 
     STRATEGY_KEY: str = ""
     DISPLAY_NAME: str = ""
@@ -48,7 +49,7 @@ class TrendStrategyBase(PersistentStrategy):
 
         self._enabled = bool(self._cfg.get("enabled", False))
         self._bar = str(self._cfg.get("timeframe", self.DEFAULT_BAR))
-        self._min_signal_quality = self._safe_float(self._cfg.get("min_signal_quality", 0.35), 0.35)
+        self._min_signal_quality = max(0.35, self._safe_float(self._cfg.get("min_signal_quality", 0.35), 0.35))
         self._leverage = self._safe_int(self._cfg.get("leverage", 5), 5)
         self._max_concurrent_positions = self._safe_int(self._cfg.get("max_concurrent_positions", 2), 2)
         self._capital_allocation = self._safe_float(self._cfg.get("capital_allocation", 0.10), 0.10)
@@ -73,6 +74,8 @@ class TrendStrategyBase(PersistentStrategy):
         self._vol_breakout_filter = VolatilityBreakoutFilter(config)
 
         self._running = False
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._save_task: Optional[asyncio.Task] = None
 
         self.init_state_persistence(key, redis_cache)
         logger.info(f"[{key}] 初始化完成，标的={self._symbols}, bar={self._bar}, enabled={self._enabled}")
@@ -111,10 +114,17 @@ class TrendStrategyBase(PersistentStrategy):
             "take_profit_pct": "_take_profit_pct",
             "loop_interval_seconds": "_loop_interval",
         }
+        int_attrs = {"leverage", "max_concurrent_positions"}
         for cfg_key, attr in attr_map.items():
             if cfg_key in updates:
-                setattr(self, attr, self._safe_float(updates[cfg_key], getattr(self, attr)))
+                if cfg_key in int_attrs:
+                    setattr(self, attr, self._safe_int(updates[cfg_key], getattr(self, attr)))
+                else:
+                    setattr(self, attr, self._safe_float(updates[cfg_key], getattr(self, attr)))
                 logger.info(f"[{self._strategy_name}] config hot-updated: {attr}={updates[cfg_key]}")
+
+        # 阈值硬下限：min_signal_quality 不得低于 0.35（A/B/E 趋势类信号质量门槛）
+        self._min_signal_quality = max(0.35, self._safe_float(self._min_signal_quality, 0.35))
 
     # ------------------------------------------------------------------
     # 标的池
@@ -146,16 +156,20 @@ class TrendStrategyBase(PersistentStrategy):
                 total_eq = self._safe_float(account_info.get("totalEq"), 0.0)
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
-        return self._safe_float(self.config.get("trading", {}).get("total_capital", 100.0), 100.0)
+        except Exception as e:
+            logger.debug(f"[{self._strategy_name}] get_account_info failed: {type(e).__name__}: {e}")
+        # fail-closed: 账户权益查询失败时返回 0，避免用静态 total_capital 兜底导致仓位失真
+        logger.warning(f"[{self._strategy_name}] 账户权益查询失败，返回 0（fail-closed）")
+        return 0.0
 
     def _get_allocation(self) -> float:
         if self._adaptive_controller:
             try:
                 return self._adaptive_controller.get_allocation(self._strategy_name)
-            except Exception:
-                pass
+            except Exception as e:
+                # fail-closed: 自适应资金分配查询失败时拒绝开仓，避免风险收缩失效
+                logger.warning(f"[{self._strategy_name}] 资金分配查询失败，返回 0（fail-closed）: {e}")
+                return 0.0
         return self._capital_allocation
 
     def _get_leverage(self, symbol: str) -> int:
@@ -307,6 +321,10 @@ class TrendStrategyBase(PersistentStrategy):
     def _publish_exit_signal(self, symbol: str, direction: str, price: float,
                              quantity: float, reason: str = "exit"):
         signal_type = f"{self._strategy_name}_{reason}"  # 含 exit/close/reduce 关键词由 signal_processor 识别
+        # P0: 平仓 direction 语义反转——本方法入参 direction 为「持仓方向」(long/short)，
+        #     下游 order_executor 将平仓信号的 direction 解释为「平仓 side 归一化值」(与持仓相反)，
+        #     故需反转为 opposite(direction)；同时显式下发 reduce_only/close_position，防止平仓被当开仓。
+        close_dir = DirectionUnifier.opposite(direction)
         # P2: 复用开仓 traceID，实现开仓→平仓全链路同源追踪；缺失时生成新 ID
         existing = self._position_state.get(symbol) or {}
         trace_id = existing.get("trace_id") or EventIDGenerator.get_instance().generate()
@@ -314,7 +332,7 @@ class TrendStrategyBase(PersistentStrategy):
             symbol=symbol,
             strategy_name=self._strategy_name,
             signal_type=signal_type,
-            direction=direction,
+            direction=close_dir,
             price=price,
             quantity=quantity,
             leverage=self._get_leverage(symbol),
@@ -334,13 +352,15 @@ class TrendStrategyBase(PersistentStrategy):
                 "confidence": signal.confidence,
                 "timestamp": signal.timestamp.isoformat(),
                 "trace_id": trace_id,
+                "reduce_only": True,
+                "close_position": True,
             },
         })
         self._position_state.pop(symbol, None)
         self._last_signal_time[symbol] = datetime.now()
         # P33: 记录退出时间，用于冷却追踪
         self._last_exit_time[symbol] = datetime.now().timestamp()
-        logger.info(f"[{self._strategy_name}] 平仓信号: {direction} {symbol} @ {price:.4f} "
+        logger.info(f"[{self._strategy_name}] 平仓信号: {direction}→{close_dir} {symbol} @ {price:.4f} "
                     f"qty={quantity} reason={reason}")
 
     # ------------------------------------------------------------------
@@ -357,21 +377,38 @@ class TrendStrategyBase(PersistentStrategy):
             logger.warning(f"[{self._strategy_name}] 状态加载失败，使用默认状态: {e}")
 
         self._running = True
-        asyncio.create_task(self._monitor_loop())
-        asyncio.create_task(self.periodic_save_loop())
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self._save_task = asyncio.create_task(self.periodic_save_loop())
 
     async def stop(self):
         self._running = False
+        for task in (self._monitor_task, self._save_task):
+            if task and not task.done():
+                task.cancel()
+        # 取消后等待任务退出，确保最终状态被保存
+        for task in (self._monitor_task, self._save_task):
+            if task:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._monitor_task = None
+        self._save_task = None
         await self.save_state_async()
         logger.info(f"[{self._strategy_name}] 已停止")
 
     async def pause(self):
         self._running = False
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        self._monitor_task = None
         logger.info(f"[{self._strategy_name}] 已暂停")
 
     async def resume(self):
         if self._enabled:
             self._running = True
+            if not self._monitor_task or self._monitor_task.done():
+                self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info(f"[{self._strategy_name}] 已恢复")
 
     def get_health(self) -> Dict[str, Any]:
@@ -398,13 +435,15 @@ class TrendStrategyBase(PersistentStrategy):
     # ------------------------------------------------------------------
     # 子类接口
     # ------------------------------------------------------------------
-    async def _check_signals(self):
-        """子类实现：检查并生成开仓信号。"""
-        raise NotImplementedError
-
-    async def _manage_positions(self):
-        """子类可选实现：管理持仓（移动止盈/反向信号出场）。默认不处理。"""
-        return
+    def _get_risk_params(self) -> Dict[str, Any]:
+        """Return the normalized risk settings shared by trend strategies."""
+        return {
+            "leverage": self._leverage,
+            "capital_allocation": self._capital_allocation,
+            "max_concurrent_positions": self._max_concurrent_positions,
+            "max_stop_loss_pct": self._max_stop_loss_pct,
+            "take_profit_pct": self._take_profit_pct,
+        }
 
     # ------------------------------------------------------------------
     # 状态持久化
@@ -413,6 +452,7 @@ class TrendStrategyBase(PersistentStrategy):
         return {
             "_position_state": self._position_state,
             "_last_signal_time": self._last_signal_time,
+            "_last_exit_time": self._last_exit_time,
         }
 
     def restore_persistent_state(self, state: Dict[str, Any]):
@@ -438,3 +478,12 @@ class TrendStrategyBase(PersistentStrategy):
                     self._last_signal_time[sym] = datetime.fromisoformat(ts)
                 except (ValueError, TypeError):
                     pass
+
+        # P33: 恢复退出冷却时间戳（json.dumps(default=str) 会将其转为字符串/数字）
+        raw_exit = state.get("_last_exit_time", {}) or {}
+        self._last_exit_time = {}
+        for sym, ts in raw_exit.items():
+            try:
+                self._last_exit_time[sym] = float(ts)
+            except (TypeError, ValueError):
+                pass

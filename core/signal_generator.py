@@ -95,9 +95,9 @@ class TradingSignal:
         return datetime.now() > self.expiry
     
     def is_executable(self) -> bool:
-        """判断信号是否可执行（强/中级别且未过期）"""
+        """判断信号是否可执行（强/中级别且未过期，权重 > 0.4）"""
         return (self.level in [SignalLevel.STRONG, SignalLevel.MEDIUM] and
-                not self.is_expired() and self.weight > 0.3)
+                not self.is_expired() and self.weight > 0.4)
     
     def to_dict(self) -> Dict[str, Any]:
         return {

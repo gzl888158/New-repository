@@ -4,8 +4,8 @@
   P0  过滤链构造与优先级排序
   P0  统一结果口径 FilterDecision / FilterChainResult（to_dict / reduced_quantity）
   P0  12 个过滤器各自命中逻辑（blacklist / strategy_pause / confidence / regime /
-      trend_alignment / consecutive_loss / frequency / hour_risk / volatility /
-      min_profit / wear_type / multi_timeframe）
+      trend_confirmation / trend_alignment / consecutive_loss / frequency / hour_risk /
+      volatility / min_profit / wear_type / multi_timeframe）
   P0  evaluate 短路与 breakdown 可解释报告
   P0  惰性求值 _resolve（黑名单命中时不触发 wear_type / mtf callable）
   P0  过滤器异常不中断链路（按放行不误杀）
@@ -28,6 +28,7 @@ from core.signal_pre_filter import (
     StrategyPauseFilter,
     ConfidenceFilter,
     RegimeCompatibilityFilter,
+    TrendConfirmationFilter,
     TrendAlignmentFilter,
     ConsecutiveLossFilter,
     FrequencyFilter,
@@ -116,7 +117,7 @@ class TestChainConstruction:
         names = [f.name for f in chain.filters]
         assert names[0] == "blacklist"
         assert names[-1] == "multi_timeframe"
-        assert len(names) == 13
+        assert len(names) == 14
 
     def test_filters_sorted_by_priority(self):
         chain = SignalPreFilterChain()
@@ -231,6 +232,49 @@ class TestIndividualFilters:
         r = chain.evaluate(_ctx(), state)
         assert r.passed is True
 
+    def test_trend_confirmation_one_sided_rejects_mean_reversion(self):
+        chain = SignalPreFilterChain(filters=[TrendConfirmationFilter()])
+        state = _state(trend_confirmation={
+            "adx": 35.0, "adx_strength": 0.8, "trend_direction": -0.75, "di_dir": -1.0,
+            "one_sided": True, "divergence": False,
+        })
+        r = chain.evaluate(_ctx(signal_type="mean_reversion"), state)
+        assert r.action == ACTION_REJECT
+        assert r.blocked_source == "audit_trend_confirmation"
+
+    def test_trend_confirmation_one_sided_rejects_grid(self):
+        chain = SignalPreFilterChain(filters=[TrendConfirmationFilter()])
+        state = _state(trend_confirmation={
+            "adx": 35.0, "adx_strength": 0.8, "trend_direction": 0.75, "di_dir": 1.0,
+            "one_sided": True, "divergence": False,
+        })
+        r = chain.evaluate(_ctx(strategy_name="grid"), state)
+        assert r.action == ACTION_REJECT
+
+    def test_trend_confirmation_one_sided_allows_trend_strategy(self):
+        chain = SignalPreFilterChain(filters=[TrendConfirmationFilter()])
+        state = _state(trend_confirmation={
+            "adx": 35.0, "adx_strength": 0.8, "trend_direction": 0.75, "di_dir": 1.0,
+            "one_sided": True, "divergence": False,
+        })
+        r = chain.evaluate(_ctx(strategy_name="trend", signal_type="entry"), state)
+        assert r.passed is True
+
+    def test_trend_confirmation_divergence_reduces(self):
+        chain = SignalPreFilterChain(filters=[TrendConfirmationFilter()])
+        state = _state(trend_confirmation={
+            "adx": 20.0, "adx_strength": 0.2, "trend_direction": 0.5, "di_dir": -1.0,
+            "one_sided": False, "divergence": True,
+        })
+        r = chain.evaluate(_ctx(quantity=0.01), state)
+        assert r.action == ACTION_REDUCE
+        assert r.reduced_quantity == pytest.approx(0.007)
+
+    def test_trend_confirmation_missing_state_passes(self):
+        chain = SignalPreFilterChain(filters=[TrendConfirmationFilter()])
+        r = chain.evaluate(_ctx(), _state())  # 无 trend_confirmation 键
+        assert r.passed is True
+
     def test_consecutive_loss_delay(self):
         chain = SignalPreFilterChain(filters=[ConsecutiveLossFilter()])
         r = chain.evaluate(_ctx(), _state(consecutive_losses=5, dynamic_threshold=5))
@@ -313,7 +357,7 @@ class TestEvaluateShortCircuit:
         chain = SignalPreFilterChain()
         r = chain.evaluate(_ctx(), _state())
         assert r.passed is True
-        assert len(r.breakdown) == 13
+        assert len(r.breakdown) == 14
         assert all(b["action"] == ACTION_PASS for b in r.breakdown)
         assert all(b["hit"] is False for b in r.breakdown)
 

@@ -22,6 +22,36 @@ from loguru import logger
 from core.tp_sl_monitor import TpSlMonitor
 
 
+def _safe_int(value: Any, default: Any = None) -> Any:
+    """安全 int 转换：None/非法值返回 default，避免热更新配置崩溃。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value: Any, default: Any = None) -> Any:
+    """安全 bool 转换：None 返回 default，字符串按真值字面量解析（避免 "false" 被误判为 True）。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        return bool(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: Any = None) -> Any:
+    """安全 float 转换：None/非法值返回 default，避免批量挂单被单个脏数据中断。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class ConditionalOrderManager:
     """条件单管理器"""
 
@@ -41,6 +71,10 @@ class ConditionalOrderManager:
         # 企业级强化：algoClOrdId 会话盐，避免跨进程/跨重启后历史成交或取消订单
         # 残留的确定性 ID 与同价位重挂单冲突；同会话内盐不变，重试幂等不受影响。
         self._algo_id_salt = uuid.uuid4().hex[:6]
+
+        # algo 触发成交落库：由 scheduler 注入，未注入时降级为跳过落库（不阻塞同步）
+        self._fill_quality_tracker = None
+        self._trade_journal = None
 
         self._retry_interval = 5  # 重试间隔（秒）
         self._max_retries = 3     # 最大重试次数
@@ -82,6 +116,14 @@ class ConditionalOrderManager:
         self._load_active_orders()
 
         logger.info(f"ConditionalOrderManager initialized: {len(self._active_orders)} active orders loaded")
+
+    def set_fill_quality_tracker(self, tracker):
+        """注入成交质量追踪器，用于 algo 触发成交落库 fill_quality。"""
+        self._fill_quality_tracker = tracker
+
+    def set_trade_journal(self, trade_journal):
+        """注入交易日志，用于 algo 触发成交落库 trade_records/trades 对齐。"""
+        self._trade_journal = trade_journal
 
     def _save_active_orders(self):
         """原子写入条件单状态到文件（使用线程锁防止并发写竞态）
@@ -181,8 +223,10 @@ class ConditionalOrderManager:
         """与交易所同步条件单状态"""
         try:
             exchange_orders = self._okx_client.get_algo_orders()
-            if not exchange_orders:
-                return
+            # None = 查询失败（网络/API 错误）：保持本地缓存不动，避免网络抖动误清幽灵数据
+            # [] = 成功但交易所无条件单：继续执行清理，将本地过期订单全部移除
+            if exchange_orders is None:
+                return False
 
             exchange_order_ids = set()
             for order in exchange_orders:
@@ -197,6 +241,10 @@ class ConditionalOrderManager:
                     local_ids_to_remove.append(order_id)
 
             for order_id in local_ids_to_remove:
+                # algo 从 orders-algo-pending 消失：可能已触发成交或已取消。
+                # 先查 orders-algo-history 拿触发成交并落库，而不是静默当 stale 移除
+                # （否则条件单触发产生的平仓成交回执永久丢失，fill_quality/trades 缺账）。
+                await self._record_algo_fill_if_triggered(order_id, self._active_orders.get(order_id))
                 self._active_orders.pop(order_id, None)
                 logger.debug(f"Removed stale order from local cache: {order_id}")
 
@@ -221,13 +269,29 @@ class ConditionalOrderManager:
                         lever = int(order.get("lever", "1") or "1")
                     except (ValueError, TypeError):
                         lever = 1
-                    
+
+                    # 账本一致性：本地缓存 side 语义是「持仓方向」(long/short/net)，
+                    # 交易所原始字段 posSide=持仓方向、side=买卖方向，必须用 posSide。
+                    # type 依据 tpTriggerPx/slTriggerPx 是否存在（ordType 对 TP/SL 均为 conditional，不可靠）。
+                    try:
+                        is_tp = float(order.get("tpTriggerPx", "") or "0") > 0
+                    except (ValueError, TypeError):
+                        is_tp = False
+
+                    symbol = order.get("instId", "")
+                    coin_qty = sz
+                    if symbol:
+                        try:
+                            coin_qty = self._okx_client.contracts_to_coins(symbol, sz)
+                        except Exception:
+                            coin_qty = sz
+
                     order_info = {
-                        "symbol": order.get("instId", ""),
-                        "side": order.get("side", ""),
-                        "type": "take_profit" if "tp" in order.get("ordType", "").lower() else "stop_loss",
+                        "symbol": symbol,
+                        "side": order.get("posSide", ""),
+                        "type": "take_profit" if is_tp else "stop_loss",
                         "price": price,
-                        "quantity": sz,
+                        "quantity": coin_qty,
                         "leverage": lever,
                         "is_algo": True,
                         "status": order.get("state", "")
@@ -236,9 +300,151 @@ class ConditionalOrderManager:
                     logger.info(f"Synchronized order from exchange: {algo_id} - {order_info['symbol']}")
 
             self._save_active_orders()
+            return True
 
         except Exception as e:
             logger.error(f"Failed to sync with exchange: {e}")
+            return False
+
+    async def _record_algo_fill_if_triggered(self, algo_id: str, order_info: Optional[Dict[str, Any]]):
+        """algo 从 orders-algo-pending 消失时，查 orders-algo-history 判断是否已触发成交。
+
+        若 state=effective（已触发），用其 ordId 调 get_order 拿真实成交回执
+        （fillPx/avgPx/accFillSz/fee/pnl/tradeId）并落库 fill_quality / trade_records。
+        若 state=canceled 或查询失败（网络半死返回 None），则跳过，不做误落库，
+        留待下一轮同步重试（fail-closed）。
+        """
+        if not order_info or not algo_id:
+            return
+        symbol = order_info.get("symbol", "")
+        if not symbol:
+            return
+        try:
+            history = self._okx_client.get_algo_order_history(symbol=symbol, state="effective")
+            # None = 查询失败：宁可漏记也不能误记，下一轮同步会重试
+            if history is None:
+                logger.warning(
+                    f"algo fill check: get_algo_order_history returned None for {algo_id} "
+                    f"({symbol}), skip (will retry next sync)"
+                )
+                return
+
+            triggered = None
+            for h in history:
+                if h.get("algoId") == algo_id and h.get("state") == "effective":
+                    triggered = h
+                    break
+            if not triggered:
+                return  # 已取消或不存在，非触发成交
+
+            ord_id = triggered.get("ordId") or (triggered.get("ordIdList") or [""])[0]
+            if not ord_id:
+                logger.warning(f"algo fill check: {algo_id} effective but no ordId, skip")
+                return
+
+            order_detail = self._okx_client.get_order(symbol, ord_id)
+            if not order_detail:
+                logger.warning(f"algo fill check: get_order({ord_id}) returned None, skip")
+                return
+
+            self._persist_algo_fill(symbol, triggered, order_detail)
+        except Exception as e:
+            logger.error(f"Failed to record algo fill for {algo_id}: {e}")
+
+    def _persist_algo_fill(self, symbol: str, algo_order: Dict[str, Any], order_detail: Dict[str, Any]):
+        """把 algo 触发产生的平仓成交落库：fill_quality + trade_records/trades 对齐。"""
+        try:
+            ord_id = str(order_detail.get("ordId") or "")
+            side = order_detail.get("side", algo_order.get("side", ""))  # buy平空 / sell平多
+            pos_side = order_detail.get("posSide", algo_order.get("posSide", ""))
+            actual_side = algo_order.get("actualSide", "")  # tp / sl
+
+            fill_px = float(order_detail.get("avgPx") or order_detail.get("fillPx") or 0)
+            if fill_px <= 0:
+                return
+            # 张数 → 币数（fill_quality/trade_records 口径均为币数量）
+            contracts = float(order_detail.get("accFillSz") or order_detail.get("fillSz") or 0)
+            coin_qty = contracts
+            if contracts > 0:
+                try:
+                    coin_qty = self._okx_client.contracts_to_coins(symbol, contracts)
+                except Exception:
+                    coin_qty = contracts
+            fee = abs(float(order_detail.get("fee") or 0))
+            trade_id = str(order_detail.get("tradeId") or ord_id)
+
+            # 期望价用触发价（SL/TP 触发价），成交价用成交均价，统一口径计算滑点
+            trigger_px = 0.0
+            for key in ("slTriggerPx", "tpTriggerPx", "actualPx"):
+                try:
+                    v = float(algo_order.get(key) or 0)
+                except (TypeError, ValueError):
+                    v = 0.0
+                if v > 0:
+                    trigger_px = v
+                    break
+            expected_px = trigger_px if trigger_px > 0 else fill_px
+
+            strategy_name = self._infer_strategy_for_symbol(symbol)
+
+            if self._fill_quality_tracker:
+                self._fill_quality_tracker.record_fill(
+                    order_id=ord_id,
+                    symbol=symbol,
+                    strategy_name=strategy_name,
+                    side=side,
+                    expected_price=expected_px,
+                    filled_price=fill_px,
+                    quantity=coin_qty,
+                    order_type=order_detail.get("ordType", "limit") or "limit",
+                )
+
+            if self._trade_journal:
+                exit_reason = "take_profit" if actual_side == "tp" else "stop_loss"
+                fill_data = {
+                    "trade_id": trade_id,
+                    "symbol": symbol,
+                    "strategy_name": strategy_name,
+                    "direction": side,  # 平仓方向（buy 平空 / sell 平多），record_fill 据此区分加仓/减仓
+                    "price": fill_px,
+                    "quantity": coin_qty,
+                    "leverage": int(float(order_detail.get("lever") or algo_order.get("lever") or 1)),
+                    "fees": fee,
+                    "signal_type": "grid_trade",
+                    "exit_reason": exit_reason,
+                    "trace_id": order_detail.get("trace_id", ""),
+                }
+                # 不阻塞同步主流程：落账异常由 journal 内部兜底，且失败会留待下一轮再试
+                asyncio.ensure_future(self._trade_journal.record_fill(fill_data))
+
+            logger.info(
+                f"Algo fill recorded: {symbol} {side} ordId={ord_id} algoId={algo_order.get('algoId')} "
+                f"px={fill_px} qty={coin_qty} fee={fee} tradeId={trade_id} reason={actual_side}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to persist algo fill for {symbol}: {e}")
+
+    def _infer_strategy_for_symbol(self, symbol: str) -> str:
+        """从 trade_records 推断该 symbol 的归属策略（用于 algo 触发成交落库 strategy_name）。"""
+        try:
+            tj = getattr(self, "_trade_journal", None)
+            storage = getattr(tj, "sqlite_storage", None) if tj else None
+            if storage is None:
+                return "grid"
+            conn = storage.get_connection()
+            try:
+                from sqlalchemy import text as _text
+                row = conn.execute(_text(
+                    "SELECT strategy_name FROM trade_records WHERE symbol = :s "
+                    "ORDER BY create_time DESC LIMIT 1"
+                ), {"s": symbol}).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return "grid"
 
     async def _retry_order(self, order_id: str, order_info: Dict[str, Any]) -> bool:
         """重试放置条件单"""
@@ -584,11 +790,14 @@ class ConditionalOrderManager:
                 (tp3_price, 0.10, "far"),
             ]
 
-            for tp_price, ratio, stage_name in stages:
+            # 企业级：分段落袋张数精确分配（前 N-1 档向下取整、最后一档用剩余量），
+            # 确保各档合计 == 总持仓张数，避免每档独立 round_up 导致 TP 超挂。
+            stage_qtys = self.allocate_staged_quantities(symbol, total_quantity, [0.40, 0.50, 0.10])
+
+            for (tp_price, ratio, stage_name), stage_qty in zip(stages, stage_qtys):
                 # 账本一致性（修复4）：stage_qty 保持币数交 place_take_profit；仅用张数取整结果做最小手数判断
-                stage_qty = total_quantity * ratio
                 contracts_check = self._okx_client.round_quantity_to_lot(
-                    symbol, self._okx_client.coin_to_contracts(symbol, stage_qty)
+                    symbol, self._okx_client.coin_to_contracts(symbol, stage_qty), round_up=False
                 )
                 if contracts_check <= 0:
                     logger.warning(f"Staged TP {stage_name} qty too small for {symbol}, skipping")
@@ -620,6 +829,44 @@ class ConditionalOrderManager:
         except Exception as e:
             logger.error(f"Failed to place staged take profit: {e}")
             return placed_order_ids
+
+    def allocate_staged_quantities(self, symbol: str, total_quantity: float,
+                                   ratios: List[float]) -> List[float]:
+        """分段落袋币数精确分配，确保各档张数合计 == 总持仓张数。
+
+        - 总张数 = coin_to_contracts(total_quantity) 向下取整到 lot
+        - 前 N-1 档：总张数 * ratio 向下取整到 lot
+        - 最后一档：剩余张数
+        - 每档转回币数返回（底层 place_order 再做 coin→contracts，结果稳定不跳格）
+        """
+        from decimal import Decimal, ROUND_DOWN
+
+        info = self._okx_client.get_instrument_info(symbol) or {}
+        ct_val = Decimal(str(info.get("ctVal", "1") or "1"))
+        lot_sz = Decimal(str(info.get("lotSz", "1") or "1"))
+        if ct_val <= 0 or lot_sz <= 0:
+            # 无合约信息时退化为简单比例分配（保持原行为）
+            total = Decimal(str(total_quantity))
+            return [float(total * Decimal(str(r))) for r in ratios]
+
+        # 总张数用底层 round_quantity_to_lot 计算（与 place_order 口径一致），
+        # 避免 Decimal 与 float 对「币数→张数」取整产生歧义导致合计超挂。
+        total_contracts = Decimal(str(
+            self._okx_client.round_quantity_to_lot(
+                symbol, self._okx_client.coin_to_contracts(symbol, total_quantity), round_up=False
+            )
+        ))
+        n = len(ratios)
+        allocated = Decimal("0")
+        coins = []
+        for i, r in enumerate(ratios):
+            if i == n - 1:
+                stage = total_contracts - allocated  # 最后一档用剩余量，确保合计 == total_contracts
+            else:
+                stage = (total_contracts * Decimal(str(r))).quantize(lot_sz, rounding=ROUND_DOWN)
+            allocated += stage
+            coins.append(float(stage * ct_val))
+        return coins
 
     def cancel_conditional_order(self, symbol: str, order_id: str):
         """取消条件单"""
@@ -717,6 +964,47 @@ class ConditionalOrderManager:
             logger.error(f"Failed to update stop loss: {e}")
             return None
 
+    async def update_take_profit(self, symbol: str, new_tp_price: float) -> Optional[str]:
+        """S5: 动态止盈收紧闭环 — 取消现有 TP 条件单并按新价重挂（cancel+replace）。
+
+        当反转评分上升、ReversalTakeProfitEngine 收紧止盈价时，交易所侧的 TP 条件单
+        仍是旧价，需要实际替换为新价才能让收紧生效。取消全部既有 TP 分段单后，
+        按合并数量重挂一张新价 TP；仅在存在活跃 TP 单时才动作。
+        """
+        try:
+            tp_orders = self.get_tp_orders_for_symbol(symbol)
+            if not tp_orders:
+                return None
+
+            side = tp_orders[0][1].get("side")
+            leverage = int(tp_orders[0][1].get("leverage", 1) or 1)
+            total_qty = 0.0
+            for _, info in tp_orders:
+                try:
+                    total_qty += float(info.get("quantity", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+            if side not in ("long", "short") or total_qty <= 0:
+                logger.warning(f"Skip TP tighten for {symbol}: invalid side={side} or qty={total_qty}")
+                return None
+
+            # 取消旧 TP 分段单
+            for oid, _ in tp_orders:
+                self.cancel_conditional_order(symbol, oid)
+
+            # 重挂新价 TP（合并数量）
+            return await self.place_take_profit(
+                symbol=symbol,
+                side=side,
+                quantity=total_qty,
+                trigger_price=round(float(new_tp_price), 4),
+                leverage=leverage,
+            )
+        except Exception as e:
+            logger.error(f"Failed to update take profit for {symbol}: {e}")
+            return None
+
     async def ensure_all_positions_have_stops(self, skip_existing: bool = True):
         """确保所有持仓都有止损单"""
         try:
@@ -739,6 +1027,7 @@ class ConditionalOrderManager:
 
                     has_stop = any(
                         order_info["symbol"] == symbol and order_info["type"] == "stop_loss"
+                        and order_info.get("side", "") == side
                         for order_info in self._active_orders.values()
                     )
 
@@ -786,6 +1075,27 @@ class ConditionalOrderManager:
         except Exception as e:
             logger.error(f"Failed to calculate stop price: {e}")
             return 0
+
+    def _calculate_tp_prices(self, side: str, entry_price: float) -> list:
+        """计算止盈价格（心跳补挂用）：基于入场价的两级 TP。
+
+        默认 TP1=2%、TP2=4%，与趋势策略配置对齐。
+        short: TP < entry（下方），long: TP > entry（上方）。
+        返回 [(tp1_price, tp1_ratio), (tp2_price, tp2_ratio)] 或空列表。
+        """
+        try:
+            tp1_offset = 0.02
+            tp2_offset = 0.04
+            if side == "long":
+                tp1_price = round(entry_price * (1 + tp1_offset), 4)
+                tp2_price = round(entry_price * (1 + tp2_offset), 4)
+            else:
+                tp1_price = round(entry_price * (1 - tp1_offset), 4)
+                tp2_price = round(entry_price * (1 - tp2_offset), 4)
+            return [(tp1_price, 0.5), (tp2_price, 0.5)]
+        except Exception as e:
+            logger.error(f"Failed to calculate TP prices: {e}")
+            return []
 
     # ==================== 企业级强化：防重 / 幂等 / 熔断 ====================
 
@@ -1150,13 +1460,28 @@ class ConditionalOrderManager:
 
     async def heartbeat_check(self):
         """
-        条件单心跳检测：确保所有持仓都有对应的止损条件单，
-        丢失的自动补挂（交易所API有时会静默丢失条件单）
+        条件单心跳检测：确保所有持仓都有对应的止损和止盈条件单，
+        丢失的自动补挂（交易所API有时会静默丢失条件单）。
+        SL 丢失补挂 SL；TP 全部丢失时补挂两级 TP。
         """
         if not self._heartbeat_enabled:
             return 0
         try:
-            positions = self._okx_client.get_positions() or []
+            positions = self._okx_client.get_positions()
+            # None = 查询失败：跳过本轮心跳，避免在 API 不可用时误判无持仓
+            if positions is None:
+                logger.warning("heartbeat_check: get_positions() returned None (query failed), skipping this cycle")
+                return 0
+
+            # 止损恢复 fail-closed：恢复前先强制全量同步交易所 algo 单真值，
+            # 避免网络半死时按本地缓存补挂重复/错误止损。同步失败则跳过本轮恢复。
+            if not await self._sync_with_exchange():
+                logger.warning(
+                    "heartbeat_check: exchange algo sync failed (network half-dead), "
+                    "skip SL/TP restoration this cycle"
+                )
+                return 0
+
             restored_count = 0
 
             for pos_data in positions:
@@ -1168,15 +1493,17 @@ class ConditionalOrderManager:
                     if pos_qty <= 0:
                         continue
 
-                    # 检查是否有活跃的SL单
+                    leverage = int(float(pos_data.get("lever", 1)))
+
+                    # --- SL 检查与补挂 ---
                     has_sl = any(
                         info["symbol"] == inst_id and info["type"] in ("stop_loss", "move_stop")
+                        and info.get("side", "") == pos_side
                         for info in self._active_orders.values()
                     )
 
                     if not has_sl:
                         mark_price = float(pos_data.get("markPx", 0))
-                        leverage = int(float(pos_data.get("lever", 1)))
                         if mark_price > 0:
                             stop_price = self._calculate_stop_price(pos_side, mark_price, leverage)
                             if stop_price and not self._check_immediate_trigger(inst_id, pos_side, stop_price):
@@ -1191,11 +1518,45 @@ class ConditionalOrderManager:
                                 if result:
                                     restored_count += 1
                                     logger.warning(f"Restored missing SL for {inst_id}: {stop_price:.4f}")
+
+                    # --- TP 检查与补挂（仅当全部 TP 丢失时才补挂，避免重复挂单） ---
+                    has_tp = any(
+                        info["symbol"] == inst_id and info["type"] == "take_profit"
+                        and info.get("side", "") == pos_side
+                        for info in self._active_orders.values()
+                    )
+
+                    if not has_tp:
+                        avg_px = float(pos_data.get("avgPx", 0))
+                        if avg_px > 0:
+                            tp_prices = self._calculate_tp_prices(pos_side, avg_px)
+                            for tp_price, tp_ratio in tp_prices:
+                                stage_qty = pos_qty * tp_ratio
+                                # 转合约张数取整判断最小手数
+                                contracts_check = self._okx_client.round_quantity_to_lot(
+                                    inst_id, self._okx_client.coin_to_contracts(inst_id, stage_qty)
+                                )
+                                if contracts_check <= 0:
+                                    continue
+                                # 校验止盈价不会立即触发
+                                if self._check_immediate_trigger(inst_id, pos_side, tp_price):
+                                    logger.warning(f"Skip restoring TP for {inst_id}: price {tp_price} would immediately trigger")
+                                    continue
+                                result = await self.place_take_profit(
+                                    symbol=inst_id,
+                                    side=pos_side,
+                                    quantity=stage_qty,
+                                    trigger_price=tp_price,
+                                    leverage=leverage
+                                )
+                                if result:
+                                    restored_count += 1
+                                    logger.warning(f"Restored missing TP for {inst_id}: {tp_price:.4f}")
                 except Exception as inner_e:
                     logger.error(f"Heartbeat check error for position: {inner_e}")
 
             if restored_count > 0:
-                logger.info(f"Heartbeat check: restored {restored_count} missing stop loss orders")
+                logger.info(f"Heartbeat check: restored {restored_count} missing conditional orders (SL/TP)")
             self._heartbeat_restored_count += restored_count
             return restored_count
 
@@ -1221,22 +1582,28 @@ class ConditionalOrderManager:
         返回清理的订单数量
         """
         try:
-            positions = self._okx_client.get_positions() or []
-            active_symbols = set()
+            positions = self._okx_client.get_positions()
+            # None = 查询失败（网络/API错误）：绝不能降级为空列表，否则所有条件单都会被误判为孤儿并取消
+            # [] = 成功但无持仓：安全清理真正的孤儿单
+            if positions is None:
+                logger.warning("cleanup_orphaned_orders: get_positions() returned None (query failed), skipping cleanup to avoid wiping protection orders")
+                return 0
+            active_sides = set()  # (instId, posSide) 持仓方向对
             for p in positions:
                 inst_id = p.get("instId", "")
                 pos_qty = abs(float(p.get("pos", 0)))
                 if inst_id and pos_qty > 0:
-                    active_symbols.add(inst_id)
+                    active_sides.add((inst_id, p.get("posSide", "net")))
 
             cleaned_count = 0
             orphan_ids = []
 
-            # 检查活跃条件单
+            # 检查活跃条件单：持仓已不存在，或方向已翻转（对向遗留单不再保护当前持仓）
             for order_id, order_info in list(self._active_orders.items()):
                 symbol = order_info.get("symbol", "")
-                if symbol and symbol not in active_symbols:
-                    # 该持仓已不存在，取消条件单
+                side = order_info.get("side", "")
+                if symbol and (symbol, side) not in active_sides:
+                    # 该持仓已不存在或方向已变，取消条件单
                     try:
                         if order_info.get("is_algo"):
                             self._okx_client.cancel_algo_order(symbol, order_id)
@@ -1246,7 +1613,7 @@ class ConditionalOrderManager:
                         pass  # 交易所可能已经取消了
                     orphan_ids.append(order_id)
                     cleaned_count += 1
-                    logger.info(f"Cleaned orphaned conditional order: {order_id} for {symbol} (position gone)")
+                    logger.info(f"Cleaned orphaned conditional order: {order_id} for {symbol}/{side} (position gone or flipped)")
 
             # 清理失败订单列表中超过24小时的旧记录
             stale_failed_ids = []
@@ -1452,26 +1819,26 @@ class ConditionalOrderManager:
         changes = []
 
         if "retry_interval" in config:
-            new_val = int(config["retry_interval"])
-            if new_val != self._retry_interval:
+            new_val = _safe_int(config["retry_interval"])
+            if new_val is not None and new_val != self._retry_interval:
                 changes.append(f"retry_interval: {self._retry_interval} -> {new_val}")
                 self._retry_interval = new_val
 
         if "max_retries" in config:
-            new_val = int(config["max_retries"])
-            if new_val != self._max_retries:
+            new_val = _safe_int(config["max_retries"])
+            if new_val is not None and new_val != self._max_retries:
                 changes.append(f"max_retries: {self._max_retries} -> {new_val}")
                 self._max_retries = new_val
 
         if "heartbeat_enabled" in config:
-            new_val = bool(config["heartbeat_enabled"])
-            if new_val != self._heartbeat_enabled:
+            new_val = _safe_bool(config["heartbeat_enabled"])
+            if new_val is not None and new_val != self._heartbeat_enabled:
                 changes.append(f"heartbeat_enabled: {self._heartbeat_enabled} -> {new_val}")
                 self._heartbeat_enabled = new_val
 
         if "sync_enabled" in config:
-            new_val = bool(config["sync_enabled"])
-            if new_val != self._sync_enabled:
+            new_val = _safe_bool(config["sync_enabled"])
+            if new_val is not None and new_val != self._sync_enabled:
                 changes.append(f"sync_enabled: {self._sync_enabled} -> {new_val}")
                 self._sync_enabled = new_val
 
@@ -1501,6 +1868,16 @@ class ConditionalOrderManager:
         self._active_orders = state.get("active_orders", {})
         self._pending_orders = state.get("pending_orders", {})
         self._failed_orders = state.get("failed_orders", {})
+
+        # 归一化 side 为持仓方向：历史脏数据可能把买卖方向（buy平空/sell平多）写入 side，
+        # 导致 cleanup_orphaned_orders/heartbeat 按持仓方向对齐时误判（如误取消保护单）。
+        for _oid, _info in self._active_orders.items():
+            if isinstance(_info, dict):
+                _side = _info.get("side", "")
+                if _side == "buy":
+                    _info["side"] = "short"
+                elif _side == "sell":
+                    _info["side"] = "long"
 
         saved_version = state.get("version", 1)
         saved_at = state.get("saved_at", "unknown")
@@ -1585,9 +1962,9 @@ class ConditionalOrderManager:
         for pos in positions:
             symbol = pos.get("symbol", "")
             side = pos.get("side", "long")
-            quantity = float(pos.get("quantity", 0))
-            trigger_price = float(pos.get("trigger_price", 0))
-            leverage = int(pos.get("leverage", 1))
+            quantity = _safe_float(pos.get("quantity", 0), 0) or 0
+            trigger_price = _safe_float(pos.get("trigger_price", 0), 0) or 0
+            leverage = _safe_int(pos.get("leverage", 1), 1) or 1
             is_new_position = pos.get("is_new_position", True)
 
             results["by_symbol"][symbol] = {"success": False, "order_id": None}
@@ -1644,9 +2021,9 @@ class ConditionalOrderManager:
         for pos in positions:
             symbol = pos.get("symbol", "")
             side = pos.get("side", "long")
-            quantity = float(pos.get("quantity", 0))
-            trigger_price = float(pos.get("trigger_price", 0))
-            leverage = int(pos.get("leverage", 1))
+            quantity = _safe_float(pos.get("quantity", 0), 0) or 0
+            trigger_price = _safe_float(pos.get("trigger_price", 0), 0) or 0
+            leverage = _safe_int(pos.get("leverage", 1), 1) or 1
 
             results["by_symbol"][symbol] = {"success": False, "order_id": None}
 

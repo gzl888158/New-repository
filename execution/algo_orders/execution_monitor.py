@@ -1,6 +1,8 @@
 """
 算法订单执行监控器 (Execution Monitor)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 实时追踪 TWAP / VWAP / Iceberg 的执行状态：
   - 切片级事件时间线 (submitted → filled → confirmed)
   - 进度 vs 计划（调度漂移检测）
@@ -19,6 +21,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from loguru import logger
+
+from core.direction_unifier import DirectionUnifier
 
 
 class SliceEvent(Enum):
@@ -462,10 +466,10 @@ class AlgoExecutionMonitor:
         fill = record.avg_fill_price
         if arrival > 0 and fill > 0:
             slip_arr = (fill - arrival) / arrival * 10000
-            record.arrival_slippage_bps = -slip_arr if side == "sell" else slip_arr
+            record.arrival_slippage_bps = -slip_arr if DirectionUnifier.is_short(side) else slip_arr
         if vwap_cmp > 0 and fill > 0:
             slip_vwap = (fill - vwap_cmp) / vwap_cmp * 10000
-            record.vwap_slippage_bps = -slip_vwap if side == "sell" else slip_vwap
+            record.vwap_slippage_bps = -slip_vwap if DirectionUnifier.is_short(side) else slip_vwap
 
     def _update_cumulative_metrics(self, tl: AlgoExecutionTimeline):
         """基于所有切片记录更新累计指标"""

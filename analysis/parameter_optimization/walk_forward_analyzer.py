@@ -24,6 +24,15 @@ from loguru import logger
 from analysis.parameter_optimization.genetic_optimizer import ParameterDef
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """安全转换数值，None/非数值/NaN/Inf 返回默认值。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if np.isfinite(f) else default
+
+
 class WindowMode(Enum):
     """窗口模式"""
     ANCHORED = "anchored"        # 锚定：训练窗口固定起点，逐渐扩展
@@ -164,6 +173,9 @@ class WalkForwardAnalyzer:
     def set_data(self, price_data: np.ndarray, date_labels: List[str] = None):
         """设置价格数据"""
         self._price_data = price_data
+        if price_data is None:
+            self._date_labels = []
+            return
         self._date_labels = date_labels or [str(i) for i in range(len(price_data))]
 
     # ── 窗口生成 ──────────────────────────────────────────────
@@ -172,22 +184,25 @@ class WalkForwardAnalyzer:
         """生成训练/验证窗口索引
         返回: [(train_start, train_end, test_start, test_end), ...]
         """
+        if self._train_window <= 0 or self._test_window <= 0 or self._step_size <= 0:
+            logger.warning("Invalid window configuration: train/test/step must be positive")
+            return []
         n = len(self._price_data)
         windows = []
 
-        if self._window_mode == WindowMode.ANCHORED:
-            # 锚定模式：训练起点固定，终点逐渐后移
+        if self._window_mode in (WindowMode.ANCHORED, WindowMode.EXPANDING):
+            # 锚定/扩展：训练窗口起点固定，终点随步长逐渐后移，训练集不断增大。
+            # ANCHORED 与 EXPANDING 为同一语义（Anchored == Expanding），
+            # 保留两个枚举仅为向后兼容，消除注释与实现不一致。
             train_start = 0
             train_end = self._train_window
-            while train_end + self._test_window <= n and len(windows) < 30:
+            while train_end + self._test_window <= n:
                 test_start = train_end
-                test_end = train_end + self._test_window
+                test_end = test_start + self._test_window
                 windows.append((train_start, train_end, test_start, test_end))
                 train_end += self._step_size
-                # 扩展训练窗口
-                # (anchored keeps start, moves end)
 
-        elif self._window_mode == WindowMode.ROLLING:
+        else:  # ROLLING
             train_start = 0
             while train_start + self._train_window + self._test_window <= n:
                 train_end = train_start + self._train_window
@@ -198,17 +213,8 @@ class WalkForwardAnalyzer:
                 windows.append((train_start, train_end, test_start, test_end))
                 train_start += self._step_size
 
-        else:  # EXPANDING
-            train_start = 0
-            train_end = self._train_window
-            while train_end + self._test_window <= n:
-                test_start = train_end
-                test_end = min(test_start + self._test_window, n)
-                windows.append((train_start, train_end, test_start, test_end))
-                train_end += self._step_size
-
         logger.info(f"Generated {len(windows)} walk-forward windows")
-        return windows[:max(len(windows), self._min_windows)]
+        return windows
 
     def _get_window_data(self, start: int, end: int) -> np.ndarray:
         """提取窗口数据"""
@@ -219,38 +225,58 @@ class WalkForwardAnalyzer:
     @staticmethod
     def _compute_returns(prices: np.ndarray) -> np.ndarray:
         """计算收益率序列"""
-        if len(prices) < 2:
+        if prices is None:
             return np.zeros(1)
-        return np.diff(prices) / prices[:-1]
+        arr = np.asarray(prices, dtype=float)
+        if len(arr) < 2:
+            return np.zeros(1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rets = np.diff(arr) / arr[:-1]
+        return rets[np.isfinite(rets)]
 
     @staticmethod
     def _compute_sharpe(returns: np.ndarray, risk_free: float = 0.0) -> float:
         """计算夏普比率"""
-        if len(returns) < 2:
+        if returns is None:
             return 0.0
-        excess = returns - risk_free / 365
+        rets = np.asarray(returns, dtype=float)
+        rets = rets[np.isfinite(rets)]
+        if len(rets) < 2:
+            return 0.0
+        excess = rets - risk_free / 365
         mean = float(np.mean(excess))
         std = float(np.std(excess, ddof=1))
-        if std <= 0:
+        if not np.isfinite(mean) or not np.isfinite(std) or std <= 0:
             return 0.0
         return mean / std * math.sqrt(365)
 
     @staticmethod
     def _compute_max_drawdown(returns: np.ndarray) -> float:
         """计算最大回撤"""
-        if len(returns) < 2:
+        if returns is None:
             return 0.0
-        cumulative = np.cumprod(1 + returns)
+        rets = np.asarray(returns, dtype=float)
+        rets = rets[np.isfinite(rets)]
+        if len(rets) < 2:
+            return 0.0
+        cumulative = np.cumprod(1 + rets)
         running_max = np.maximum.accumulate(cumulative)
         dd = (cumulative - running_max) / np.maximum(running_max, 1e-10)
+        dd = dd[np.isfinite(dd)]
+        if len(dd) == 0:
+            return 0.0
         return float(abs(np.min(dd)))
 
     @staticmethod
     def _compute_win_rate(returns: np.ndarray) -> float:
         """计算胜率"""
-        if len(returns) == 0:
+        if returns is None:
             return 0.0
-        return float(np.sum(returns > 0) / len(returns))
+        rets = np.asarray(returns, dtype=float)
+        rets = rets[np.isfinite(rets)]
+        if len(rets) == 0:
+            return 0.0
+        return float(np.sum(rets > 0) / len(rets))
 
     def _eval_performance(self, params: Dict[str, float],
                           data: np.ndarray) -> Optional[Dict[str, float]]:
@@ -270,10 +296,10 @@ class WalkForwardAnalyzer:
 
         if isinstance(result, dict):
             return {
-                "return": float(result.get("return", result.get("total_return", 0.0) or 0.0)),
-                "sharpe": float(result.get("sharpe", result.get("sharpe_ratio", 0.0) or 0.0)),
-                "max_drawdown": float(result.get("max_drawdown", result.get("max_dd", 0.0) or 0.0)),
-                "win_rate": float(result.get("win_rate", 0.0) or 0.0),
+                "return": _safe_float(result.get("return", result.get("total_return", 0.0))),
+                "sharpe": _safe_float(result.get("sharpe", result.get("sharpe_ratio", 0.0))),
+                "max_drawdown": _safe_float(result.get("max_drawdown", result.get("max_dd", 0.0))),
+                "win_rate": _safe_float(result.get("win_rate", 0.0)),
             }
 
         try:
@@ -291,10 +317,12 @@ class WalkForwardAnalyzer:
         """计算两组参数之间的归一化欧氏距离"""
         if not self._param_defs:
             return 0.0
+        if params1 is None or params2 is None:
+            return 0.0
         total_dist = 0.0
         for pd in self._param_defs:
-            v1 = params1.get(pd.name, 0)
-            v2 = params2.get(pd.name, 0)
+            v1 = _safe_float(params1.get(pd.name, 0.0))
+            v2 = _safe_float(params2.get(pd.name, 0.0))
             range_val = max(pd.high - pd.low, 1e-10)
             total_dist += ((v1 - v2) / range_val) ** 2
         return math.sqrt(total_dist / len(self._param_defs))
@@ -303,40 +331,51 @@ class WalkForwardAnalyzer:
 
     def _compute_robustness(self, result: WalkForwardResult):
         """计算综合稳健性评分"""
+        avg_sharpe = result.avg_test_sharpe if np.isfinite(result.avg_test_sharpe) else 0.0
+        std_sharpe = result.std_test_sharpe if np.isfinite(result.std_test_sharpe) else 0.0
+        avg_is_oos = result.avg_is_oos_ratio if np.isfinite(result.avg_is_oos_ratio) else 0.0
+        param_mean = result.param_stability_mean if np.isfinite(result.param_stability_mean) else 0.0
+
         # 1. OOS Sharpe 稳定性 (权重 0.35)
-        sharpe_stability = 1.0 - min(result.std_test_sharpe / max(abs(result.avg_test_sharpe), 0.01), 1.0)
+        sharpe_stability = 1.0 - min(std_sharpe / max(abs(avg_sharpe), 0.01), 1.0)
 
         # 2. IS/OOS 比率 (权重 0.25)
-        is_oos_score = max(0, 1.0 - result.avg_is_oos_ratio / self._overfit_is_oos_threshold)
+        oos_threshold = self._overfit_is_oos_threshold if self._overfit_is_oos_threshold > 0 else 2.0
+        is_oos_score = max(0.0, 1.0 - avg_is_oos / oos_threshold)
 
         # 3. 参数稳定性 (权重 0.25)
-        param_score = max(0, 1.0 - result.param_stability_mean / self._overfit_param_stability_threshold)
+        param_threshold = self._overfit_param_stability_threshold if self._overfit_param_stability_threshold > 0 else 0.3
+        param_score = max(0.0, 1.0 - param_mean / param_threshold)
 
         # 4. 平均 OOS Sharpe (权重 0.15)
-        sharpe_score = min(result.avg_test_sharpe / 1.0, 1.0) if result.avg_test_sharpe > 0 else 0
+        sharpe_score = min(avg_sharpe / 1.0, 1.0) if avg_sharpe > 0 else 0.0
 
         score = sharpe_stability * 0.35 + is_oos_score * 0.25 + param_score * 0.25 + sharpe_score * 0.15
+        result.robustness_score = float(np.clip(score, 0.0, 1.0))
 
         # 过拟合风险评估
-        if result.avg_is_oos_ratio > self._overfit_is_oos_threshold:
+        if avg_is_oos > oos_threshold:
             result.overfit_risk = "high"
-        elif result.avg_is_oos_ratio > self._overfit_is_oos_threshold * 0.7:
+        elif avg_is_oos > oos_threshold * 0.7:
             result.overfit_risk = "moderate"
         else:
             result.overfit_risk = "low"
-
-        result.robustness_score = score
 
     def _analyze_param_distributions(self, result: WalkForwardResult):
         """分析参数分布统计"""
         if not result.window_results or not self._param_defs:
             return
         for pd in self._param_defs:
-            values = [w.best_params.get(pd.name, 0) for w in result.window_results]
-            arr = np.array(values)
+            values = [_safe_float(w.best_params.get(pd.name, 0.0)) for w in result.window_results]
+            arr = np.array([v for v in values if np.isfinite(v)])
+            if len(arr) == 0:
+                result.param_distributions[pd.name] = {
+                    "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "median": 0.0,
+                }
+                continue
             result.param_distributions[pd.name] = {
                 "mean": float(np.mean(arr)),
-                "std": float(np.std(arr, ddof=1)),
+                "std": float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
                 "min": float(np.min(arr)),
                 "max": float(np.max(arr)),
                 "median": float(np.median(arr)),
@@ -348,6 +387,8 @@ class WalkForwardAnalyzer:
         """执行前向行走分析"""
         if self._price_data is None or len(self._price_data) < self._train_window:
             raise ValueError("Insufficient price data")
+        if self._train_window <= 0 or self._test_window <= 0 or self._step_size <= 0:
+            raise ValueError("Invalid window parameters: train/test/step must be positive")
         if not self._optimize_fn:
             raise ValueError("No optimize function set")
         if not self._eval_fn:
@@ -381,6 +422,10 @@ class WalkForwardAnalyzer:
                 logger.warning(f"WF window {wi} optimization failed: {e}")
                 continue
 
+            if params is None or not isinstance(params, dict):
+                logger.warning(f"WF window {wi} optimization returned invalid params: {params}")
+                continue
+
             # 训练集评估
             train_perf = self._eval_performance(params, train_data)
             if train_perf is not None:
@@ -410,7 +455,10 @@ class WalkForwardAnalyzer:
                 test_wr = self._compute_win_rate(test_ret)
 
             # IS/OOS 比率
-            is_oos = train_sharpe / max(abs(test_sharpe), 0.01) if test_sharpe != 0 else 0
+            if not np.isfinite(train_sharpe) or not np.isfinite(test_sharpe) or test_sharpe == 0:
+                is_oos = 0.0
+            else:
+                is_oos = train_sharpe / max(abs(test_sharpe), 0.01)
 
             # 参数稳定性
             stability = self._compute_param_stability(prev_params, params) if prev_params else 0
@@ -445,21 +493,29 @@ class WalkForwardAnalyzer:
         # 聚合统计
         valid_windows = [w for w in result.window_results]
         if valid_windows:
-            test_sharpes = [w.test_sharpe for w in valid_windows]
-            test_returns = [w.test_return for w in valid_windows]
-            is_oos_ratios = [w.is_oos_ratio for w in valid_windows]
-            stabilities = [w.param_stability for w in valid_windows]
+            full_sharpes = [w.test_sharpe for w in valid_windows]
+            finite_mask = [np.isfinite(s) for s in full_sharpes]
+            test_sharpes = [s for s, m in zip(full_sharpes, finite_mask) if m]
+            test_returns = [w.test_return for w in valid_windows if np.isfinite(w.test_return)]
+            is_oos_ratios = [w.is_oos_ratio for w in valid_windows if np.isfinite(w.is_oos_ratio)]
+            stabilities = [w.param_stability for w in valid_windows if np.isfinite(w.param_stability)]
 
-            result.avg_test_sharpe = float(np.mean(test_sharpes))
-            result.std_test_sharpe = float(np.std(test_sharpes, ddof=1))
-            result.avg_test_return = float(np.mean(test_returns))
-            result.avg_is_oos_ratio = float(np.mean(is_oos_ratios))
-            result.param_stability_mean = float(np.mean(stabilities))
+            if test_sharpes:
+                result.avg_test_sharpe = float(np.mean(test_sharpes))
+                result.std_test_sharpe = float(np.std(test_sharpes, ddof=1)) if len(test_sharpes) > 1 else 0.0
+            if test_returns:
+                result.avg_test_return = float(np.mean(test_returns))
+            if is_oos_ratios:
+                result.avg_is_oos_ratio = float(np.mean(is_oos_ratios))
+            if stabilities:
+                result.param_stability_mean = float(np.mean(stabilities))
 
             # 最优窗口
-            best_idx = int(np.argmax(test_sharpes))
-            result.best_window_index = best_idx
-            result.best_window_params = dict(valid_windows[best_idx].best_params)
+            if any(finite_mask):
+                masked = [s if m else -np.inf for s, m in zip(full_sharpes, finite_mask)]
+                best_idx = int(np.argmax(masked))
+                result.best_window_index = best_idx
+                result.best_window_params = dict(valid_windows[best_idx].best_params)
 
         # 稳健性评分
         self._compute_robustness(result)

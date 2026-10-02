@@ -38,7 +38,8 @@ class SLACompliance(Enum):
 class ExecutionEvent:
     """执行事件"""
     def __init__(self, event_type: str, order_id: str = "", symbol: str = "",
-                 strategy: str = "", latency_ms: float = 0.0, metadata: Dict = None):
+                 strategy: str = "", latency_ms: float = 0.0, metadata: Dict = None,
+                 trace_id: str = ""):
         self.event_type = event_type
         self.order_id = order_id
         self.symbol = symbol
@@ -46,6 +47,7 @@ class ExecutionEvent:
         self.latency_ms = latency_ms
         self.timestamp = datetime.now()
         self.metadata = metadata or {}
+        self.trace_id = trace_id
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -55,6 +57,7 @@ class ExecutionEvent:
             "strategy": self.strategy,
             "latency_ms": self.latency_ms,
             "timestamp": self.timestamp.isoformat(),
+            "trace_id": self.trace_id,
             "metadata": self.metadata,
         }
 
@@ -166,7 +169,8 @@ class ExecutionMonitor:
     # ===================== 事件记录 =====================
 
     async def record_latency(self, latency_type: LatencyType, latency_ms: float,
-                              order_id: str = "", symbol: str = "", strategy: str = ""):
+                              order_id: str = "", symbol: str = "", strategy: str = "",
+                              trace_id: str = ""):
         """记录延迟事件"""
         async with self._lock:
             event = ExecutionEvent(
@@ -174,6 +178,7 @@ class ExecutionMonitor:
                 order_id=order_id, symbol=symbol, strategy=strategy,
                 latency_ms=latency_ms,
                 metadata={"latency_type": latency_type.value},
+                trace_id=trace_id,
             )
             self._events.append(event)
 
@@ -195,13 +200,15 @@ class ExecutionMonitor:
     async def record_order_event(self, event_type: str, order_id: str = "",
                                   symbol: str = "", strategy: str = "",
                                   quantity: float = 0, price: float = 0,
-                                  status: str = "", metadata: Dict = None):
+                                  status: str = "", metadata: Dict = None,
+                                  trace_id: str = ""):
         """记录订单事件"""
         async with self._lock:
             event = ExecutionEvent(
                 event_type=event_type, order_id=order_id,
                 symbol=symbol, strategy=strategy,
                 metadata=metadata or {},
+                trace_id=trace_id,
             )
             event.metadata["quantity"] = quantity
             event.metadata["price"] = price

@@ -17,11 +17,36 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
-from typing import Dict, Any, Optional, List, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 import numpy as np
 from loguru import logger
+
+
+def _is_finite(x) -> bool:
+    """判断是否为有限数值（拒绝 None/bool/NaN/Inf）。"""
+    if x is None or isinstance(x, bool):
+        return False
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return False
+    return not (math.isnan(v) or math.isinf(v))
+
+
+def _safe_float(x, default: float = 0.0) -> float:
+    """将输入安全转换为有限 float，None/NaN/Inf/非法值返回 default。"""
+    if x is None or isinstance(x, bool):
+        return default
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -39,6 +64,9 @@ class MarketRegime(Enum):
     """市场状态（轻量版，不依赖MarketRegimeEngine）"""
     TRENDING_UP = "trending_up"
     TRENDING_DOWN = "trending_down"
+    BREAKOUT = "breakout"
+    BREAKDOWN = "breakdown"
+    REVERSAL = "reversal"
     RANGING = "ranging"
     HIGH_VOLATILITY = "high_volatility"
     LOW_VOLATILITY = "low_volatility"
@@ -107,7 +135,9 @@ class StrategyAllocation:
     # 状态标记
     is_active: bool = True             # 策略是否活跃
     is_frozen: bool = False            # 是否被冻结
+    is_open_blocked: bool = False      # 是否禁止新增仓位
     freeze_reason: str = ""            # 冻结原因
+    is_probing: bool = False           # 是否处于缩量试探期（冻结观察期满后）
 
     # ── 企业级：资金利用率追踪 ──
     capital_utilization_pct: float = 0.0    # 实际资金利用率（已用保证金/已分配资金）
@@ -192,6 +222,9 @@ class AllocationPlan:
                     "kelly_fraction": round(v.kelly_fraction, 4),
                     "priority": v.priority.name,
                     "is_frozen": v.is_frozen,
+                    "is_open_blocked": v.is_open_blocked,
+                    "is_probing": v.is_probing,
+                    "freeze_reason": v.freeze_reason,
                 } for k, v in self.strategy_allocations.items()
             },
             "allocation_changes": {k: round(v, 4) for k, v in self.allocation_changes.items()},
@@ -233,29 +266,29 @@ class DynamicAllocator:
 
         # ── 资金池配置 ──
         cap_cfg = config.get("capital_pool", {})
-        self._base_ratio = cap_cfg.get("base_ratio", 0.60)
-        self._addon_ratio = cap_cfg.get("add_reserve_ratio", 0.25)
-        self._reserve_ratio = cap_cfg.get("risk_isolation_ratio", 0.15)
+        self._base_ratio = _safe_float(cap_cfg.get("base_ratio"), 0.60)
+        self._addon_ratio = _safe_float(cap_cfg.get("add_reserve_ratio"), 0.25)
+        self._reserve_ratio = _safe_float(cap_cfg.get("risk_isolation_ratio"), 0.15)
 
         # ── 盈亏再分配配置 ──
         pnl_cfg = config.get("pnl_reallocation", {})
-        self._profit_to_addon = pnl_cfg.get("profit_to_add_ratio", 0.50)
-        self._loss_shrink = pnl_cfg.get("loss_shrink_ratio", 0.30)
-        self._consecutive_profit_days = pnl_cfg.get("consecutive_profit_days", 3)
-        self._consecutive_loss_days = pnl_cfg.get("consecutive_loss_days", 2)
-        self._max_addon_ratio = pnl_cfg.get("max_add_pool_ratio", 0.40)
-        self._min_base_ratio = pnl_cfg.get("min_base_pool_ratio", 0.50)
+        self._profit_to_addon = _safe_float(pnl_cfg.get("profit_to_add_ratio"), 0.50)
+        self._loss_shrink = _safe_float(pnl_cfg.get("loss_shrink_ratio"), 0.30)
+        self._consecutive_profit_days = int(_safe_float(pnl_cfg.get("consecutive_profit_days"), 3))
+        self._consecutive_loss_days = int(_safe_float(pnl_cfg.get("consecutive_loss_days"), 2))
+        self._max_addon_ratio = _safe_float(pnl_cfg.get("max_add_pool_ratio"), 0.40)
+        self._min_base_ratio = _safe_float(pnl_cfg.get("min_base_pool_ratio"), 0.50)
 
         # ── 分配控制参数 ──
         alloc_cfg = config.get("allocation_agent", {})
-        self._max_weight_change = alloc_cfg.get("max_allocation_change", 0.10)
-        self._min_trade_count = alloc_cfg.get("min_trade_count", 20)
-        self._rebalance_interval = alloc_cfg.get("rebalance_interval", 3600)
+        self._max_weight_change = _safe_float(alloc_cfg.get("max_allocation_change"), 0.10)
+        self._min_trade_count = int(_safe_float(alloc_cfg.get("min_trade_count"), 20))
+        self._rebalance_interval = int(_safe_float(alloc_cfg.get("rebalance_interval"), 3600))
 
         # ── 风险参数 ──
-        self._max_single_weight = config.get("symbol_allocation", {}).get("max_symbol_weight", 0.15) * 3  # 策略级放宽
-        self._min_single_weight = config.get("symbol_allocation", {}).get("min_symbol_weight", 0.02)
-        self._max_total_leverage = config.get("leverage_tiers", {}).get("absolute_max", 10)
+        self._max_single_weight = _safe_float(config.get("symbol_allocation", {}).get("max_symbol_weight"), 0.15) * 3  # 策略级放宽
+        self._min_single_weight = _safe_float(config.get("symbol_allocation", {}).get("min_symbol_weight"), 0.02)
+        self._max_total_leverage = _safe_float(config.get("leverage_tiers", {}).get("absolute_max"), 10)
 
         # ── Kelly 参数 ──
         self._kelly_enabled = True
@@ -264,14 +297,14 @@ class DynamicAllocator:
 
         # ── 企业级：资金效率强化参数 ──
         eff_cfg = config.get("capital_efficiency", {})
-        self._idle_sweep_threshold = eff_cfg.get("idle_sweep_threshold", 0.20)     # 闲置>20%触发归集
-        self._idle_sweep_min_duration = eff_cfg.get("idle_sweep_min_duration", 30) # 闲置持续30分钟才归集
-        self._utilization_reclaim_threshold = eff_cfg.get("utilization_reclaim_threshold", 0.50)  # 利用率<50%回收
-        self._min_capital_efficiency = eff_cfg.get("min_capital_efficiency", 0.15)  # 最低资金效率
-        self._emergency_reserve_threshold = eff_cfg.get("emergency_reserve_threshold", 0.10)  # 风控池<10%触发补充
-        self._max_concentration_ratio = eff_cfg.get("max_concentration_ratio", 0.50)  # 最大集中度
+        self._idle_sweep_threshold = _safe_float(eff_cfg.get("idle_sweep_threshold"), 0.20)     # 闲置>20%触发归集
+        self._idle_sweep_min_duration = _safe_float(eff_cfg.get("idle_sweep_min_duration"), 30) # 闲置持续30分钟才归集
+        self._utilization_reclaim_threshold = _safe_float(eff_cfg.get("utilization_reclaim_threshold"), 0.50)  # 利用率<50%回收
+        self._min_capital_efficiency = _safe_float(eff_cfg.get("min_capital_efficiency"), 0.15)  # 最低资金效率
+        self._emergency_reserve_threshold = _safe_float(eff_cfg.get("emergency_reserve_threshold"), 0.10)  # 风控池<10%触发补充
+        self._max_concentration_ratio = _safe_float(eff_cfg.get("max_concentration_ratio"), 0.50)  # 最大集中度
         self._volatility_pool_adapt = eff_cfg.get("volatility_pool_adapt", True)       # 波动率自适应池比例
-        self._opportunity_cost_daily = eff_cfg.get("opportunity_cost_daily", 0.0005)   # 闲置资金机会成本日化率（0.05%）
+        self._opportunity_cost_daily = _safe_float(eff_cfg.get("opportunity_cost_daily"), 0.0005)   # 闲置资金机会成本日化率（0.05%）
         self._positive_return_protection = eff_cfg.get("positive_return_protection", True)  # 正收益策略保护
 
         # ── 状态 ──
@@ -284,6 +317,31 @@ class DynamicAllocator:
         # ── 策略绩效缓存 ──
         self._strategy_returns: Dict[str, List[float]] = {}
         self._daily_pnl: Dict[str, List[float]] = {}
+
+        # ── 冻结策略观察期自动解冻 + 缩量试探（企业级 fail-closed） ──
+        freeze_cfg = config.get("freeze_policy", {})
+        self._freeze_enabled = bool(freeze_cfg.get("enabled", True))
+        self._freeze_observe_seconds = max(0.0, _safe_float(freeze_cfg.get("observe_minutes"), 60.0) * 60.0)
+        self._probe_weight_ratio = max(0.05, min(1.0, _safe_float(freeze_cfg.get("probe_weight_ratio"), 0.5)))
+        self._probe_max_attempts = max(0, int(_safe_float(freeze_cfg.get("probe_max_attempts"), 3)))
+        self._consecutive_loss_freeze = max(1, int(_safe_float(freeze_cfg.get("consecutive_loss_freeze"), 5)))
+        self._max_drawdown_freeze = max(0.0, _safe_float(freeze_cfg.get("max_drawdown_freeze"), 0.15))
+        # 正收益高盈亏比策略（低胜率高盈亏比，回撤天然大）的回撤冻结阈值放宽
+        self._positive_return_drawdown_freeze = max(
+            self._max_drawdown_freeze,
+            _safe_float(freeze_cfg.get("positive_return_drawdown_freeze"), 0.60),
+        )
+        self._positive_return_min_profit_factor = _safe_float(
+            freeze_cfg.get("positive_return_min_profit_factor"), 2.0
+        )
+        # 正收益高盈亏比策略的最低成交数门槛（放宽，避免样本略不足即降为 LOW）
+        self._positive_return_min_trade_count = max(
+            0, int(_safe_float(freeze_cfg.get("positive_return_min_trade_count"), 10))
+        )
+        # 冻结状态机：{strategy: {frozen_at, reason, probing, probe_attempts, probe_wins_baseline}}
+        self._freeze_state: Dict[str, Dict[str, Any]] = {}
+        # 本轮处于「缩量试探」的策略集合（由 _evaluate_strategy_priorities 填充，供瀑布缩量使用）
+        self._probing_strategies: set = set()
 
         # ── 外部依赖（延迟注入） ──
         self._portfolio_optimizer = None
@@ -308,6 +366,7 @@ class DynamicAllocator:
 
     def update_strategy_returns(self, name: str, daily_return: float):
         """更新策略日收益率"""
+        daily_return = _safe_float(daily_return, 0.0)
         if name not in self._strategy_returns:
             self._strategy_returns[name] = []
         self._strategy_returns[name].append(daily_return)
@@ -316,6 +375,7 @@ class DynamicAllocator:
 
     def update_strategy_pnl(self, name: str, pnl: float):
         """更新策略每日盈亏"""
+        pnl = _safe_float(pnl, 0.0)
         if name not in self._daily_pnl:
             self._daily_pnl[name] = []
         self._daily_pnl[name].append(pnl)
@@ -329,10 +389,11 @@ class DynamicAllocator:
         total_capital: float,
         total_equity: float,
         strategy_names: List[str],
-        strategy_metrics: Dict[str, Dict[str, float]] = None,
+        strategy_metrics: Dict[str, Dict[str, Any]] = None,
         market_regime: MarketRegime = MarketRegime.UNKNOWN,
         current_weights: Dict[str, float] = None,
         used_margin_by_strategy: Dict[str, float] = None,
+        persist_last_plan: bool = True,
     ) -> AllocationPlan:
         """
         计算完整资金分配方案
@@ -341,7 +402,9 @@ class DynamicAllocator:
             total_capital: 总资金
             total_equity: 总权益（含浮动盈亏）
             strategy_names: 活跃策略名称列表
-            strategy_metrics: 策略绩效指标 {name: {win_rate, sharpe, ...}}
+            strategy_metrics: 策略绩效及可选预测指标；预测指标包括
+                projected_pnl_per_cycle、projection_confidence、
+                bear_case_horizon、bear_case_fail_closed
             market_regime: 当前市场状态
             current_weights: 当前策略权重
             used_margin_by_strategy: 各策略已用保证金 {name: used_margin}（企业级修复数据断链）
@@ -350,6 +413,23 @@ class DynamicAllocator:
             完整分配方案
         """
         async with self._lock:
+            total_capital = _safe_float(total_capital, 0.0)
+            total_equity = _safe_float(total_equity, 0.0)
+            strategy_names = list(strategy_names or [])
+
+            # fail-closed：无法确认权益时不做任何分配，返回空方案而非崩溃/放行
+            if total_equity <= 0:
+                plan = AllocationPlan(
+                    total_capital=total_capital,
+                    total_equity=total_equity,
+                )
+                plan.warnings.append(
+                    "Invalid or non-positive total equity; allocation aborted (fail-closed)"
+                )
+                if persist_last_plan:
+                    self._last_plan = plan
+                return plan
+
             plan = AllocationPlan(
                 total_capital=total_capital,
                 total_equity=total_equity,
@@ -367,11 +447,13 @@ class DynamicAllocator:
 
             # ── Step 3: 评估策略优先级 ──
             priorities = self._evaluate_strategy_priorities(
-                strategy_names, strategy_metrics, market_regime
+                strategy_names, strategy_metrics, market_regime, total_equity
             )
 
             # ── Step 4: Kelly 公式计算最优仓位 ──
-            kelly_weights = self._compute_kelly_weights(strategy_names, strategy_metrics)
+            kelly_weights = self._compute_kelly_weights(
+                strategy_names, strategy_metrics, total_equity
+            )
 
             # ── Step 5: 分配优先级瀑布 ──
             self._waterfall_allocation(plan, strategy_names, priorities, kelly_weights,
@@ -402,7 +484,8 @@ class DynamicAllocator:
             # ── Step 13: 企业级 — 应急储备检查 ──
             self._emergency_reserve_check(plan, strategy_metrics)
 
-            self._last_plan = plan
+            if persist_last_plan:
+                self._last_plan = plan
             return plan
 
     # ── Step 1: 三级资金池 ───────────────────────────────────
@@ -442,6 +525,9 @@ class DynamicAllocator:
         regime_adjustments = {
             MarketRegime.TRENDING_UP:    (1.05, 1.10, 0.85),   # 趋势上涨→增仓
             MarketRegime.TRENDING_DOWN:  (0.85, 0.60, 1.30),   # 趋势下跌→减仓+增风控
+            MarketRegime.BREAKOUT:       (1.00, 1.15, 0.85),   # 突破确认→适度提高进攻池
+            MarketRegime.BREAKDOWN:      (0.80, 0.45, 1.55),   # 破位→收缩加仓并提高隔离池
+            MarketRegime.REVERSAL:       (0.70, 0.35, 1.65),   # 反转不确定性高→防守优先
             MarketRegime.RANGING:        (1.00, 0.95, 1.00),   # 震荡→略减加仓
             MarketRegime.HIGH_VOLATILITY:(0.80, 0.50, 1.50),   # 高波动→大幅减仓
             MarketRegime.LOW_VOLATILITY: (1.10, 1.15, 0.75),   # 低波动→增仓
@@ -482,41 +568,73 @@ class DynamicAllocator:
     def _evaluate_strategy_priorities(
         self,
         strategy_names: List[str],
-        metrics: Dict[str, Dict[str, float]],
+        metrics: Dict[str, Dict[str, Any]],
         regime: MarketRegime,
+        total_equity: float = 0.0,
     ) -> Dict[str, AllocationPriority]:
-        """综合评估策略优先级"""
+        """综合评估策略优先级（含冻结策略观察期自动解冻 + 缩量试探）。"""
         priorities: Dict[str, AllocationPriority] = {}
+        self._probing_strategies = set()
 
         for name in strategy_names:
             m = metrics.get(name, {})
 
-            # 检查冻结条件
-            if m.get("trade_count", 0) > 0:
-                # 连续亏损过多 → 冻结
-                if m.get("consecutive_losses", 0) >= 5:
-                    priorities[name] = AllocationPriority.FROZEN
+            if bool(m.get("bear_case_fail_closed")):
+                priorities[name] = AllocationPriority.FROZEN
+                continue
+
+            trade_count = _safe_float(m.get("trade_count"), 0)
+            consecutive_losses = _safe_float(m.get("consecutive_losses"), 0)
+            max_drawdown = _safe_float(m.get("max_drawdown"), 0)
+            profit_factor = _safe_float(m.get("profit_factor"), 1.0)
+            total_pnl = _safe_float(m.get("total_pnl"), 0.0)
+
+            should_freeze, _reason = self._detect_freeze_condition(
+                trade_count, consecutive_losses, max_drawdown,
+                profit_factor=profit_factor, total_pnl=total_pnl,
+            )
+
+            if should_freeze:
+                # 冻结状态机：观察期自动解冻 / 缩量试探
+                probe_priority = self._resolve_frozen_strategy(name, m, reason=_reason)
+                if probe_priority is not None:
+                    priorities[name] = probe_priority
+                    if probe_priority == AllocationPriority.LOW:
+                        self._probing_strategies.add(name)
                     continue
 
-                # 回撤过大 → 冻结
-                if m.get("max_drawdown", 0) > 0.15:
-                    priorities[name] = AllocationPriority.FROZEN
-                    continue
+            # 不满足冻结条件（或试探期已恢复）：清除冻结状态，走正常评估
+            if name in self._freeze_state:
+                logger.info(f"[FreezePolicy] {name} 已恢复（不再满足冻结条件），解除冻结")
+                self._freeze_state.pop(name, None)
 
             # 交易数不足 → 最低优先级但不冻结
-            if m.get("trade_count", 0) < self._min_trade_count:
+            # 正收益高盈亏比策略放宽门槛（已证明正期望，避免样本略不足即降为 LOW）
+            min_trade = self._min_trade_count
+            if total_pnl > 0 and profit_factor >= self._positive_return_min_profit_factor:
+                min_trade = self._positive_return_min_trade_count
+            if trade_count < min_trade:
                 priorities[name] = AllocationPriority.LOW
                 continue
 
             # 综合评分
-            sharpe = m.get("sharpe_ratio", 0)
-            win_rate = m.get("win_rate", 0.5)
-            profit_factor = m.get("profit_factor", 1.0)
-            trade_count = m.get("trade_count", 0)
+            sharpe = _safe_float(m.get("sharpe_ratio"), 0)
+            win_rate = _safe_float(m.get("win_rate"), 0.5)
 
             # 评分 = Sharpe*0.4 + WinRate*0.2 + ProfitFactor*0.2 + TradeCount*0.2
             tc_norm = min(1.0, trade_count / 50)
             score = sharpe * 0.4 + win_rate * 0.2 + profit_factor * 0.2 + tc_norm * 0.2
+
+            # 前瞻推算维度（非破坏性微调，不改原权重）
+            # projected_pnl_per_cycle 由 AGI orchestrator 注入，反映未来 horizon 期望盈亏
+            projected_pnl = _safe_float(m.get("projected_pnl_per_cycle"), 0.0)
+            proj_conf = max(0.0, min(1.0, _safe_float(m.get("projection_confidence"), 0.0)))
+            # 归一化：以权益 5% 为满档（projected_pnl 多为小数，用 sigmoid 风格压缩到 [-0.15, 0.15])
+            _eq_ref = max(_safe_float(total_equity, 0.0), 1.0)
+            if total_equity <= 0:
+                _eq_ref = max(abs(total_pnl), 1.0)
+            _proj_norm = max(-1.0, min(1.0, projected_pnl / (0.05 * _eq_ref)))
+            score += _proj_norm * 0.15 * proj_conf
 
             if score >= 0.6:
                 priorities[name] = AllocationPriority.HIGH
@@ -527,12 +645,108 @@ class DynamicAllocator:
 
         return priorities
 
+    def _detect_freeze_condition(
+        self,
+        trade_count: float,
+        consecutive_losses: float,
+        max_drawdown: float,
+        profit_factor: float = 1.0,
+        total_pnl: float = 0.0,
+    ) -> Tuple[bool, str]:
+        """判断策略是否满足冻结条件。返回 (should_freeze, reason)。
+
+        正收益高盈亏比策略（低胜率高盈亏比，回撤天然大）放宽回撤冻结阈值，
+        避免误杀盈利但回撤大的策略（如 sync 这种低胜率 / 高盈亏比）。
+        """
+        if trade_count > 0:
+            if consecutive_losses >= self._consecutive_loss_freeze:
+                return True, "consecutive_losses"
+            dd_threshold = self._max_drawdown_freeze
+            if total_pnl > 0 and profit_factor >= self._positive_return_min_profit_factor:
+                dd_threshold = self._positive_return_drawdown_freeze
+            if max_drawdown > dd_threshold:
+                return True, "high_drawdown"
+        return False, ""
+
+    def _resolve_frozen_strategy(
+        self,
+        name: str,
+        m: Dict[str, Any],
+        reason: str = "",
+    ) -> Optional[AllocationPriority]:
+        """冻结状态机：观察期自动解冻 + 缩量试探。
+
+        仅当 `_detect_freeze_condition` 判定应冻结时调用。
+
+        返回：
+          - FROZEN：观察期内 / 试探耗尽（永久冻结，需人工）
+          - LOW：进入缩量试探
+          - None：本轮判定应由正常评估路径接管（防御分支，正常情况下不会发生）
+        """
+        if not self._freeze_enabled:
+            return AllocationPriority.FROZEN
+
+        now = time.time()
+        reason = reason or "high_drawdown"  # 兜底（调用方未传入时）
+
+        state = self._freeze_state.get(name)
+        if state is None:
+            # 首次冻结：记录时间，进入观察期
+            self._freeze_state[name] = {
+                "frozen_at": now,
+                "reason": reason,
+                "probing": False,
+                "probe_attempts": 0,
+            }
+            logger.warning(
+                f"[FreezePolicy] {name} 触发冻结（{reason}），"
+                f"进入观察期 {self._freeze_observe_seconds / 60:.0f}min"
+            )
+            return AllocationPriority.FROZEN
+
+        # 冻结原因随指标变化时更新（如 high_drawdown → consecutive_losses）
+        if state.get("reason") != reason:
+            state["reason"] = reason
+
+        if not state.get("probing"):
+            # 观察期中：期满才进入缩量试探
+            elapsed = now - _safe_float(state.get("frozen_at"), now)
+            if self._freeze_observe_seconds <= 0 or elapsed < self._freeze_observe_seconds:
+                return AllocationPriority.FROZEN
+            state["probing"] = True
+            state["probe_attempts"] = int(state.get("probe_attempts", 0)) + 1
+            state["probe_started_at"] = now
+            logger.info(
+                f"[FreezePolicy] {name} 观察期满 → 缩量试探 "
+                f"第 {state['probe_attempts']}/{self._probe_max_attempts} 次（权重 x{self._probe_weight_ratio:.0%}）"
+            )
+            return AllocationPriority.LOW
+
+        # 试探窗口内：窗口时长 = 观察期时长；期满仍未恢复则计数并回观察期
+        probe_elapsed = now - _safe_float(state.get("probe_started_at"), now)
+        if self._freeze_observe_seconds > 0 and probe_elapsed >= self._freeze_observe_seconds:
+            if int(state.get("probe_attempts", 0)) >= self._probe_max_attempts:
+                logger.warning(
+                    f"[FreezePolicy] {name} 试探 {self._probe_max_attempts} 次仍未恢复，"
+                    f"永久冻结（需人工确认）"
+                )
+                return AllocationPriority.FROZEN
+            # 重新进入观察期，等待下一轮试探
+            state["probing"] = False
+            state["frozen_at"] = now
+            logger.info(f"[FreezePolicy] {name} 试探未恢复，重新进入观察期")
+            return AllocationPriority.FROZEN
+
+        # 试探窗口内，继续缩量试探
+        return AllocationPriority.LOW
+
     # ── Step 4: Kelly 最优仓位 ────────────────────────────────
 
     def _compute_kelly_weights(
         self,
         strategy_names: List[str],
-        metrics: Dict[str, Dict[str, float]],
+        metrics: Dict[str, Dict[str, Any]],
+        total_equity: float = 0.0,
     ) -> Dict[str, float]:
         """
         Kelly 公式: f* = (p * b - q) / b
@@ -544,8 +758,8 @@ class DynamicAllocator:
 
         for name in strategy_names:
             m = metrics.get(name, {})
-            win_rate = m.get("win_rate", 0.5)
-            profit_factor = m.get("profit_factor", 1.0)
+            win_rate = _safe_float(m.get("win_rate"), 0.5)
+            profit_factor = _safe_float(m.get("profit_factor"), 1.0)
 
             if win_rate <= 0 or profit_factor <= 0:
                 kelly_weights[name] = 0.0
@@ -565,10 +779,23 @@ class DynamicAllocator:
                 kelly *= 0.5
 
             # 波动率调整
-            vol = m.get("volatility_30d", 0.02)
+            vol = _safe_float(m.get("volatility_30d"), 0.02)
             if vol > 0:
                 vol_adj = min(1.0, 0.02 / vol)  # 高波动→降低仓位
                 kelly *= vol_adj
+
+            # Forecasts may reduce Kelly exposure, but never increase it.
+            # Use the worse of expected and bear-case PnL when both are available.
+            if total_equity > 0:
+                projected_pnl = _safe_float(m.get("projected_pnl_per_cycle"), 0.0)
+                bear_case_pnl = _safe_float(m.get("bear_case_horizon"), projected_pnl)
+                downside = min(projected_pnl, bear_case_pnl, 0.0)
+                confidence = max(
+                    0.0, min(1.0, _safe_float(m.get("projection_confidence"), 0.0))
+                )
+                risk_reference = max(total_equity * 0.05, 1.0)
+                downside_severity = min(1.0, abs(downside) / risk_reference)
+                kelly *= 1.0 - (0.5 * confidence * downside_severity)
 
             kelly_weights[name] = round(kelly, 6)
 
@@ -620,30 +847,38 @@ class DynamicAllocator:
             alloc = StrategyAllocation(
                 name=name,
                 priority=priority,
-                current_weight=current_w,
-                used_margin=used_margin_by_strategy.get(name, 0.0),
+                current_weight=_safe_float(current_w, 0.0),
+                used_margin=_safe_float(used_margin_by_strategy.get(name), 0.0),
                 # ── 企业级：盈亏拆账 ──
-                realized_pnl=m.get("realized_pnl", 0.0),
-                unrealized_pnl=m.get("unrealized_pnl", 0.0),
+                realized_pnl=_safe_float(m.get("realized_pnl"), 0.0),
+                unrealized_pnl=_safe_float(m.get("unrealized_pnl"), 0.0),
                 # ── 绩效快照 ──
-                win_rate=m.get("win_rate", 0.5),
-                sharpe_ratio=m.get("sharpe_ratio", 0.0),
-                profit_factor=m.get("profit_factor", 1.0),
-                max_drawdown=m.get("max_drawdown", 0.0),
-                trade_count=m.get("trade_count", 0),
-                consecutive_wins=m.get("consecutive_wins", 0),
-                consecutive_losses=m.get("consecutive_losses", 0),
-                volatility_30d=m.get("volatility_30d", 0.0),
+                win_rate=_safe_float(m.get("win_rate"), 0.5),
+                sharpe_ratio=_safe_float(m.get("sharpe_ratio"), 0.0),
+                profit_factor=_safe_float(m.get("profit_factor"), 1.0),
+                max_drawdown=_safe_float(m.get("max_drawdown"), 0.0),
+                trade_count=int(_safe_float(m.get("trade_count"), 0)),
+                consecutive_wins=int(_safe_float(m.get("consecutive_wins"), 0)),
+                consecutive_losses=int(_safe_float(m.get("consecutive_losses"), 0)),
+                volatility_30d=_safe_float(m.get("volatility_30d"), 0.0),
             )
 
             if priority == AllocationPriority.FROZEN:
-                # 冻结：权重归零
+                # 冻结/开仓门控：权重归零，不将该策略纳入资金分配。
                 alloc.target_weight = 0
                 alloc.allocated_capital = 0
                 alloc.is_frozen = True
-                alloc.freeze_reason = (
-                    "consecutive_losses" if kelly_w == 0 else "high_drawdown"
-                )
+                alloc.is_open_blocked = bool(m.get("bear_case_fail_closed"))
+                # 投影门控独立于基于历史绩效的冻结状态机。
+                fs = self._freeze_state.get(name)
+                if alloc.is_open_blocked:
+                    alloc.freeze_reason = "bear_case_projection"
+                elif isinstance(fs, dict) and fs.get("reason"):
+                    alloc.freeze_reason = fs.get("reason", "")
+                else:
+                    alloc.freeze_reason = (
+                        "consecutive_losses" if kelly_w == 0 else "high_drawdown"
+                    )
                 plan.strategy_allocations[name] = alloc
                 continue
 
@@ -654,6 +889,9 @@ class DynamicAllocator:
                 target_w = max(self._min_single_weight, min(self._max_single_weight * 0.7, kelly_w))
             else:  # LOW
                 target_w = self._min_single_weight
+                # 冻结策略缩量试探：权重再打折，控制试探风险
+                if name in self._probing_strategies:
+                    target_w = self._min_single_weight * self._probe_weight_ratio
 
             # 市场状态微调
             target_w = self._regime_weight_adj(target_w, regime, priority)
@@ -690,6 +928,7 @@ class DynamicAllocator:
             alloc.available = max(0.0, allocated - alloc.used_margin)
             alloc.kelly_fraction = kelly_w
             alloc.half_kelly = kelly_w * 0.5
+            alloc.is_probing = name in self._probing_strategies
 
             plan.strategy_allocations[name] = alloc
 
@@ -725,7 +964,7 @@ class DynamicAllocator:
     def _compute_changes(self, plan: AllocationPlan, current_weights: Dict[str, float]):
         """计算需要调整的权重变化"""
         for name, alloc in plan.strategy_allocations.items():
-            current_w = current_weights.get(name, 0)
+            current_w = _safe_float(current_weights.get(name), 0.0)
             diff = alloc.target_weight - current_w
 
             # 限制单次变更幅度
@@ -740,7 +979,7 @@ class DynamicAllocator:
     def _detect_idle_cash(self, plan: AllocationPlan):
         """检测各池闲置资金，带时间加权追踪"""
         total_idle = 0.0
-        for pool_name, pool in plan.pools.items():
+        for pool in plan.pools.values():
             pool_free = pool.available - pool.allocated
             if pool_free > 0:
                 total_idle += pool_free
@@ -845,7 +1084,7 @@ class DynamicAllocator:
         for name, alloc in plan.strategy_allocations.items():
             if alloc.allocated_capital <= 0:
                 continue
-            sharpe = strategy_metrics.get(name, {}).get("sharpe_ratio", 0.0)
+            sharpe = _safe_float(strategy_metrics.get(name, {}).get("sharpe_ratio"), 0.0)
             weight = alloc.allocated_capital / total_allocated
             weighted_sharpe += sharpe * weight
 
@@ -869,7 +1108,7 @@ class DynamicAllocator:
         盈利→流入加仓池；亏损→收缩底仓→流入风控池
         """
         total_profit = sum(
-            m.get("total_pnl", 0)
+            _safe_float(m.get("total_pnl"), 0)
             for m in strategy_metrics.values()
         )
 
@@ -948,12 +1187,13 @@ class DynamicAllocator:
         当高优先级策略需要资金时，从低优先级闲置策略借用。
         """
         async with self._lock:
+            amount = _safe_float(amount, 0.0)
             if target_strategy not in plan.strategy_allocations:
                 return False, f"Strategy {target_strategy} not in plan"
 
             target_alloc = plan.strategy_allocations[target_strategy]
             if target_alloc.priority.value > AllocationPriority.MEDIUM.value:
-                return False, f"Target strategy priority too low"
+                return False, "Target strategy priority too low"
 
             # 寻找可借用来源
             borrowed = 0.0
@@ -1003,14 +1243,14 @@ class DynamicAllocator:
             if alloc.is_frozen:
                 continue
 
-            min_cap = min_capital_per_strategy.get(name, 200)
+            min_cap = _safe_float(min_capital_per_strategy.get(name), 200)
             if alloc.allocated_capital < min_cap:
                 issues[name] = {
                     "current": alloc.allocated_capital,
                     "required": min_cap,
                     "shortfall": min_cap - alloc.allocated_capital,
                     "recommendation": (
-                        f"Increase allocation or merge with another strategy"
+                        "Increase allocation or merge with another strategy"
                     ),
                 }
 
@@ -1028,8 +1268,8 @@ class DynamicAllocator:
         """检测连续盈利/亏损天数，触发再分配建议"""
         streaks = {}
         for name, m in strategy_metrics.items():
-            consecutive_wins = m.get("consecutive_wins", 0)
-            consecutive_losses = m.get("consecutive_losses", 0)
+            consecutive_wins = _safe_float(m.get("consecutive_wins"), 0)
+            consecutive_losses = _safe_float(m.get("consecutive_losses"), 0)
 
             action = "hold"
             if consecutive_wins >= self._consecutive_profit_days:
@@ -1081,9 +1321,40 @@ class DynamicAllocator:
                 "kelly_fraction": round(v.kelly_fraction, 4),
                 "priority": v.priority.name,
                 "is_frozen": v.is_frozen,
+                "is_probing": v.is_probing,
+                "freeze_reason": v.freeze_reason,
             }
             for k, v in self._last_plan.strategy_allocations.items()
         }
+
+    def get_freeze_state(self) -> Dict[str, Dict[str, Any]]:
+        """返回冻结状态机快照，供 AGI 编排器感知「观察期自动解冻 / 缩量试探」状态。"""
+        now = time.time()
+        result: Dict[str, Dict[str, Any]] = {}
+        for name, state in self._freeze_state.items():
+            frozen_at = _safe_float(state.get("frozen_at"), now)
+            probing = bool(state.get("probing", False))
+            probe_attempts = int(state.get("probe_attempts", 0))
+            observe_seconds = self._freeze_observe_seconds
+
+            if probing:
+                started = _safe_float(state.get("probe_started_at"), now)
+                remaining = max(0.0, observe_seconds - (now - started))
+            else:
+                remaining = max(0.0, observe_seconds - (now - frozen_at))
+
+            result[name] = {
+                "reason": state.get("reason", ""),
+                "probing": probing,
+                "probe_attempts": probe_attempts,
+                "probe_max_attempts": self._probe_max_attempts,
+                "observe_seconds": round(observe_seconds, 1),
+                "remaining_seconds": round(remaining, 1),
+                "permanently_frozen": (
+                    probing and probe_attempts >= self._probe_max_attempts
+                ),
+            }
+        return result
 
     # ── 企业级 Step 11: 闲置资金自动归集 ─────────────────────
 
@@ -1160,13 +1431,13 @@ class DynamicAllocator:
             if alloc.allocated_capital <= 0:
                 continue
 
-            util_pct = alloc.capital_utilization_pct
+            util_pct = _safe_float(alloc.capital_utilization_pct, 0.0)
             min_keep = plan.total_equity * self._min_single_weight
 
             # 正收益策略保护：Sharpe > 0 或近期正收益
             m = strategy_metrics.get(name, {})
             is_positive_return = (
-                m.get("sharpe_ratio", 0) > 0 or m.get("total_pnl", 0) > 0
+                _safe_float(m.get("sharpe_ratio"), 0) > 0 or _safe_float(m.get("total_pnl"), 0) > 0
             )
 
             if util_pct < 0.20 and alloc.allocated_capital > min_keep:
@@ -1232,7 +1503,7 @@ class DynamicAllocator:
 
         # 检测连续亏损：任意策略连续亏损笔数达到阈值
         consecutive_loss = any(
-            m.get("consecutive_losses", 0) >= self._consecutive_loss_days
+            _safe_float(m.get("consecutive_losses"), 0) >= self._consecutive_loss_days
             for m in strategy_metrics.values()
         )
 
@@ -1346,15 +1617,15 @@ class VolatilityTargeter:
     def __init__(self, config: Dict[str, Any]):
         self._config = config
         self._lock = asyncio.Lock()
-        self._target_vol = config.get("target_volatility", 0.20)        # 年化目标波动率
-        self._max_vol = config.get("max_volatility", 0.50)              # 波动率上限
-        self._min_vol = config.get("min_volatility", 0.05)              # 波动率下限
-        self._ewma_lambda = config.get("ewma_lambda", 0.94)             # EWMA 衰减因子
-        self._garch_omega = config.get("garch_omega", 0.00001)
-        self._garch_alpha = config.get("garch_alpha", 0.05)
-        self._garch_beta = config.get("garch_beta", 0.90)
-        self._forecast_horizon = config.get("forecast_horizon", 21)      # 预测天数
-        self._confidence_z = config.get("confidence_z", 1.96)            # 95% 置信区间
+        self._target_vol = _safe_float(config.get("target_volatility"), 0.20)        # 年化目标波动率
+        self._max_vol = _safe_float(config.get("max_volatility"), 0.50)              # 波动率上限
+        self._min_vol = _safe_float(config.get("min_volatility"), 0.05)              # 波动率下限
+        self._ewma_lambda = _safe_float(config.get("ewma_lambda"), 0.94)             # EWMA 衰减因子
+        self._garch_omega = _safe_float(config.get("garch_omega"), 0.00001)
+        self._garch_alpha = _safe_float(config.get("garch_alpha"), 0.05)
+        self._garch_beta = _safe_float(config.get("garch_beta"), 0.90)
+        self._forecast_horizon = int(_safe_float(config.get("forecast_horizon"), 21))  # 预测天数
+        self._confidence_z = _safe_float(config.get("confidence_z"), 1.96)            # 95% 置信区间
         self._current_vol = 0.0
         self._latest_estimate: Dict[str, float] = {}
 
@@ -1370,13 +1641,14 @@ class VolatilityTargeter:
         Returns:
             {current, ewma, predicted, upper, lower}
         """
-        if not returns or len(returns) < 2:
+        clean = [r for r in returns if _is_finite(r)] if returns else []
+        if len(clean) < 2:
             return {
                 "current": self._target_vol, "ewma": self._target_vol,
                 "predicted": self._target_vol, "upper": self._max_vol, "lower": self._min_vol,
             }
 
-        arr = np.array(returns, dtype=np.float64)
+        arr = np.array(clean, dtype=np.float64)
         # 年化系数（假设日收益）
         annual_factor = np.sqrt(365)
 
@@ -1399,7 +1671,7 @@ class VolatilityTargeter:
         current_vol = 0.6 * ewma_vol + 0.4 * garch_vol
 
         # ── 预测区间 ──
-        se = current_vol / np.sqrt(len(returns))
+        se = current_vol / np.sqrt(len(clean))
         upper = min(self._max_vol, current_vol + self._confidence_z * se)
         lower = max(self._min_vol, current_vol - self._confidence_z * se)
 
@@ -1426,6 +1698,11 @@ class VolatilityTargeter:
         Returns:
             {scale_factor, target_position, max_allowed_leverage, reason}
         """
+        current_vol = _safe_float(current_vol, 0.0)
+        target_vol = _safe_float(target_vol, 0.0)
+        current_leverage = _safe_float(current_leverage, 1.0)
+        max_leverage = _safe_float(max_leverage, 1.0)
+
         if current_vol <= 0 or target_vol <= 0:
             return {"scale_factor": 1.0, "target_position": current_leverage,
                     "max_allowed_leverage": max_leverage, "reason": "invalid_vol"}
@@ -1459,6 +1736,7 @@ class VolatilityTargeter:
 
     def check_volatility_breach(self, current_vol: float) -> Tuple[bool, str]:
         """检查波动率是否突破上限"""
+        current_vol = _safe_float(current_vol, 0.0)
         if current_vol > self._max_vol:
             return True, f"Volatility {current_vol:.2%} exceeds max {self._max_vol:.2%}; reduce positions immediately"
         if current_vol > self._target_vol * 1.5:
@@ -1496,38 +1774,38 @@ class AdaptiveKelly:
     def __init__(self, config: Dict[str, Any]):
         self._config = config
         self._lock = asyncio.Lock()
-        self._max_kelly = config.get("max_kelly_fraction", 0.25)
-        self._default_fraction = config.get("default_kelly_fraction", 0.5)
-        self._min_trade_count = config.get("min_trade_count_kelly", 20)
+        self._max_kelly = _safe_float(config.get("max_kelly_fraction"), 0.25)
+        self._default_fraction = _safe_float(config.get("default_kelly_fraction"), 0.5)
+        self._min_trade_count = int(_safe_float(config.get("min_trade_count_kelly"), 20))
 
         # 不同市场状态下的 Kelly 乘数
         self._regime_multipliers: Dict[str, float] = {
-            "trending_up": config.get("kelly_trending_up", 1.10),
-            "trending_down": config.get("kelly_trending_down", 0.60),
-            "ranging": config.get("kelly_ranging", 0.90),
-            "high_volatility": config.get("kelly_high_vol", 0.50),
-            "low_volatility": config.get("kelly_low_vol", 1.00),
-            "unknown": config.get("kelly_unknown", 0.80),
+            "trending_up": _safe_float(config.get("kelly_trending_up"), 1.10),
+            "trending_down": _safe_float(config.get("kelly_trending_down"), 0.60),
+            "ranging": _safe_float(config.get("kelly_ranging"), 0.90),
+            "high_volatility": _safe_float(config.get("kelly_high_vol"), 0.50),
+            "low_volatility": _safe_float(config.get("kelly_low_vol"), 1.00),
+            "unknown": _safe_float(config.get("kelly_unknown"), 0.80),
         }
 
         # 回撤惩罚曲线参数
-        self._dd_penalty_start = config.get("kelly_dd_start", 0.05)    # 回撤5%开始惩罚
-        self._dd_penalty_max = config.get("kelly_dd_max", 0.30)         # 回撤30%惩罚最大
-        self._dd_min_multiplier = config.get("kelly_dd_min", 0.30)      # 最低保留30% Kelly
+        self._dd_penalty_start = _safe_float(config.get("kelly_dd_start"), 0.05)    # 回撤5%开始惩罚
+        self._dd_penalty_max = _safe_float(config.get("kelly_dd_max"), 0.30)         # 回撤30%惩罚最大
+        self._dd_min_multiplier = _safe_float(config.get("kelly_dd_min"), 0.30)      # 最低保留30% Kelly
 
         # 连续盈亏调整参数
-        self._streak_win_step = config.get("kelly_streak_win_step", 0.05)
-        self._streak_loss_step = config.get("kelly_streak_loss_step", 0.08)
-        self._streak_max_adj = config.get("kelly_streak_max_adj", 0.30)
+        self._streak_win_step = _safe_float(config.get("kelly_streak_win_step"), 0.05)
+        self._streak_loss_step = _safe_float(config.get("kelly_streak_loss_step"), 0.08)
+        self._streak_max_adj = _safe_float(config.get("kelly_streak_max_adj"), 0.30)
 
         # P31: 企业级估计误差修正（凯利公式对胜率/赔率估计误差极度敏感，
         # 点估计会导致过度下注，企业级实现用贝叶斯收缩 + 赔率收缩替代点估计）
         self._use_wilson_lcb = config.get("kelly_use_wilson_lcb", False)      # 可选：Wilson置信下界（更保守）
-        self._wilson_z = config.get("kelly_wilson_z", 1.645)                  # Wilson置信度 z 值
-        self._win_prior_strength = config.get("kelly_win_rate_prior_strength", 40.0)  # 胜率先验强度（等效α+β样本量，先验50%）
-        self._b_shrinkage = config.get("kelly_b_shrinkage_strength", 20.0)    # 赔率收缩强度（等效先验样本量）
+        self._wilson_z = _safe_float(config.get("kelly_wilson_z"), 1.645)                  # Wilson置信度 z 值
+        self._win_prior_strength = _safe_float(config.get("kelly_win_rate_prior_strength"), 40.0)  # 胜率先验强度（等效α+β样本量，先验50%）
+        self._b_shrinkage = _safe_float(config.get("kelly_b_shrinkage_strength"), 20.0)    # 赔率收缩强度（等效先验样本量）
         self._use_semivariance = config.get("kelly_use_semivariance", True)   # 连续Kelly使用下行半方差
-        self._skew_penalty = config.get("kelly_skew_penalty_strength", 0.5)   # 负偏度惩罚强度
+        self._skew_penalty = _safe_float(config.get("kelly_skew_penalty_strength"), 0.5)   # 负偏度惩罚强度
 
         self._latest_summary: Dict[str, Any] = {}
 
@@ -1547,6 +1825,14 @@ class AdaptiveKelly:
 
         f* = (p*b - q) / b
         """
+        win_rate = _safe_float(win_rate, 0.0)
+        avg_win = _safe_float(avg_win, 0.0)
+        avg_loss = _safe_float(avg_loss, 0.0)
+        drawdown = _safe_float(drawdown, 0.0)
+        consecutive_wins = int(_safe_float(consecutive_wins, 0))
+        consecutive_losses = int(_safe_float(consecutive_losses, 0))
+        trade_count = int(_safe_float(trade_count, 0))
+
         avg_loss_abs = abs(avg_loss) if avg_loss != 0 else 0.01
 
         # ── 基础 Kelly（P31: 置信下界胜率 + 赔率收缩）──
@@ -1626,8 +1912,11 @@ class AdaptiveKelly:
         if not returns or len(returns) < 2:
             return 0.0
 
-        arr = np.array(returns, dtype=np.float64)
-        mu_daily = np.mean(arr)
+        clean = [r for r in returns if _is_finite(r)]
+        if len(clean) < 2:
+            return 0.0
+        arr = np.array(clean, dtype=np.float64)
+        mu_daily = float(np.mean(arr))
 
         # P31: 下行半方差——只统计低于均值的波动，*2 保持与全方差的量级一致
         if self._use_semivariance:
@@ -1658,6 +1947,8 @@ class AdaptiveKelly:
 
     def compute_fractional_kelly(self, kelly: float, fraction: float = 0.5) -> float:
         """计算分数 Kelly"""
+        kelly = _safe_float(kelly, 0.0)
+        fraction = _safe_float(fraction, 0.5)
         fraction = max(0.1, min(1.0, fraction))
         return round(kelly * fraction, 6)
 
@@ -1668,6 +1959,10 @@ class AdaptiveKelly:
         用 Wilson 区间下界替代点估计，样本越少越保守，随样本增加收敛到真实值。
         """
         if n <= 0:
+            return 0.5
+        wins = _safe_float(wins, 0.0)
+        z = _safe_float(z, 1.645)
+        if not _is_finite(wins) or not _is_finite(z):
             return 0.5
         p = max(0.0, min(1.0, wins / n))
         z2 = z * z
@@ -1682,6 +1977,8 @@ class AdaptiveKelly:
 
         防止小样本下赔率被极端盈利/亏损交易放大导致过度下注。
         """
+        b = _safe_float(b, 0.0)
+        strength = _safe_float(strength, 20.0)
         if strength <= 0 or n <= 0:
             return b
         weight = n / (n + strength)
@@ -1693,6 +1990,8 @@ class AdaptiveKelly:
         等效于 Beta(α, β) 后验均值，α+β=strength，先验胜率=prior。
         避免小样本胜率被少数交易主导导致过度下注。
         """
+        p = _safe_float(p, 0.5)
+        strength = _safe_float(strength, 40.0)
         if strength <= 0 or n <= 0:
             return p
         prior_wins = prior * strength
@@ -1702,6 +2001,11 @@ class AdaptiveKelly:
     @staticmethod
     def _safe_skewness(arr: np.ndarray) -> float:
         """样本偏度（Fisher-Pearson），对空/常量数组安全"""
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+            arr = arr[np.isfinite(arr)]
+        except (TypeError, ValueError):
+            return 0.0
         n = arr.size
         if n < 3:
             return 0.0
@@ -1723,7 +2027,7 @@ class AdaptiveKelly:
         drawdown start~max: 线性下降至 dd_min_multiplier
         drawdown > max: 保持 dd_min_multiplier
         """
-        drawdown = abs(drawdown)
+        drawdown = abs(_safe_float(drawdown, 0.0))
         if drawdown <= self._dd_penalty_start:
             return 1.0
         if drawdown >= self._dd_penalty_max:
@@ -1767,11 +2071,11 @@ class CapitalEfficiencyMonitor:
     def __init__(self, config: Dict[str, Any]):
         self._config = config
         self._lock = asyncio.Lock()
-        self._idle_threshold = config.get("idle_cash_threshold", 0.15)     # 闲置超过15%触发提醒
-        self._efficiency_min = config.get("efficiency_min", 0.02)          # 最低ROC E阈值
-        self._turnover_min = config.get("turnover_min", 1.0)               # 最低年化周转率
-        self._trend_window = config.get("trend_window", 5)                 # 趋势观察窗口
-        self._deployment_min = config.get("deployment_min", 0.30)          # 最低部署率
+        self._idle_threshold = _safe_float(config.get("idle_cash_threshold"), 0.15)     # 闲置超过15%触发提醒
+        self._efficiency_min = _safe_float(config.get("efficiency_min"), 0.02)          # 最低ROC E阈值
+        self._turnover_min = _safe_float(config.get("turnover_min"), 1.0)               # 最低年化周转率
+        self._trend_window = int(_safe_float(config.get("trend_window"), 5))            # 趋势观察窗口
+        self._deployment_min = _safe_float(config.get("deployment_min"), 0.30)          # 最低部署率
 
         # 策略指标存储
         self._strategy_metrics: Dict[str, Dict[str, Any]] = {}
@@ -1801,11 +2105,11 @@ class CapitalEfficiencyMonitor:
             holding_time: 持仓时间（天）
         """
         self._strategy_metrics[strategy_name] = {
-            "allocated": max(0, allocated),
-            "used_margin": max(0, used_margin),
-            "pnl": pnl,
-            "volume": max(0, volume),
-            "holding_time": max(1, holding_time),
+            "allocated": max(0, _safe_float(allocated, 0.0)),
+            "used_margin": max(0, _safe_float(used_margin, 0.0)),
+            "pnl": _safe_float(pnl, 0.0),
+            "volume": max(0, _safe_float(volume, 0.0)),
+            "holding_time": max(1, _safe_float(holding_time, 1.0)),
             "updated_at": time.time(),
         }
 
@@ -1828,20 +2132,23 @@ class CapitalEfficiencyMonitor:
         if not m:
             return {"error": f"Strategy {strategy_name} not found"}
 
-        allocated = max(m["allocated"], 1.0)
-        holding_time = max(m["holding_time"], 1)
+        pnl = _safe_float(m.get("pnl"), 0.0)
+        used_margin = _safe_float(m.get("used_margin"), 0.0)
+        volume = _safe_float(m.get("volume"), 0.0)
+        allocated = max(_safe_float(m.get("allocated"), 0.0), 1.0)
+        holding_time = max(_safe_float(m.get("holding_time"), 1.0), 1.0)
 
         # ── 资本回报率（ROCE） ──
-        roc_e = m["pnl"] / allocated
+        roc_e = pnl / allocated
 
         # ── 年化资金周转率 ──
-        turnover = (m["volume"] / allocated) * (365 / holding_time) if holding_time > 0 else 0
+        turnover = (volume / allocated) * (365 / holding_time) if holding_time > 0 else 0
 
         # ── 保证金利用率 ──
-        margin_util = m["used_margin"] / allocated if allocated > 0 else 0
+        margin_util = used_margin / allocated if allocated > 0 else 0
 
         # ── 部署率 ──
-        deployment_rate = m["used_margin"] / allocated if allocated > 0 else 0
+        deployment_rate = used_margin / allocated if allocated > 0 else 0
 
         # ── 闲置比例 ──
         idle_pct = 1.0 - min(1.0, deployment_rate)
@@ -1917,8 +2224,8 @@ class CapitalEfficiencyMonitor:
         total_idle_amount = 0.0
 
         for name, m in self._strategy_metrics.items():
-            allocated = max(m["allocated"], 1.0)
-            deployed = m["used_margin"]
+            allocated = max(_safe_float(m.get("allocated"), 0.0), 1.0)
+            deployed = _safe_float(m.get("used_margin"), 0.0)
             idle_amount = max(0, allocated - deployed)
             idle_pct = idle_amount / allocated if allocated > 0 else 0
 
@@ -2008,11 +2315,9 @@ class CapitalEfficiencyMonitor:
         if not self._strategy_metrics:
             return {"status": "no_data", "total_strategies": 0}
 
-        total_allocated = sum(m["allocated"] for m in self._strategy_metrics.values())
-        total_used = sum(m["used_margin"] for m in self._strategy_metrics.values())
-        total_pnl = sum(m["pnl"] for m in self._strategy_metrics.values())
-        total_volume = sum(m["volume"] for m in self._strategy_metrics.values())
-
+        total_allocated = sum(_safe_float(m.get("allocated"), 0.0) for m in self._strategy_metrics.values())
+        total_used = sum(_safe_float(m.get("used_margin"), 0.0) for m in self._strategy_metrics.values())
+        total_pnl = sum(_safe_float(m.get("pnl"), 0.0) for m in self._strategy_metrics.values())
         overall_roc = total_pnl / max(total_allocated, 1)
         overall_margin_util = total_used / max(total_allocated, 1)
 
@@ -2056,15 +2361,17 @@ async def _da_compute_adjusted_allocation(
     current_leverage: float = 1.0,
 ) -> Dict:
     """综合考虑波动率目标和Kelly调整后的分配"""
+    base_weight = _safe_float(base_weight, 0.0)
     result: Dict[str, Any] = {"base_weight": base_weight, "adjusted_weight": base_weight}
 
     # 波动率调整
-    if hasattr(self, '_vol_targeter') and self._vol_targeter and returns:
-        vol_info = self._vol_targeter.estimate_volatility(returns)
+    clean_returns = [r for r in returns if _is_finite(r)] if returns else []
+    if hasattr(self, '_vol_targeter') and self._vol_targeter and clean_returns:
+        vol_info = self._vol_targeter.estimate_volatility(clean_returns)
         scale = self._vol_targeter.compute_scale_factor(
             vol_info["ewma"], 0.20, current_leverage, 10,
         )
-        vol_adjusted = base_weight * scale.get("scale_factor", 1.0)
+        vol_adjusted = base_weight * _safe_float(scale.get("scale_factor"), 1.0)
         result["vol_adjusted"] = round(vol_adjusted, 6)
         result["vol_scale"] = scale
         result["vol_info"] = vol_info
@@ -2076,7 +2383,7 @@ async def _da_compute_adjusted_allocation(
         # 从内部绩效缓存拉取策略指标做 Kelly
         m = {}
         if hasattr(self, '_strategy_returns') and self._strategy_returns:
-            s_returns = self._strategy_returns.get(strategy_name, [])
+            s_returns = [r for r in self._strategy_returns.get(strategy_name, []) if _is_finite(r)]
             if s_returns:
                 wins = [r for r in s_returns if r > 0]
                 losses = [r for r in s_returns if r < 0]

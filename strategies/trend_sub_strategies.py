@@ -17,6 +17,22 @@ import numpy as np
 # ============================================================
 # 内部指标原语
 # ============================================================
+def _safe_int(v: Any, default: int) -> int:
+    """安全 int 转换：None/非法值回退到 default，避免纯函数被畸形参数打崩。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(v: Any, default: float) -> float:
+    """安全 float 转换：None/非法值回退到 default。"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _sma(prices: np.ndarray, period: int) -> Optional[float]:
     """简单移动平均。数据不足返回 None。"""
     prices = np.asarray(prices, dtype=float)
@@ -105,7 +121,7 @@ def evaluate_ma_trend(
     highs = np.asarray(highs, dtype=float) if highs is not None else np.array([])
     lows = np.asarray(lows, dtype=float) if lows is not None else np.array([])
 
-    atr_pct_threshold = float(params.get("atr_pct_threshold", 0.003))  # ATR% 低于 0.3% 视为震荡
+    atr_pct_threshold = _safe_float(params.get("atr_pct_threshold", 0.003), 0.003)  # ATR% 低于 0.3% 视为震荡
 
     ma5 = _sma(closes, 5)
     ma20 = _sma(closes, 20)
@@ -206,11 +222,11 @@ def evaluate_ema_trend(
        "golden_cross": bool, "death_cross": bool, "stop_loss": ..., "take_profit": ...}
     """
     params = params or {}
-    fast = int(params.get("ema_fast", 9))
-    slow = int(params.get("ema_slow", 21))
-    atr_pct_threshold = float(params.get("atr_pct_threshold", 0.003))
-    atr_sl_mult = float(params.get("atr_sl_mult", 2.0))
-    atr_tp_mult = float(params.get("atr_tp_mult", 3.0))
+    fast = _safe_int(params.get("ema_fast", 9), 9)
+    slow = _safe_int(params.get("ema_slow", 21), 21)
+    atr_pct_threshold = _safe_float(params.get("atr_pct_threshold", 0.003), 0.003)
+    atr_sl_mult = _safe_float(params.get("atr_sl_mult", 2.0), 2.0)
+    atr_tp_mult = _safe_float(params.get("atr_tp_mult", 3.0), 3.0)
 
     closes = np.asarray(closes, dtype=float)
     highs = np.asarray(highs, dtype=float) if highs is not None else np.array([])
@@ -297,9 +313,9 @@ def evaluate_donchian(
        "upper": ..., "lower": ..., "mid": ..., "breakout": bool, "atr": ...}
     """
     params = params or {}
-    n = int(params.get("donchian_period", 20))
-    atr_multiplier_sl = float(params.get("atr_sl_multiplier", 2.0))
-    atr_multiplier_tp = float(params.get("atr_tp_multiplier", 3.0))
+    n = _safe_int(params.get("donchian_period", 20), 20)
+    atr_multiplier_sl = _safe_float(params.get("atr_sl_multiplier", 2.0), 2.0)
+    atr_multiplier_tp = _safe_float(params.get("atr_tp_multiplier", 3.0), 3.0)
 
     highs = np.asarray(highs, dtype=float)
     lows = np.asarray(lows, dtype=float)

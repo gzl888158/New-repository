@@ -67,6 +67,7 @@ class GlobalRiskControl:
         
         self._circuit_breakers = CircuitBreakers(config, okx_client)
         self._breaker_linker = None  # P1-⑥：熔断联动器（通过 set_breaker_linker 注入）
+        self._monitor_task = None  # 监控循环 task 引用（幂等启停 + 优雅取消）
 
     def set_order_executor(self, order_executor):
         """注入订单执行器（风控前置：平仓/减仓信号走 order_executor 经五层风控校验）"""
@@ -91,8 +92,18 @@ class GlobalRiskControl:
         logger.info("CircuitBreakerLinker injected into GlobalRiskControl for unified breaker write path")
 
     async def start(self):
+        # 幂等启动：避免重复调用创建多套监控循环
+        if self._monitor_task is not None and not self._monitor_task.done():
+            return
         await self._initialize_equity()
-        asyncio.create_task(self._monitor_loop())
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+    async def stop(self):
+        task = self._monitor_task
+        self._monitor_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _initialize_equity(self):
         account_info = self.okx_client.get_account_info()
@@ -134,11 +145,32 @@ class GlobalRiskControl:
             logger.info(f"Initial equity: {self._initial_equity:.2f}, Peak equity: {self._peak_equity:.2f}, Effective: {self._effective_peak:.2f}")
 
     async def _monitor_loop(self):
+        # 每个检查独立兜底：单个检查异常不能杀死整个风控监控循环（fail-safe）
         while True:
-            await self._check_account_risk()
-            await self._check_position_risk()
-            await self._check_consecutive_losses()
-            await self._check_circuit_breakers()
+            try:
+                await self._check_account_risk()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in _check_account_risk: {e}")
+            try:
+                await self._check_position_risk()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in _check_position_risk: {e}")
+            try:
+                await self._check_consecutive_losses()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in _check_consecutive_losses: {e}")
+            try:
+                await self._check_circuit_breakers()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in _check_circuit_breakers: {e}")
             # 检查是否有手动重置指令
             await asyncio.to_thread(self._check_manual_controls)
             # 消费告警引擎/dashboard 下发的干预信号（告警 → 交易动作闭环）
@@ -401,12 +433,14 @@ class GlobalRiskControl:
         # 紧急回撤保护：超过阈值的2倍立即停止所有交易
         emergency_drawdown = drawdown >= self._max_drawdown * 2
         
+        daily_loss_ratio = (self._daily_pnl / self._daily_start_equity) if self._daily_start_equity else 0.0
+        hourly_loss_ratio = (self._hourly_pnl / self._hourly_start_equity) if self._hourly_start_equity else 0.0
         checks = [
             ("max_drawdown", drawdown >= self._max_drawdown, 
              f"Max drawdown {drawdown:.2%} exceeded threshold {self._max_drawdown:.2%} (peak={self._peak_equity:.2f}, current={equity:.2f})", self._handle_max_drawdown),
-            ("daily_loss", self._daily_pnl / self._daily_start_equity <= -self._daily_max_loss,
+            ("daily_loss", daily_loss_ratio <= -self._daily_max_loss,
              f"Daily loss {self._daily_pnl:.2f} exceeded threshold {self._daily_max_loss:.2%}", self._handle_daily_loss),
-            ("hourly_loss", self._hourly_pnl / self._hourly_start_equity <= -self._hourly_max_loss,
+            ("hourly_loss", hourly_loss_ratio <= -self._hourly_max_loss,
              f"Hourly loss {self._hourly_pnl:.2f} exceeded threshold {self._hourly_max_loss:.2%}", self._handle_hourly_loss),
         ]
         
@@ -429,7 +463,10 @@ class GlobalRiskControl:
 
         # 获取账户总权益用于计算分品种仓位占比
         account_info = self.okx_client.get_account_info()
-        total_equity = float(account_info.get("totalEq", 0)) if account_info else 0
+        try:
+            total_equity = float(account_info.get("totalEq") or 0) if account_info else 0.0
+        except (TypeError, ValueError):
+            total_equity = 0.0
 
         # 按symbol聚合持仓保证金（同symbol可能有多策略）
         symbol_margins: Dict[str, float] = {}
@@ -532,17 +569,37 @@ class GlobalRiskControl:
                                 await self._reduce_position(pos, excess_ratio)
 
     async def _check_consecutive_losses(self):
-        orders = self.okx_client.get_order_history(limit=50)
+        try:
+            orders = self.okx_client.get_order_history(limit=50)
+        except Exception as e:
+            logger.warning(f"Failed to fetch order history for consecutive loss check: {e}")
+            return
         if not orders:
             return
         
         now = datetime.now()
-        recent_orders = [o for o in orders if 
-                        (now - datetime.fromtimestamp(float(o.get("updateTime", 0))/1000)) <= self._consecutive_loss_window]
+        recent_orders = []
+        for o in orders:
+            try:
+                update_ms = float(o.get("updateTime") or 0)
+                if update_ms <= 0:
+                    continue
+                ts = datetime.fromtimestamp(update_ms / 1000)
+            except (TypeError, ValueError, OSError, OverflowError):
+                continue
+            if (now - ts) <= self._consecutive_loss_window:
+                recent_orders.append(o)
         
-        closed_loss_orders = [o for o in recent_orders if 
-                            o.get("state") == "filled" and 
-                            float(o.get("pnl", 0)) < 0]
+        closed_loss_orders = []
+        for o in recent_orders:
+            if o.get("state") != "filled":
+                continue
+            try:
+                pnl = float(o.get("pnl") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pnl < 0:
+                closed_loss_orders.append(o)
         
         self._consecutive_losses = len(closed_loss_orders)
         

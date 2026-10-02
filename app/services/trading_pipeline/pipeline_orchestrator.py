@@ -1,5 +1,7 @@
 """
 交易流水线编排器，按阶段串联信号接收、决策、下单与执行监控。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
 """
 from enum import Enum
 from datetime import datetime
@@ -8,6 +10,10 @@ from loguru import logger
 import asyncio
 import heapq
 import time
+
+from app.services.enterprise import EnterpriseServiceMixin
+from core.unified_layer import Event, EventType
+from core.event_id import EventIDGenerator
 
 
 class PipelineStage(Enum):
@@ -30,6 +36,7 @@ class PipelineStatus(Enum):
 
 class PipelineContext:
     def __init__(self):
+        self.trace_id = ""
         self.signal = None
         self.validated_signal = None
         self.decision = None
@@ -58,9 +65,10 @@ class PipelineContext:
         return self.stage_times.get(stage.value, {}).get("duration_ms", 0.0)
 
 
-class PipelineOrchestrator:
+class PipelineOrchestrator(EnterpriseServiceMixin):
     def __init__(self, config: Dict[str, Any]):
         self._config = config
+        self._event_bus = None
         self._status = PipelineStatus.STOPPED
         self._stages: Dict[str, List[Callable]] = {}
         self._contexts: Dict[str, PipelineContext] = {}
@@ -105,6 +113,35 @@ class PipelineOrchestrator:
         for stage, handlers in stage_handlers.items():
             for handler in handlers:
                 self.register_stage_handler(stage, handler)
+
+    def set_event_bus(self, event_bus):
+        """注入事件总线，用于流水线生命周期事件溯源（未注入时静默降级）。"""
+        self._event_bus = event_bus
+
+    def _publish_pipeline_event(self, event_type: EventType, context: PipelineContext,
+                                signal_data: Dict[str, Any], context_id: str = "",
+                                **extra) -> None:
+        """发布流水线生命周期事件（traceID 贯穿 + EventStore 溯源，fail-open）。"""
+        if self._event_bus is None:
+            return
+        try:
+            trace_id = context.trace_id
+            if not trace_id and isinstance(signal_data, dict):
+                trace_id = signal_data.get("trace_id", "")
+            if not trace_id:
+                trace_id = EventIDGenerator.get_instance().generate()
+                context.trace_id = trace_id
+            payload = {
+                "trace_id": trace_id,
+                "context_id": context_id,
+                "priority": context.priority,
+                "symbol": (signal_data or {}).get("symbol", "") if isinstance(signal_data, dict) else "",
+                "strategy": (signal_data or {}).get("strategy_name", "") if isinstance(signal_data, dict) else "",
+            }
+            payload.update(extra)
+            self._event_bus.publish_sync(Event(event_type, payload))
+        except Exception as e:
+            logger.debug(f"Failed to publish {event_type.value} event: {e}")
 
     async def start(self):
         self._status = PipelineStatus.RUNNING
@@ -159,6 +196,21 @@ class PipelineOrchestrator:
         context = PipelineContext()
         context.priority = priority
         context.stage_timeouts = self._stage_timeouts
+
+        # traceID 贯穿：复用 signal 既有 trace_id，缺失则生成并回写（全链路审计）
+        if isinstance(signal_data, dict):
+            trace_id = signal_data.get("trace_id") or ""
+            if not trace_id:
+                try:
+                    trace_id = EventIDGenerator.get_instance().generate()
+                except Exception as e:
+                    logger.debug(f"traceID generation failed, fallback to context_id: {e}")
+                    trace_id = f"ctx_{context_id}"
+                signal_data["trace_id"] = trace_id
+            context.trace_id = trace_id
+        else:
+            context.trace_id = f"ctx_{context_id}"
+
         self._contexts[context_id] = context
 
         try:
@@ -176,6 +228,7 @@ class PipelineOrchestrator:
 
     async def _run_pipeline(self, context_id: str, context: PipelineContext, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Starting pipeline execution: {context_id}")
+        self._publish_pipeline_event(EventType.PIPELINE_STARTED, context, signal_data, context_id)
         try:
             pipeline_coro = self._run_pipeline_inner(context_id, context, signal_data)
             result = await asyncio.wait_for(pipeline_coro, timeout=self._pipeline_timeout)
@@ -186,6 +239,10 @@ class PipelineOrchestrator:
             logger.error(f"Pipeline {context_id} timed out after {self._pipeline_timeout}s")
             # 触发 TIMEOUT_HANDLING 阶段处理器（真实超时处理而非仅返回 status）
             await self._run_timeout_handlers(context, signal_data)
+            self._publish_pipeline_event(
+                EventType.PIPELINE_TIMEOUT, context, signal_data, context_id,
+                error=f"Pipeline timeout after {self._pipeline_timeout}s",
+            )
             return {"status": "timeout", "context_id": context_id, "error": f"Pipeline timeout after {self._pipeline_timeout}s"}
 
     async def _run_pipeline_inner(self, context_id: str, context: PipelineContext, signal_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -205,17 +262,35 @@ class PipelineOrchestrator:
                     context.set_stage_end(stage)
                     continue
 
+                stage_timeout = context.stage_timeouts.get(stage.value, self._pipeline_timeout)
                 for handler in self._stages[stage.value]:
                     try:
-                        result = await handler(context)
-                        if result is not None:
-                            if isinstance(result, dict):
-                                for key, value in result.items():
-                                    setattr(context, key, value)
+                        result = await asyncio.wait_for(handler(context), timeout=stage_timeout)
+                    except asyncio.TimeoutError:
+                        logger.error(f"Handler timed out at stage {stage.value} after {stage_timeout}s")
+                        self._metrics["failed_pipelines"] += 1
+                        self._metrics["timeout_count"] += 1
+                        context.set_stage_end(stage)
+                        self._update_stage_latency(stage, context.get_stage_duration(stage))
+                        self._publish_pipeline_event(
+                            EventType.PIPELINE_FAILED, context, signal_data, context_id,
+                            stage=stage.value, error=f"Stage timeout after {stage_timeout}s",
+                        )
+                        return {
+                            "status": "failed",
+                            "stage": stage.value,
+                            "error": f"Stage timeout after {stage_timeout}s",
+                            "latencies": context.stage_times,
+                        }
                     except Exception as e:
                         logger.error(f"Handler failed at stage {stage.value}: {e}")
                         self._metrics["failed_pipelines"] += 1
+                        context.set_stage_end(stage)
                         self._update_stage_latency(stage, context.get_stage_duration(stage))
+                        self._publish_pipeline_event(
+                            EventType.PIPELINE_FAILED, context, signal_data, context_id,
+                            stage=stage.value, error=str(e),
+                        )
                         return {
                             "status": "failed",
                             "stage": stage.value,
@@ -223,12 +298,37 @@ class PipelineOrchestrator:
                             "latencies": context.stage_times,
                         }
 
+                    # handler 返回 False 表示该阶段失败，短路中断 pipeline
+                    if result is False:
+                        logger.warning(f"Stage {stage.value} handler returned False, aborting pipeline {context_id}")
+                        self._metrics["failed_pipelines"] += 1
+                        context.set_stage_end(stage)
+                        self._update_stage_latency(stage, context.get_stage_duration(stage))
+                        self._publish_pipeline_event(
+                            EventType.PIPELINE_FAILED, context, signal_data, context_id,
+                            stage=stage.value, error=f"Stage {stage.value} rejected",
+                        )
+                        return {
+                            "status": "failed",
+                            "stage": stage.value,
+                            "error": f"Stage {stage.value} rejected",
+                            "latencies": context.stage_times,
+                        }
+
+                    if result is not None and isinstance(result, dict):
+                        for key, value in result.items():
+                            setattr(context, key, value)
+
                 context.set_stage_end(stage)
                 self._update_stage_latency(stage, context.get_stage_duration(stage))
 
             self._metrics["success_pipelines"] += 1
             total_latency = (datetime.now() - context.start_time).total_seconds() * 1000
             self._record_latency("pipeline_total", total_latency, {"status": "success"})
+            self._publish_pipeline_event(
+                EventType.PIPELINE_COMPLETED, context, signal_data, context_id,
+                total_latency_ms=round(total_latency, 2),
+            )
             self._metrics["avg_latency_ms"] = (
                 self._metrics["avg_latency_ms"] * (self._metrics["total_pipelines"] - 1) + total_latency
             ) / self._metrics["total_pipelines"]
@@ -256,6 +356,9 @@ class PipelineOrchestrator:
         except Exception as e:
             self._handle_exception(e, module="PipelineOrchestrator", function="_run_pipeline_inner", severity="high", category="pipeline")
             self._metrics["failed_pipelines"] += 1
+            self._publish_pipeline_event(
+                EventType.PIPELINE_FAILED, context, signal_data, context_id, error=str(e),
+            )
             return {"status": "error", "error": str(e)}
 
     def _update_stage_latency(self, stage: PipelineStage, duration_ms: float):

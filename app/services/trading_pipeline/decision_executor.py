@@ -1,5 +1,7 @@
 """
 决策执行器，按优先级与批量模式执行交易决策并记录审计日志。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
 """
 from collections import deque
 from datetime import datetime

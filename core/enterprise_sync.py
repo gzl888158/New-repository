@@ -256,7 +256,7 @@ class SyncHealthMonitor:
         for key, default in self.DEFAULTS.items():
             setattr(self, f"_{key}", cfg.get(key, default))
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._channels: Dict[SyncChannel, SyncChannelStatus] = {}
         self._start_time = time.time()
         self._last_health_check = 0.0

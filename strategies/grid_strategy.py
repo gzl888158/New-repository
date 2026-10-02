@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List
 from loguru import logger
 
 from core.models import Signal, TickData, Position
-from configs.settings import get_currency_tier
+from configs.settings import get_symbol_config
 from utils.helpers import calculate_take_profit, calculate_stop_loss, validate_tp_sl_prices, calculate_tp_sl_from_atr, get_price_precision, map_market_state_to_regime
 from utils.state_persistence import PersistentStrategy
 from risk.dynamic_allocator import AdaptiveKelly
@@ -83,6 +83,14 @@ class GridStrategy(PersistentStrategy):
         self._stop_loss_orders: Dict[str, Dict[str, Any]] = {}
         self._order_check_interval = 60
 
+        # P34: 单方向连续止损熔断 — 同 symbol+side 在观察窗口内连续止损达阈值后，冷却该方向开仓
+        # 目标：阻断「同方向分层加仓→趋势反向→多层同时止损」的密集爆损（如 XRP 三连止损 -6.2）
+        self._stop_loss_history: Dict[str, List[float]] = {}  # {symbol:buy|sell: [止损unix时间戳]}
+        self._sl_circuit_breaker_enabled = grid_cfg.get("sl_circuit_breaker_enabled", True)
+        self._sl_circuit_breaker_window = grid_cfg.get("sl_circuit_breaker_window", 7200)      # 观察窗口2h
+        self._sl_circuit_breaker_threshold = grid_cfg.get("sl_circuit_breaker_threshold", 2)   # 连续止损≥2次
+        self._sl_circuit_breaker_cooldown = grid_cfg.get("sl_circuit_breaker_cooldown", 3600)  # 冷却60min
+
         # 信号去重和节流机制
         self._last_signal_time: Dict[str, float] = {}  # {symbol: last_signal_timestamp}
         self._signal_fingerprints: Dict[str, float] = {}  # {fingerprint: timestamp}
@@ -96,6 +104,10 @@ class GridStrategy(PersistentStrategy):
         self._signal_window_seconds = config["strategies"]["grid"].get("signal_window_seconds", 10.0)  # 滑动窗口10秒
         # P0-4: 信号质量阈值接入config（buy方向）；sell方向保持 +0.25 风险溢价
         self._min_signal_quality = config["strategies"]["grid"].get("min_signal_quality", 0.50)
+        # P2: sell 门槛上限，防止高风时段 + 做空溢价叠加形成过高的绝对门槛
+        self._sell_signal_quality_cap = config["strategies"]["grid"].get("sell_signal_quality_cap", 0.75)
+        # P33: 趋势确认门禁模式 — strict（ADX<20 拒绝，旧行为）/ regime_aware（震荡市 ADX<20 放行）
+        self._trend_confirmation_mode = config["strategies"]["grid"].get("trend_confirmation_mode", "regime_aware")
 
         # P0-3: 极端波动暂停截止时间 {symbol: unix_timestamp}，到期前禁止开新网格
         self._extreme_vol_until: Dict[str, float] = {}
@@ -107,6 +119,7 @@ class GridStrategy(PersistentStrategy):
 
         self._adaptive_controller = None  # 动态分配控制器（由scheduler注入）
         self._stop_loss_manager = None    # 统一止损管理器（由scheduler注入）
+        self._regime_engine = None        # MarketRegimeEngine（由StrategyFactory注入，供统一 ADX/DI 趋势明细复用）
 
         # 企业级：Grid 自适应利用率引擎
         self._grid_adaptive_engine = None
@@ -176,6 +189,13 @@ class GridStrategy(PersistentStrategy):
         self._tp3_trailing_pct = config["strategies"]["grid"].get("tp3_trailing_pct", 0.02)
         self._take_profit_enabled = config["strategies"]["grid"].get("take_profit_enabled", True)
 
+        # P36: 分钟级反转过滤器 — EMA20-EMA50/ADX(15m) 均为滞后指标，捕捉不到分钟级反弹。
+        # grid 做空在长期下跌趋势中被短期反弹反复止损（XRP/SOL short 累计约 -3.9）。
+        self._minute_rebound_window = config["strategies"]["grid"].get("minute_rebound_window", 15)  # 观察窗口（分钟）
+        self._minute_rebound_threshold = config["strategies"]["grid"].get("minute_rebound_threshold", 0.005)  # 反转幅度阈值（默认0.5%）
+        self._minute_rebound_cache: Dict[str, Dict[str, Any]] = {}  # {symbol: {ts, rise, drop}}
+        self._minute_rebound_cache_ttl = 30.0  # 1m K线结果缓存30秒，避免每tick重复请求
+
         self._grid_performance: Dict[str, Dict[str, Any]] = {}
         self._adaptive_kelly = AdaptiveKelly(config.get("adaptive_kelly", {}))
 
@@ -223,6 +243,24 @@ class GridStrategy(PersistentStrategy):
     def set_coordinator(self, coordinator):
         """注入StrategyCoordinator实例"""
         self._coordinator = coordinator
+
+    def set_regime_engine(self, engine):
+        """注入MarketRegimeEngine，供内部评分复用统一 ADX/DI 趋势明细（消除口径漂移）。"""
+        self._regime_engine = engine
+
+    def _get_unified_trend_detail(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """读取 MarketRegimeEngine 的统一 ADX/DI 趋势明细（get_symbol_trend_detail）。
+
+        与框架层 TrendConfirmationFilter 同源，供 grid 内部评分复用，避免与策略内部
+        自算 ADX 口径漂移。引擎未注入/币种未被监控/数据不足时返回 None（调用方回退）。
+        """
+        engine = getattr(self, "_regime_engine", None)
+        if engine is None:
+            return None
+        try:
+            return engine.get_symbol_trend_detail(symbol)
+        except Exception:
+            return None
 
     def set_trade_journal(self, trade_journal):
         """注入TradeJournal实例，用于网格对账时查询实际成交"""
@@ -280,17 +318,31 @@ class GridStrategy(PersistentStrategy):
                 setattr(self, attr_name, updates[cfg_key])
                 logger.info(f"Grid config hot-updated: {attr_name}={updates[cfg_key]}")
 
+    def _get_signal_relaxation(self) -> float:
+        """获取资金利用率引擎的信号质量放松量（仅取正数放松部分）。
+
+        正数=放松（降低门槛，让更多信号通过），作用于最终门槛；
+        负数=收紧方向由上层 AdaptiveController 通过 min_signal_quality 路径处理，
+        此处只取正数避免双重计数。
+        """
+        try:
+            if self._adaptive_controller and hasattr(self._adaptive_controller, "get_signal_relaxation"):
+                return max(0.0, float(self._adaptive_controller.get_signal_relaxation()))
+        except Exception as e:
+            logger.debug(f"[grid] get_signal_relaxation failed: {e}")
+        return 0.0
+
     def _get_allocation(self) -> float:
         """获取当前资金分配比例：优先使用AdaptiveController动态分配，回退到config"""
         if self._adaptive_controller:
             try:
                 return self._adaptive_controller.get_allocation("grid")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[grid] get_allocation failed, fallback to config: {e}")
         return self.config["trading"].get("grid_allocation", 0.30)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital"""
+        """获取有效资金；账户权益无法确认时返回 0，禁止按静态配置扩大仓位。"""
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -303,19 +355,21 @@ class GridStrategy(PersistentStrategy):
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
-        return self.config["trading"].get("total_capital", 100.0)
+        except Exception as e:
+            logger.warning(f"[grid] get_account_info failed, refusing new exposure: {e}")
+        return 0.0
 
-    def _get_existing_symbol_margin(self, symbol: str) -> float:
+    def _get_existing_symbol_margin(self, symbol: str) -> Optional[float]:
         """查询该币种现有持仓的累计保证金（与 global_risk 单币种上限口径一致）。
 
         返回该币种所有方向持仓的 margin 之和；margin 为 0 时按 notionalUsd/lever 估算，
         避免跨/逐仓模式下 margin 字段为空导致累计上限失效。
         """
-        total_margin = 0.0
         try:
             positions = self.okx_client.get_positions()
+            if positions is None:
+                return None
+            total_margin = 0.0
             for p in positions:
                 if p.get("instId", "") != symbol:
                     continue
@@ -326,9 +380,10 @@ class GridStrategy(PersistentStrategy):
                     if notional > 0 and lever > 0:
                         margin = notional / lever
                 total_margin += margin
+            return total_margin
         except Exception as e:
-            logger.debug(f"Grid: failed to query existing margin for {symbol}: {e}")
-        return total_margin
+            logger.warning(f"Grid: failed to query existing margin for {symbol}; refusing new exposure: {e}")
+            return None
 
     def apply_param_update(self, params: Dict[str, Any]):
         """热更新策略参数（由StrategyOptimizer调用，无需重启）
@@ -412,12 +467,34 @@ class GridStrategy(PersistentStrategy):
             "_grid_rollback_cooldown": self._grid_rollback_cooldown,
             "_trailing_state": self._trailing_state,
             "_position_entry_time": self._position_entry_time,
+            # P34: 单方向止损熔断历史
+            "_stop_loss_history": self._stop_loss_history,
             # 生产级各币种网格状态管理
             "_coin_health": self._coin_health,
             "_coin_paused": self._coin_paused,
             "_coin_lifecycle": self._coin_lifecycle,
             "_grid_performance": self._grid_performance,
         }
+
+    @staticmethod
+    def _restore_int_keyed_dict(raw):
+        """将 JSON 序列化后 int 键变成字符串键的嵌套 dict 恢复为 int 键。
+
+        _grid_retry_count / _grid_rollback_cooldown 使用 grid_index(int) 作内层键，
+        json.dumps 会把 int 键转成字符串，恢复后若直接使用 int 键查询必然 miss，
+        导致重试/冷却防护在重启后静默失效。
+        """
+        out = {}
+        for symbol, inner in (raw or {}).items():
+            if not isinstance(inner, dict):
+                continue
+            out[symbol] = {}
+            for k, v in inner.items():
+                try:
+                    out[symbol][int(k)] = v
+                except (TypeError, ValueError):
+                    out[symbol][k] = v
+        return out
 
     def restore_persistent_state(self, state: Dict[str, Any]):
         """从持久化数据恢复状态。"""
@@ -429,10 +506,12 @@ class GridStrategy(PersistentStrategy):
         self._martingale_state = state.get("_martingale_state", {}) or {}
         self._trend_mode = state.get("_trend_mode", {}) or {}
         self._extreme_vol_until = state.get("_extreme_vol_until", {}) or {}
-        self._grid_retry_count = state.get("_grid_retry_count", {}) or {}
-        self._grid_rollback_cooldown = state.get("_grid_rollback_cooldown", {}) or {}
+        self._grid_retry_count = self._restore_int_keyed_dict(state.get("_grid_retry_count", {}))
+        self._grid_rollback_cooldown = self._restore_int_keyed_dict(state.get("_grid_rollback_cooldown", {}))
         self._trailing_state = state.get("_trailing_state", {}) or {}
         self._position_entry_time = state.get("_position_entry_time", {}) or {}
+        # P34: 单方向止损熔断历史（恢复时保留窗口内的止损时间戳）
+        self._stop_loss_history = state.get("_stop_loss_history", {}) or {}
         # 生产级各币种网格状态管理
         self._coin_health = state.get("_coin_health", {}) or {}
         self._coin_paused = state.get("_coin_paused", {}) or {}
@@ -656,8 +735,7 @@ class GridStrategy(PersistentStrategy):
             if not ticker:
                 return
             price = float(ticker["last"])
-        tier = get_currency_tier(symbol, self.config)
-        tier_settings = self.config["currencies"][f"{tier}_settings"]
+        tier_settings = get_symbol_config(symbol, self.config)
         
         atr = self._atr_cache.get(symbol, 0)
         if atr > 0 and price > 0:
@@ -691,7 +769,7 @@ class GridStrategy(PersistentStrategy):
         # 保存实际网格间距，供手续费检查使用
         self._actual_grid_spacing[symbol] = base_spacing
         
-        if self._dynamic_grid_count and atr > 0:
+        if self._dynamic_grid_count and atr > 0 and price > 0:
             volatility_ratio = atr / price
             if volatility_ratio > 0.02:
                 grid_count = self._grid_count_min
@@ -950,6 +1028,8 @@ class GridStrategy(PersistentStrategy):
         # 频率控制：WS可用时0.1s，REST降级时1s
         self._last_active_time = time.time()  # 策略活跃时间戳，用于心跳检测
         heartbeat_interval = 30  # 每30秒更新一次活跃信号
+        _adaptive_eval_interval = 300  # 每300s评估一次grid自适应利用率（补上evaluate调度）
+        _last_adaptive_eval = 0.0
         
         while True:
             ws_used = False
@@ -966,6 +1046,14 @@ class GridStrategy(PersistentStrategy):
                 # 更新全局心跳：使用特殊key "_heartbeat" 让调度器感知策略存活
                 self._last_signal_time["_heartbeat"] = now
             
+            # 周期评估 grid 自适应利用率（修复：此前 evaluate 从未被调用，multiplier 恒为 1.0）
+            if self._grid_adaptive_engine and now - _last_adaptive_eval >= _adaptive_eval_interval:
+                _last_adaptive_eval = now
+                try:
+                    self._grid_adaptive_engine.evaluate()
+                except Exception as e:
+                    logger.debug(f"Grid adaptive evaluate error: {e}")
+
             # WS数据正常则高频轮询，REST降级则低频
             await asyncio.sleep(0.1 if ws_used else 1.0)
 
@@ -1062,6 +1150,10 @@ class GridStrategy(PersistentStrategy):
                         # P0-4: buy方向阈值接入config min_signal_quality（替代硬编码0.50）
                         # P32: 高风险时段叠加质量门槛，优质信号仍可开仓
                         _buy_threshold = self._min_signal_quality + self._high_risk_quality_margin
+                        # P2: 做多逆势惩罚 — 下跌趋势中做多是逆势，提高门槛（对称于做空的溢价取消）
+                        _bias = self._trend_bias_cache.get(symbol)
+                        if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
+                            _buy_threshold += 0.10
                         if quality < _buy_threshold:
                             logger.debug(f"Grid {symbol} buy signal rejected: quality={quality:.2f} < {_buy_threshold:.2f}")
                             continue
@@ -1071,7 +1163,8 @@ class GridStrategy(PersistentStrategy):
                             logger.debug(f"Grid {symbol} buy signal invalid: {reason}")
                             continue
                     except Exception as e:
-                        logger.debug(f"Grid {symbol} quality/validation check error: {e}, proceeding")
+                        logger.debug(f"Grid {symbol} quality/validation check error: {e}, rejecting")
+                        continue
                     await self._trigger_grid_order(symbol, "buy", grid_price, grid["layer"], grid_index=i)
                     grid["filled"] = "pending"
                     if symbol not in self._grid_pending_at:
@@ -1084,9 +1177,17 @@ class GridStrategy(PersistentStrategy):
                     # 信号质量评分检查
                     try:
                         quality = self._calculate_grid_signal_quality(symbol, "sell", price, grid)
-                        # P0-4: sell方向保持 +0.25 风险溢价（做空亏损是做多37倍，需更高门槛）
+                        # P2: 做空溢价方向感知 — 下跌趋势中做空是顺势，取消 +0.25 做空溢价
+                        # （_trend_bias_cache.direction: 1=上涨, -1=下跌, 0=震荡）
+                        _short_premium = 0.25
+                        _bias = self._trend_bias_cache.get(symbol)
+                        if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
+                            _short_premium = 0.0
                         # P32: 高风险时段叠加质量门槛
-                        _sell_threshold = self._min_signal_quality + 0.25 + self._high_risk_quality_margin
+                        # P2: 叠加信号质量放松量（资本层意图传导到信号门槛）+ 门槛上限
+                        _sell_threshold = self._min_signal_quality + _short_premium + self._high_risk_quality_margin
+                        _sell_threshold -= self._get_signal_relaxation()
+                        _sell_threshold = max(self._min_signal_quality, min(_sell_threshold, self._sell_signal_quality_cap))
                         if quality < _sell_threshold:
                             logger.debug(f"Grid {symbol} sell signal rejected: quality={quality:.2f} < {_sell_threshold:.2f}")
                             continue
@@ -1096,7 +1197,8 @@ class GridStrategy(PersistentStrategy):
                             logger.debug(f"Grid {symbol} sell signal invalid: {reason}")
                             continue
                     except Exception as e:
-                        logger.debug(f"Grid {symbol} quality/validation check error: {e}, proceeding")
+                        logger.debug(f"Grid {symbol} quality/validation check error: {e}, rejecting")
+                        continue
                     await self._trigger_grid_order(symbol, "sell", grid_price, grid["layer"], grid_index=i)
                     grid["filled"] = "pending"
                     if symbol not in self._grid_pending_at:
@@ -1140,8 +1242,134 @@ class GridStrategy(PersistentStrategy):
             logger.debug(f"REST tick fallback failed for {symbol}: {e}")
             return None
 
+    def _record_side_stop_loss(self, symbol: str, position_direction: str):
+        """P34: 记录一次单方向止损事件，用于熔断判定。
+
+        position_direction 为持仓方向（long/short），归一化到开仓方向 buy/sell。
+        仅保留观察窗口内的止损时间戳，避免内存无限增长。
+        """
+        if not self._sl_circuit_breaker_enabled:
+            return
+        side = "buy" if position_direction == "long" else "sell"
+        key = f"{symbol}:{side}"
+        now = time.time()
+        if key not in self._stop_loss_history:
+            self._stop_loss_history[key] = []
+        self._stop_loss_history[key].append(now)
+        # 清理观察窗口外的旧止损记录
+        cutoff = now - self._sl_circuit_breaker_window
+        self._stop_loss_history[key] = [t for t in self._stop_loss_history[key] if t >= cutoff]
+
+    def _is_side_circuit_broken(self, symbol: str, side: str) -> bool:
+        """P34: 判断 symbol 的 side 方向是否处于熔断冷却期。
+
+        观察窗口内连续止损次数 >= 阈值，且最近一次止损距今 < 冷却时长时，返回 True。
+        """
+        if not self._sl_circuit_breaker_enabled:
+            return False
+        key = f"{symbol}:{side}"
+        history = self._stop_loss_history.get(key, [])
+        if not history:
+            return False
+        now = time.time()
+        cutoff = now - self._sl_circuit_breaker_window
+        recent = [t for t in history if t >= cutoff]
+        if len(recent) < self._sl_circuit_breaker_threshold:
+            return False
+        last_sl = max(recent)
+        remaining = self._sl_circuit_breaker_cooldown - (now - last_sl)
+        if remaining > 0:
+            return True
+        # 冷却已过期，清空记录重新开始计数
+        self._stop_loss_history[key] = []
+        return False
+
+    def _get_minute_rebound_metrics(self, symbol: str) -> Optional[Dict[str, float]]:
+        """P36: 计算分钟级反转指标（带30秒缓存）。
+
+        用最近 1m K 线度量短期急拉(rise)/急杀(drop)，区分方向：
+        - rise = (最后一根收盘 - 窗口最低) / 窗口最低  → 做空危险（反弹）
+        - drop = (窗口最高 - 最后一根收盘) / 窗口最高  → 做多危险（急杀）
+        返回 None 表示数据不足/异常（调用方放行，不阻塞主流程）。
+        """
+        try:
+            now = time.time()
+            cached = self._minute_rebound_cache.get(symbol)
+            if cached and now - cached.get("ts", 0) < self._minute_rebound_cache_ttl:
+                return cached.get("metrics")
+
+            window = max(3, int(self._minute_rebound_window))
+            klines = self.okx_client.get_kline(symbol, "1m", limit=window + 2)
+            metrics: Optional[Dict[str, float]] = None
+            if len(klines) >= 3:
+                highs, lows, closes = [], [], []
+                for k in klines:
+                    try:
+                        h, l, c = float(k[2]), float(k[3]), float(k[4])
+                    except (ValueError, IndexError, TypeError):
+                        continue
+                    if not (math.isfinite(h) and math.isfinite(l) and math.isfinite(c)):
+                        continue
+                    if l <= 0 or h <= 0:
+                        continue
+                    highs.append(h); lows.append(l); closes.append(c)
+                if len(closes) >= 3:
+                    lo = min(lows)
+                    hi = max(highs)
+                    last_close = closes[-1]
+                    rise = (last_close - lo) / lo if lo > 0 else 0.0
+                    drop = (hi - last_close) / hi if hi > 0 else 0.0
+                    metrics = {"rise": max(0.0, rise), "drop": max(0.0, drop)}
+            self._minute_rebound_cache[symbol] = {"ts": now, "metrics": metrics}
+            return metrics
+        except Exception as e:
+            logger.debug(f"P36: minute rebound metrics error for {symbol}: {e}")
+            return None
+
+    def _check_minute_rebound(self, symbol: str, side: str, price: float) -> bool:
+        """P36: 分钟级反转过滤器。返回 True 表示存在危险反转，应拦截开仓。
+
+        - 做空(sell)：短期急拉（反弹）幅度超阈值 → 禁开空（对称于既有做多逆势惩罚）。
+        - 做多(buy)：短期急杀幅度超阈值 → 禁开多。
+        仅拦截开仓（提前减仓由上层 _check_reversal_take_profit 处理）。
+        """
+        if self._minute_rebound_threshold <= 0:
+            return False
+        metrics = self._get_minute_rebound_metrics(symbol)
+        if not metrics:
+            return False
+        threshold = self._minute_rebound_threshold
+        if side == "sell":
+            if metrics.get("rise", 0.0) >= threshold:
+                logger.debug(
+                    f"P36: Grid {symbol} sell blocked — minute rebound rise={metrics['rise']:.2%} "
+                    f">= {threshold:.2%} (window={self._minute_rebound_window}m)"
+                )
+                return True
+        else:
+            if metrics.get("drop", 0.0) >= threshold:
+                logger.debug(
+                    f"P36: Grid {symbol} buy blocked — minute drop={metrics['drop']:.2%} "
+                    f">= {threshold:.2%} (window={self._minute_rebound_window}m)"
+                )
+                return True
+        return False
+
     async def _confirm_grid_entry(self, symbol: str, side: str, price: float, tick) -> bool:
         """成交量+订单簿+趋势方向三重确认，减少假突破"""
+        # P34: 单方向连续止损熔断 — 该方向处于冷却期时直接拒绝开仓
+        if self._is_side_circuit_broken(symbol, side):
+            now = time.time()
+            key = f"{symbol}_{side}"
+            if now - self._last_grid_skip_log.get(key, 0) > 30:
+                logger.warning(
+                    f"Grid circuit-breaker: {symbol} {side} 开仓被熔断拦截 "
+                    f"(观察窗口 {self._sl_circuit_breaker_window}s 内连续止损 >= "
+                    f"{self._sl_circuit_breaker_threshold} 次)"
+                )
+                self._last_grid_skip_log[key] = now
+            return False
+
         # 趋势方向过滤：强趋势中禁止逆势开仓（grid适合震荡市）
         bias = self._trend_bias_cache.get(symbol)
         if bias and bias.get("strength", 0) > 0.05:
@@ -1162,6 +1390,11 @@ class GridStrategy(PersistentStrategy):
                     logger.debug(f"Grid skip {symbol} buy: strong downtrend (strength={bias['strength']:.4f})")
                     self._last_grid_skip_log[key] = now
                 return False
+
+        # P36: 分钟级反转过滤 — 短期急拉(做空)/急杀(做多)超阈值拦截，
+        # 补齐 EMA20-EMA50 滞后指标捕捉不到的分钟级反弹（grid 做空反复被反弹止损的根因）。
+        if self._check_minute_rebound(symbol, side, price):
+            return False
 
         # 成交量确认 - 降低阈值，更容易触发
         if tick.volume and tick.volume > 0:
@@ -1187,11 +1420,11 @@ class GridStrategy(PersistentStrategy):
         return True
 
     async def _check_trend_ready_for_entry(self, symbol: str, side: str, price: float) -> bool:
-        """P33: 趋势确认门禁 — 趋势确认后才允许入场，拒绝追行情
+        """P33: 趋势确认门禁，按 trend_confirmation_mode 分流。
 
-        - ADX > 20（趋势足够强）
-        - +DI / -DI 方向对齐开仓方向（顺势交易）
-        - 价格在近期高低点区间的合理位置（避免追高/追低）
+        - strict：ADX < 20 直接拒绝（旧行为，震荡市不做网格）
+        - regime_aware：震荡市（ADX < 20）放行，由信号质量门槛 + 趋势方向过滤兜底；
+          趋势市（ADX ≥ 20）才做 +DI / -DI 方向对齐（顺势）+ 价格位置过滤（避免追高/追低）
         """
         try:
             klines = self.okx_client.get_kline(symbol, "15m", limit=50)
@@ -1216,11 +1449,20 @@ class GridStrategy(PersistentStrategy):
 
             adx_floor = 20.0
 
-            if side == "buy":
-                # 做多条件：ADX > 20 且 +DI > -DI（上涨趋势）
+            # P33 趋势确认门禁模式
+            if self._trend_confirmation_mode == "strict":
+                # strict：ADX < 20 直接拒绝（旧行为，震荡市不做网格）
                 if adx < adx_floor:
-                    logger.debug(f"P33: Grid {symbol} buy rejected — ADX={adx:.1f} < {adx_floor}")
+                    logger.debug(f"P33: Grid {symbol} {side} rejected — ADX={adx:.1f} < {adx_floor} (strict)")
                     return False
+            else:
+                # regime_aware：震荡市（ADX < 20）是 grid 均值回归主场，放行；
+                # 趋势市（ADX >= 20）才做方向对齐 + 价格位置过滤，避免逆势追涨杀跌。
+                if adx < adx_floor:
+                    return True
+
+            if side == "buy":
+                # 趋势市做多条件：+DI > -DI（上涨趋势顺势）
                 if plus_di <= minus_di:
                     logger.debug(f"P33: Grid {symbol} buy rejected — +DI={plus_di:.1f} <= -DI={minus_di:.1f}")
                     return False
@@ -1237,10 +1479,7 @@ class GridStrategy(PersistentStrategy):
                         )
                         return False
             else:
-                # 做空条件：ADX > 20 且 -DI > +DI（下跌趋势）
-                if adx < adx_floor:
-                    logger.debug(f"P33: Grid {symbol} sell rejected — ADX={adx:.1f} < {adx_floor}")
-                    return False
+                # 趋势市做空条件：-DI > +DI（下跌趋势顺势）
                 if minus_di <= plus_di:
                     logger.debug(f"P33: Grid {symbol} sell rejected — -DI={minus_di:.1f} <= +DI={plus_di:.1f}")
                     return False
@@ -1401,8 +1640,7 @@ class GridStrategy(PersistentStrategy):
         if not await self._check_trend_ready_for_entry(symbol, side, price):
             return
 
-        tier = get_currency_tier(symbol, self.config)
-        tier_settings = self.config["currencies"][f"{tier}_settings"]
+        tier_settings = get_symbol_config(symbol, self.config)
         leverage = tier_settings["leverage_default"]
 
         total_capital = self._get_effective_capital()
@@ -1449,7 +1687,17 @@ class GridStrategy(PersistentStrategy):
             logger.debug(f"Grid skip {symbol}: base_position {base_position:.4f} < min_margin {min_margin}")
             return
 
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "1"))
+        instrument_info = self.okx_client.get_instrument_info(symbol)
+        if not instrument_info:
+            logger.debug(f"Grid {symbol}: instrument info unavailable, skip")
+            return
+        min_lot_size = self._safe_float(instrument_info.get("lotSz"), 0.0)
+        if min_lot_size <= 0 or leverage <= 0 or price <= 0:
+            logger.debug(
+                f"Grid {symbol}: invalid lot/leverage/price "
+                f"(lotSz={min_lot_size}, leverage={leverage}, price={price}), skip"
+            )
+            return
         margin_needed_for_min_lot = price * min_lot_size / leverage
 
         strategy_cap = trading_capital * allocation
@@ -1476,6 +1724,9 @@ class GridStrategy(PersistentStrategy):
         single_symbol_ratio = 0.25
         cumulative_margin_cap = total_capital * single_symbol_ratio
         existing_margin = self._get_existing_symbol_margin(symbol)
+        if existing_margin is None:
+            logger.warning(f"Grid {symbol}: current position margin unavailable, skip new layer")
+            return
         available_margin = max(0.0, cumulative_margin_cap - existing_margin)
         if base_position > available_margin:
             logger.info(
@@ -1750,8 +2001,7 @@ class GridStrategy(PersistentStrategy):
             pos_side = "buy"
         direction = "long" if pos_side == "buy" else "short"
         
-        tier = get_currency_tier(symbol, self.config)
-        tier_settings = self.config["currencies"][f"{tier}_settings"]
+        tier_settings = get_symbol_config(symbol, self.config)
         leverage = tier_settings["leverage_max"]
         
         precision = get_price_precision(symbol)
@@ -1773,7 +2023,7 @@ class GridStrategy(PersistentStrategy):
             logger.error(f"TP/SL validation failed for {symbol}: {validation['errors']}")
             return
         
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "1"))
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = current_price * min_lot_size / leverage
         
         effective_capital = self._get_effective_capital()
@@ -2250,6 +2500,7 @@ class GridStrategy(PersistentStrategy):
             self._grid_stale_count[symbol] = 0
             # P14: 传入当前价格避免使用过期缓存ticker
             await self._rebuild_stale_grid(symbol, current_price=current_price)
+            return
         
         # P13: 确保价格在新范围内（至少靠近边界）
         if current_price < lower_bound * 0.95 or current_price > upper_bound * 1.05:
@@ -2259,6 +2510,7 @@ class GridStrategy(PersistentStrategy):
             )
             # P14: 传入当前价格避免使用过期缓存ticker
             await self._rebuild_stale_grid(symbol, current_price=current_price)
+            return
         
         prices = np.linspace(lower_bound, upper_bound, grid_count)
         
@@ -2760,9 +3012,10 @@ class GridStrategy(PersistentStrategy):
                 await self._trigger_stop_loss(symbol, sl_order)
 
     async def _execute_pending_order(self, symbol: str, order: Dict[str, Any]):
-        tier = get_currency_tier(symbol, self.config)
-        tier_settings = self.config["currencies"][f"{tier}_settings"]
+        tier_settings = get_symbol_config(symbol, self.config)
         
+        # exit_reason 全链路补全：止盈/止损挂单必须显式透传 reason，禁止下游兜底 "close"
+        exit_reason = "take_profit" if order.get("type") == "take_profit" else "stop_loss"
         signal_data = {
             "type": "signal",
             "data": {
@@ -2774,6 +3027,8 @@ class GridStrategy(PersistentStrategy):
                 "quantity": order["quantity"],
                 "leverage": tier_settings["leverage_default"],
                 "confidence": 0.9,
+                "exit_reason": exit_reason,
+                "reduce_only": True,
                 "timestamp": datetime.now().isoformat()
             }
         }
@@ -2807,13 +3062,16 @@ class GridStrategy(PersistentStrategy):
     async def _trigger_stop_loss(self, symbol: str, sl_order: Dict[str, Any]):
         sl_order["status"] = "triggered"
         
+        # P34: 记录单方向止损事件，供熔断判定（position_direction = 持仓方向）
+        self._record_side_stop_loss(symbol, sl_order.get("direction", ""))
+        
         # 清理移动止损追踪和入场时间
         self._trailing_state.pop(symbol, None)
         self._position_entry_time.pop(symbol, None)
         
-        tier = get_currency_tier(symbol, self.config)
-        tier_settings = self.config["currencies"][f"{tier}_settings"]
+        tier_settings = get_symbol_config(symbol, self.config)
         
+        # exit_reason 全链路补全：止损必须显式透传 reason，禁止下游兜底 "close"
         signal_data = {
             "type": "signal",
             "data": {
@@ -2825,6 +3083,8 @@ class GridStrategy(PersistentStrategy):
                 "quantity": sl_order["quantity"],
                 "leverage": tier_settings["leverage_max"],
                 "confidence": 0.95,
+                "exit_reason": "stop_loss",
+                "reduce_only": True,
                 "timestamp": datetime.now().isoformat()
             }
         }
@@ -2842,12 +3102,49 @@ class GridStrategy(PersistentStrategy):
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
+
+        # stop_loss_audit 落库：网格用自身止损触发逻辑（不走 StopLossManager.check_and_execute_stop_loss），
+        # 必须显式补记审计，否则 stop_loss_audit 表缺失网格止损记录，复盘时止损执行质量不可见。
+        self._record_grid_stop_loss_audit(symbol, sl_order)
         
         try:
             self._trend_mode[symbol] = True
             await self._switch_to_trend_mode(symbol)
         except Exception as e:
             logger.error(f"Failed to switch to trend mode after stop loss: {e}")
+
+    def _record_grid_stop_loss_audit(self, symbol: str, sl_order: Dict[str, Any]):
+        """网格止损审计落库（无副作用，失败不影响主流程）。"""
+        slm = getattr(self, "_stop_loss_manager", None)
+        if slm is None or not hasattr(slm, "record_stop_loss_audit"):
+            return
+        try:
+            direction = sl_order.get("direction", "")
+            entry_price = float(sl_order.get("entry_price") or sl_order.get("price") or 0.0)
+            trigger_price = float(sl_order.get("price") or 0.0)
+            quantity = float(sl_order.get("quantity") or 0.0)
+            if entry_price <= 0 or trigger_price <= 0 or quantity <= 0:
+                return
+            if direction == "long":
+                pnl = (trigger_price - entry_price) * quantity
+                pnl_pct = (trigger_price - entry_price) / entry_price
+            else:
+                pnl = (entry_price - trigger_price) * quantity
+                pnl_pct = (entry_price - trigger_price) / entry_price
+            slm.record_stop_loss_audit(
+                symbol=symbol,
+                strategy_name="grid",
+                trigger_type="hard_stop",
+                entry_price=entry_price,
+                trigger_price=trigger_price,
+                exit_price=trigger_price,
+                quantity=quantity,
+                pnl=pnl,
+                pnl_percent=pnl_pct,
+                exit_reason="stop_loss",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record grid stop_loss_audit for {symbol}: {e}")
 
     def _add_pending_order(self, symbol: str, order_type: str, direction: str, 
                           price: float, quantity: float):
@@ -3840,6 +4137,27 @@ class GridStrategy(PersistentStrategy):
             else:
                 score += 0.05
 
+            # 6. 趋势确认（统一 ADX/DI 方向对齐，0 上下浮动 ±0.10）
+            # 复用 MarketRegimeEngine.get_symbol_trend_detail 的统一口径（与框架层
+            # TrendConfirmationFilter 同源），替代/补充策略内自算 EMA20/50 的单因子趋势判断：
+            # 顺势均值回归（上涨趋势买回调 / 下跌趋势卖反弹）加分，逆势（接飞刀）减分。
+            # 引擎未注入或明细缺失时保持中性（0），不改变原有评分行为。
+            detail = self._get_unified_trend_detail(symbol)
+            if detail:
+                try:
+                    direction = float(detail.get("direction", 0.0))
+                    adx_strength = float(detail.get("adx_strength", 0.0))
+                    if math.isfinite(direction) and math.isfinite(adx_strength):
+                        aligned = (side == "buy" and direction > 0) or (side == "sell" and direction < 0)
+                        opposing = (side == "buy" and direction < 0) or (side == "sell" and direction > 0)
+                        weight = max(0.0, min(1.0, adx_strength))
+                        if aligned:
+                            score += 0.10 * weight
+                        elif opposing:
+                            score -= 0.10 * weight
+                except (TypeError, ValueError):
+                    pass
+
             return min(1.0, max(0.0, score))
         except Exception as e:
             logger.debug(f"Grid signal quality calculation error for {symbol}: {e}")
@@ -3930,7 +4248,7 @@ class GridStrategy(PersistentStrategy):
             return True, "ok"
         except Exception as e:
             logger.debug(f"Grid signal validation error for {symbol}: {e}")
-            return True, "validation_error_skipped"  # 出错时不阻塞
+            return False, f"validation_error: {e}"  # 出错时拒绝（fail-closed）
 
     async def _check_coin_health(self, symbol: str):
         """执行单币种健康检查，更新健康状态"""

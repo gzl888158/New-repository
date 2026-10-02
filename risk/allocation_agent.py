@@ -1,8 +1,18 @@
 """
-资金分配优化Agent：基于策略表现动态分配资金
-智能分析策略绩效、风险指标，自动优化资金配置
+资金分配监控 Agent（Observer 模式）：采集策略绩效与风险指标，为 Dashboard / RiskBudgetEngine 提供只读视图。
 
-增强版：集成 DynamicAllocator 动态资金分配引擎
+.. deprecated::
+    实验性模块，未接入生产交易链路。仅提供只读指标视图，不执行资金再平衡。
+    实际资金分配由 AdaptiveController 负责。
+
+注意：本模块 **不执行** 实际资金再平衡。Live 策略权重的写入与执行由 AdaptiveController 独占负责。
+AllocationAgent 的职责边界：
+  - 采集策略表现（胜率、Sharpe、回撤、连胜连败）
+  - 计算 MPT 最优权重建议（仅供查看，不下发）
+  - 为 DynamicAllocator 提供分配计划数据
+  - 为 Dashboard API 和 RiskBudgetEngine 提供策略指标查询
+
+增强版：集成 DynamicAllocator 动态资金分配引擎（只读数据源）
   - 多级资金池管理（底仓/加仓/风控隔离）
   - Kelly 公式最优仓位计算
   - 分配优先级瀑布模型
@@ -12,7 +22,8 @@
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta
+import math
+from datetime import datetime
 from typing import Dict, Any, Optional, List
 from loguru import logger
 import numpy as np
@@ -22,29 +33,52 @@ from risk.dynamic_allocator import (
 )
 
 
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
 class AllocationAgent:
-    """智能资金分配Agent（增强版）"""
+    """资金分配监控 Agent（Observer 模式）。
+
+    本模块仅采集策略指标并提供只读视图，**不执行**实际资金再平衡。
+    Live 策略权重由 AdaptiveController 独占管理。详见模块级 docstring。
+    """
 
     def __init__(self, config: Dict[str, Any], trade_journal, profit_optimizer, account_manager):
         self.config = config
         self.trade_journal = trade_journal
         self.profit_optimizer = profit_optimizer
         self.account_manager = account_manager
+        self._learning_memory = None
 
         self._enabled = config.get("allocation_agent", {}).get("enabled", True)
-        self._rebalance_interval = config.get("allocation_agent", {}).get("rebalance_interval", 3600)  # 每小时检查
         self._min_trade_count = config.get("allocation_agent", {}).get("min_trade_count", 20)  # 最小交易数
-        self._max_allocation_change = config.get("allocation_agent", {}).get("max_allocation_change", 0.05)  # 单次最大变更5%
         self._allocation_method = config.get("allocation_agent", {}).get("method", "dynamic")  # equal, performance, risk_adjusted, dynamic
+        legacy_rebalance_requested = bool(
+            config.get("allocation_agent", {}).get("rebalance_enabled", False)
+        )
+        self._rebalance_enabled = False
+        if legacy_rebalance_requested:
+            logger.warning(
+                "Ignoring allocation_agent.rebalance_enabled: AdaptiveController is the sole live allocation authority"
+            )
 
         self._strategy_weights: Dict[str, float] = {}
         self._performance_history: Dict[str, List[Dict[str, float]]] = {}
         self._last_rebalance_time: Optional[datetime] = None
         self._running = False
+        self._tasks: List[asyncio.Task] = []
 
-        self._strategy_names = [
-            "grid", "trend", "scalping", "arbitrage", "spot_grid", "spot_martingale"
-        ]
+        self._strategy_names = self._load_strategy_names_from_config()
+        self._strategy_manager = None  # 由 Scheduler 注入，作为策略名称单一事实来源
+        self._adaptive_controller = None  # 由 Scheduler 注入，作为实时权重权威来源
 
         # ── DynamicAllocator 集成 ───────────────────────────
         self._dynamic_allocator: Optional[DynamicAllocator] = None
@@ -57,16 +91,27 @@ class AllocationAgent:
             logger.info("Allocation Agent is disabled")
             return
 
+        if self._running:
+            return
+
         logger.info("Starting Allocation Agent")
         self._running = True
         self._last_rebalance_time = datetime.now()
         await self._load_initial_weights()
 
-        asyncio.create_task(self._rebalance_loop())
-        asyncio.create_task(self._performance_monitor_loop())
+        logger.info(
+            "AllocationAgent running in observer mode; AdaptiveController owns live strategy weights"
+        )
+        self._tasks.append(asyncio.create_task(self._performance_monitor_loop()))
 
     async def stop(self):
         self._running = False
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("Allocation Agent stopped")
 
     async def _load_initial_weights(self):
@@ -74,7 +119,7 @@ class AllocationAgent:
         trading_cfg = self.config.get("trading", {})
         for strategy in self._strategy_names:
             key = f"{strategy}_allocation"
-            self._strategy_weights[strategy] = trading_cfg.get(key, 0.167)
+            self._strategy_weights[strategy] = _finite(trading_cfg.get(key, 0.167), 0.0)
 
         self._normalize_weights()
         logger.info(f"Initial allocation weights: {self._strategy_weights}")
@@ -104,12 +149,70 @@ class AllocationAgent:
         self._portfolio_optimizer = optimizer
         logger.info("AllocationAgent: PortfolioOptimizer injected")
 
+    def set_learning_memory(self, memory) -> None:
+        """Inject shared cross-agent performance memory."""
+        self._learning_memory = memory
+
     def set_dynamic_allocator(self, allocator: DynamicAllocator) -> None:
         """注入 DynamicAllocator，使用增强版资金分配引擎"""
         self._dynamic_allocator = allocator
         if self._portfolio_optimizer:
             allocator.set_portfolio_optimizer(self._portfolio_optimizer)
         logger.info("AllocationAgent: DynamicAllocator injected")
+
+    def set_strategy_manager(self, strategy_manager) -> None:
+        """注入 StrategyManager 作为策略名称的单一事实来源。
+
+        注入后刷新 self._strategy_names，确保与系统其他模块使用同一套
+        策略列表（含 spot_grid / spot_martingale 等）。
+        """
+        self._strategy_manager = strategy_manager
+        if strategy_manager is not None:
+            try:
+                # 取所有已注册策略名（不限于 enabled），与 StrategyManager 注册表一致
+                self._strategy_names = list(strategy_manager.get_all_descriptors().keys())
+                logger.info(
+                    f"AllocationAgent: strategy names refreshed from StrategyManager "
+                    f"({len(self._strategy_names)} strategies)"
+                )
+            except Exception as e:
+                logger.warning(f"StrategyManager strategy name refresh failed: {e}")
+
+    def _load_strategy_names_from_config(self) -> List[str]:
+        """从 config 读取策略名称列表（strategy_manager 未注入时的兜底）。
+
+        遍历 strategies.* 配置项，保持与 StrategyManager 同口径。
+        """
+        strategies_cfg = self.config.get("strategies", {})
+        if strategies_cfg:
+            return list(strategies_cfg.keys())
+        # 极端兜底：config 中无 strategies 段时使用已知策略名
+        return ["grid", "trend", "scalping", "arbitrage", "spot_grid", "spot_martingale"]
+
+    def set_adaptive_controller(self, adaptive_controller) -> None:
+        """注入 AdaptiveController 作为实时权重的权威来源。
+
+        注入后，get_recommendations / get_current_allocation / get_allocation_report
+        将以 AdaptiveController.get_allocations() 返回的实时可部署权重为基准，
+        避免使用启动时加载的陈旧 config 快照产生误导性 diff。
+        """
+        self._adaptive_controller = adaptive_controller
+        logger.info(
+            "AllocationAgent: AdaptiveController injected as live-weight authority"
+        )
+
+    def _get_live_weights(self) -> Dict[str, float]:
+        """获取实时权威权重（供建议计算使用）。
+
+        优先使用 AdaptiveController.get_allocations()（单一权威读取入口，
+        含可部署性门控）；未注入时回退到本地 config 快照（仅用于离线/测试场景）。
+        """
+        if self._adaptive_controller is not None and hasattr(self._adaptive_controller, "get_allocations"):
+            try:
+                return dict(self._adaptive_controller.get_allocations())
+            except Exception as e:
+                logger.debug(f"AdaptiveController.get_allocations failed: {e}")
+        return dict(self._strategy_weights)
 
     def set_market_regime(self, regime_str: str) -> None:
         """设置当前市场状态（用于DynamicAllocator）"""
@@ -119,29 +222,30 @@ class AllocationAgent:
             self._market_regime = MarketRegime.UNKNOWN
 
     def get_optimized_weights(self) -> Dict[str, float]:
-        """从 PortfolioOptimizer 获取 MPT 最优权重作为再平衡目标"""
+        """从 PortfolioOptimizer 获取 MPT 最优权重作为再平衡目标。
+
+        fail-closed：优化器缺失或异常时返回空权重（不编造建议），由权威
+        AdaptiveController 继续持有真实分配口径。
+        """
         if not hasattr(self, '_portfolio_optimizer') or not self._portfolio_optimizer:
-            return dict(self._strategy_weights)
+            return {}
 
-        result = self._portfolio_optimizer.optimize()
-        if result and result.optimal_weights:
-            # 合并优化结果：使用优化权重，未覆盖的策略保持原权重
-            merged = dict(self._strategy_weights)
-            merged.update(result.optimal_weights)
-            return merged
-
-        return dict(self._strategy_weights)
-
-    async def _rebalance_loop(self):
-        """定期重新平衡资金分配"""
-        while self._running:
-            try:
-                await asyncio.sleep(self._rebalance_interval)
-                await self._rebalance()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Rebalance loop error: {e}")
+        try:
+            result = self._portfolio_optimizer.optimize()
+            if result and result.optimal_weights:
+                merged = {}
+                merged.update(result.optimal_weights)
+                enabled = set(self._enabled_strategy_names())
+                merged = {
+                    name: max(0.0, _finite(weight, 0.0))
+                    for name, weight in merged.items() if name in enabled
+                }
+                total = sum(merged.values())
+                if total > 0:
+                    return {name: weight / total for name, weight in merged.items()}
+        except Exception as e:
+            logger.warning(f"PortfolioOptimizer failed; returning empty recommendation (fail-closed): {e}")
+        return {}
 
     async def _performance_monitor_loop(self):
         """监控策略表现，每10分钟记录一次"""
@@ -175,83 +279,49 @@ class AllocationAgent:
             # 保留最近100条记录
             if len(self._performance_history[strategy]) > 100:
                 self._performance_history[strategy] = self._performance_history[strategy][-100:]
+            if self._learning_memory is not None:
+                try:
+                    self._learning_memory.record(
+                        agent="allocation_agent",
+                        kind="strategy_performance",
+                        context={"strategy": strategy},
+                        outcome={
+                            "win_rate": metrics["win_rate"],
+                            "profit_factor": metrics["profit_factor"],
+                            "sharpe_ratio": metrics["sharpe_ratio"],
+                            "max_drawdown": metrics["max_drawdown"],
+                            "total_pnl": metrics["total_pnl"],
+                            "trade_count": metrics["trade_count"],
+                        },
+                    )
+                except Exception as e:
+                    logger.debug(f"Shared strategy memory write failed: {e}")
 
     async def _rebalance(self):
-        """执行资金重新分配"""
-        logger.info("Starting capital rebalance...")
+        """Observer-mode no-op.
 
-        new_weights = await self._calculate_optimal_allocation()
-        changes = await self._apply_allocation_changes(new_weights)
-
-        if changes:
-            logger.info(f"Capital rebalance completed: {changes}")
-            await self._save_allocation_state()
-        else:
-            logger.info("No allocation changes needed")
-
+        AdaptiveController 是唯一的实时分配权威；AllocationAgent 不再执行
+        任何写入（不修改 strategy_weights、不调用 AccountManager、不回写 config）。
+        若需触发真实再平衡，请通过 AdaptiveController 的权威入口。
+        """
+        logger.info(
+            "AllocationAgent._rebalance is a no-op in observer mode; "
+            "AdaptiveController is the sole live allocation authority"
+        )
         self._last_rebalance_time = datetime.now()
 
     async def _calculate_optimal_allocation(self) -> Dict[str, float]:
         """计算最优资金分配"""
         if self._allocation_method == "equal":
-            return self._allocate_equal()
+            return self.get_optimized_weights()
         elif self._allocation_method == "performance":
-            return await self._allocate_by_performance()
+            return self.get_optimized_weights()
         elif self._allocation_method == "risk_adjusted":
-            return await self._allocate_by_risk_adjusted()
+            return self.get_optimized_weights()
         elif self._allocation_method == "dynamic":
             return await self._allocate_dynamic()
         else:
             return await self._allocate_dynamic()
-
-    def _allocate_equal(self) -> Dict[str, float]:
-        """等权分配"""
-        num_strategies = len(self._strategy_names)
-        return {s: 1.0 / num_strategies for s in self._strategy_names}
-
-    async def _allocate_by_performance(self) -> Dict[str, float]:
-        """基于表现分配：盈利越多，分配越多"""
-        scores = {}
-        for strategy in self._strategy_names:
-            metrics = self._get_strategy_metrics(strategy)
-            # 评分 = 胜率 * 利润因子 * 夏普比率
-            score = metrics["win_rate"] * metrics["profit_factor"] * max(0, metrics["sharpe_ratio"])
-            scores[strategy] = max(0.01, score)
-
-        total = sum(scores.values())
-        if total > 0:
-            return {s: scores[s] / total for s in self._strategy_names}
-        return self._allocate_equal()
-
-    async def _allocate_by_risk_adjusted(self) -> Dict[str, float]:
-        """风险调整分配：兼顾收益和风险"""
-        scores = {}
-        for strategy in self._strategy_names:
-            metrics = self._get_strategy_metrics(strategy)
-
-            # 风险调整收益 = 收益 / 风险
-            # 收益指标：胜率 * 利润因子
-            # 风险指标：最大回撤 + (1 - 夏普比率)
-            reward = metrics["win_rate"] * metrics["profit_factor"]
-            risk = metrics["max_drawdown"] + max(0, 1 - metrics["sharpe_ratio"])
-
-            if risk > 0:
-                score = reward / risk
-            else:
-                score = reward * 10  # 低风险时给予高评分
-
-            # 如果交易数不足，降低权重
-            if metrics["trade_count"] < self._min_trade_count:
-                confidence = min(1.0, metrics["trade_count"] / self._min_trade_count)
-                score *= confidence
-
-            scores[strategy] = max(0.001, score)
-
-        total = sum(scores.values())
-        if total > 0:
-            weights = {s: scores[s] / total for s in self._strategy_names}
-            return weights
-        return self._allocate_equal()
 
     async def _allocate_dynamic(self) -> Dict[str, float]:
         """
@@ -267,8 +337,8 @@ class AllocationAgent:
         """
         # 确保 DynamicAllocator 已初始化
         if self._dynamic_allocator is None:
-            logger.warning("DynamicAllocator not available, falling back to risk_adjusted")
-            return await self._allocate_by_risk_adjusted()
+            logger.warning("DynamicAllocator unavailable; returning empty recommendation (fail-closed)")
+            return {}
 
         # 收集所有策略的绩效指标
         strategy_metrics = {}
@@ -297,8 +367,11 @@ class AllocationAgent:
             total_equity = self.config.get("trading", {}).get("total_capital", 5000)
             total_capital = total_equity
 
+        total_equity = _finite(total_equity, 0.0)
+        total_capital = _finite(total_capital, total_equity)
         if total_equity <= 0:
-            return self._allocate_equal()
+            logger.warning("Allocation skipped: equity unavailable; returning empty recommendation (fail-closed)")
+            return {}
 
         # 调用 DynamicAllocator 计算分配方案
         try:
@@ -336,8 +409,8 @@ class AllocationAgent:
             return new_weights
 
         except Exception as e:
-            logger.error(f"DynamicAllocator failed: {e}, falling back to risk_adjusted")
-            return await self._allocate_by_risk_adjusted()
+            logger.error(f"DynamicAllocator failed: {e}; returning empty recommendation (fail-closed)")
+            return {}
 
     def _get_consecutive_count(self, strategy: str, streak_type: str) -> int:
         """获取连续盈利/亏损天数"""
@@ -365,7 +438,15 @@ class AllocationAgent:
         if len(history) < 5:
             return 0.02
 
-        pnl_values = [h.get("total_pnl", 0) for h in history]
+        pnl_values = []
+        for h in history:
+            v = _finite(h.get("total_pnl"), None)
+            if v is None:
+                continue
+            pnl_values.append(v)
+        if len(pnl_values) < 5:
+            return 0.02
+
         std = float(np.std(pnl_values))
         if std > 0:
             return float(std * np.sqrt(365))  # 日波动率年化
@@ -401,7 +482,15 @@ class AllocationAgent:
             return base_metrics
 
         # 企业级修复：统一 USDT 净额口径（t.pnl_usdt），废弃百分比 t.pnl
-        pnl_values = [t.pnl_usdt for t in trades if t.pnl_usdt is not None]
+        pnl_values = []
+        for t in trades:
+            try:
+                v = float(t.pnl_usdt)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(v) or math.isinf(v):
+                continue
+            pnl_values.append(v)
         if not pnl_values:
             base_metrics["trade_count"] = len(trades)
             return base_metrics
@@ -459,90 +548,44 @@ class AllocationAgent:
         return max_dd
 
     async def _apply_allocation_changes(self, new_weights: Dict[str, float]) -> Dict[str, float]:
-        """应用资金分配变更（带限制）。
+        """Observer-mode no-op.
 
-        单一写入口（P1-④）：归一化后的最终权重经 _publish_allocations 统一写入
-        AccountManager，并回写 config，确保 AccountManager / AdaptivePositionSizer /
-        AllocationAgent 三处读取同一数据源，避免各自快照导致分配值分歧。
+        单一权威写入已收敛到 AdaptiveController；AllocationAgent 不再写入
+        AccountManager 或 config，避免双引擎改写策略权重。返回空变更集。
         """
-        changes = {}
-
-        # 禁用策略强制归零（config 未启用的策略不应占用资金）
-        enabled_names = set(self._enabled_strategy_names())
-        for strategy in self._strategy_names:
-            if strategy not in enabled_names:
-                current = self._strategy_weights.get(strategy, 0.0)
-                if abs(current) > 0.001:
-                    self._strategy_weights[strategy] = 0.0
-                    changes[strategy] = -current
-                new_weights.pop(strategy, None)
-
-        for strategy, new_weight in new_weights.items():
-            current_weight = self._strategy_weights.get(strategy, 0)
-            diff = new_weight - current_weight
-
-            # 限制单次变更幅度
-            max_change = self._max_allocation_change
-            if abs(diff) > max_change:
-                diff = max_change if diff > 0 else -max_change
-                new_weight = current_weight + diff
-
-            if abs(diff) > 0.001:
-                self._strategy_weights[strategy] = new_weight
-                changes[strategy] = diff
-
-        if changes:
-            self._normalize_weights()
-            self._publish_allocations(dict(self._strategy_weights))
-
-        return changes
+        logger.debug(
+            "AllocationAgent._apply_allocation_changes is a no-op in observer mode; "
+            "AdaptiveController owns live strategy weights"
+        )
+        return {}
 
     def _publish_allocations(self, weights: Dict[str, float]) -> None:
-        """将归一化后的最终权重发布到单一权威源（AccountManager），回写 config 兜底。"""
-        if self.account_manager is not None and hasattr(self.account_manager, "set_strategy_allocations"):
-            try:
-                self.account_manager.set_strategy_allocations(weights)
-                return
-            except Exception as e:
-                logger.error(f"Failed to publish allocations via AccountManager: {e}")
-        # 兜底：直接回写 config（保持原行为）
-        trading_cfg = self.config.get("trading", {})
-        for strategy, weight in weights.items():
-            trading_cfg[f"{strategy}_allocation"] = round(weight, 6)
+        """Observer-mode no-op.
 
-    async def _save_allocation_state(self):
-        """保存分配状态到文件（原子写入，防止崩溃损坏）"""
-        state = {
-            "last_rebalance_time": datetime.now().isoformat(),
-            "strategy_weights": self._strategy_weights,
-            "allocation_method": self._allocation_method,
-            "performance_history": self._performance_history
-        }
-
-        try:
-            import os
-            from core.atomic_writer import atomic_write_json
-            data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
-            os.makedirs(data_dir, exist_ok=True)
-            path = os.path.join(data_dir, "allocation_state.json")
-
-            if atomic_write_json(path, state):
-                logger.debug(f"Allocation state saved to {path}")
-            else:
-                logger.error(f"Failed to save allocation state atomically")
-        except Exception as e:
-            logger.error(f"Failed to save allocation state: {e}")
+        单一权威写入已收敛到 AdaptiveController；此处不再向 AccountManager 或
+        config 发布权重，避免双引擎改写策略权重。
+        """
+        logger.debug(
+            "AllocationAgent._publish_allocations is a no-op in observer mode; "
+            "AdaptiveController is the sole live allocation authority"
+        )
 
     def get_current_allocation(self) -> Dict[str, float]:
-        """获取当前资金分配"""
-        return dict(self._strategy_weights)
+        """获取当前资金分配（实时权威口径）。
+
+        优先返回 AdaptiveController 的实时可部署权重；未注入时回退到本地快照。
+        """
+        return self._get_live_weights()
 
     def get_allocation_report(self) -> Dict[str, Any]:
-        """生成资金分配报告（增强版：含 DynamicAllocator 数据）"""
+        """生成资金分配报告（增强版：含 DynamicAllocator 数据）。
+
+        current_weights 字段使用实时权威权重，避免与真实分配口径脱节。
+        """
         report = {
             "last_rebalance_time": self._last_rebalance_time.isoformat() if self._last_rebalance_time else None,
             "allocation_method": self._allocation_method,
-            "current_weights": self._strategy_weights,
+            "current_weights": self._get_live_weights(),
             "strategy_metrics": {}
         }
 
@@ -567,12 +610,18 @@ class AllocationAgent:
         return report
 
     async def get_recommendations(self) -> Dict[str, Any]:
-        """获取资金分配建议"""
+        """获取资金分配建议（advisory only，仅供参考，不直接执行）。
+
+        以 AdaptiveController 的实时可部署权重为 current 基准，计算与
+        优化器建议权重的差异，避免使用陈旧 config 快照产生误导性 diff。
+        真实再平衡由 AdaptiveController 权威执行。
+        """
         optimal = await self._calculate_optimal_allocation()
+        live_weights = self._get_live_weights()
         recommendations = {}
 
         for strategy, optimal_weight in optimal.items():
-            current_weight = self._strategy_weights.get(strategy, 0)
+            current_weight = live_weights.get(strategy, 0)
             diff = optimal_weight - current_weight
 
             recommendations[strategy] = {
@@ -585,6 +634,12 @@ class AllocationAgent:
         return recommendations
 
     async def manual_rebalance(self):
-        """手动触发重新平衡"""
-        logger.info("Manual rebalance requested")
-        await self._rebalance()
+        """Observer-mode no-op.
+
+        手动触发再平衡在 observer 模式下被禁用；真实再平衡需通过
+        AdaptiveController 的权威入口执行，避免双引擎冲突。
+        """
+        logger.warning(
+            "AllocationAgent.manual_rebalance is disabled in observer mode; "
+            "use AdaptiveController for live allocation changes"
+        )

@@ -10,12 +10,14 @@
 """
 
 import asyncio
+import json
 import math
-from datetime import datetime
-from typing import Dict, Any, Optional, List
-from loguru import logger
-from dataclasses import dataclass
 import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
 
 
 @dataclass
@@ -38,7 +40,7 @@ class StopLossEvent:
 
 class StopLossManager:
     """统一止损管理器"""
-    
+
     def __init__(self, config: Dict[str, Any], okx_client, redis_cache, trade_journal, order_executor):
         self.config = config
         self._okx_client = okx_client
@@ -48,7 +50,9 @@ class StopLossManager:
         self._conditional_manager = None  # P0: 由Scheduler在初始化后注入
         self._reversal_tp_engine = None   # 行情反转落袋引擎，由 Scheduler 注入
         self._market_regime_detector = None  # HMM 检测器，用于自动获取反转信号
-        
+        self._regime_arbiter = None  # RegimeArbiter（融合后统一 regime），优先于 HMM 检测器
+        self._alert_callback = None
+
         # 止损配置（从config读取）
         trading_cfg = config.get("trading", {})
         self._max_stop_loss_pct = trading_cfg.get("max_stop_loss_pct", 0.05)  # 全局硬性止损上限5%
@@ -65,24 +69,28 @@ class StopLossManager:
         self._trailing_activation_threshold = trading_cfg.get("trailing_activation_threshold", 0.015)  # 1.5%盈利激活
         self._trailing_min_distance = trading_cfg.get("trailing_min_distance", 0.005)  # 最小追踪距离0.5%
         self._force_execution_enabled = trading_cfg.get("force_stop_loss_execution", True)
-        
+        self._slippage_buffer = trading_cfg.get("stop_loss_slippage_buffer", 0.001)  # 止损滑点缓冲0.1%
+
         # 止损事件历史
         self._stop_loss_events: List[StopLossEvent] = []
         self._pending_stop_losses: Dict[str, Dict[str, Any]] = {}  # key(symbol:strategy) -> stop_loss_order
         self._triggered_recently: Dict[str, float] = {}  # key(symbol:strategy) -> trigger_time, 防重复触发
         self._sl_cooldown_seconds = 120  # 同一position的止损冷却时间（秒）
-        
+
         # 止损审计数据库
         self._db_path = config.get("sqlite", {}).get("db_path", "./data/trading.db")
+        # init 阶段 alert_callback 尚未注入，关键失败先缓冲，待 set_alert_callback 时补发
+        self._buffered_alerts: List[Dict[str, Any]] = []
         self._init_audit_table()
-        
+        self._load_pending_stop_losses()
+
         # 回调函数（策略注入）
         self._strategy_callbacks: Dict[str, callable] = {}
-        
+
         logger.info(f"StopLossManager initialized: max_sl={self._max_stop_loss_pct:.2%}, "
                    f"trailing_activation={self._trailing_activation_threshold:.2%}, "
                    f"force_execution={self._force_execution_enabled}")
-    
+
     def _init_audit_table(self):
         """初始化止损审计表"""
         conn = None
@@ -109,13 +117,105 @@ class StopLossManager:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_stop_losses (
+                    position_key VARCHAR(160) PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.commit()
         except Exception as e:
-            logger.warning(f"Failed to init stop_loss_audit table: {e}")
+            logger.critical(f"Failed to init stop_loss_audit table: {e}")
+            self._emit_alert(
+                "STOP_LOSS_AUDIT_INIT_FAILED",
+                f"止损审计表初始化失败，止损记录将无法落盘: {e}",
+                severity="CRITICAL",
+            )
         finally:
             if conn:
                 conn.close()
-    
+
+    def _load_pending_stop_losses(self) -> None:
+        """恢复进程重启前尚未成功执行的止损状态。"""
+        conn = None
+        try:
+            conn = sqlite3.connect(self._db_path)
+            rows = conn.execute(
+                "SELECT position_key, payload FROM pending_stop_losses"
+            ).fetchall()
+            for position_key, payload in rows:
+                record = json.loads(payload)
+                if not isinstance(record, dict):
+                    raise ValueError(f"pending stop-loss payload is not an object: {position_key}")
+                self._pending_stop_losses[position_key] = record
+        except Exception as e:
+            logger.critical(f"Failed to restore pending stop-loss state: {e}")
+            # 恢复失败意味着可能有未平仓的止损单丢失，必须通知运营人员人工介入
+            self._emit_alert(
+                "STOP_LOSS_RESTORE_FAILED",
+                f"止损挂单状态恢复失败，可能存在未平仓风险仓位: {e}",
+                severity="CRITICAL",
+            )
+        finally:
+            if conn:
+                conn.close()
+
+    def _persist_pending_stop_loss(
+        self, position_key: str, record: Dict[str, Any]
+    ) -> None:
+        """持久化止损失败状态，避免进程重启丢失未平仓风险记录。"""
+        conn = None
+        try:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO pending_stop_losses
+                    (position_key, payload, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (position_key, json.dumps(record, allow_nan=False)),
+            )
+            conn.commit()
+        except (OSError, sqlite3.Error, TypeError, ValueError) as e:
+            logger.critical(
+                f"Failed to persist pending stop loss {position_key}: {e}"
+            )
+            # 持久化失败意味着进程重启后将丢失该未平仓止损记录，风险裸奔
+            self._emit_alert(
+                "STOP_LOSS_PERSIST_FAILED",
+                f"止损挂单状态持久化失败，重启后将丢失未平仓记录: {position_key}: {e}",
+                severity="CRITICAL",
+                symbol=record.get("symbol", ""),
+                metadata={"position_key": position_key, "strategy_name": record.get("strategy_name", "")},
+            )
+        finally:
+            if conn:
+                conn.close()
+
+    def _remove_persisted_pending_stop_loss(self, position_key: str) -> None:
+        conn = None
+        try:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute(
+                "DELETE FROM pending_stop_losses WHERE position_key = ?",
+                (position_key,),
+            )
+            conn.commit()
+        except (OSError, sqlite3.Error) as e:
+            logger.critical(
+                f"Failed to remove resolved pending stop loss {position_key}: {e}"
+            )
+            # 清理失败会导致重启后重复尝试已平仓的止损，但不构成新增风险
+            self._emit_alert(
+                "STOP_LOSS_REMOVE_FAILED",
+                f"已解决止损挂单状态清理失败，可能导致重启后重复处理: {position_key}: {e}",
+                severity="WARNING",
+            )
+        finally:
+            if conn:
+                conn.close()
+
     def register_strategy_callback(self, strategy_name: str, callback: callable):
         """注册策略回调函数（用于强制执行止损）"""
         self._strategy_callbacks[strategy_name] = callback
@@ -125,6 +225,75 @@ class StopLossManager:
         """注入条件单管理器，以便止损触发时取消相关条件单（避免孤儿订单）"""
         self._conditional_manager = conditional_manager
 
+    def set_alert_callback(self, callback):
+        """注入异步告警回调，用于止损执行失败等高优先级风险事件。
+
+        若 __init__ 阶段（callback 尚未注入）发生了关键失败，会在此处补发。
+        """
+        self._alert_callback = callback
+        # 补发 init 阶段缓冲的告警（此时 callback 已就绪）
+        for alert in self._buffered_alerts:
+            try:
+                coro = callback(
+                    alert["alert_type"], alert["message"],
+                    severity=alert["severity"], symbol=alert["symbol"],
+                    metadata=alert["metadata"],
+                )
+                if asyncio.iscoroutine(coro):
+                    try:
+                        asyncio.get_running_loop().create_task(coro)
+                    except RuntimeError:
+                        # 无运行中的事件循环（如单元测试同步调用），记录并丢弃
+                        logger.warning(
+                            f"[ALERT_DROPPED] {alert['alert_type']}: "
+                            f"no running event loop for async alert callback"
+                        )
+            except Exception as e:
+                logger.error(f"Failed to flush buffered alert {alert['alert_type']}: {e}")
+        self._buffered_alerts.clear()
+
+    def _emit_alert(
+        self,
+        alert_type: str,
+        message: str,
+        severity: str = "CRITICAL",
+        symbol: str = "",
+        metadata: Dict[str, Any] = None,
+    ) -> None:
+        """统一风险告警出口。
+
+        - callback 未注入（init 阶段）：缓冲，待 set_alert_callback 补发。
+        - callback 已注入：将异步 coroutine 调度到当前运行中的事件循环。
+        - 回调自身异常：仅记录日志，绝不影响止损主流程（fail-safe 而非 fail-closed）。
+        """
+        if self._alert_callback is None:
+            self._buffered_alerts.append({
+                "alert_type": alert_type,
+                "message": message,
+                "severity": severity,
+                "symbol": symbol,
+                "metadata": metadata,
+            })
+            return
+        try:
+            coro = self._alert_callback(
+                alert_type, message, severity=severity,
+                symbol=symbol, metadata=metadata,
+            )
+            if asyncio.iscoroutine(coro):
+                try:
+                    asyncio.get_running_loop().create_task(coro)
+                except RuntimeError:
+                    logger.warning(
+                        f"[ALERT_DROPPED] {alert_type}: no running event loop"
+                    )
+        except Exception as e:
+            logger.error(f"Failed to emit risk alert {alert_type}: {e}")
+
+    def get_pending_stop_losses(self) -> List[Dict[str, Any]]:
+        """返回止损失败且仍需重试的仓位信息。"""
+        return [dict(item) for item in self._pending_stop_losses.values()]
+
     def set_reversal_take_profit_engine(self, engine):
         """注入行情反转落袋引擎（由 Scheduler 调用）"""
         self._reversal_tp_engine = engine
@@ -132,7 +301,11 @@ class StopLossManager:
     def set_market_regime_detector(self, detector):
         """注入 HMM 检测器，用于自动获取反转信号（由 Scheduler 调用）"""
         self._market_regime_detector = detector
-    
+
+    def set_regime_arbiter(self, arbiter):
+        """注入 RegimeArbiter（融合后统一 regime），优先于 HMM 检测器（由 Scheduler 调用）"""
+        self._regime_arbiter = arbiter
+
     def calculate_stop_loss(
         self,
         symbol: str,
@@ -143,7 +316,7 @@ class StopLossManager:
     ) -> Dict[str, Any]:
         """
         计算止损价格（统一逻辑）
-        
+
         返回：
         {
             "hard_stop": float,  # 硬性止损价
@@ -183,14 +356,20 @@ class StopLossManager:
             }
 
         precision = 4
+        tick_sz_float = 0.0001
         try:
             # 获取价格精度
             inst_info = self._okx_client.get_instrument_info(symbol)
             if inst_info:
-                tick_sz = inst_info.get("tickSz", "0.0001")
-                precision = len(tick_sz.split(".")[-1]) if "." in tick_sz else 0
-        except Exception:
-            pass
+                tick_sz_str = inst_info.get("tickSz", "0.0001")
+                tick_sz_float = float(tick_sz_str)
+                precision = len(tick_sz_str.split(".")[-1]) if "." in tick_sz_str else 0
+        except Exception as e:
+            # 获取精度失败时回退默认精度 4，避免止损价因精度错误被拒绝
+            logger.warning(
+                f"[STOP_LOSS] Failed to fetch price precision for {symbol}, "
+                f"using default {precision}: {e}"
+            )
 
         # ── 数据层：strategy_sl_pct 清洗（NaN/Inf/类型/越界 → 安全默认） ──
         strategy_sl_pct = strategy_config.get("stop_loss_pct", 0.03)
@@ -225,7 +404,7 @@ class StopLossManager:
             hard_stop = entry_price
         if not math.isfinite(max_stop) or max_stop <= 0:
             max_stop = entry_price
-        
+
         # ATR自适应止损
         atr_stop = hard_stop
         if atr > 0:
@@ -237,7 +416,7 @@ class StopLossManager:
             else:
                 atr_stop = entry_price + atr * atr_multiplier
                 atr_stop = min(atr_stop, hard_stop)
-        
+
         # 最终止损：取更严格的（对于多头，取更高的止损价；对于空头，取更低的止损价）
         if direction == "long":
             final_stop = max(hard_stop, atr_stop)
@@ -246,21 +425,38 @@ class StopLossManager:
         else:
             final_stop = min(hard_stop, atr_stop)
             final_stop = min(final_stop, max_stop)
-        
+
+        # 滑点缓冲：止损价向更保守方向偏移，补偿执行滑点
+        if self._slippage_buffer > 0:
+            if direction == "long":
+                final_stop = final_stop * (1 - self._slippage_buffer)
+            else:
+                final_stop = final_stop * (1 + self._slippage_buffer)
+
         # Trailing stop激活价格
         if direction == "long":
             trailing_activation = entry_price * (1 + self._trailing_activation_threshold)
         else:
             trailing_activation = entry_price * (1 - self._trailing_activation_threshold)
-        
+
+        # Tick对齐：止损价向更保守方向对齐到tick_size
+        # 多头止损向下对齐（floor），空头止损向上对齐（ceil）
+        def _tick_align(price: float, conservative_down: bool) -> float:
+            if tick_sz_float <= 0:
+                return round(price, precision)
+            aligned = math.floor(price / tick_sz_float) * tick_sz_float if conservative_down \
+                else math.ceil(price / tick_sz_float) * tick_sz_float
+            return round(aligned, precision)
+
+        is_long = direction == "long"
         return {
-            "hard_stop": round(hard_stop, precision),
-            "atr_stop": round(atr_stop, precision),
-            "final_stop": round(final_stop, precision),
-            "max_stop": round(max_stop, precision),
+            "hard_stop": _tick_align(hard_stop, conservative_down=is_long),
+            "atr_stop": _tick_align(atr_stop, conservative_down=is_long),
+            "final_stop": _tick_align(final_stop, conservative_down=is_long),
+            "max_stop": _tick_align(max_stop, conservative_down=is_long),
             "trailing_activation": round(trailing_activation, precision),
         }
-    
+
     def update_trailing_stop(
         self,
         symbol: str,
@@ -272,19 +468,19 @@ class StopLossManager:
     ) -> Optional[float]:
         """
         更新Trailing Stop
-        
+
         返回：新的止损价（如果需要更新），否则返回None
         """
         if peak_price is None:
             peak_price = current_price
-        
+
         precision = 4
-        
+
         # 检查是否已激活trailing stop
         if direction == "long":
             if current_price < entry_price * (1 + self._trailing_activation_threshold):
                 return None
-            
+
             # 盈利超过阈值，开始追踪
             new_stop = current_price * (1 - self._trailing_min_distance)
             # 只向有利方向移动
@@ -293,13 +489,13 @@ class StopLossManager:
         else:
             if current_price > entry_price * (1 - self._trailing_activation_threshold):
                 return None
-            
+
             new_stop = current_price * (1 + self._trailing_min_distance)
             if new_stop < current_stop:
                 return round(new_stop, precision)
-        
+
         return None
-    
+
     async def check_and_execute_stop_loss(
         self,
         symbol: str,
@@ -309,19 +505,19 @@ class StopLossManager:
     ) -> bool:
         """
         检查并执行止损（核心方法）
-        
+
         返回：是否触发了止损
         """
         direction = position_state.get("direction", "")
         entry_price = position_state.get("entry_price", 0)
         stop_loss_price = position_state.get("stop_loss") or position_state.get("final_stop") or position_state.get("adjusted_stop_loss")
-        
+
         if not direction or entry_price <= 0 or stop_loss_price <= 0:
             return False
-        
+
         triggered = False
         trigger_type = ""
-        
+
         # 检查是否触发止损
         if direction == "long" and current_price <= stop_loss_price:
             triggered = True
@@ -329,10 +525,10 @@ class StopLossManager:
         elif direction == "short" and current_price >= stop_loss_price:
             triggered = True
             trigger_type = position_state.get("exit_reason", "hard_stop")
-        
+
         if not triggered:
             return False
-        
+
         # 防重复触发：同一symbol+strategy在冷却期内不重复触发
         sl_key = f"{symbol}:{strategy_name}"
         now_ts = datetime.now().timestamp()
@@ -342,23 +538,23 @@ class StopLossManager:
             return False
         # P0 修复：冷却写入延后到执行成功之后，避免止损失败被 120s 冷却阻塞补救。
         # 若执行失败，不设冷却，下一个 tick 会再次进入本方法并重试止损平仓。
-        
+
         # 触发止损，记录事件
         start_time = datetime.now()
         logger.warning(f"[STOP_LOSS_TRIGGER] {symbol} {strategy_name}: {trigger_type}, "
                       f"entry={entry_price:.4f}, current={current_price:.4f}, stop={stop_loss_price:.4f}")
-        
+
         # 强制执行止损平仓
         # 兼容不同策略的字段命名：trend用"current_quantity"，其他用"quantity"
         quantity = position_state.get("current_quantity", 0) or position_state.get("quantity", 0)
-        
+
         # qty=0 表示持仓已不存在（已平仓但状态未同步），跳过执行
         if quantity <= 0:
             logger.info(f"[STOP_LOSS_SKIP] {symbol} {strategy_name}: qty=0, position already closed")
             return False
-        
+
         exit_reason = trigger_type if trigger_type in ["stop_loss", "trailing_stop", "atr_stop"] else "stop_loss"
-        
+
         # 调用OrderExecutor执行止损平仓（最高优先级）
         success = await self._execute_stop_loss_order(
             symbol=symbol,
@@ -384,16 +580,26 @@ class StopLossManager:
             }
             # 移除已成功处理的挂起止损单
             self._pending_stop_losses.pop(sl_key, None)
+            self._remove_persisted_pending_stop_loss(sl_key)
             try:
                 if self._order_executor is not None and hasattr(self._order_executor, "sqlite_storage"):
                     self._order_executor.sqlite_storage.close_open_record(symbol, strategy_name, exit_reason)
             except Exception as e:
-                logger.debug(f"Failed to close open record after stop loss {symbol}/{strategy_name}: {e}")
+                # 止损平仓后 open 记录未关闭，会导致 reconcile 误判为幽灵仓位，
+                # 需提升至 warning 以便复盘定位（不告警，因止损本身已成功执行）
+                logger.warning(
+                    f"Failed to close open record after stop loss "
+                    f"{symbol}/{strategy_name}: {e}"
+                )
         else:
             # P0 修复：止损失败，明确告警并挂起待重试，且不设冷却（下一个 tick 会再次进入本方法重试）
+            previous_failure = self._pending_stop_losses.get(sl_key, {})
+            failure_count = int(previous_failure.get("failure_count", 0)) + 1
+            first_attempt_at = previous_failure.get("first_attempt_at", start_time.isoformat())
             logger.error(
                 f"[STOP_LOSS_EXECUTION_FAILED] {symbol} {strategy_name}: stop loss order failed after retries, "
-                f"position NOT closed. entry={entry_price:.4f}, stop={stop_loss_price:.4f}, current={current_price:.4f}"
+                f"position NOT closed. entry={entry_price:.4f}, stop={stop_loss_price:.4f}, "
+                f"current={current_price:.4f}, consecutive_failures={failure_count}"
             )
             self._pending_stop_losses[sl_key] = {
                 "symbol": symbol,
@@ -402,45 +608,80 @@ class StopLossManager:
                 "quantity": quantity,
                 "current_price": current_price,
                 "exit_reason": exit_reason,
-                "first_attempt_at": start_time.isoformat(),
+                "first_attempt_at": first_attempt_at,
+                "last_attempt_at": start_time.isoformat(),
+                "failure_count": failure_count,
             }
+            self._persist_pending_stop_loss(sl_key, self._pending_stop_losses[sl_key])
+            if self._alert_callback is not None:
+                try:
+                    await self._alert_callback(
+                        "STOP_LOSS_EXECUTION_FAILED",
+                        f"止损执行失败，仓位仍未平: {symbol} {strategy_name}; "
+                        f"stop={stop_loss_price:.4f}, current={current_price:.4f}, "
+                        f"consecutive_failures={failure_count}",
+                        severity="EMERGENCY",
+                        symbol=symbol,
+                        metadata={
+                            "strategy_name": strategy_name,
+                            "quantity": quantity,
+                            "stop_loss_price": stop_loss_price,
+                            "current_price": current_price,
+                            "failure_count": failure_count,
+                        },
+                    )
+                except Exception as alert_error:
+                    logger.error(
+                        f"Failed to dispatch stop-loss failure alert for "
+                        f"{symbol}/{strategy_name}: {alert_error}"
+                    )
 
-        end_time = datetime.now()
-        execution_latency_ms = (end_time - start_time).total_seconds() * 1000
-        
-        # 记录止损事件
-        pnl = (current_price - entry_price) * quantity if direction == "long" else (entry_price - current_price) * quantity
-        # ── 运算层：pnl_percent 除零/NaN 防护 ──
-        if not math.isfinite(entry_price) or entry_price == 0:
-            pnl_percent = 0.0
-        else:
-            pnl_percent = (current_price - entry_price) / entry_price if direction == "long" else (entry_price - current_price) / entry_price
-            if not math.isfinite(pnl_percent):
+        if success:
+            end_time = datetime.now()
+            execution_latency_ms = (end_time - start_time).total_seconds() * 1000
+
+            # Only successful executions are recorded as exits; failed attempts stay
+            # visible through the pending-stop state and emergency alert above.
+            pnl = (
+                (current_price - entry_price) * quantity
+                if direction == "long"
+                else (entry_price - current_price) * quantity
+            )
+            if not math.isfinite(entry_price) or entry_price == 0:
                 pnl_percent = 0.0
-        
-        event = StopLossEvent(
-            symbol=symbol,
-            strategy_name=strategy_name,
-            trigger_type=trigger_type,
-            entry_price=entry_price,
-            trigger_price=stop_loss_price,
-            exit_price=current_price,
-            quantity=quantity,
-            pnl=pnl,
-            pnl_percent=pnl_percent,
-            exit_reason=exit_reason,
-            timestamp=end_time,
-            execution_latency_ms=execution_latency_ms,
-            slippage_pct=abs(current_price - stop_loss_price) / stop_loss_price if stop_loss_price > 0 else 0
-        )
-        
-        self._stop_loss_events.append(event)
-        # 防止内存泄漏：最多保留最近500条事件
-        if len(self._stop_loss_events) > 500:
-            self._stop_loss_events = self._stop_loss_events[-500:]
-        self._save_stop_loss_audit(event)
-        
-        return True
+            else:
+                pnl_percent = (
+                    (current_price - entry_price) / entry_price
+                    if direction == "long"
+                    else (entry_price - current_price) / entry_price
+                )
+                if not math.isfinite(pnl_percent):
+                    pnl_percent = 0.0
+
+            event = StopLossEvent(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                trigger_type=trigger_type,
+                entry_price=entry_price,
+                trigger_price=stop_loss_price,
+                exit_price=current_price,
+                quantity=quantity,
+                pnl=pnl,
+                pnl_percent=pnl_percent,
+                exit_reason=exit_reason,
+                timestamp=end_time,
+                execution_latency_ms=execution_latency_ms,
+                slippage_pct=abs(current_price - stop_loss_price) / stop_loss_price
+                if stop_loss_price > 0
+                else 0,
+            )
+
+            self._stop_loss_events.append(event)
+            if len(self._stop_loss_events) > 500:
+                self._stop_loss_events = self._stop_loss_events[-500:]
+            self._save_stop_loss_audit(event)
+
+        return success
 
     async def compute_reversal_take_profit(
         self,
@@ -481,14 +722,31 @@ class StopLossManager:
             return None
 
     async def _fetch_reversal_inputs(self, symbol: str, hmm_result: Dict[str, Any], ohlcv_data: List):
-        """自动获取反转信号（未显式传入时）：HMM 检测器 + K 线兜底。"""
+        """自动获取反转信号（未显式传入时）：RegimeArbiter 优先，HMM 检测器兜底 + K 线兜底。"""
         if hmm_result is None:
-            detector = getattr(self, '_market_regime_detector', None)
-            if detector is not None and hasattr(detector, 'get_regime'):
+            # 优先 RegimeArbiter（融合后统一 regime，含检测器 reversal 概率）
+            arbiter = getattr(self, '_regime_arbiter', None)
+            if arbiter is not None and hasattr(arbiter, 'arbitrate'):
                 try:
-                    hmm_result = detector.get_regime(symbol)
+                    unified = arbiter.arbitrate(symbol)
+                    if isinstance(unified, dict) and unified.get('arbiter_strategy') != 'main_fallback':
+                        # 从 arbiter 输出重建 hmm_result 结构（供下游 compute_reversal_take_profit 复用）
+                        hmm_result = unified.get('detector_raw') or {
+                            'symbol': symbol,
+                            'regime': unified.get('detector_regime'),
+                            'probabilities': {'reversal': unified.get('detector_reversal_prob', 0.0)},
+                            'early_warnings': unified.get('early_warnings', []),
+                        }
                 except Exception as e:
-                    logger.debug(f"get_regime failed for {symbol}: {e}")
+                    logger.debug(f"arbiter.arbitrate failed for {symbol}: {e}")
+            # arbiter 未命中或失败 → 回退 HMM 检测器
+            if hmm_result is None:
+                detector = getattr(self, '_market_regime_detector', None)
+                if detector is not None and hasattr(detector, 'get_regime'):
+                    try:
+                        hmm_result = detector.get_regime(symbol)
+                    except Exception as e:
+                        logger.debug(f"get_regime failed for {symbol}: {e}")
 
         if ohlcv_data is None:
             client = getattr(self, '_okx_client', None)
@@ -554,6 +812,13 @@ class StopLossManager:
             position_state["reversal_source"] = result.reversal_source
 
             if result.exit_action == "none":
+                # S5: 动态止盈收紧闭环 — 无平仓动作时，把反转引擎收紧后的止盈价
+                # 实际替换到交易所 TP 条件单（cancel+replace）。此前只写回持仓状态，
+                # 交易所侧条件单仍是旧价，收紧形同虚设。
+                if result.adaptive_tp_price is not None and self._conditional_manager:
+                    await self._tighten_take_profit_conditional(
+                        symbol, direction, result.adaptive_tp_price
+                    )
                 return False
 
             is_full = result.exit_action == "close"
@@ -579,6 +844,50 @@ class StopLossManager:
         except Exception as e:
             logger.error(f"[REVERSAL_TAKE_PROFIT_ERROR] {symbol} {strategy_name}: {e}")
             return False
+
+    async def _tighten_take_profit_conditional(self, symbol: str, direction: str, new_tp_price: float):
+        """S5: 仅在止盈价「实质收紧」时替换交易所 TP 条件单（cancel+replace）。
+
+        反转引擎每个 tick 都会返回 adaptive_tp_price，若无条件替换会每个 tick
+        都 cancel+replace 一次 TP，既浪费配额又可能触发限流。这里先比对当前
+        活跃 TP 条件单中最「紧」的价位，仅当新价更保守（多头更低 / 空头更高）
+        时才调用 ConditionalOrderManager.update_take_profit 收紧。
+        """
+        try:
+            tp_orders = self._conditional_manager.get_tp_orders_for_symbol(symbol)
+            if not tp_orders:
+                return
+
+            current_tightest = None
+            for _, info in tp_orders:
+                try:
+                    p = float(info.get("price", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if p <= 0:
+                    continue
+                if current_tightest is None:
+                    current_tightest = p
+                elif direction == "long" and p < current_tightest:
+                    current_tightest = p
+                elif direction == "short" and p > current_tightest:
+                    current_tightest = p
+
+            if current_tightest is None:
+                return
+
+            # 仅当新价比当前最紧的 TP 更保守时才收紧，避免反复替换
+            if direction == "long" and new_tp_price >= current_tightest:
+                return
+            if direction == "short" and new_tp_price <= current_tightest:
+                return
+
+            logger.info(
+                f"[TP_TIGHTEN] {symbol}: {current_tightest:.4f} -> {new_tp_price:.4f} ({direction})"
+            )
+            await self._conditional_manager.update_take_profit(symbol, new_tp_price)
+        except Exception as e:
+            logger.warning(f"Failed to tighten TP conditional for {symbol}: {e}")
 
     async def _execute_reversal_take_profit_order(
         self,
@@ -713,7 +1022,7 @@ class StopLossManager:
                 else:
                     logger.error(f"[STOP_LOSS_EXECUTION_ERROR] {symbol} {strategy_name} exhausted {max_retries} retries: {e}")
         return False
-    
+
     def _save_stop_loss_audit(self, event: StopLossEvent):
         """保存止损审计记录到数据库"""
         conn = None
@@ -722,7 +1031,7 @@ class StopLossManager:
             conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO stop_loss_audit 
+                INSERT INTO stop_loss_audit
                 (symbol, strategy_name, trigger_type, entry_price, trigger_price, exit_price,
                  quantity, pnl, pnl_percent, exit_reason, timestamp, execution_latency_ms, slippage_pct)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -735,10 +1044,64 @@ class StopLossManager:
             conn.commit()
         except Exception as e:
             logger.error(f"Failed to save stop_loss_audit: {e}")
+            # 审计落盘失败不影响已执行的止损，但会导致复盘缺失，需通知运营
+            self._emit_alert(
+                "STOP_LOSS_AUDIT_SAVE_FAILED",
+                f"止损审计记录保存失败: {e}",
+                severity="WARNING",
+                symbol=event.symbol,
+                metadata={"strategy_name": event.strategy_name, "trigger_type": event.trigger_type},
+            )
         finally:
             if conn:
                 conn.close()
-    
+
+    def record_stop_loss_audit(
+        self,
+        symbol: str,
+        strategy_name: str,
+        trigger_type: str,
+        entry_price: float,
+        trigger_price: float,
+        exit_price: float,
+        quantity: float,
+        pnl: float,
+        pnl_percent: float,
+        exit_reason: str = "stop_loss",
+        execution_latency_ms: float = 0.0,
+        slippage_pct: float = 0.0,
+    ) -> bool:
+        """供策略层直接落库止损审计，无需走 check_and_execute_stop_loss 执行路径。
+
+        修复：grid 等策略用自己的止损触发逻辑（_trigger_stop_loss 发信号+切趋势模式），
+        不经过 check_and_execute_stop_loss，导致 stop_loss_audit 表长期缺失网格止损记录，
+        复盘时止损执行质量与触发次数不可见。此处提供无副作用的纯审计落库入口。
+        """
+        try:
+            event = StopLossEvent(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                trigger_type=trigger_type,
+                entry_price=float(entry_price or 0.0),
+                trigger_price=float(trigger_price or 0.0),
+                exit_price=float(exit_price or 0.0),
+                quantity=float(quantity or 0.0),
+                pnl=float(pnl or 0.0),
+                pnl_percent=float(pnl_percent or 0.0),
+                exit_reason=exit_reason,
+                timestamp=datetime.now(),
+                execution_latency_ms=float(execution_latency_ms or 0.0),
+                slippage_pct=float(slippage_pct or 0.0),
+            )
+            self._stop_loss_events.append(event)
+            if len(self._stop_loss_events) > 500:
+                self._stop_loss_events = self._stop_loss_events[-500:]
+            self._save_stop_loss_audit(event)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to record stop_loss_audit for {symbol}/{strategy_name}: {e}")
+            return False
+
     def get_stop_loss_statistics(self, strategy_name: str = None, days: int = 30) -> Dict[str, Any]:
         """获取止损统计"""
         conn = None
@@ -746,9 +1109,9 @@ class StopLossManager:
             conn = sqlite3.connect(self._db_path)
             conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.cursor()
-            
+
             query = """
-                SELECT 
+                SELECT
                     trigger_type,
                     COUNT(*) as count,
                     AVG(pnl_percent) as avg_pnl_pct,
@@ -758,26 +1121,26 @@ class StopLossManager:
                 WHERE timestamp >= datetime('now', 'localtime', ?)
             """
             params = [f'-{days} days']
-            
+
             if strategy_name:
                 query += " AND strategy_name = ?"
                 params.append(strategy_name)
-            
+
             query += " GROUP BY trigger_type"
-            
+
             cursor.execute(query, params)
             rows = cursor.fetchall()
-            
+
             stats = {
                 "trigger_types": {},
                 "total_count": 0,
                 "avg_execution_latency_ms": 0,
                 "avg_slippage_pct": 0
             }
-            
+
             total_latency = 0
             total_slippage = 0
-            
+
             for row in rows:
                 trigger_type, count, avg_pnl_pct, avg_latency_ms, avg_slippage_pct = row
                 stats["trigger_types"][trigger_type] = {
@@ -789,13 +1152,13 @@ class StopLossManager:
                 stats["total_count"] += count
                 total_latency += (avg_latency_ms or 0) * count
                 total_slippage += (avg_slippage_pct or 0) * count
-            
+
             if stats["total_count"] > 0:
                 stats["avg_execution_latency_ms"] = total_latency / stats["total_count"]
                 stats["avg_slippage_pct"] = total_slippage / stats["total_count"]
-            
+
             return stats
-            
+
         except Exception as e:
             logger.error(f"Failed to get stop_loss statistics: {e}")
             return {}

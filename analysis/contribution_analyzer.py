@@ -28,6 +28,21 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 from loguru import logger
 
+from utils.helpers import safe_finite
+
+
+def _safe_float(value, default=0.0):
+    """安全转换为有限浮点数；None/NaN/Inf/不可解析值回退为 default。"""
+    if value is None:
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if np.isnan(f) or np.isinf(f):
+        return default
+    return f
+
 
 # ============================================================
 # 数据模型
@@ -46,6 +61,7 @@ class StrategyContribution:
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
+    consecutive_losses: int = 0                 # 最大连续亏损笔数（负期望早期熔断信号）
     win_rate: float = 0.0
     avg_win: float = 0.0
     avg_loss: float = 0.0
@@ -59,6 +75,20 @@ class StrategyContribution:
     pnl_per_trade: float = 0.0                  # 每笔交易平均盈亏
     total_fees: float = 0.0                     # 总手续费
     fee_ratio: float = 0.0                      # 手续费 / |PnL| (手续费损耗率)
+    # 成本细分归因（企业级：区分手续费 / 资金费 / 滑点 / 点差）
+    total_funding_cost: float = 0.0             # 总资金费
+    total_slippage_cost: float = 0.0            # 总滑点成本
+    total_spread_cost: float = 0.0              # 总点差成本
+    # 方向归因（long / short 分解）
+    long_pnl: float = 0.0                       # 多单累计盈亏
+    short_pnl: float = 0.0                      # 空单累计盈亏
+    long_trades: int = 0                        # 多单笔数
+    short_trades: int = 0                       # 空单笔数
+    # 退出原因归因（止损 / 止盈 分解）
+    stop_loss_count: int = 0                    # 止损平仓笔数
+    stop_loss_pnl: float = 0.0                  # 止损单累计盈亏
+    take_profit_count: int = 0                  # 止盈平仓笔数
+    take_profit_pnl: float = 0.0                # 止盈单累计盈亏
     # 时间维度
     first_trade_time: Optional[str] = None
     last_trade_time: Optional[str] = None
@@ -69,6 +99,8 @@ class StrategyContribution:
     trend_pnl_7d_vs_30d: float = 0.0            # 近7天 vs 近30天 PnL 比率
     # 风险调整贡献
     risk_adjusted_contribution: float = 0.0     # PnL / MaxDD (风险调整后贡献)
+    sharpe_ratio: float = 0.0                   # 真实夏普比率（mean/std，与寻优侧口径一致）
+    volatility: float = 0.0                     # 单笔盈亏标准差（波动率，独立风险维度）
     # 【强化】生命周期
     lifecycle: str = "unknown"                   # newborn / mature / declining / dormant
     lifecycle_age_days: float = 0.0              # 首次交易至今的天数
@@ -102,6 +134,9 @@ class ContributionSnapshot:
     synergy_score: float = 0.0                   # 策略协同效应得分
     # 【强化】生命周期统计
     lifecycle_summary: Dict[str, int] = field(default_factory=dict)  # 各生命周期策略数
+    # 数据可用性标记（fail-closed）
+    available: bool = True
+    data_error: Optional[str] = None
 
 
 # ============================================================
@@ -125,9 +160,11 @@ class ContributionAnalyzer:
         # 历史快照（内存缓存）
         self._snapshot_history: List[ContributionSnapshot] = []
         self._max_history = 168  # 保留最近 168 个快照 (7天 * 24小时)
+        # 交易数据查询状态（fail-closed）
+        self._trade_query_error: Optional[str] = None
 
         # 策略生命周期配置
-        contrib_cfg = config.get("contribution", {})
+        contrib_cfg = self.config.get("contribution", {})
         self._lifecycle_config = contrib_cfg.get("lifecycle", {
             "newborn_max_days": 7,           # 7天内为新生期
             "mature_min_trades": 10,         # 成熟期最少10笔交易
@@ -146,6 +183,9 @@ class ContributionAnalyzer:
             "stability": 0.10,
         })
 
+        # 健康度最小样本量：低于此笔成交的策略不评估健康度（噪声太大），标记为 N/A
+        self._min_health_sample = int(contrib_cfg.get("health_min_sample", 5))
+
         # 窗口配置
         self._windows = {
             "1h": timedelta(hours=1),
@@ -159,7 +199,7 @@ class ContributionAnalyzer:
 
     def set_dynamic_allocations(self, allocations: Dict[str, float]):
         """注入动态分配权重（从 AdaptiveController）"""
-        self._dynamic_allocations = dict(allocations)
+        self._dynamic_allocations = dict(allocations or {})
 
     # ============================================================
     # 核心分析
@@ -186,6 +226,7 @@ class ContributionAnalyzer:
 
         # 1. 从 SQLite 获取交易数据
         trades = self._get_trades_since(since)
+        data_error = self._trade_query_error
         # 2. 按策略聚合
         strategy_data = self._aggregate_by_strategy(trades)
         # 3. 获取未实现盈亏（从持仓数据）
@@ -211,6 +252,7 @@ class ContributionAnalyzer:
                 total_trades=data["total_trades"],
                 winning_trades=data["winning_trades"],
                 losing_trades=data["losing_trades"],
+                consecutive_losses=data.get("consecutive_losses", 0),
                 win_rate=round(data["win_rate"], 4),
                 avg_win=round(data["avg_win"], 4),
                 avg_loss=round(data["avg_loss"], 4),
@@ -223,12 +265,25 @@ class ContributionAnalyzer:
                 pnl_per_trade=round(data["pnl_per_trade"], 4),
                 total_fees=round(data["total_fees"], 4),
                 fee_ratio=round(data["fee_ratio"], 4),
+                total_funding_cost=round(data.get("total_funding_cost", 0), 4),
+                total_slippage_cost=round(data.get("total_slippage_cost", 0), 4),
+                total_spread_cost=round(data.get("total_spread_cost", 0), 4),
+                long_pnl=round(data.get("long_pnl", 0), 4),
+                short_pnl=round(data.get("short_pnl", 0), 4),
+                long_trades=data.get("long_trades", 0),
+                short_trades=data.get("short_trades", 0),
+                stop_loss_count=data.get("stop_loss_count", 0),
+                stop_loss_pnl=round(data.get("stop_loss_pnl", 0), 4),
+                take_profit_count=data.get("take_profit_count", 0),
+                take_profit_pnl=round(data.get("take_profit_pnl", 0), 4),
                 first_trade_time=data.get("first_trade_time"),
                 last_trade_time=data.get("last_trade_time"),
                 active_hours=round(data.get("active_hours", 0), 2),
                 pnl_per_hour=round(data["pnl_per_hour"], 4),
                 risk_adjusted_contribution=round(
                     data["risk_adjusted_contribution"], 4),
+                sharpe_ratio=round(data["sharpe_ratio"], 4),
+                volatility=round(data.get("volatility", 0), 4),
             )
             contributions[sname] = contrib
 
@@ -281,6 +336,8 @@ class ContributionAnalyzer:
             overall_health_score=round(overall_health, 2),
             synergy_score=round(synergy, 4),
             lifecycle_summary=dict(lifecycle_summary),
+            available=data_error is None,
+            data_error=data_error,
         )
 
         # 14. 缓存历史
@@ -296,36 +353,113 @@ class ContributionAnalyzer:
 
     def _get_trades_since(self, since: datetime) -> List[Dict[str, Any]]:
         """获取指定时间范围内的交易记录"""
+        self._trade_query_error = None
         trades = []
         try:
             if self._sqlite:
-                records = self._sqlite.get_trade_records(limit=5000)
+                getter = getattr(self._sqlite, "get_trade_records_checked", None)
+                if getter is not None:
+                    records, err = getter(limit=5000)
+                else:
+                    records, err = self._sqlite.get_trade_records(limit=5000), None
+                if err:
+                    self._trade_query_error = f"sqlite_storage.get_trade_records failed: {err}"
+                    return []
+                if records is None:
+                    self._trade_query_error = "sqlite_storage.get_trade_records returned None"
+                    return []
                 for tr in records:
-                    close_time = tr.get("close_time")
-                    if not close_time:
+                    rec = self._normalize_trade_record(tr)
+                    ts = self._parse_close_time(rec.get("close_time"))
+                    if ts is None or ts < since:
                         continue
-                    if hasattr(close_time, "timestamp"):
-                        ts = datetime.fromtimestamp(close_time.timestamp())
-                    elif isinstance(close_time, str):
-                        try:
-                            ts = datetime.fromisoformat(close_time)
-                        except ValueError:
-                            continue
-                    else:
-                        continue
-                    if ts >= since:
-                        trades.append(tr)
+                    trades.append(rec)
             elif self._journal:
-                all_trades = self._journal.get_all_trade_records()
+                getter = getattr(self._journal, "get_trades_since", None)
+                if getter is None:
+                    self._trade_query_error = "trade_journal.get_trades_since unavailable"
+                    return []
+                all_trades = getter(since)
+                if all_trades is None:
+                    self._trade_query_error = "trade_journal.get_trades_since returned None"
+                    return []
                 for tr in all_trades:
-                    ct = tr.get("close_time")
-                    if ct:
-                        if hasattr(ct, "timestamp") and \
-                           datetime.fromtimestamp(ct.timestamp()) >= since:
-                            trades.append(tr)
+                    rec = self._normalize_trade_record(tr)
+                    ts = self._parse_close_time(rec.get("close_time"))
+                    if ts is None or ts < since:
+                        continue
+                    trades.append(rec)
+            else:
+                self._trade_query_error = "no data source configured (sqlite_storage/trade_journal)"
+                return []
         except Exception as e:
-            logger.debug(f"Trade retrieval error: {e}")
-        return trades
+            self._trade_query_error = f"Trade retrieval error: {e}"
+            logger.debug(self._trade_query_error)
+        return self._dedup_trades(trades)
+
+    @staticmethod
+    def _parse_close_time(value) -> Optional[datetime]:
+        """安全解析平仓时间，解析失败返回 None。"""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if hasattr(value, "timestamp"):
+            try:
+                return datetime.fromtimestamp(value.timestamp())
+            except (OSError, OverflowError, ValueError, TypeError):
+                return None
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    @staticmethod
+    def _normalize_trade_record(tr: Dict[str, Any]) -> Dict[str, Any]:
+        """统一交易记录字段（兼容 sqlite_storage 与 trade_journal 两种口径）。"""
+        if not isinstance(tr, dict):
+            return {}
+        rec = dict(tr)
+        if rec.get("pnl") is None:
+            rec["pnl"] = rec.get("pnl_usdt", 0)
+        if rec.get("fee") is None:
+            rec["fee"] = rec.get("fees", rec.get("commission", 0))
+        # 成本细分归因：兼容 funding_cost/slippage_cost/spread_cost 及缩写别名
+        rec["funding_cost"] = rec.get("funding_cost", rec.get("funding", 0))
+        rec["slippage_cost"] = rec.get("slippage_cost", rec.get("slippage", 0))
+        rec["spread_cost"] = rec.get("spread_cost", rec.get("spread", 0))
+        if rec.get("close_time") is None:
+            rec["close_time"] = rec.get("exit_time")
+        if rec.get("strategy_name") is None:
+            rec["strategy_name"] = rec.get("strategy", "unknown")
+        if "status" not in rec:
+            rec["status"] = "closed"
+        return rec
+
+    @staticmethod
+    def _dedup_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按交易 id 去重，避免重复统计。"""
+        seen = set()
+        result = []
+        for tr in trades:
+            if not isinstance(tr, dict):
+                continue
+            key = None
+            for k in ("id", "trade_id", "tradeId"):
+                v = tr.get(k)
+                if v is not None:
+                    key = v
+                    break
+            if key is None:
+                result.append(tr)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(tr)
+        return result
 
     def _aggregate_by_strategy(self,
                                 trades: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -339,21 +473,60 @@ class ContributionAnalyzer:
             "losing_trades": 0,
             "pnl_list": [],
             "total_fees": 0.0,
+            "total_funding_cost": 0.0,
+            "total_slippage_cost": 0.0,
+            "total_spread_cost": 0.0,
+            "long_pnl": 0.0,
+            "short_pnl": 0.0,
+            "long_trades": 0,
+            "short_trades": 0,
+            "stop_loss_count": 0,
+            "stop_loss_pnl": 0.0,
+            "take_profit_count": 0,
+            "take_profit_pnl": 0.0,
             "equity_curve": [0.0],
             "drawdown_durations": [],
             "trade_times": [],
+            "equity_timeline": [],
         })
 
         for tr in trades:
-            sname = tr.get("strategy_name", tr.get("strategy", "unknown"))
-            pnl = float(tr.get("pnl", 0) or 0)
-            fee = float(tr.get("fee", tr.get("commission", 0)) or 0)
+            tr = self._normalize_trade_record(tr)
+            if not tr:
+                continue
+            sname = tr.get("strategy_name") or tr.get("strategy") or "unknown"
+            pnl = _safe_float(tr.get("pnl"))
+            fee = _safe_float(tr.get("fee"))
+            funding = _safe_float(tr.get("funding_cost"))
+            slippage = _safe_float(tr.get("slippage_cost"))
+            spread = _safe_float(tr.get("spread_cost"))
+            direction = (tr.get("direction") or tr.get("side") or "").lower()
+            exit_reason = (tr.get("exit_reason") or tr.get("close_reason") or "").lower()
             status = tr.get("status", "")
 
             d = data[sname]
             d["total_pnl"] += pnl
             d["total_fees"] += fee
+            d["total_funding_cost"] += funding
+            d["total_slippage_cost"] += slippage
+            d["total_spread_cost"] += spread
             d["pnl_list"].append(pnl)
+
+            # 方向归因（long / short 分解）
+            if direction == "long":
+                d["long_pnl"] += pnl
+                d["long_trades"] += 1
+            elif direction == "short":
+                d["short_pnl"] += pnl
+                d["short_trades"] += 1
+
+            # 退出原因归因（止损 / 止盈 分解）
+            if exit_reason in ("stop_loss", "stoploss", "sl", "止损"):
+                d["stop_loss_count"] += 1
+                d["stop_loss_pnl"] += pnl
+            elif exit_reason in ("take_profit", "takeprofit", "tp", "止盈"):
+                d["take_profit_count"] += 1
+                d["take_profit_pnl"] += pnl
 
             if status == "closed":
                 d["total_trades"] += 1
@@ -372,15 +545,11 @@ class ContributionAnalyzer:
                 d["equity_curve"] = [pnl]
 
             # 交易时间
-            ct = tr.get("close_time")
-            if ct:
-                if hasattr(ct, "timestamp"):
-                    d["trade_times"].append(datetime.fromtimestamp(ct.timestamp()))
-                elif isinstance(ct, str):
-                    try:
-                        d["trade_times"].append(datetime.fromisoformat(ct))
-                    except ValueError:
-                        pass
+            ts = self._parse_close_time(tr.get("close_time"))
+            if ts is not None:
+                d["trade_times"].append(ts)
+                # 权益时间线（供回撤持续时长计算：与 equity_curve 对齐，仅含有效平仓时间的交易）
+                d["equity_timeline"].append((ts, d["equity_curve"][-1]))
 
         # 计算派生指标
         for sname, d in data.items():
@@ -398,12 +567,34 @@ class ContributionAnalyzer:
                                   else (2.0 if d["winning_trades"] > d["losing_trades"]
                                         else 0.5))
 
+            # 真实夏普比率（mean/std，与 allocation_agent / DataAnalysisEngine 口径一致）。
+            # 同时暴露波动率（单笔盈亏标准差）：独立于夏普的风险维度——夏普看单位风险收益，
+            # 波动率看绝对不确定性，二者正交（夏普持平但波动率上升 = 承担更多风险换同等收益）。
+            if len(pnl_list) >= 2:
+                pnl_arr = np.array(pnl_list, dtype=float)
+                pnl_std = float(np.std(pnl_arr))
+                d["volatility"] = pnl_std
+                d["sharpe_ratio"] = float(np.mean(pnl_arr) / pnl_std) if pnl_std > 0 else 0.0
+            else:
+                d["volatility"] = 0.0
+                d["sharpe_ratio"] = 0.0
+
             # 最大回撤
             d["max_drawdown"] = self._calc_max_drawdown(d["equity_curve"])
 
+            # 最大回撤持续时长（小时）：独立于回撤深度（max_drawdown）的「资金时间价值」维度——
+            # 策略可能回撤不深但长时间无法收复前高，资金被套牢、恢复能力差。
+            d["max_drawdown_duration_hours"] = self._calc_max_drawdown_duration_hours(
+                d["equity_timeline"]
+            )
+
+            # 最大连续亏损（负期望早期熔断信号）
+            d["consecutive_losses"] = self._calc_consecutive_losses(d["pnl_list"])
+
             # 平均占用资金
-            alloc = self._dynamic_allocations.get(sname, 0.2)
-            total_capital = self.config.get("trading", {}).get("total_capital", 559)
+            alloc = _safe_float(self._dynamic_allocations.get(sname), 0.2)
+            trading_cfg = self.config.get("trading") or {}
+            total_capital = _safe_float(trading_cfg.get("total_capital", 559), 559.0)
             d["avg_capital_used"] = total_capital * alloc
 
             d["pnl_per_capital_pct"] = (d["total_pnl"] / d["avg_capital_used"] * 100
@@ -437,7 +628,12 @@ class ContributionAnalyzer:
 
     @staticmethod
     def _calc_max_drawdown(equity_curve: List[float]) -> float:
-        """计算最大回撤"""
+        """计算最大回撤（结果 clamp 到 [0,1]）。
+
+        权益曲线为累计 PnL（从 0 起），可为负；当曲线先正后深负时
+        (peak-val)/peak 会 >1（曾产出 119.48 = 11948%），污染 stability_score
+        与 risk_adjusted_contribution。此处 clamp 到 [0,1]。
+        """
         if not equity_curve or len(equity_curve) < 2:
             return 0.0
         peak = equity_curve[0]
@@ -445,9 +641,64 @@ class ContributionAnalyzer:
         for val in equity_curve:
             peak = max(peak, val)
             if peak > 0:
-                dd = (peak - val) / peak
+                dd = max(0.0, min(1.0, (peak - val) / peak))
                 max_dd = max(max_dd, dd)
         return max_dd
+
+    @staticmethod
+    def _calc_max_drawdown_duration_hours(timeline: List[Tuple[Any, float]]) -> float:
+        """计算最大回撤持续时长（小时）：权益从峰值回落到恢复峰值的最长时间跨度。
+
+        timeline 为 [(close_time, cumulative_pnl), ...] 时间升序序列（仅含有效平仓时间的
+        交易），权益为累计 PnL。用「时间跨度」度量回撤持续——策略可能回撤不深但长时间
+        无法收复前高，资金被套牢、恢复能力差，这是独立于回撤深度（max_drawdown）的
+        「资金时间价值」维度。时间解析失败或类型不支持时该段时长记为 0（不污染结果）。
+        """
+        if not timeline or len(timeline) < 2:
+            return 0.0
+
+        def _hours(a, b):
+            try:
+                return max(0.0, (b - a).total_seconds() / 3600.0)
+            except (TypeError, AttributeError):
+                return 0.0
+
+        peak = timeline[0][1]
+        peak_time = timeline[0][0]
+        dd_start = None
+        max_dur = 0.0
+
+        for t, val in timeline[1:]:
+            if val >= peak:
+                # 恢复或创新高：结束回撤区间，并推进峰值时间（下次回撤起点从当前算起）
+                if dd_start is not None:
+                    max_dur = max(max_dur, _hours(dd_start, t))
+                    dd_start = None
+                if val > peak:
+                    peak = val
+                peak_time = t
+            else:
+                # 回撤中：记录起点（从最近一次峰值时间算起）
+                if dd_start is None:
+                    dd_start = peak_time
+
+        # 未恢复的尾部回撤（截至最后一笔交易）
+        if dd_start is not None and timeline:
+            max_dur = max(max_dur, _hours(dd_start, timeline[-1][0]))
+        return max_dur
+
+    @staticmethod
+    def _calc_consecutive_losses(pnl_list: List[float]) -> int:
+        """计算最大连续亏损笔数（负期望策略早期熔断信号）。"""
+        max_streak = 0
+        streak = 0
+        for pnl in pnl_list or []:
+            if pnl < 0:
+                streak += 1
+                max_streak = max(max_streak, streak)
+            else:
+                streak = 0
+        return max_streak
 
     def _compute_trends(self, contributions: Dict[str, StrategyContribution]):
         """计算贡献趋势（对比不同窗口）"""
@@ -513,23 +764,32 @@ class ContributionAnalyzer:
         b_arr = np.array(b[:n], dtype=float)
         std_a = np.std(a_arr)
         std_b = np.std(b_arr)
-        if std_a == 0 or std_b == 0:
+        if not np.isfinite(std_a) or not np.isfinite(std_b) or std_a == 0 or std_b == 0:
             return 0.0
-        return float(np.corrcoef(a_arr, b_arr)[0, 1])
+        corr = float(np.corrcoef(a_arr, b_arr)[0, 1])
+        return corr if np.isfinite(corr) else 0.0
 
     def _compute_concentration(self,
                                 contributions: Dict[str, StrategyContribution]
                                 ) -> float:
-        """Herfindahl-Hirschman Index (HHI) 计算集中度
-        HHI = sum(share_i^2)，值越大越集中
-        """
-        total_pnl = sum(c.total_pnl for c in contributions.values())
-        if total_pnl == 0:
-            return 1.0 / max(len(contributions), 1)
+        """Herfindahl-Hirschman Index (HHI) 计算集中度（基于资金配置权重）。
 
-        hhi = sum((c.total_pnl / total_pnl) ** 2
-                  for c in contributions.values())
-        return hhi
+        HHI = sum(weight_i^2)，weight_i 为归一化后的资金配置权重（非负、和=1），
+        取值 ∈ [1/N, 1]。不再使用 PnL 份额：PnL 可为负、总和近 0，导致 HHI 无界
+        （曾出现 300+，告警显示 30055%）。
+        """
+        alloc = self._dynamic_allocations or {}
+        weights = [w for w in alloc.values() if _safe_float(w, 0.0) > 0]
+        if weights:
+            total = sum(weights)
+            if total > 0:
+                hhi = sum((w / total) ** 2 for w in weights)
+                n = len(weights)
+                return max(1.0 / max(n, 1), min(1.0, hhi))
+
+        # 回退：无正权重时等权（最分散）
+        n = max(len(contributions), 1)
+        return 1.0 / n
 
     def _compute_diversification(self,
                                   correlation: Dict[str, Dict[str, float]]
@@ -587,7 +847,7 @@ class ContributionAnalyzer:
                 positions = self._okx_client.get_positions()
                 if positions:
                     for pos in positions:
-                        upl = float(pos.get("upl", 0) or 0)
+                        upl = _safe_float(pos.get("upl"))
                         if upl == 0:
                             continue
                         # 从持仓推断策略（通过 posSide 和 instId）
@@ -602,7 +862,7 @@ class ContributionAnalyzer:
                 if active:
                     for pos in active:
                         sname = pos.get("strategy_name", pos.get("strategy", "unknown"))
-                        upl = float(pos.get("unrealized_pnl", 0) or 0)
+                        upl = _safe_float(pos.get("unrealized_pnl"))
                         result[sname] = result.get(sname, 0.0) + upl
 
             # 方式3：从 SQLite 查询 open 状态的交易
@@ -612,10 +872,10 @@ class ContributionAnalyzer:
                     for tr in records:
                         if tr.get("status") == "open":
                             sname = tr.get("strategy_name", tr.get("strategy", "unknown"))
-                            upl = float(tr.get("unrealized_pnl", 0) or 0)
+                            upl = _safe_float(tr.get("unrealized_pnl"))
                             result[sname] = result.get(sname, 0.0) + upl
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Unrealized PnL via sqlite failed: {e}")
         except Exception as e:
             logger.debug(f"Unrealized PnL query error: {e}")
 
@@ -629,8 +889,8 @@ class ContributionAnalyzer:
                 for tr in records:
                     if tr.get("symbol") == inst_id and tr.get("status") == "open":
                         return tr.get("strategy_name", tr.get("strategy", "unknown"))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Resolve strategy for position {inst_id} failed: {e}")
         return "unknown"
 
     # ============================================================
@@ -666,13 +926,13 @@ class ContributionAnalyzer:
             # 判断生命周期
             if c.total_trades == 0:
                 c.lifecycle = "dormant"
-            elif idle_hours > cfg.get("dormant_max_idle_hours", 72):
+            elif idle_hours > _safe_float(cfg.get("dormant_max_idle_hours"), 72.0):
                 c.lifecycle = "dormant"
-            elif age_days <= cfg.get("newborn_max_days", 7):
+            elif age_days <= _safe_float(cfg.get("newborn_max_days"), 7.0):
                 c.lifecycle = "newborn"
-            elif c.trend == "declining" and c.trend_pnl_7d_vs_30d < cfg.get("declining_7d_vs_30d_ratio", 0.5):
+            elif c.trend == "declining" and c.trend_pnl_7d_vs_30d < _safe_float(cfg.get("declining_7d_vs_30d_ratio"), 0.5):
                 c.lifecycle = "declining"
-            elif c.total_trades >= cfg.get("mature_min_trades", 10) and c.win_rate > 0:
+            elif c.total_trades >= _safe_float(cfg.get("mature_min_trades"), 10.0) and c.win_rate > 0:
                 c.lifecycle = "mature"
             elif c.trend == "declining":
                 c.lifecycle = "declining"
@@ -688,7 +948,7 @@ class ContributionAnalyzer:
         w = self._health_weights
 
         for sname, c in contributions.items():
-            if c.total_trades < 1:
+            if c.total_trades < self._min_health_sample:
                 c.health_score = 0.0
                 c.health_grade = "N/A"
                 continue
@@ -699,11 +959,11 @@ class ContributionAnalyzer:
             # 2. 胜率得分 (0-100)
             wr_score = min(100, c.win_rate * 100)
 
-            # 3. 风险调整得分 (0-100)
-            ra_score = min(100, c.risk_adjusted_contribution * 20)
+            # 3. 风险调整得分 (0-100) — 负贡献 clamp 到 0，防健康度越界为负
+            ra_score = max(0.0, min(100.0, c.risk_adjusted_contribution * 20))
 
-            # 4. 资金效率得分 (0-100)
-            ce_score = min(100, c.pnl_per_capital_pct * 10)
+            # 4. 资金效率得分 (0-100) — 负资本回报 clamp 到 0，防健康度越界为负
+            ce_score = max(0.0, min(100.0, c.pnl_per_capital_pct * 10))
 
             # 5. 费率效率得分 (0-100) — 费率越低越好
             fe_score = max(0, 100 - c.fee_ratio * 2)
@@ -726,7 +986,7 @@ class ContributionAnalyzer:
                 stability_score * w.get("stability", 0.10)
             )
 
-            c.health_score = round(composite, 1)
+            c.health_score = round(max(0.0, min(100.0, composite)), 1)
 
             # 等级映射
             if composite >= 80:
@@ -935,6 +1195,21 @@ class ContributionAnalyzer:
                 "trend": c.trend,
                 "delta_health": c.delta_health,
                 "delta_pnl": c.delta_pnl,
+                # 方向归因
+                "long_pnl": c.long_pnl,
+                "short_pnl": c.short_pnl,
+                "long_trades": c.long_trades,
+                "short_trades": c.short_trades,
+                # 成本细分归因
+                "total_fees": c.total_fees,
+                "total_funding_cost": c.total_funding_cost,
+                "total_slippage_cost": c.total_slippage_cost,
+                "total_spread_cost": c.total_spread_cost,
+                # 退出原因归因
+                "stop_loss_count": c.stop_loss_count,
+                "stop_loss_pnl": c.stop_loss_pnl,
+                "take_profit_count": c.take_profit_count,
+                "take_profit_pnl": c.take_profit_pnl,
             }
             strategies_health.append(health_entry)
 
@@ -965,6 +1240,8 @@ class ContributionAnalyzer:
 
         return {
             "timestamp": snapshot.timestamp,
+            "available": snapshot.available,
+            "data_error": snapshot.data_error,
             "overall_health": snapshot.overall_health_score,
             "overall_health_grade": self._health_grade_for(snapshot.overall_health_score),
             "total_pnl": snapshot.total_pnl,
@@ -1004,22 +1281,16 @@ class ContributionAnalyzer:
         # 按时段分组
         hourly = defaultdict(lambda: defaultdict(float))
         for tr in trades:
-            ct = tr.get("close_time")
-            if not ct:
+            tr = self._normalize_trade_record(tr)
+            if not tr:
                 continue
-            if hasattr(ct, "timestamp"):
-                ts = datetime.fromtimestamp(ct.timestamp())
-            elif isinstance(ct, str):
-                try:
-                    ts = datetime.fromisoformat(ct)
-                except ValueError:
-                    continue
-            else:
+            ts = self._parse_close_time(tr.get("close_time"))
+            if ts is None:
                 continue
 
             hour_key = ts.strftime("%Y-%m-%dT%H:00")
-            sname = tr.get("strategy_name", tr.get("strategy", "unknown"))
-            pnl = float(tr.get("pnl", 0) or 0)
+            sname = tr.get("strategy_name") or tr.get("strategy") or "unknown"
+            pnl = _safe_float(tr.get("pnl"))
             hourly[hour_key][sname] += pnl
 
         # 排序输出
@@ -1082,7 +1353,25 @@ class ContributionAnalyzer:
             for i, c in enumerate(ranked)
         ]
 
-    def get_capital_reallocation_suggestions(self, since_override: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    def _normalized_allocation_pool(self) -> Dict[str, float]:
+        """返回归一化后的资金配置权重（仅正权重、和=1.0）。
+
+        仅包含真实资金池策略；manual_override 等非策略标签不在 _dynamic_allocations
+        中，天然被排除。负值/零值剔除，剩余正权重归一化到 1.0。
+        """
+        result: Dict[str, float] = {}
+        total = 0.0
+        for k, v in (self._dynamic_allocations or {}).items():
+            w = _safe_float(v, 0.0)
+            if w > 0:
+                result[k] = w
+                total += w
+        if total <= 0:
+            return result
+        return {k: w / total for k, w in result.items()}
+
+    def get_capital_reallocation_suggestions(self, since_override: Optional[datetime] = None,
+                                              snapshot: Optional[ContributionSnapshot] = None) -> List[Dict[str, Any]]:
         """基于贡献度分析生成资金重分配建议（强化版）
 
         规则：
@@ -1090,12 +1379,20 @@ class ContributionAnalyzer:
         - 低健康度 + 恶化趋势 → 建议减配
         - 高效率高贡献 → 建议作为核心策略
         - 休眠策略 → 建议回收资金
+
+        当传入 snapshot 时复用该快照（避免与调用方感知快照口径不一致），
+        否则回退到 analyze(window="7d")。
         """
-        snapshot = self.analyze(window="7d", since_override=since_override)
+        if snapshot is None:
+            snapshot = self.analyze(window="7d", since_override=since_override)
         suggestions = []
 
+        pool_weights = self._normalized_allocation_pool()
+
         for sname, contrib in snapshot.strategies.items():
-            current_alloc = self._dynamic_allocations.get(sname, 0.2)
+            if sname not in pool_weights:
+                continue  # 非资金池标签（manual_override / 未配置权重），不参与重配
+            current_alloc = pool_weights[sname]
             suggestion = {
                 "strategy": sname,
                 "current_allocation": round(current_alloc, 4),
@@ -1169,8 +1466,8 @@ class ContributionAnalyzer:
     # 持久化
     # ============================================================
 
-    def persist_snapshot(self, snapshot: ContributionSnapshot = None):
-        """持久化贡献度快照到 JSON 文件"""
+    def persist_snapshot(self, snapshot: ContributionSnapshot = None) -> bool:
+        """持久化贡献度快照到 JSON 文件（fail-closed：成功返回 True，失败返回 False）"""
         if snapshot is None:
             snapshot = self.analyze(window="24h")
 
@@ -1195,63 +1492,82 @@ class ContributionAnalyzer:
             self._cleanup_old_snapshots(data_dir, keep=90)
 
             logger.debug(f"Contribution snapshot persisted: {latest_path}")
+            return True
 
         except Exception as e:
             logger.error(f"Persist contribution snapshot error: {e}")
+            return False
 
     def _snapshot_to_dict(self, snapshot: ContributionSnapshot) -> Dict[str, Any]:
         """将 ContributionSnapshot 转为 JSON 可序列化字典"""
         strategies = {}
         for sname, c in snapshot.strategies.items():
             strategies[sname] = {
-                "total_pnl": c.total_pnl,
-                "pnl_contribution_pct": c.pnl_contribution_pct,
-                "realized_pnl": c.realized_pnl,
-                "unrealized_pnl": c.unrealized_pnl,
-                "total_trades": c.total_trades,
-                "winning_trades": c.winning_trades,
-                "losing_trades": c.losing_trades,
-                "win_rate": c.win_rate,
-                "avg_win": c.avg_win,
-                "avg_loss": c.avg_loss,
-                "profit_factor": c.profit_factor,
-                "max_drawdown": c.max_drawdown,
-                "avg_capital_used": c.avg_capital_used,
-                "pnl_per_capital_pct": c.pnl_per_capital_pct,
-                "pnl_per_trade": c.pnl_per_trade,
-                "total_fees": c.total_fees,
-                "fee_ratio": c.fee_ratio,
-                "active_hours": c.active_hours,
-                "pnl_per_hour": c.pnl_per_hour,
+                "total_pnl": safe_finite(c.total_pnl),
+                "pnl_contribution_pct": safe_finite(c.pnl_contribution_pct),
+                "realized_pnl": safe_finite(c.realized_pnl),
+                "unrealized_pnl": safe_finite(c.unrealized_pnl),
+                "total_trades": int(c.total_trades),
+                "winning_trades": int(c.winning_trades),
+                "losing_trades": int(c.losing_trades),
+                "win_rate": safe_finite(c.win_rate),
+                "avg_win": safe_finite(c.avg_win),
+                "avg_loss": safe_finite(c.avg_loss),
+                "profit_factor": safe_finite(c.profit_factor),
+                "max_drawdown": safe_finite(c.max_drawdown),
+                "volatility": safe_finite(c.volatility),
+                "avg_capital_used": safe_finite(c.avg_capital_used),
+                "pnl_per_capital_pct": safe_finite(c.pnl_per_capital_pct),
+                "pnl_per_trade": safe_finite(c.pnl_per_trade),
+                "total_fees": safe_finite(c.total_fees),
+                "fee_ratio": safe_finite(c.fee_ratio),
+                "active_hours": safe_finite(c.active_hours),
+                "pnl_per_hour": safe_finite(c.pnl_per_hour),
                 "trend": c.trend,
-                "trend_pnl_7d_vs_30d": c.trend_pnl_7d_vs_30d,
-                "risk_adjusted_contribution": c.risk_adjusted_contribution,
+                "trend_pnl_7d_vs_30d": safe_finite(c.trend_pnl_7d_vs_30d),
+                "risk_adjusted_contribution": safe_finite(c.risk_adjusted_contribution),
+                # 成本细分归因
+                "total_funding_cost": safe_finite(c.total_funding_cost),
+                "total_slippage_cost": safe_finite(c.total_slippage_cost),
+                "total_spread_cost": safe_finite(c.total_spread_cost),
+                # 方向归因
+                "long_pnl": safe_finite(c.long_pnl),
+                "short_pnl": safe_finite(c.short_pnl),
+                "long_trades": int(c.long_trades),
+                "short_trades": int(c.short_trades),
+                # 退出原因归因
+                "stop_loss_count": int(c.stop_loss_count),
+                "stop_loss_pnl": safe_finite(c.stop_loss_pnl),
+                "take_profit_count": int(c.take_profit_count),
+                "take_profit_pnl": safe_finite(c.take_profit_pnl),
                 # 强化字段
                 "lifecycle": c.lifecycle,
-                "lifecycle_age_days": c.lifecycle_age_days,
-                "lifecycle_last_trade_age_hours": c.lifecycle_last_trade_age_hours,
-                "health_score": c.health_score,
+                "lifecycle_age_days": safe_finite(c.lifecycle_age_days),
+                "lifecycle_last_trade_age_hours": safe_finite(c.lifecycle_last_trade_age_hours),
+                "health_score": safe_finite(c.health_score),
                 "health_grade": c.health_grade,
-                "delta_pnl": c.delta_pnl,
-                "delta_contribution_pct": c.delta_contribution_pct,
-                "delta_health": c.delta_health,
+                "delta_pnl": safe_finite(c.delta_pnl),
+                "delta_contribution_pct": safe_finite(c.delta_contribution_pct),
+                "delta_health": safe_finite(c.delta_health),
             }
 
         return {
             "timestamp": snapshot.timestamp,
             "window": snapshot.window,
-            "total_pnl": snapshot.total_pnl,
-            "total_trades": snapshot.total_trades,
-            "total_fees": snapshot.total_fees,
-            "total_unrealized_pnl": snapshot.total_unrealized_pnl,
+            "total_pnl": safe_finite(snapshot.total_pnl),
+            "total_trades": int(snapshot.total_trades),
+            "total_fees": safe_finite(snapshot.total_fees),
+            "total_unrealized_pnl": safe_finite(snapshot.total_unrealized_pnl),
             "strategies": strategies,
             "correlation_matrix": snapshot.correlation_matrix,
-            "concentration": snapshot.concentration,
-            "diversification_score": snapshot.diversification_score,
-            "efficiency_score": snapshot.efficiency_score,
-            "overall_health_score": snapshot.overall_health_score,
-            "synergy_score": snapshot.synergy_score,
+            "concentration": safe_finite(snapshot.concentration),
+            "diversification_score": safe_finite(snapshot.diversification_score),
+            "efficiency_score": safe_finite(snapshot.efficiency_score),
+            "overall_health_score": safe_finite(snapshot.overall_health_score),
+            "synergy_score": safe_finite(snapshot.synergy_score),
             "lifecycle_summary": snapshot.lifecycle_summary,
+            "available": snapshot.available,
+            "data_error": snapshot.data_error,
         }
 
     @staticmethod
@@ -1297,6 +1613,7 @@ class ContributionAnalyzer:
             "lifecycle_config": self._lifecycle_config,
             "health_weights": self._health_weights,
             "has_okx_client": self._okx_client is not None,
+            "trade_query_error": self._trade_query_error,
         }
 
 

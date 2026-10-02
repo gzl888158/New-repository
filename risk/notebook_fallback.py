@@ -1,13 +1,43 @@
 """负责笔记本环境降级保护：电量、温度、防休眠与进程崩溃监控。"""
 import asyncio
+import math
 import psutil
 import platform
 import subprocess
 import os
 import signal
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from loguru import logger
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _position_close_side(position) -> str:
+    """计算平仓方向：多头卖、空头买；net 模式按数量正负判断。"""
+    raw = (getattr(position, "side", "") or "").strip().lower()
+    if raw == "long":
+        return "sell"
+    if raw == "short":
+        return "buy"
+    return "sell" if _finite(getattr(position, "quantity", 0.0), 0.0) > 0 else "buy"
+
+
+def _position_pos_side(position) -> str:
+    """归一化 posSide：long/short 原样返回，net 原样返回，其余按数量符号推导。"""
+    raw = (getattr(position, "side", "") or "").strip().lower()
+    if raw in ("long", "short", "net"):
+        return raw
+    return "long" if _finite(getattr(position, "quantity", 0.0), 0.0) >= 0 else "short"
 
 
 class NotebookFallbackControl:
@@ -35,15 +65,38 @@ class NotebookFallbackControl:
         self._max_crashes = 5
         self._crash_window = 300
 
+        self._running = False
+        self._tasks: List[asyncio.Task] = []
+
     async def start(self):
-        asyncio.create_task(self._monitor_loop())
-        asyncio.create_task(self._sleep_prevention_loop())
-        asyncio.create_task(self._crash_monitor_loop())
+        if self._running:
+            return
+        self._running = True
+        self._tasks.append(asyncio.create_task(self._monitor_loop()))
+        self._tasks.append(asyncio.create_task(self._sleep_prevention_loop()))
+        self._tasks.append(asyncio.create_task(self._crash_monitor_loop()))
+        logger.info("NotebookFallbackControl started")
+
+    async def stop(self):
+        self._running = False
+        self._sleep_prevention_active = False
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("NotebookFallbackControl stopped")
 
     async def _monitor_loop(self):
-        while True:
-            await self._check_battery()
-            await self._check_temperature()
+        while self._running:
+            try:
+                await self._check_battery()
+                await self._check_temperature()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Notebook monitor loop error: {e}")
             await asyncio.sleep(10)
 
     async def _check_battery(self):
@@ -78,13 +131,14 @@ class NotebookFallbackControl:
         except AttributeError:
             return
         
-        cpu_temp = 0
-        if "coretemp" in temps:
-            cpu_temp = max(temp.current for temp in temps["coretemp"])
-        elif "cpu_thermal" in temps:
-            cpu_temp = max(temp.current for temp in temps["cpu_thermal"])
-        elif "acpitz" in temps:
-            cpu_temp = max(temp.current for temp in temps["acpitz"])
+        cpu_temp = 0.0
+        for key in ("coretemp", "cpu_thermal", "acpitz"):
+            entries = temps.get(key) or []
+            valid = [_finite(getattr(temp, "current", None), None) for temp in entries]
+            valid = [v for v in valid if v is not None]
+            if valid:
+                cpu_temp = max(valid)
+                break
         
         if cpu_temp >= self._temp_critical:
             logger.critical(f"CPU temperature {cpu_temp}°C critically high, initiating emergency shutdown")
@@ -102,37 +156,71 @@ class NotebookFallbackControl:
         await self._pause_high_frequency_strategies()
 
     async def _emergency_shutdown(self):
-        positions = self.okx_client.get_positions()
-        for pos_data in positions:
-            position = self.okx_client._parse_position(pos_data)
-            if position and float(position.quantity) > 0:
-                side = "sell" if position.side == "long" else "buy"
+        try:
+            positions = self.okx_client.get_positions()
+        except Exception as e:
+            logger.error(f"Failed to fetch positions during emergency shutdown: {e}")
+            positions = None
+        for pos_data in positions or []:
+            try:
+                position = self.okx_client._parse_position(pos_data)
+            except Exception:
+                position = None
+            if not position:
+                continue
+            qty = abs(_finite(position.quantity, 0.0))
+            if qty <= 0:
+                continue
+            side = _position_close_side(position)
+            pos_side = _position_pos_side(position)
+            try:
                 self.okx_client.place_order(
                     symbol=position.symbol,
                     side=side,
                     order_type="market",
-                    quantity=abs(float(position.quantity)),
-                    leverage=position.leverage
+                    quantity=qty,
+                    leverage=position.leverage,
+                    reduce_only=True,
+                    pos_side=pos_side,
                 )
-        
+            except Exception as e:
+                logger.error(f"Emergency close failed for {position.symbol}: {e}")
+
         logger.critical("All positions closed. System shutting down.")
         self._sleep_prevention_active = False
 
     async def _close_aggressive_positions(self):
-        positions = self.okx_client.get_positions()
-        for pos_data in positions:
-            position = self.okx_client._parse_position(pos_data)
-            if position and float(position.quantity) > 0:
-                leverage = position.leverage
-                if leverage >= 8:
-                    side = "sell" if position.side == "long" else "buy"
+        try:
+            positions = self.okx_client.get_positions()
+        except Exception as e:
+            logger.error(f"Failed to fetch positions for aggressive close: {e}")
+            positions = None
+        for pos_data in positions or []:
+            try:
+                position = self.okx_client._parse_position(pos_data)
+            except Exception:
+                position = None
+            if not position:
+                continue
+            qty = abs(_finite(position.quantity, 0.0))
+            if qty <= 0:
+                continue
+            leverage = _finite(position.leverage, 1.0)
+            if leverage >= 8:
+                side = _position_close_side(position)
+                pos_side = _position_pos_side(position)
+                try:
                     self.okx_client.place_order(
                         symbol=position.symbol,
                         side=side,
                         order_type="market",
-                        quantity=abs(float(position.quantity)),
-                        leverage=position.leverage
+                        quantity=qty,
+                        leverage=position.leverage,
+                        reduce_only=True,
+                        pos_side=pos_side,
                     )
+                except Exception as e:
+                    logger.error(f"Aggressive close failed for {position.symbol}: {e}")
 
     async def _pause_high_frequency_strategies(self):
         pass
@@ -141,9 +229,11 @@ class NotebookFallbackControl:
         logger.info(f"Battery alert: {self._battery_level}% remaining")
 
     async def _sleep_prevention_loop(self):
-        while self._sleep_prevention_active:
+        while self._sleep_prevention_active and self._running:
             try:
                 self._prevent_sleep()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Sleep prevention failed: {e}")
             await asyncio.sleep(60)
@@ -176,8 +266,13 @@ class NotebookFallbackControl:
             )
 
     async def _crash_monitor_loop(self):
-        while True:
-            await self._check_process_crashes()
+        while self._running:
+            try:
+                await self._check_process_crashes()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Crash monitor loop error: {e}")
             await asyncio.sleep(60)
 
     async def _check_process_crashes(self):

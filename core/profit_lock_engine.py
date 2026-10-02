@@ -12,7 +12,9 @@
   阶段 1 breakeven   —— 浮盈 ≥ breakeven_pct：激活保本，回落至成本即平仓锁 0 利润
   阶段 2 partial     —— 浮盈 ≥ partial_pct：部分落袋 partial_ratio，剩余进入紧追踪
   阶段 3 trailing    —— 剩余仓位按紧追踪（回撤 trailing_distance_pct）全平
-  旁路   reversal    —— 反转评分 ≥ reversal_close_score 且浮盈时，直接全平锁利
+
+反转落袋（HMM/指标反转评分）不在本引擎内处理，统一由 ReversalTakeProfitEngine 负责，
+避免同一反转评分被两个引擎以不同阈值重复/过早平仓（S1 收敛）。
 
 设计原则（与 ReversalTakeProfitEngine / AdaptiveTpSlEngine 一致）：
 - 纯计算引擎，不直接下单、不读写数据库（I/O 由调用方 Scheduler 负责）；
@@ -37,11 +39,10 @@ class ProfitLockDecision:
     position_side: str            # long / short
     action: str                   # none / partial / full
     partial_ratio: float          # partial 时有效，其余为 0.0
-    exit_reason: str              # profit_lock_breakeven / profit_lock_partial / profit_lock_trailing / profit_lock_reversal / ""
+    exit_reason: str              # profit_lock_breakeven / profit_lock_partial / profit_lock_trailing / ""
     pnl_pct: float
     peak_price: float
     phase: str                    # 决策后的阶段（供审计/调试）
-    reversal_score: float
     retrace_pct: float            # 当前从峰值回撤比例（trailing 判定用）
     details: Dict[str, Any] = field(default_factory=dict)
 
@@ -62,9 +63,11 @@ def _finite(v: float, default: float) -> float:
 
 
 # ── 阈值硬下限（企业级护栏，防止阈值被误配/学习下调到无效或危险区间）──
-_BREAKEVEN_PCT_FLOOR = 0.002      # 保本激活最低 0.2%
-_PARTIAL_PCT_FLOOR = 0.005        # 部分落袋最低 0.5%
-_TRAILING_DIST_FLOOR = 0.002      # 紧追踪回撤最低 0.2%
+# 下调以适配微利行情：保本激活 0.1%（覆盖往返手续费约 0.1%~0.15%），
+# 部分落袋 0.3%，紧追踪回撤 0.15%。仍高于手续费缓冲，避免无意义锁利。
+_BREAKEVEN_PCT_FLOOR = 0.001      # 保本激活最低 0.1%
+_PARTIAL_PCT_FLOOR = 0.003        # 部分落袋最低 0.3%
+_TRAILING_DIST_FLOOR = 0.0015     # 紧追踪回撤最低 0.15%
 
 
 class ProfitLockEngine:
@@ -75,7 +78,6 @@ class ProfitLockEngine:
         "breakeven": "profit_lock_breakeven",
         "partial": "profit_lock_partial",
         "trailing": "profit_lock_trailing",
-        "reversal": "profit_lock_reversal",
     }
 
     def __init__(self, config: Dict[str, Any]):
@@ -90,9 +92,15 @@ class ProfitLockEngine:
         self._partial_pct = _finite(_f(cfg.get("partial_pct"), 0.01), 0.01)
         self._partial_ratio = _finite(_f(cfg.get("partial_ratio"), 0.35), 0.35)
         self._trailing_distance_pct = _finite(_f(cfg.get("trailing_distance_pct"), 0.006), 0.006)
-        self._reversal_close_score = _finite(_f(cfg.get("reversal_close_score"), 0.5), 0.5)
-        self._reversal_min_profit_pct = _finite(_f(cfg.get("reversal_min_profit_pct"), 0.002), 0.002)
         self._cooldown_seconds = _finite(_f(cfg.get("cooldown_seconds"), 120.0), 120.0)
+
+        # ── 保本阶段快速回撤落袋（增强收益落袋：捕捉 0.1%~0.4% 的小利润，
+        #    避免其在到达 partial 线前回吐为亏损）──
+        # 进入 breakeven 阶段后，若价格从峰值回撤 >= trailing_distance_pct，
+        # 且当前仍处于「扣除手续费后仍盈利」区间，则立即平掉 breakeven_retrace_partial_ratio 仓位锁利。
+        self._breakeven_retrace_partial_enabled = bool(cfg.get("breakeven_retrace_partial_enabled", True))
+        self._breakeven_retrace_partial_ratio = _finite(_f(cfg.get("breakeven_retrace_partial_ratio"), 0.4), 0.4)
+        self._breakeven_retrace_partial_ratio = max(0.05, min(0.8, self._breakeven_retrace_partial_ratio))
 
         # ── 阈值范围/硬下限校验（企业级护栏：防止阈值被误配/学习下调到无效或危险区间）──
         # 部分落袋比例必须在 (0.05, 0.95) 之间
@@ -103,8 +111,6 @@ class ProfitLockEngine:
         self._partial_pct = max(self._breakeven_pct, max(_PARTIAL_PCT_FLOOR, self._partial_pct))
         # 紧追踪回撤硬下限 0.2%（低于此值会在正常噪声下误触全平）
         self._trailing_distance_pct = max(_TRAILING_DIST_FLOOR, self._trailing_distance_pct)
-        self._reversal_close_score = max(0.0, min(1.0, self._reversal_close_score))
-        self._reversal_min_profit_pct = max(0.0, self._reversal_min_profit_pct)
         self._breakeven_exit_pct = max(0.0, self._breakeven_exit_pct)
         self._cooldown_seconds = max(0.0, self._cooldown_seconds)
 
@@ -116,7 +122,8 @@ class ProfitLockEngine:
             f"breakeven={self._breakeven_pct:.2%}(exit@={self._breakeven_exit_pct:.2%}), "
             f"partial={self._partial_pct:.2%}({self._partial_ratio:.0%}), "
             f"trailing={self._trailing_distance_pct:.2%}, "
-            f"reversal={self._reversal_close_score:.2f}(min_pnl={self._reversal_min_profit_pct:.2%}), "
+            f"be_retrace_partial={'on' if self._breakeven_retrace_partial_enabled else 'off'}"
+            f"({self._breakeven_retrace_partial_ratio:.0%}), "
             f"cooldown={self._cooldown_seconds:.0f}s"
         )
 
@@ -128,8 +135,8 @@ class ProfitLockEngine:
         pos_side: str,
         entry_price: float,
         current_price: float,
-        reversal_score: float = 0.0,
         breakeven_buffer: float = 0.0,
+        sl_trailing_active: bool = False,
     ) -> ProfitLockDecision:
         """计算利润锁定动作与阶段推进。
 
@@ -138,9 +145,11 @@ class ProfitLockEngine:
             pos_side: long/short
             entry_price: 持仓均价
             current_price: 当前标记价
-            reversal_score: 反转评分 0~1（由调用方 HMM/指标计算，缺省 0）
             breakeven_buffer: 保本缓冲（往返手续费折算），把「回落至成本」的平仓线
                              上移到至少覆盖手续费，实现 fee-aware 保本。缺省 0。
+            sl_trailing_active: 止损侧（保命移动止损）是否已进入 trailing 保护态。
+                               为 True 时，本引擎的紧追踪全平（阶段3 落袋）让位，
+                               由止损侧统一保护，避免双信号重复平仓（S4 止损优先仲裁）。
         """
         direction = self._normalize_direction(pos_side)
 
@@ -148,15 +157,13 @@ class ProfitLockEngine:
         try:
             entry_price = float(entry_price)
             current_price = float(current_price)
-            reversal_score = float(reversal_score)
             breakeven_buffer = float(breakeven_buffer)
         except (TypeError, ValueError):
-            return self._none(symbol, direction, 0.0, 0.0, 0.0, 0.0, "unknown")
+            return self._none(symbol, direction, 0.0, 0.0, 0.0, "unknown")
         if not math.isfinite(entry_price) or entry_price <= 0 or not math.isfinite(current_price) or current_price <= 0:
-            return self._none(symbol, direction, 0.0, 0.0, 0.0, 0.0, "unknown")
+            return self._none(symbol, direction, 0.0, 0.0, 0.0, "unknown")
         if direction not in ("long", "short"):
-            return self._none(symbol, direction, 0.0, 0.0, reversal_score, 0.0, "unknown")
-        reversal_score = max(0.0, min(1.0, reversal_score))
+            return self._none(symbol, direction, 0.0, 0.0, 0.0, "unknown")
         breakeven_buffer = 0.0 if not math.isfinite(breakeven_buffer) or breakeven_buffer < 0 else breakeven_buffer
 
         pnl_pct = self._pnl_pct(direction, entry_price, current_price)
@@ -164,7 +171,10 @@ class ProfitLockEngine:
         key = f"{symbol}:{direction}"
         st = self._states.get(key)
         if st is None:
-            st = {"phase": "none", "peak": current_price, "partial_done": False, "last_action_ts": 0.0}
+            st = {
+                "phase": "none", "peak": current_price, "partial_done": False,
+                "be_retrace_partial_done": False, "last_action_ts": 0.0,
+            }
             self._states[key] = st
 
         # 更新价格极值（long 记最高，short 记最低）
@@ -176,17 +186,6 @@ class ProfitLockEngine:
         peak = float(st["peak"])
         retrace_pct = self._retrace_pct(direction, peak, current_price)
         phase = str(st["phase"])
-
-        # ── 旁路：反转落袋（最高优先级，盈利且反转信号强）──
-        if pnl_pct >= self._reversal_min_profit_pct and reversal_score >= self._reversal_close_score:
-            if self._cooldown_ok(st):
-                st["last_action_ts"] = time.time()
-                st["phase"] = "trailing"  # 全平后仓位将消失，此处标记仅作审计
-                return self._decision(
-                    symbol, direction, "full", 0.0, "reversal",
-                    pnl_pct, peak, retrace_pct, reversal_score, st
-                )
-            # 冷却中不重复触发，继续走下方逻辑（可能落入 none）
 
         # ── 阶段 1：保本激活 ──
         if phase == "none" and pnl_pct >= self._breakeven_pct:
@@ -205,7 +204,7 @@ class ProfitLockEngine:
                 st["last_action_ts"] = time.time()
                 return self._decision(
                     symbol, direction, "partial", self._partial_ratio, "partial",
-                    pnl_pct, current_price, 0.0, reversal_score, st
+                    pnl_pct, current_price, 0.0, st
                 )
 
         # ── 保本保护：激活后回落至「成本 + 手续费缓冲」→ 平仓，fee-aware 锁利 ──
@@ -215,21 +214,53 @@ class ProfitLockEngine:
                 st["last_action_ts"] = time.time()
                 return self._decision(
                     symbol, direction, "full", 0.0, "breakeven",
-                    pnl_pct, peak, retrace_pct, reversal_score, st
+                    pnl_pct, peak, retrace_pct, st
+                )
+
+        # ── 保本阶段回撤快速部分落袋（增强收益落袋）──
+        # 已进入 breakeven 但尚未到 partial 线时，若从峰值回撤 >= trailing_distance_pct，
+        # 且扣除手续费后仍盈利（pnl_pct > exit_pct），立即平掉部分仓位锁利，
+        # 剩余仓位进入 trailing 保护，防止小利润回吐为亏损。
+        if (
+            phase == "breakeven"
+            and not st.get("be_retrace_partial_done", False)
+            and self._breakeven_retrace_partial_enabled
+            and pnl_pct > exit_pct
+            and retrace_pct >= self._trailing_distance_pct
+        ):
+            if self._cooldown_ok(st):
+                st["be_retrace_partial_done"] = True
+                st["phase"] = "trailing"
+                st["last_action_ts"] = time.time()
+                logger.info(
+                    f"[PROFIT_LOCK] breakeven retrace partial: {symbol} {direction} "
+                    f"pnl={pnl_pct:.2%} retrace={retrace_pct:.2%} "
+                    f"ratio={self._breakeven_retrace_partial_ratio:.0%}"
+                )
+                return self._decision(
+                    symbol, direction, "partial", self._breakeven_retrace_partial_ratio,
+                    "partial", pnl_pct, peak, retrace_pct, st
                 )
 
         # ── 阶段 3：紧追踪 ──
         if phase == "trailing" and retrace_pct >= self._trailing_distance_pct:
-            if self._cooldown_ok(st):
+            # S4: 止损优先仲裁 — 止损侧（保命移动止损）已进入 trailing 保护时，
+            # 让位给止损侧统一保护，避免同一持仓被两条 trailing 路径先后平仓。
+            if sl_trailing_active:
+                logger.debug(
+                    f"[PROFIT_LOCK] trailing skipped (SL trailing active): {symbol} {direction} "
+                    f"retrace={retrace_pct:.2%}"
+                )
+            elif self._cooldown_ok(st):
                 st["last_action_ts"] = time.time()
                 return self._decision(
                     symbol, direction, "full", 0.0, "trailing",
-                    pnl_pct, peak, retrace_pct, reversal_score, st
+                    pnl_pct, peak, retrace_pct, st
                 )
 
         return self._decision(
             symbol, direction, "none", 0.0, "",
-            pnl_pct, peak, retrace_pct, reversal_score, st
+            pnl_pct, peak, retrace_pct, st
         )
 
     # ==================== 状态管理 ====================
@@ -259,12 +290,47 @@ class ProfitLockEngine:
             "phase": st.get("phase"),
             "peak": st.get("peak"),
             "partial_done": st.get("partial_done", False),
+            "be_retrace_partial_done": st.get("be_retrace_partial_done", False),
             "last_action_ts": st.get("last_action_ts", 0.0),
         }
 
     def get_all_states(self) -> Dict[str, Dict[str, Any]]:
         """返回全部持仓方向的锁利状态快照。"""
         return {k: dict(v) for k, v in self._states.items()}
+
+    def dump_state(self) -> Dict[str, Dict[str, Any]]:
+        """导出全部锁利梯度状态（JSON 可序列化），供跨重启持久化。"""
+        return {k: dict(v) for k, v in self._states.items()}
+
+    def restore_state(self, state: Dict[str, Dict[str, Any]]) -> None:
+        """从持久化快照恢复锁利梯度状态（跨重启续用，含峰价/阶段/冷却时间戳）。
+
+        只恢复 key 形如 `symbol:long/short` 的合法条目；字段缺失/非法值回退安全默认，
+        避免脏数据把引擎带入危险状态（例如 peak=NaN 导致回撤计算失效）。
+        """
+        if not isinstance(state, dict):
+            return
+        valid_phases = {"none", "breakeven", "trailing"}
+        restored = 0
+        for key, value in state.items():
+            if not isinstance(value, dict) or ":" not in key:
+                continue
+            symbol, direction = key.rsplit(":", 1)
+            if not symbol or direction not in ("long", "short"):
+                continue
+            phase = value.get("phase")
+            if phase not in valid_phases:
+                phase = "none"
+            self._states[key] = {
+                "phase": phase,
+                "peak": _finite(_f(value.get("peak"), 0.0), 0.0),
+                "partial_done": bool(value.get("partial_done", False)),
+                "be_retrace_partial_done": bool(value.get("be_retrace_partial_done", False)),
+                "last_action_ts": _finite(_f(value.get("last_action_ts"), 0.0), 0.0),
+            }
+            restored += 1
+        if restored > 0:
+            logger.info(f"ProfitLockEngine restored {restored} persisted lock state(s)")
 
     # ==================== 工具方法 ====================
 
@@ -312,7 +378,6 @@ class ProfitLockEngine:
         pnl_pct: float,
         peak: float,
         retrace_pct: float,
-        reversal_score: float,
         st: Dict[str, Any],
     ) -> ProfitLockDecision:
         return ProfitLockDecision(
@@ -324,13 +389,11 @@ class ProfitLockEngine:
             pnl_pct=round(pnl_pct, 6),
             peak_price=round(peak, 10),
             phase=str(st["phase"]),
-            reversal_score=round(reversal_score, 4),
             retrace_pct=round(retrace_pct, 6),
             details={
                 "breakeven_pct": self._breakeven_pct,
                 "partial_pct": self._partial_pct,
                 "trailing_distance_pct": self._trailing_distance_pct,
-                "reversal_close_score": self._reversal_close_score,
             },
         )
 
@@ -341,7 +404,6 @@ class ProfitLockEngine:
         pnl_pct: float,
         peak: float,
         retrace_pct: float,
-        reversal_score: float,
         phase: str,
     ) -> ProfitLockDecision:
         return ProfitLockDecision(
@@ -353,7 +415,6 @@ class ProfitLockEngine:
             pnl_pct=round(pnl_pct, 6),
             peak_price=round(peak, 10),
             phase=phase,
-            reversal_score=round(reversal_score, 4),
             retrace_pct=round(retrace_pct, 6),
             details={},
         )

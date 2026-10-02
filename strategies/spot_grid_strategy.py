@@ -104,16 +104,15 @@ class SpotGridStrategy(PersistentStrategy):
         self.config.setdefault("strategies", {})["spot_grid"] = strategy_cfg
 
         attr_map = {
-            "grid_count_max": "grid_count_max",
-            "grid_count_min": "grid_count_min",
-            "min_grid_spacing": "min_grid_spacing",
-            "max_grid_spacing": "max_grid_spacing",
-            "atr_multiplier": "atr_multiplier",
-            "stop_loss_pct": "stop_loss_pct",
-            "min_signal_quality": "min_signal_quality",
-            "take_profit_pct": "take_profit_pct",
-            "grid_reset_enabled": "grid_reset_enabled",
-            "grid_reset_delay": "grid_reset_delay",
+            "grid_count_max": "_grid_count_max",
+            "grid_count_min": "_grid_count_min",
+            "min_grid_spacing": "_min_grid_spacing",
+            "max_grid_spacing": "_max_grid_spacing",
+            "atr_multiplier": "_atr_multiplier",
+            "stop_loss_pct": "_stop_loss_pct",
+            "take_profit_pct": "_take_profit_pct",
+            "grid_reset_enabled": "_grid_reset_enabled",
+            "grid_reset_delay": "_grid_reset_delay",
         }
         for cfg_key, attr_name in attr_map.items():
             if cfg_key in updates:
@@ -127,12 +126,14 @@ class SpotGridStrategy(PersistentStrategy):
         if self._adaptive_controller:
             try:
                 return self._adaptive_controller.get_allocation("spot_grid")
-            except Exception:
-                pass
+            except Exception as e:
+                # fail-closed: 资金分配查询失败时返回 0，拒绝开仓
+                logger.warning(f"SpotGrid 资金分配查询失败，返回 0（fail-closed）: {e}")
+                return 0.0
         return self.config["trading"].get("spot_grid_allocation", 0.20)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital"""
+        """获取有效资金：优先使用实际账户权益，失败时 fail-closed 返回 0。"""
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -145,9 +146,11 @@ class SpotGridStrategy(PersistentStrategy):
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
-        return self.config["trading"].get("total_capital", 100.0)
+        except Exception as e:
+            logger.warning(f"[spot_grid] get_account_info failed: {e}")
+        # fail-closed: 账户权益查询失败时返回 0，避免用静态 total_capital 兜底导致仓位失真
+        logger.warning("[spot_grid] 账户权益查询失败，返回 0（fail-closed）")
+        return 0.0
 
     def apply_param_update(self, params: Dict[str, Any]):
         applied = []
@@ -203,17 +206,29 @@ class SpotGridStrategy(PersistentStrategy):
 
     async def _update_indicators_loop(self):
         while True:
-            for symbol in self._all_symbols:
-                await self._update_atr(symbol)
-                await self._update_volume_profile(symbol)
-            await asyncio.sleep(300)
+            try:
+                for symbol in self._all_symbols:
+                    await self._update_atr(symbol)
+                    await self._update_volume_profile(symbol)
+                await asyncio.sleep(300)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SpotGrid _update_indicators_loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _update_ema_loop(self):
         """优化：更新EMA趋势指标"""
         while True:
-            for symbol in self._all_symbols:
-                await self._update_ema(symbol)
-            await asyncio.sleep(60)
+            try:
+                for symbol in self._all_symbols:
+                    await self._update_ema(symbol)
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SpotGrid _update_ema_loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _update_ema(self, symbol: str):
         """计算EMA趋势"""
@@ -392,7 +407,10 @@ class SpotGridStrategy(PersistentStrategy):
         if not ticker:
             return
 
-        current_price = float(ticker["last"])
+        current_price = float(ticker.get("last", 0) or 0)
+        if not np.isfinite(current_price) or current_price <= 0:
+            logger.warning(f"Spot Grid {symbol}: invalid current_price {current_price!r}, skip grid build")
+            return
         tier = get_currency_tier(symbol, self.config)
         tier_settings = self.config["currencies"][f"{tier}_settings"]
 
@@ -492,11 +510,17 @@ class SpotGridStrategy(PersistentStrategy):
 
     async def _monitor_ticks(self):
         while True:
-            ws_used = False
-            for symbol in self._all_symbols:
-                if await self._process_tick(symbol):
-                    ws_used = True
-            await asyncio.sleep(0.1 if ws_used else 1.0)
+            try:
+                ws_used = False
+                for symbol in self._all_symbols:
+                    if await self._process_tick(symbol):
+                        ws_used = True
+                await asyncio.sleep(0.1 if ws_used else 1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SpotGrid _monitor_ticks error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _process_tick(self, symbol: str) -> bool:
         tick = self.redis_cache.get_tick(symbol)
@@ -644,8 +668,8 @@ class SpotGridStrategy(PersistentStrategy):
                 boost = self._adaptive_controller.get_position_boost()
                 if boost > 1.0:
                     base_position *= boost
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[spot_grid] get_position_boost failed: {e}")
 
         min_margin = self.config["trading"].get("min_margin_per_trade", 0.5)
         if base_position < min_margin:
@@ -687,7 +711,8 @@ class SpotGridStrategy(PersistentStrategy):
 
         quantity = base_position / price
 
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "0.001"))
+        instr_info = self.okx_client.get_instrument_info(symbol) or {}
+        min_lot_size = self._safe_float(instr_info.get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             logger.debug(f"Spot Grid {symbol}: quantity {quantity:.6f} < min lot {min_lot_size}, skip")
             return
@@ -707,6 +732,9 @@ class SpotGridStrategy(PersistentStrategy):
         quantity_precision = self._get_quantity_precision(symbol)
 
         quantity = round(quantity, quantity_precision)
+        if quantity <= 0:
+            logger.debug(f"Spot Grid {symbol}: skip open, quantity {quantity} <= 0 after rounding")
+            return
         price = round(price, precision)
 
         signal = Signal(
@@ -764,28 +792,32 @@ class SpotGridStrategy(PersistentStrategy):
         if side == "sell":
             retain_ratio = 0.3
             rebuy_qty = quantity * retain_ratio
-            min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "0.001"))
+            instr_info = self.okx_client.get_instrument_info(symbol) or {}
+            min_lot_size = self._safe_float(instr_info.get("lotSz", "0.001"), 0.001)
             if rebuy_qty >= min_lot_size:
                 precision = get_price_precision(symbol)
                 qty_prec = self._get_quantity_precision(symbol)
                 rebuy_qty = round(rebuy_qty, qty_prec)
-                rebuy_price = round(price, precision)
-                retain_signal = Signal(
-                    symbol=symbol,
-                    strategy_name="spot_grid",
-                    signal_type="spot_grid_retain",
-                    direction="buy",
-                    price=rebuy_price,
-                    quantity=rebuy_qty,
-                    leverage=1,
-                    stop_loss=None,
-                    take_profit=None,
-                    confidence=0.85,
-                    timestamp=datetime.now()
-                )
-                if self._signal_callback:
-                    await self._signal_callback(retain_signal)
-                logger.info(f"Spot Grid retain: {symbol} rebuy {rebuy_qty:.6f} @ {rebuy_price:.4f} (30% of sold qty)")
+                if rebuy_qty <= 0:
+                    logger.debug(f"Spot Grid {symbol}: skip retain rebuy, rebuy_qty {rebuy_qty} <= 0 after rounding")
+                else:
+                    rebuy_price = round(price, precision)
+                    retain_signal = Signal(
+                        symbol=symbol,
+                        strategy_name="spot_grid",
+                        signal_type="spot_grid_retain",
+                        direction="buy",
+                        price=rebuy_price,
+                        quantity=rebuy_qty,
+                        leverage=1,
+                        stop_loss=None,
+                        take_profit=None,
+                        confidence=0.85,
+                        timestamp=datetime.now()
+                    )
+                    if self._signal_callback:
+                        await self._signal_callback(retain_signal)
+                    logger.info(f"Spot Grid retain: {symbol} rebuy {rebuy_qty:.6f} @ {rebuy_price:.4f} (30% of sold qty)")
 
         self._log_throttled(symbol, f"Spot Grid {side.upper()} signal: {symbol} @ {price:.4f} x {quantity:.6f}")
 
@@ -816,12 +848,18 @@ class SpotGridStrategy(PersistentStrategy):
 
     async def _dynamic_adjust_loop(self):
         while True:
-            now = datetime.now()
-            for symbol in self._all_symbols:
-                last_adjust = self._last_adjust_time.get(symbol)
-                if last_adjust and (now - last_adjust).total_seconds() >= self._dynamic_adjust_interval:
-                    await self._adjust_grid(symbol)
-            await asyncio.sleep(self._dynamic_adjust_interval)
+            try:
+                now = datetime.now()
+                for symbol in self._all_symbols:
+                    last_adjust = self._last_adjust_time.get(symbol)
+                    if last_adjust and (now - last_adjust).total_seconds() >= self._dynamic_adjust_interval:
+                        await self._adjust_grid(symbol)
+                await asyncio.sleep(self._dynamic_adjust_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SpotGrid _dynamic_adjust_loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _adjust_grid(self, symbol: str):
         ticker = self.okx_client.get_ticker(symbol)
@@ -843,16 +881,28 @@ class SpotGridStrategy(PersistentStrategy):
 
     async def _order_check_loop(self):
         while True:
-            for symbol in self._all_symbols:
-                await self._check_pending_orders(symbol)
-            await asyncio.sleep(self._order_check_interval)
+            try:
+                for symbol in self._all_symbols:
+                    await self._check_pending_orders(symbol)
+                await asyncio.sleep(self._order_check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SpotGrid _order_check_loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _check_pending_orders(self, symbol: str):
         pass
 
     async def _multi_symbol_rebalance_loop(self):
         while True:
-            await asyncio.sleep(self._rebalance_interval)
+            try:
+                await asyncio.sleep(self._rebalance_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"SpotGrid _multi_symbol_rebalance_loop error: {e}")
+                await asyncio.sleep(60)
 
     async def _position_monitor_loop(self):
         """优化：持仓监控循环 - 动态止盈止损"""
@@ -1064,6 +1114,17 @@ class SpotGridStrategy(PersistentStrategy):
         try:
             grids = state.get("grids")
             if isinstance(grids, dict):
+                # P0-4: 反序列化 fill_time（json.dumps(default=str) 会将其转字符串），
+                #       否则重启后 _process_tick 的 (datetime.now() - fill_time) 会抛 TypeError。
+                for sym, levels in grids.items():
+                    if not isinstance(levels, list):
+                        continue
+                    for g in levels:
+                        if isinstance(g, dict) and isinstance(g.get("fill_time"), str):
+                            try:
+                                g["fill_time"] = datetime.fromisoformat(g["fill_time"])
+                            except (ValueError, TypeError):
+                                g["fill_time"] = None
                 self._grids = grids
             ap = state.get("active_positions")
             if isinstance(ap, dict):

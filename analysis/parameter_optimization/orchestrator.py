@@ -15,6 +15,7 @@ import json
 import os
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
 from functools import partial
 from datetime import datetime
@@ -70,6 +71,8 @@ class OptimizationPipelineResult:
     bo_result: Optional[BOOptimizationResult] = None
     wf_result: Optional[WalkForwardResult] = None
     mc_result: Optional[MCValidationResult] = None
+    # 唯一运行标识（幂等去重、持久化追溯）
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     # 最终最优参数
     best_params: Dict[str, float] = field(default_factory=dict)
     final_fitness: float = 0.0
@@ -80,11 +83,13 @@ class OptimizationPipelineResult:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
+        final_fitness = self.final_fitness if np.isfinite(self.final_fitness) else 0.0
         return {
+            "run_id": self.run_id,
             "strategy_name": self.strategy_name,
             "phase": self.phase.value,
             "best_params": self.best_params,
-            "final_fitness": round(self.final_fitness, 6),
+            "final_fitness": round(final_fitness, 6),
             "ga_result": self.ga_result.to_dict() if self.ga_result else None,
             "bo_result": self.bo_result.to_dict() if self.bo_result else None,
             "wf_result": self.wf_result.to_dict() if self.wf_result else None,
@@ -129,6 +134,8 @@ class ParameterOptimizationOrchestrator:
         self._price_data: Optional[np.ndarray] = None
         self._param_defs: List[ParameterDef] = []
         self._lock = asyncio.Lock()
+        # fail-closed：记录最近一次 load_history 的读取失败原因，区分「读取失败」与「无历史」
+        self._history_load_error: Optional[str] = None
 
         os.makedirs(self._persist_dir, exist_ok=True)
         logger.info(f"ParameterOptimizationOrchestrator initialized: strategy={self._default_strategy.value}")
@@ -148,9 +155,12 @@ class ParameterOptimizationOrchestrator:
         except TypeError:
             val = self._fitness_fn(params)
         try:
-            return float(val) if val is not None else 0.0
+            f = float(val) if val is not None else 0.0
         except (TypeError, ValueError):
             return 0.0
+        if not np.isfinite(f):
+            return 0.0
+        return f
 
     def set_price_data(self, data: np.ndarray):
         """设置价格数据（用于WF和MC验证）"""
@@ -174,14 +184,12 @@ class ParameterOptimizationOrchestrator:
                 ParameterDef("min_signal_strength", "float", 0.15, 0.60, step=0.05, description="最小信号强度"),
             ],
             "scalping": [
-                ParameterDef("atr_period", "int", 5, 20, description="ATR周期"),
-                ParameterDef("atr_multiplier", "float", 0.5, 2.0, step=0.1, description="ATR倍数"),
                 ParameterDef("rsi_period", "int", 3, 14, description="RSI周期"),
-                ParameterDef("rsi_lower", "int", 15, 35, description="RSI下轨"),
-                ParameterDef("rsi_upper", "int", 65, 85, description="RSI上轨"),
-                ParameterDef("target_pct", "float", 0.003, 0.015, step=0.001, description="目标止盈%"),
-                ParameterDef("stop_pct", "float", 0.002, 0.010, step=0.001, description="止损%"),
-                ParameterDef("max_hold_seconds", "int", 30, 300, description="最大持仓秒数"),
+                ParameterDef("rsi_oversold", "float", 20.0, 40.0, step=1.0, description="RSI超卖线"),
+                ParameterDef("rsi_overbought", "float", 60.0, 80.0, step=1.0, description="RSI超买线"),
+                ParameterDef("profit_target_min", "float", 0.004, 0.015, step=0.001, description="止盈目标"),
+                ParameterDef("stop_loss", "float", 0.002, 0.015, step=0.001, description="止损"),
+                ParameterDef("max_hold_minutes", "int", 5, 60, description="最大持仓分钟"),
             ],
             "grid": [
                 ParameterDef("grid_count", "int", 3, 15, description="网格层数"),
@@ -219,10 +227,11 @@ class ParameterOptimizationOrchestrator:
                 timeout=self._timeout_seconds
             )
             result.ga_result = ga_result
-            result.best_params = ga_result.best_params
-            result.final_fitness = ga_result.best_fitness
-            result.total_evaluations += ga_result.total_evaluations
-            logger.info(f"GA phase complete: best_fitness={ga_result.best_fitness:.4f}, "
+            best_fitness = float(ga_result.best_fitness) if np.isfinite(ga_result.best_fitness) else 0.0
+            result.best_params = dict(ga_result.best_params)
+            result.final_fitness = best_fitness
+            result.total_evaluations += int(ga_result.total_evaluations or 0)
+            logger.info(f"GA phase complete: best_fitness={best_fitness:.4f}, "
                        f"gen={ga_result.convergence_generation}, evals={ga_result.total_evaluations}")
 
         except asyncio.TimeoutError:
@@ -240,8 +249,10 @@ class ParameterOptimizationOrchestrator:
 
         # 热启动：将 GA 最优参数注入为 BO 初始观测，加速局部精调收敛
         if use_ga_best and result.ga_result and result.ga_result.best_params:
-            self._bo.set_warm_start(dict(result.ga_result.best_params))
-            logger.info(f"BO warm-started from GA best: {result.ga_result.best_fitness:.4f}")
+            warm = {k: v for k, v in result.ga_result.best_params.items() if np.isfinite(v)}
+            if warm:
+                self._bo.set_warm_start(warm)
+                logger.info(f"BO warm-started from GA best: {result.ga_result.best_fitness:.4f}")
 
         try:
             bo_result = await asyncio.wait_for(
@@ -249,12 +260,13 @@ class ParameterOptimizationOrchestrator:
                 timeout=self._timeout_seconds
             )
             result.bo_result = bo_result
-            result.total_evaluations += bo_result.total_iterations
+            result.total_evaluations += int(bo_result.total_iterations or 0)
 
             # 如果BO结果更好就替换
-            if bo_result.best_value > result.final_fitness:
-                result.best_params = bo_result.best_params
-                result.final_fitness = bo_result.best_value
+            bo_best = float(bo_result.best_value) if np.isfinite(bo_result.best_value) else None
+            if bo_best is not None and bo_best > result.final_fitness:
+                result.best_params = dict(bo_result.best_params)
+                result.final_fitness = bo_best
 
             logger.info(f"BO phase complete: best_value={bo_result.best_value:.4f}, "
                        f"iter={bo_result.total_iterations}")
@@ -282,6 +294,12 @@ class ParameterOptimizationOrchestrator:
             params = dict(best)
             for pd in param_defs:
                 v = params.get(pd.name, (pd.low + pd.high) / 2)
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    v = (pd.low + pd.high) / 2
+                if not np.isfinite(v):
+                    v = (pd.low + pd.high) / 2
                 # 加小扰动
                 noise = v * np.random.normal(0, 0.05)
                 params[pd.name] = pd.clamp(v + noise)
@@ -403,7 +421,9 @@ class ParameterOptimizationOrchestrator:
             logger.error(f"Optimization pipeline failed for {strategy_name}: {e}")
 
         # 持久化
-        self._history.append(result)
+        # 幂等去重：相同 run_id 只入历史一次（重复提交/重试不产生重复记录）
+        if not any(getattr(r, "run_id", None) == result.run_id for r in self._history):
+            self._history.append(result)
         # 内存沉淤防护：限制内存历史记录上限
         if len(self._history) > self._max_history:
             self._history = self._history[-self._max_history:]
@@ -417,18 +437,20 @@ class ParameterOptimizationOrchestrator:
 
     # ── 持久化 ────────────────────────────────────────────────
 
-    def _persist_result(self, result: OptimizationPipelineResult):
-        """持久化优化结果"""
+    def _persist_result(self, result: OptimizationPipelineResult) -> bool:
+        """持久化优化结果（fail-closed：成功返回 True，失败返回 False）"""
         try:
-            filename = f"opt_{result.strategy_name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+            filename = f"opt_{result.strategy_name}_{result.run_id}.json"
             filepath = os.path.join(self._persist_dir, filename)
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
             logger.debug(f"Optimization result persisted: {filepath}")
             # 磁盘沉淤防护：清理过期优化结果文件，仅保留最近 N 个
             self._prune_persist_files()
+            return True
         except Exception as e:
             logger.warning(f"Failed to persist optimization result: {e}")
+            return False
 
     def _prune_persist_files(self):
         """清理参数优化历史文件，只保留最近 _max_persist_files 个，防止磁盘沉淤。"""
@@ -450,10 +472,15 @@ class ParameterOptimizationOrchestrator:
             logger.debug(f"Prune optimization files error: {e}")
 
     def load_history(self, strategy_name: str = None) -> List[Dict[str, Any]]:
-        """加载历史优化记录"""
+        """加载历史优化记录。
+
+        fail-closed：读取失败通过 self._history_load_error 暴露，
+        区分「读取失败」与「无历史记录」（目录不存在/无文件返回空列表且无错误）。
+        """
         results = []
         try:
             if not os.path.exists(self._persist_dir):
+                self._history_load_error = None
                 return results
             for fname in sorted(os.listdir(self._persist_dir), reverse=True):
                 if not fname.endswith('.json'):
@@ -464,8 +491,10 @@ class ParameterOptimizationOrchestrator:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     results.append(data)
+            self._history_load_error = None
         except Exception as e:
             logger.warning(f"Failed to load optimization history: {e}")
+            self._history_load_error = str(e)
         return results
 
     # ── 查询接口 ──────────────────────────────────────────────
@@ -475,6 +504,7 @@ class ParameterOptimizationOrchestrator:
         latest_summary = None
         if latest:
             latest_summary = {
+                "run_id": latest.get("run_id"),
                 "strategy_name": latest.get("strategy_name"),
                 "phase": latest.get("phase"),
                 "best_params": latest.get("best_params"),
@@ -484,10 +514,13 @@ class ParameterOptimizationOrchestrator:
                 "timestamp": latest.get("timestamp"),
             }
         persisted_count = 0
+        persisted_count_error = None
         try:
             persisted_count = len([f for f in os.listdir(self._persist_dir) if f.endswith('.json')])
-        except Exception:
+        except Exception as e:
+            # fail-closed：磁盘列举失败不应与「0 个历史文件」混淆，暴露错误原因
             persisted_count = 0
+            persisted_count_error = str(e)
         return {
             "enabled": self._enabled,
             "current_phase": self._current_phase.value,
@@ -496,6 +529,7 @@ class ParameterOptimizationOrchestrator:
             "history_count": len(self._history),
             "in_memory_history_count": len(self._history),
             "persisted_history_count": persisted_count,
+            "persisted_history_error": self._history_load_error or persisted_count_error,
             "last_optimization": self._history[-1].timestamp if self._history else None,
             "latest_result": latest_summary,
             "ga_status": self._ga.get_status() if self._ga else None,

@@ -200,6 +200,25 @@ class ConfigConsistencyGuard:
                     if mn > mx:
                         report.add_error(f"{tier_key}.{key_min}({mn}) 大于 {key_max}({mx})")
 
+        # 6) position_limit × max_positions 不超过总资本
+        # 防止单策略仓位上限 × 并发数 超过可用资本
+        total_capital = _to_float(trading.get("total_capital", 0))
+        if total_capital > 0:
+            strategies = config.get("strategies", {}) or {}
+            for strategy_name, strategy_cfg in strategies.items():
+                if not isinstance(strategy_cfg, dict):
+                    continue
+                pos_limit = _to_float(strategy_cfg.get("position_limit", 0))
+                max_pos = _to_float(strategy_cfg.get("max_concurrent_positions", 0))
+                if pos_limit > 0 and max_pos > 0:
+                    max_exposure = pos_limit * max_pos
+                    if max_exposure > total_capital:
+                        report.add_error(
+                            f"策略 {strategy_name}: position_limit({pos_limit}) × "
+                            f"max_concurrent_positions({max_pos}) = {max_exposure:.2f} "
+                            f"超过总资本({total_capital:.2f})"
+                        )
+
     # ============================================================
     # 防回归检查
     # ============================================================

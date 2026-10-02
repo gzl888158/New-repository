@@ -185,6 +185,10 @@ class CapitalUtilizationEngine:
     # 触发 FORCE_REBALANCE：资金未被有效利用，需向高效策略重新分配。
     FORCE_REBALANCE_EFFICIENCY_THRESHOLD = 0.15
     FORCE_REBALANCE_MIN_EQUITY = 100.0
+    # 资金占用低于此值视为「闲置」而非「无效利用」，不触发 FORCE_REBALANCE
+    FORCE_REBALANCE_MIN_UTILIZATION = 0.10
+    # 已用保证金低于此值（USDT）时效率分母无意义，返回中性值避免被 PnL 放大成异常值
+    MIN_EFFICIENCY_MARGIN = 1.0
 
     def __init__(self, config: Dict[str, Any] = None):
         self._config = config or {}
@@ -317,6 +321,10 @@ class CapitalUtilizationEngine:
         capital_efficiency = self._calc_capital_efficiency(
             recent_pnl or {}, strategy_usage or {}
         )
+        efficiency_is_valid = (
+            sum((strategy_usage or {}).values()) > self.MIN_EFFICIENCY_MARGIN
+            and bool(recent_pnl)
+        )
         deployment_ratio = used_margin / (used_margin + available) if (used_margin + available) > 0 else 0
         util_trend = self._calc_utilization_trend(utilization)
         util_volatility = self._calc_utilization_volatility()
@@ -328,7 +336,10 @@ class CapitalUtilizationEngine:
         )
 
         # ── 6. 确定全局动作 ──
-        action = self._determine_action(utilization, tier, util_trend, capital_efficiency, total_equity)
+        action = self._determine_action(
+            utilization, tier, util_trend, capital_efficiency, total_equity,
+            efficiency_is_valid=efficiency_is_valid,
+        )
 
         # ── 7. 计算调节参数 ──
         position_boost = self._compute_position_boost(utilization, tier, action)
@@ -529,7 +540,8 @@ class CapitalUtilizationEngine:
         """计算资本效率 = 总PnL / 总已用保证金"""
         total_pnl = sum(recent_pnl.values())
         total_used = sum(strategy_usage.values())
-        if total_used <= 0:
+        # 分母过小（几乎无持仓）时比值无意义，返回中性值避免被 PnL 放大成异常值
+        if total_used <= self.MIN_EFFICIENCY_MARGIN:
             return 0.0
         return total_pnl / total_used
 
@@ -568,7 +580,8 @@ class CapitalUtilizationEngine:
 
     def _determine_action(self, utilization: float, tier: UtilizationTier,
                            trend: float, efficiency: float,
-                           total_equity: Optional[float] = None) -> UtilizationAction:
+                           total_equity: Optional[float] = None,
+                           efficiency_is_valid: bool = True) -> UtilizationAction:
         """确定全局调节动作，含迟滞防振荡机制"""
         now = datetime.now()
 
@@ -576,9 +589,13 @@ class CapitalUtilizationEngine:
         if self._equity_mode == "emergency":
             return UtilizationAction.EMERGENCY_FREEZE
 
-        # 资本效率硬约束：资金规模足够大但效率过低时，强制再平衡
+        # 资本效率硬约束：资金规模足够大、确实被占用、但效率过低时，强制再平衡。
+        # utilization 极低说明资金处于「闲置」而非「无效利用」，
+        # 应交由后续 BOOST 逻辑部署闲置资金，而非误触发 FORCE_REBALANCE。
         if (total_equity is not None
                 and total_equity > self.FORCE_REBALANCE_MIN_EQUITY
+                and utilization >= self.FORCE_REBALANCE_MIN_UTILIZATION
+            and efficiency_is_valid
                 and efficiency < self.FORCE_REBALANCE_EFFICIENCY_THRESHOLD):
             return UtilizationAction.FORCE_REBALANCE
 

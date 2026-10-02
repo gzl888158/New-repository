@@ -1,6 +1,8 @@
 """
 VWAP 执行器 (Volume-Weighted Average Price)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 基于历史成交量分布执行订单，最小化与VWAP基准的偏差：
   - 成交量预测：基于历史日内成交量分布建模
   - 动态分配：根据实时成交量偏离调整计划
@@ -11,6 +13,7 @@ VWAP 执行器 (Volume-Weighted Average Price)
 import asyncio
 import math
 import random
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -18,6 +21,7 @@ from typing import Dict, Any, Optional, List, Callable, Tuple
 import numpy as np
 from loguru import logger
 
+from core.direction_unifier import DirectionUnifier
 from execution.algo_orders.algo_execution_engine import (
     AlgoOrderConfig, AlgoExecutionResult, ExecutionSlice,
     AlgoOrderStatus,
@@ -252,15 +256,6 @@ class VWAPExecutor:
         start_time = datetime.now()
         end_time = start_time + timedelta(seconds=config.duration_seconds)
 
-        # 获取成交量分布
-        profile = self.get_volume_profile(config.symbol)
-
-        # 分配切片
-        allocations = self.allocate_to_slices(
-            config.total_quantity, profile, start_time, end_time,
-            self._min_slice_pct, self._max_slice_pct,
-        )
-
         result = AlgoExecutionResult(
             order_id=config.order_id,
             algo_type="VWAP",
@@ -273,13 +268,33 @@ class VWAPExecutor:
             start_time=start_time,
         )
 
+        # 获取成交量分布
+        profile = self.get_volume_profile(config.symbol)
+
+        # fail-closed：无真实成交量分布（合成/缺失）时拒绝执行，避免基于伪造U型分布下单
+        if profile is None or profile.is_synthetic:
+            logger.error(f"VWAP {config.order_id}: no real volume profile for {config.symbol}, "
+                         f"fail-closed - refusing to execute on synthetic distribution")
+            result.status = AlgoOrderStatus.FAILED
+            result.error_message = "volume profile unavailable (fail-closed)"
+            result.end_time = datetime.now()
+            return result
+
+        # 分配切片
+        allocations = self.allocate_to_slices(
+            config.total_quantity, profile, start_time, end_time,
+            self._min_slice_pct, self._max_slice_pct,
+        )
+
         # 获取到达价格
         if config.market_data_fn:
             try:
                 market = config.market_data_fn(config.symbol)
                 if market:
-                    result.arrival_price = float(market.get("mid", market.get("last", 0)))
-            except Exception:
+                    raw = market.get("mid", market.get("last"))
+                    if raw is not None:
+                        result.arrival_price = float(raw)
+            except (TypeError, ValueError):
                 pass
 
         total_filled = 0.0
@@ -297,15 +312,30 @@ class VWAPExecutor:
             # 限价 = mid ± offset
             price = self._calc_vwap_limit(config)
 
+            # fail-closed：限价不可得时拒绝该切片
+            if price is None or price <= 0:
+                logger.warning(f"VWAP {config.order_id}: limit price unavailable for slice {seq}, "
+                               f"fail-closed - skipping slice")
+                es = ExecutionSlice(
+                    slice_id=f"vwap_{config.order_id}_{seq:03d}", sequence=seq,
+                    quantity=qty, status="rejected",
+                    error_message="limit price unavailable (fail-closed)",
+                )
+                if on_slice_filled:
+                    await on_slice_filled(config.order_id, es)
+                continue
+
             # 执行
             if config.executor_fn:
                 try:
                     order_params = {
                         "symbol": config.symbol,
                         "side": config.side,
+                        "pos_side": DirectionUnifier.to_pos_side(config.side),
                         "quantity": qty,
                         "order_type": "limit",
                         "price": price,
+                        "trace_id": f"algo_{config.order_id}_{uuid.uuid4().hex[:8]}",
                     }
                     fill = config.executor_fn(order_params)
                     if hasattr(fill, '__await__'):
@@ -322,7 +352,7 @@ class VWAPExecutor:
                         total_cost += filled_qty * avg_px
 
                         es = ExecutionSlice(
-                            slice_id=f"vwap_{seq:03d}",
+                            slice_id=f"vwap_{config.order_id}_{seq:03d}",
                             sequence=seq,
                             quantity=qty,
                             filled_quantity=filled_qty,
@@ -338,7 +368,7 @@ class VWAPExecutor:
                 except Exception as e:
                     logger.warning(f"VWAP slice {seq} failed: {e}")
                     es = ExecutionSlice(
-                        slice_id=f"vwap_{seq:03d}", sequence=seq,
+                        slice_id=f"vwap_{config.order_id}_{seq:03d}", sequence=seq,
                         quantity=qty, status="rejected", error_message=str(e),
                     )
                     if on_slice_filled:
@@ -354,8 +384,10 @@ class VWAPExecutor:
                 order_params = {
                     "symbol": config.symbol,
                     "side": config.side,
+                    "pos_side": DirectionUnifier.to_pos_side(config.side),
                     "quantity": remaining,
                     "order_type": "market",
+                    "trace_id": f"algo_{config.order_id}_{uuid.uuid4().hex[:8]}",
                 }
                 fill = config.executor_fn(order_params)
                 if hasattr(fill, '__await__'):
@@ -381,7 +413,7 @@ class VWAPExecutor:
 
         if result.arrival_price > 0 and result.avg_execution_price > 0:
             slip = (result.avg_execution_price - result.arrival_price) / result.arrival_price * 10000
-            if config.side == "sell":
+            if DirectionUnifier.is_short(config.side):
                 slip *= -1
             result.arrival_slippage_bps = slip
             result.implementation_shortfall = abs(total_cost - total_filled * result.arrival_price)
@@ -398,10 +430,17 @@ class VWAPExecutor:
         try:
             market = config.market_data_fn(config.symbol)
             if market:
-                mid = float(market.get("mid", market.get("last", 0)))
+                raw = market.get("mid", market.get("last"))
+                if raw is None:
+                    return None
+                mid = float(raw)
+                if mid <= 0 or math.isnan(mid):
+                    return None
                 offset = mid * self._limit_offset_bps / 10000.0
-                return mid + offset if config.side == "buy" else mid - offset
-        except Exception:
+                if DirectionUnifier.is_long(config.side):
+                    return mid + offset
+                return mid - offset
+        except (TypeError, ValueError):
             pass
         return None
 
@@ -457,11 +496,11 @@ class VWAPExecutor:
 
     async def refresh_volume_profile(self, symbol: str,
                                       bar: str = "1H",
-                                      lookback_bars: int = 168) -> VolumeProfile:
-        """从 OKX 拉取K线数据，构建真实成交量分布"""
+                                      lookback_bars: int = 168) -> Optional[VolumeProfile]:
+        """从 OKX 拉取K线数据，构建真实成交量分布；失败时返回 None（fail-closed，不伪造合成分布）"""
         if not getattr(self, '_okx_client', None):
-            logger.debug(f"VWAP: no OKX client, using default profile for {symbol}")
-            return self.compute_default_profile(symbol)
+            logger.debug(f"VWAP: no OKX client, cannot build real profile for {symbol}")
+            return None
 
         try:
             import concurrent.futures
@@ -479,11 +518,11 @@ class VWAPExecutor:
         except Exception as e:
             logger.warning(f"VWAP profile refresh failed for {symbol}: {e}")
 
-        return self.compute_default_profile(symbol)
+        return None
 
     async def refresh_profiles_batch(self, symbols: List[str],
                                       bar: str = "1H",
-                                      lookback_bars: int = 168) -> Dict[str, VolumeProfile]:
+                                      lookback_bars: int = 168) -> Dict[str, Optional[VolumeProfile]]:
         """批量刷新多个标的的成交量分布"""
         results = {}
         for symbol in symbols:
@@ -491,5 +530,5 @@ class VWAPExecutor:
                 results[symbol] = await self.refresh_volume_profile(symbol, bar, lookback_bars)
             except Exception as e:
                 logger.warning(f"VWAP batch refresh failed for {symbol}: {e}")
-                results[symbol] = self.compute_default_profile(symbol)
+                results[symbol] = None
         return results

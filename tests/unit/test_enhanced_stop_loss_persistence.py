@@ -136,3 +136,48 @@ class TestSerializationRoundtrip:
         sm2 = EnhancedStopLoss(_make_config(db), "grid")
         restored = sm2._position_stops["BTC-USDT-SWAP"]["vol_lockout_until"]
         assert isinstance(restored, datetime)
+
+
+class TestReconcile:
+    """启动对账：按真实持仓清理幽灵止损/止盈状态（内存 + 持久化）。"""
+
+    def test_reconcile_removes_stale_memory_and_db(self, tmp_path):
+        db = tmp_path / "trading.db"
+        sm = EnhancedStopLoss(_make_config(db), "grid")
+        sm.init_position_stop("BTC-USDT-SWAP", 100.0, "long", 1.0)
+        sm.init_position_stop("ETH-USDT-SWAP", 2000.0, "long", 1.0)
+
+        # 只保留 BTC，ETH 是平仓未 remove 的幽灵残留
+        cleaned = sm.reconcile_with_active_positions({"BTC-USDT-SWAP"})
+        assert cleaned >= 1
+        assert "BTC-USDT-SWAP" in sm._position_stops
+        assert "ETH-USDT-SWAP" not in sm._position_stops
+
+        # 持久化层面同样被清理（新实例加载不到 ETH）
+        sm2 = EnhancedStopLoss(_make_config(db), "grid")
+        assert "BTC-USDT-SWAP" in sm2._position_stops
+        assert "ETH-USDT-SWAP" not in sm2._position_stops
+
+    def test_reconcile_keeps_active_symbols(self, tmp_path):
+        db = tmp_path / "trading.db"
+        sm = EnhancedStopLoss(_make_config(db), "grid")
+        sm.init_position_stop("BTC-USDT-SWAP", 100.0, "long", 1.0)
+        sm.reconcile_with_active_positions({"BTC-USDT-SWAP"})
+        assert "BTC-USDT-SWAP" in sm._position_stops
+
+    def test_reconcile_empty_set_clears_all(self, tmp_path):
+        db = tmp_path / "trading.db"
+        sm = EnhancedStopLoss(_make_config(db), "grid")
+        sm.init_position_stop("BTC-USDT-SWAP", 100.0, "long", 1.0)
+        sm.reconcile_with_active_positions(set())
+        assert sm._position_stops == {}
+        sm2 = EnhancedStopLoss(_make_config(db), "grid")
+        assert sm2._position_stops == {}
+
+    def test_reconcile_no_db_path_no_crash(self, tmp_path):
+        config = {"trading": {}, "strategies": {"grid": {}}}
+        sm = EnhancedStopLoss(config, "grid")
+        sm.init_position_stop("BTC-USDT-SWAP", 100.0, "long", 1.0)
+        cleaned = sm.reconcile_with_active_positions({"ETH-USDT-SWAP"})
+        assert cleaned >= 1
+        assert sm._position_stops == {}

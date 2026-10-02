@@ -80,9 +80,9 @@ class SingleInstance:
     def _write_lock_file(self):
         """将PID写入锁文件，仅作辅助诊断"""
         try:
-            self._fh = open(self.lock_file, "w")
-            self._fh.write(str(os.getpid()))
-            self._fh.flush()
+            with open(self.lock_file, "w") as f:
+                f.write(str(os.getpid()))
+                f.flush()
         except Exception as e:
             logger.warning(f"Failed to write lock file: {e}")
 

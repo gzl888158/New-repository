@@ -24,8 +24,29 @@ def _ema(data: np.ndarray, period: int) -> np.ndarray:
     return out
 
 
+def _wilder_smooth(values: Union[List[float], np.ndarray], period: int) -> np.ndarray:
+    """Wilder 平滑：首值为前 period 项均值，之后按 1/period 指数衰减。
+
+    返回与输入等长的平滑序列，前 period-1 项为 0（未收敛），供 ADX 链路使用。
+    """
+    arr = np.asarray(values, dtype=float)
+    n = len(arr)
+    out = np.zeros(n, dtype=float)
+    if n < period or period <= 0:
+        return out
+    out[period - 1] = float(np.mean(arr[:period]))
+    for i in range(period, n):
+        out[i] = out[i - 1] - out[i - 1] / period + arr[i] / period
+    return out
+
+
 def _adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14):
-    """计算 ADX 及 +DI/-DI（简化 Wilder 平滑，用于趋势强度）"""
+    """计算 ADX 及 +DI/-DI（真 Wilder 平滑，用于趋势强度）。
+
+    原实现将单点 DX 与中性值混合（0.6*dx + 0.4*20），严重压缩 ADX 动态范围且
+    丢失趋势强度的持续性。此处改为标准 Wilder 平滑 TR/DM → DI → DX → ADX 链，
+    使 ADX 反映趋势强度的平滑持续性，方向识别更抗噪。
+    """
     n = len(closes)
     if n < period + 1:
         return 20.0, 50.0, 50.0
@@ -44,21 +65,34 @@ def _adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 
         plus_dm.append(up if (up > down and up > 0) else 0.0)
         minus_dm.append(down if (down > up and down > 0) else 0.0)
 
-    tr_s = _ema(np.asarray(tr, dtype=float), period)
-    pdi_s = _ema(np.asarray(plus_dm, dtype=float), period)
-    mdi_s = _ema(np.asarray(minus_dm, dtype=float), period)
+    tr_s = _wilder_smooth(tr, period)
+    pdi_s = _wilder_smooth(plus_dm, period)
+    mdi_s = _wilder_smooth(minus_dm, period)
 
-    last_tr = tr_s[-1]
-    if last_tr <= 0:
+    # DX 序列（平滑未收敛的索引置 0），同时记录最新 +DI/-DI
+    dx: List[float] = []
+    last_pdi = 50.0
+    last_mdi = 50.0
+    for i in range(len(tr_s)):
+        trv = tr_s[i]
+        if trv <= 0:
+            dx.append(0.0)
+            continue
+        pdi = 100.0 * pdi_s[i] / trv
+        mdi = 100.0 * mdi_s[i] / trv
+        last_pdi, last_mdi = pdi, mdi
+        di_sum = pdi + mdi
+        dx.append(100.0 * abs(pdi - mdi) / di_sum if di_sum > 0 else 0.0)
+
+    adx_s = _wilder_smooth(dx, period)
+    adx = float(adx_s[-1]) if len(adx_s) > 0 else 20.0
+
+    # 数值防护：ADX/DI 出现非法值或非正值时回退中性
+    if not (math.isfinite(adx) and math.isfinite(last_pdi) and math.isfinite(last_mdi)):
         return 20.0, 50.0, 50.0
-
-    pdi = 100.0 * pdi_s[-1] / last_tr
-    mdi = 100.0 * mdi_s[-1] / last_tr
-    di_sum = pdi + mdi
-    dx = 100.0 * abs(pdi - mdi) / di_sum if di_sum > 0 else 0.0
-    # 单点 DX 与中性值混合，降低噪声
-    adx = 0.6 * dx + 0.4 * 20.0
-    return adx, pdi, mdi
+    if adx <= 0:
+        adx = 20.0
+    return adx, last_pdi, last_mdi
 
 
 def compute_trend_vote(
@@ -133,7 +167,20 @@ def compute_trend_vote(
         adx, plus_di, minus_di = 20.0, 50.0, 50.0
     di_dir = 1.0 if plus_di > minus_di else (-1.0 if minus_di > plus_di else 0.0)
 
-    direction = (ema_dir + slope_dir + structure_dir + di_dir) / 4.0
+    # ── 强化：因子可靠性加权 + DI 方向梯度化 ──
+    # DI 方向用连续梯度（(plus_di-minus_di)/di_sum，-1..1）替代二值，捕捉方向强度差异；
+    # DMI 方向因子最可靠（权重最高），结构次之，EMA/斜率对噪声敏感权重较低。
+    di_sum = plus_di + minus_di
+    di_grad = (plus_di - minus_di) / di_sum if di_sum > 0 else 0.0
+    if not math.isfinite(di_grad):
+        di_grad = 0.0
+    direction = (
+        0.20 * ema_dir
+        + 0.20 * slope_dir
+        + 0.25 * structure_dir
+        + 0.35 * di_grad
+    )
+    direction = max(-1.0, min(1.0, direction))
     # ── 运算层：adx_strength 归一化除法除零/反向防护（参数层已保证 floor<saturation） ──
     span = adx_saturation - adx_floor
     if span <= 0 or not math.isfinite(span):

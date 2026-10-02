@@ -1,6 +1,11 @@
 """
 决策协调器（Decision Coordinator）— 完善强化版
 
+.. deprecated::
+    本模块为实验性代码，当前未接入生产交易链路。
+    实际交易决策流: signal_processor.py → order_executor.py（直接执行，不经过本模块）。
+    保留仅供未来架构演进参考，勿在生产环境中依赖。
+
 核心增强：
   1. 决策依赖图 — 拓扑排序保证执行顺序（如先平仓后开仓）
   2. 决策批处理 — 原子化批量提交，全部成功或全部回滚
@@ -151,6 +156,7 @@ class Decision:
         "expires_at", "rejection_reason", "conflicts",
         "dependencies", "retry_count", "max_retries",
         "lifecycle", "impact", "batch_id", "group_key",
+        "trace_id",
     )
 
     def __init__(
@@ -164,11 +170,13 @@ class Decision:
         ttl_seconds: float = 30.0,
         max_retries: int = 3,
         dependencies: List[DecisionDependency] = None,
+        trace_id: str = "",
     ):
         self.decision_id = decision_id
         self.decision_type = decision_type
         self.source = source
         self.data = data
+        self.trace_id = trace_id
         self.priority = priority
         self.original_priority = priority
         self.confidence = confidence
@@ -209,6 +217,7 @@ class Decision:
             "decision_id": self.decision_id,
             "decision_type": self.decision_type.value,
             "source": self.source,
+            "trace_id": self.trace_id,
             "data": self.data,
             "priority": self.priority.value,
             "original_priority": self.original_priority.value,

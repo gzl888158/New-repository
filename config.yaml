@@ -21,6 +21,7 @@ currencies:
   - SOL
   - XRP
   - DOGE
+  - ARB
   tier3_settings:
     leverage_min: 2
     leverage_max: 5
@@ -31,6 +32,15 @@ currencies:
     slippage: 0.002
   tier3_symbols:
   - SUI
+  symbol_overrides:
+    ARB:
+      leverage_min: 3
+      leverage_max: 5
+      leverage_default: 4
+      position_limit: 0.2
+      grid_spacing_min: 0.009
+      grid_spacing_max: 0.016
+      slippage: 0.0015
 trade_cost:
   fetch_realtime_fee: true
   fee_cache_ttl: 3600
@@ -52,6 +62,9 @@ execution:
   retry_attempts: 3
   slippage_tolerance: 0.001
   orphan_position_auto_close: false
+  orphan_stop_loss_enabled: true
+  orphan_stop_loss_pct: 0.03
+  orphan_stop_loss_failure_auto_close: true
   no_trade_volatility_threshold: 0.1
   thread_pool_size: 8
   idempotency_enabled: true
@@ -69,6 +82,15 @@ execution:
   partial_fill_tracker_ttl_sec: 300.0
   persist_active_orders: true
   fill_reconcile_interval_sec: 30
+  price_freshness_max_age_sec: 5.0
+  post_only_timeout_sec: 60.0
+  # 回测滑点率（平仓时应用）：5bps，避免回测结果偏乐观
+  backtest_slippage_rate: 0.0005
+  # 回测手续费率
+  taker_fee: 0.0005
+  maker_fee: 0.0002
+  funding_rate: 0.0001
+  funding_interval_hours: 8
 websocket:
   enabled: true
   ping_interval: 20
@@ -107,6 +129,7 @@ strategy_engine:
 position_manager:
   enabled: true
   sync_interval_sec: 3
+  sync_failure_threshold: 3
   risk_check_interval_sec: 5
   max_total_positions: 12
   max_positions_per_symbol: 2
@@ -133,6 +156,36 @@ equity_monitor:
   save_interval: 60
   ema_alpha: 0.05
   trend_confirm_bars: 5
+  tiered_drawdown_guard:
+    enabled: true
+    levels:
+    - drawdown_pct: 0.03
+      position_multiplier: 0.7
+      risk_budget_ratio: 0.7
+      max_positions: 7
+    - drawdown_pct: 0.05
+      position_multiplier: 0.5
+      risk_budget_ratio: 0.5
+      max_positions: 5
+    - drawdown_pct: 0.08
+      position_multiplier: 0.25
+      risk_budget_ratio: 0.3
+      max_positions: 3
+  profit_reserve:
+    enabled: true
+    activation_pct: 0.02
+    max_pct: 0.1
+    max_position_multiplier_reduction: 0.3
+  drawdown_velocity:
+    enabled: true
+    window: 10
+    drop_pct_per_window: 0.03
+    position_multiplier: 0.5
+  recovery_ramp:
+    enabled: true
+    floor: 0.3
+    ceiling: 1.0
+    step_per_bar: 0.05
 hardware:
   cpu_cores: 4
   high_priority_cores:
@@ -241,6 +294,11 @@ okx:
   is_testnet: false
   passphrase: ${OKX_PASSPHRASE}
   proxy: http://127.0.0.1:7897
+  proxy_list:
+  - http://127.0.0.1:7897
+  - http://127.0.0.1:7898
+  - http://127.0.0.1:7899
+  allow_direct_fallback: false
   rest_url: https://www.okx.com
   secret_key: ${OKX_SECRET_KEY}
   websocket_private_url: wss://ws.okx.com:8443/ws/v5/private
@@ -287,6 +345,12 @@ risk:
   position_loss_threshold: 0.1
 sqlite:
   db_path: data/trading.db
+order_persistence:
+  enabled: true
+  db_path: data/orders.db
+  api_retry_times: 3
+  api_retry_delay: 2.0
+  patrol_interval: 4.0
 strategies:
   arbitrage:
     enabled: false
@@ -331,30 +395,30 @@ strategies:
     grid_count_min: 2
     grid_count_max: 3
     martingale_layers: 0
-    martingale_coefficient: 1.1
+    martingale_coefficient: 1.0
     dynamic_adjust_interval: 120
     volatility_threshold: 0.015
     atr_period: 14
     atr_multiplier: 0.8
     volume_profile_period: 30
     price_update_interval_ms: 20
-    stop_loss_pct: 0.078
+    stop_loss_pct: 0.02
     trailing_stop_enabled: true
     trailing_stop_pct: 0.018
     breakeven_trigger_pct: 0.012
     breakeven_stop_pct: 0.003
-    min_signal_quality: 0.35
+    min_signal_quality: 0.109835
     extreme_volatility_pause_minutes: 5
     max_stop_loss_pct: 0.02
     min_signal_interval: 15
     signal_cooldown: 30.0
     take_profit_enabled: true
     tp1_ratio: 0.4
-    tp1_pct: 2.0
+    tp1_pct: 4.0
     tp2_ratio: 0.5
-    tp2_pct: 4.0
+    tp2_pct: 8.0
     tp3_ratio: 0.1
-    tp3_trailing_pct: 0.02
+    tp3_trailing_pct: 0.03
     time_exit_enabled: true
     max_hold_hours: 72.0
     time_exit_partial_pct: 0.5
@@ -368,6 +432,9 @@ strategies:
     coin_health_max_errors: 5
     coin_health_degraded_score: 0.6
     coin_auto_pause_on_error: true
+    trend_confirmation_mode: regime_aware
+    minute_rebound_window: 15
+    minute_rebound_threshold: 0.005
     locked_params:
     - min_signal_quality
     - stop_loss_pct
@@ -380,6 +447,7 @@ strategies:
     grid_rebuild_cooldown_seconds: 300
     use_fill_driven_position: true
     max_daily_loss_usdt: 0.5
+    leverage: 3.0
   scalping:
     enabled: true
     run_hours_start: 0
@@ -387,15 +455,15 @@ strategies:
     min_drop: 0.008
     min_rise: 0.008
     price_deviation: 0.003
-    max_hold_minutes: 10
-    profit_target_min: 0.008
-    profit_target_max: 0.015
-    stop_loss: 0.005
+    max_hold_minutes: 7
+    profit_target_min: 0.009
+    profit_target_max: 0.03
+    stop_loss: 0.009
     momentum_periods: 5
     reversal_threshold: 0.002
-    rsi_period: 4
-    rsi_oversold: 30.0
-    rsi_overbought: 70.0
+    rsi_period: 14
+    rsi_oversold: 32.0
+    rsi_overbought: 75.0
     stoch_period: 10
     volume_delta_threshold: 0.2
     trailing_stop_activation: 0.3
@@ -412,17 +480,17 @@ strategies:
     volatility_adaptive_sl: true
     profit_protection_max_drawdown: 0.4
     adaptive_enabled: true
-    min_signal_quality: 0.18
+    min_signal_quality: 0.1
     market_state_lookback: 20
-    max_positions: 2
+    max_positions: 4
     position_sizing_mode: conservative
     take_profit_enabled: true
-    tp1_ratio: 0.5
-    tp1_pct: 0.5
-    tp2_ratio: 0.5
-    tp2_pct: 1.0
+    tp1_ratio: 0.6
+    tp1_pct: 0.003
+    tp2_ratio: 0.4
+    tp2_pct: 0.006
     tp3_ratio: 0.0
-    tp3_trailing_pct: 0.005
+    tp3_trailing_pct: 0.004
     time_exit_enabled: false
     max_hold_hours: 4.0
     time_exit_partial_pct: 0.5
@@ -431,10 +499,16 @@ strategies:
     vol_spike_threshold: 3.0
     vol_stop_partial_pct: 0.5
     volatility_lockout_minutes: 15
+    slippage_filter_enabled: true
+    max_slippage_ratio: 0.5
+    high_slippage_downgrade_ratio: 0.3
+    high_slippage_downgrade_factor: 0.5
+    symbol_slippage_overrides:
+      DOGE: 0.0032
     risk_lock_quality_boost: 0.1
     max_single_trade_loss_usdt: 0.5
     max_single_position_margin_pct: 0.25
-    max_daily_trades: 20
+    max_daily_trades: 0
     max_stop_loss_pct: 0.02
     trailing_stop_enabled: true
     trailing_stop_pct: 0.018
@@ -497,7 +571,7 @@ strategies:
     max_daily_trades_per_symbol: 5
     same_symbol_cooldown_minutes: 10
   trend:
-    enabled: false
+    enabled: true
     timeframe: 15m
     confirmation_periods:
     - 4h
@@ -507,9 +581,9 @@ strategies:
     initial_position_ratio: 1.0
     addition_ratio: 0.0
     profit_targets: []
-    trailing_stop_tier1: 0.025
-    trailing_stop_tier2: 0.04
-    trailing_stop_tier3: 0.05
+    trailing_stop_tier1: 0.001
+    trailing_stop_tier2: 0.001
+    trailing_stop_tier3: 0.001
     false_break_threshold: 0.012
     trailing_stop_initial: 0.04
     trailing_stop_min: 0.015
@@ -518,7 +592,7 @@ strategies:
     reversal_confirmation_bars: 2
     reversal_adx_threshold: 25.0
     adaptive_enabled: true
-    min_signal_quality: 0.45
+    min_signal_quality: 0.141214
     market_state_lookback: 20
     breakeven_trigger_pct: 0.012
     breakeven_stop_pct: 0.003
@@ -548,7 +622,7 @@ strategies:
     shared_trend_vote_enabled: true
     shared_trend_vote_weight: 0.15
     shared_vote_adx_floor: 25.0
-    shared_vote_adx_saturation: 40.0
+    shared_vote_adx_saturation: 60.0
     post_only: true
     pending_tier_count: 3
     pending_tier_spread: 0.005
@@ -624,6 +698,26 @@ strategies:
     adx_period: 14
     symbol_pnl_cap_enabled: true
     symbol_pnl_cap_ratio: 0.15
+  sniper:
+    enabled: true
+    timeframe: 5m
+    min_signal_quality: 0.35
+    leverage: 5
+    max_concurrent_positions: 2
+    capital_allocation: 0.1
+    max_stop_loss_pct: 0.02
+    take_profit_pct: 0.04
+    loop_interval_seconds: 30
+    adx_threshold: 20.0
+    adx_period: 14
+    breakout_lookback: 20
+    volume_multiplier: 1.5
+    rsi_period: 14
+    rsi_oversold: 30.0
+    rsi_overbought: 70.0
+    atr_period: 14
+    atr_sl_multiplier: 2.0
+    atr_tp_multiplier: 3.0
   momentum_rotation:
     enabled: false
     timeframe: 1h
@@ -862,6 +956,17 @@ notifications:
   - telegram
   - webhook
   - email
+  alert_rate_limits:
+    DEBUG: 120
+    INFO: 60
+    WARNING: 30
+    ERROR: 15
+    CRITICAL: 5
+    EMERGENCY: 0
+    max_per_window: 3
+  alert_retry_max: 2
+  alert_retry_delay_seconds: 1.0
+  alert_fallback_dir: data/alerts_failed
 telegram:
   bot_token: ${TELEGRAM_BOT_TOKEN}
   chat_id: ${TELEGRAM_CHAT_ID}
@@ -875,6 +980,16 @@ allocation_agent:
   min_trade_count: 20
   max_allocation_change: 0.05
   method: dynamic
+freeze_policy:
+  enabled: true
+  observe_minutes: 60
+  probe_weight_ratio: 0.5
+  probe_max_attempts: 3
+  consecutive_loss_freeze: 5
+  max_drawdown_freeze: 0.15
+  positive_return_drawdown_freeze: 0.6
+  positive_return_min_profit_factor: 2.0
+  positive_return_min_trade_count: 10
 focused_allocation:
   enabled: true
   nano_equity_threshold: 50.0
@@ -886,6 +1001,7 @@ focused_allocation:
   - arbitrage
   - scalping
   symbol_priority:
+  - ARB
   - SOL
   - DOGE
   - XRP
@@ -1070,21 +1186,47 @@ reversal_take_profit:
   price_precision: 4
 trailing_take_profit:
   enabled: true
-  activation_pct: 0.03
-  trailing_distance_pct: 0.02
+  activation_pct: 0.012
+  trailing_distance_pct: 0.008
   check_interval: 5
   cooldown_seconds: 120
   min_notional_usd: 1.0
 profit_lock:
   enabled: true
-  breakeven_pct: 0.005
+  breakeven_pct: 0.0015
   breakeven_exit_pct: 0.0
-  partial_pct: 0.01
-  partial_ratio: 0.35
-  trailing_distance_pct: 0.006
-  reversal_close_score: 0.5
-  reversal_min_profit_pct: 0.002
+  partial_pct: 0.004
+  partial_ratio: 0.5
+  trailing_distance_pct: 0.0025
   cooldown_seconds: 120
+  breakeven_retrace_partial_enabled: true
+  breakeven_retrace_partial_ratio: 0.4
+adaptive_tp_sl:
+  enabled: true
+  base_sl_pct: 0.02
+  base_tp_pct: 0.06
+  atr_sl_multiplier: 1.5
+  atr_tp_ratio: 3.0
+  min_sl_pct: 0.005
+  max_sl_pct: 0.08
+  min_tp_pct: 0.01
+  max_tp_pct: 0.3
+  breakeven_safety_mult: 1.5
+  breakeven_min_buffer: 0.001
+  trailing_activation_pct: 0.008
+  trailing_distance_pct: 0.003
+  smoothing_alpha: 0.5
+  protection_hysteresis_margin: 0.002
+  slippage_pct: 0.001
+  precision: 4
+  staged_tp:
+    levels:
+    - ratio: 0.6
+      close_ratio: 0.4
+    - ratio: 1.0
+      close_ratio: 0.5
+    - ratio: 1.5
+      close_ratio: 0.1
 trading:
   arbitrage_allocation: 0.0
   compound_enabled: true
@@ -1095,7 +1237,7 @@ trading:
   daily_risk_limit: 0.03
   funding_rate_check: true
   funding_rate_min_hold: 0.0008
-  grid_allocation: 0.4
+  grid_allocation: 0.0
   hourly_max_loss: 0.025
   idle_cash_allocation: true
   maker_fee_rate: 0.0002
@@ -1107,6 +1249,7 @@ trading:
   max_drawdown: 0.25
   max_queue_size: 200
   max_slippage_pct: 0.001
+  stop_loss_slippage_buffer: 0.001
   max_total_leverage: 5.0
   min_balance: 5.0
   min_hold_minutes: 5
@@ -1117,16 +1260,27 @@ trading:
   profit_reserve_ratio: 0.0
   risk_per_trade: 0.05
   risk_reserve_ratio: 0.05
-  scalping_allocation: 0.6
-  spot_grid_allocation: 0.0
+  scalping_allocation: 0.5
+  spot_grid_allocation: 0.2
   spot_martingale_allocation: 0.0
   taker_fee_rate: 0.0005
   target_return: 1.5
   target_utilization: 0.85
-  total_capital: 251.014864
+  total_capital: 221.163628
+  high_value_equity_threshold: 2000.0
   trading_capital_ratio: 0.95
   trailing_profit_lock: 0.04
-  trend_allocation: 0.0
+  trend_allocation: 0.3
+capital_management:
+  rebalance_interval: 900
+  smoothing_new_weight: 0.5
+  deployability:
+    enabled: true
+    exited_factor: 0.0
+    paused_factor: 0.15
+    blacklist_pair_penalty: 0.12
+    max_blacklist_penalty: 0.7
+  idle_cash_min_deployability: 0.3
 capital_attrition:
   enabled: true
   taker_fee_rate: 0.0005
@@ -1491,6 +1645,7 @@ portfolio_optimizer:
   min_rebalance_change_pct: 0.02
   max_single_weight: 0.5
   min_single_weight: 0.05
+  max_total_exposure_pct: 3.0
   risk_free_rate: 0.03
   correlation:
     window_days: 30
@@ -1631,7 +1786,7 @@ intelligent_decision_engine:
   prior_sell: 0.33
   prior_hold: 0.34
   tf_agreement_threshold: 0.6
-  base_confidence_threshold: 0.43
+  base_confidence_threshold: 0.35
   min_confidence_threshold: 0.3
   max_confidence_threshold: 0.7
   min_decision_interval_ms: 200
@@ -1644,10 +1799,27 @@ intelligent_decision_engine:
   funding_rate_annual: 0.1
 scheduler_intervals:
   intelligent_analysis: 21600
+market_data:
+  max_price_change_pct: 0.05
+  max_data_delay_seconds: 30
+  rest_fallback_interval_seconds: 5
+  rest_fallback_max_concurrency: 5
+  ticker_max_server_age_seconds: 5
+  orderbook_min_depth: 5
+  funding_rate_cache_ttl_seconds: 60
+  funding_rate_settlement_window_seconds: 120
+  funding_rate_settlement_ttl_seconds: 10
+  funding_rate_stale_fallback_ttl_seconds: 300
+  max_kline_gap_intervals: 1.5
 regime_gate:
   range_bound_trend_allow_high_confidence: true
   range_bound_trend_confidence_threshold: 0.6
   trend_regime_mean_reversion_allow_with_trend: true
+  trend_counter_direction_strength: 0.6
+  reversal_probability_threshold: 0.65
+  reversal_signal_confidence_threshold: 0.7
+  range_bound_volatility_check_enabled: true
+  range_bound_min_volatility: 0.005
 market_regime:
   watched_symbols:
   - BTC-USDT-SWAP
@@ -1656,10 +1828,17 @@ market_regime:
   - XRP-USDT-SWAP
   - DOGE-USDT-SWAP
   - SUI-USDT-SWAP
+  - ARB-USDT-SWAP
   trend_adx_period: 14
   trend_adx_floor: 15
-  trend_adx_saturation: 40
+  trend_adx_saturation: 60
   trend_mtf_weight: 0.4
+  extreme_vol_threshold: 0.6
+  funding_crush_threshold: 0.5
+  liquidity_crisis_threshold: -0.5
+  # P3: Regime 分类准确率验证
+  regime_accuracy_validation: true
+  regime_accuracy_window: 20  # 预测后N个周期（每个周期60秒）进行验证
 online_learner:
   learning_mode: online
   learning_rate: 0.01
@@ -1799,6 +1978,12 @@ market_regime_detector:
   - long
   feature_cache_size: 1000
   history_size: 500
+  min_stable_updates: 3
+  stability_confidence_discount: 0.7
+  reversal_direction_lookback: 8
+  reversal_direction_confirmation_bars: 3
+  reversal_direction_min_trend_pct: 0.004
+  reversal_direction_min_confirm_pct: 0.0015
   vol_expansion_ratio: 2.0
   volume_spike_ratio: 3.0
   price_compression_pct: 0.3
@@ -1855,3 +2040,621 @@ anti_debounce:
   enable_loss_cooldown: true
   enable_churn: true
   enable_adaptive: true
+expired_residue_cleaner:
+  enable_cleaner: true
+  dry_run: false
+  emergency_pause: false
+  cron_expression: 0 3 * * *
+  min_interval_sec: 600
+  check_interval_sec: 60
+  low_io_priority: true
+  io_budget_bytes: 67108864
+  disk_threshold_pct: 85
+  memory_threshold_pct: 80
+  archive_dir: ./backups/residue_archive
+  soft_retention_sec: 604800
+  state_file: ./data/expired_residue_cleaner_state.json
+  audit_file: ./data/expired_residue_cleaner_audit.jsonl
+  clock_drift_tolerance_sec: 300
+  whitelist_patterns:
+  - '*trading.db*'
+  - '*trading.db-wal'
+  - '*trading.db-shm'
+  - '*event_store*'
+  - '*audit*'
+  - '*position_snapshot*'
+  - '*trade_records*'
+  - '*order_events*'
+  manual_keep_markers:
+  - .keep
+  - KEEP
+  - manual_override
+  categories:
+    kline_cache:
+      enabled: true
+      ttl_sec: 3600
+      dirs: []
+      patterns:
+      - '*.json'
+      - '*.pkl'
+      - '*.parquet'
+    order_temp:
+      enabled: true
+      ttl_sec: 7200
+      dirs: []
+      patterns:
+      - '*.json'
+    trace_log:
+      enabled: true
+      ttl_sec: 86400
+      dirs: []
+      patterns:
+      - '*.log'
+      - '*.jsonl'
+    backtest_temp:
+      enabled: true
+      ttl_sec: 86400
+      dirs:
+      - ./data/metric_snapshots
+      patterns:
+      - snapshot_*.json
+    lock_file:
+      enabled: true
+      ttl_sec: 3600
+      dirs:
+      - ./data
+      patterns:
+      - '*.lock'
+      - '*.pid'
+    alert_cache:
+      enabled: true
+      ttl_sec: 86400
+      dirs: []
+      patterns:
+      - '*.json'
+agi_orchestrator:
+  enabled: true
+  autonomous: true
+  cooldown_seconds: 300
+  loop_interval_seconds: 300
+  utilization_low_threshold: 0.1
+  state_path: data/agi_orchestrator_state.json
+  always_require_confirmation:
+    - reallocate
+  profit_take:
+    enabled: true
+    activation_pct: 0.03
+    max_pct: 0.1
+    max_close_ratio: 0.5
+  risk_response:
+    enabled: true
+    reduce_target: 0.1
+  regime_adaptive:
+    enabled: true
+    trend_multiplier: 1.3
+    range_multiplier: 0.8
+  learning:
+    enabled: true
+    memory_size: 10
+    max_adjust_pct: 0.4
+    memory_decay_alpha: 0.85
+  goal_planning:
+    enabled: true
+    daily_target_return_pct: 0.02
+    max_drawdown_pct: 0.08
+    near_drawdown_ratio: 0.8
+    goal_reached_reduce_target: 0.3
+  param_adaptation:
+    enabled: true
+    health_f_leverage: 1.0
+    declining_leverage: 2.0
+    min_interval_cycles: 3
+    restore_enabled: true
+    restore_leverage: 3.0
+    restore_leverage_b: 2.0
+    restore_min_interval_cycles: 5
+  symbol_param_guard:
+    enabled: true
+    loss_threshold: 5.0
+    reduce_leverage_step: 1
+    min_leverage: 1
+    cooldown_cycles: 5
+  spot_hold_guard:
+    enabled: true
+    max_spot_currencies: 3
+    profit_take_pct: 0.02
+    loss_take_pct: 0.02
+    reduce_target: 0.1
+  hourly_pnl_guard:
+    enabled: true
+    min_active_hours: 24
+    min_trades: 3
+    hourly_loss_threshold: 0.5
+    reduce_target: 0.1
+  trade_frequency_guard:
+    enabled: true
+    min_active_hours: 24
+    min_trades: 10
+    frequency_threshold: 2.0
+    reduce_target: 0.1
+  risk_adjusted_contribution_guard:
+    enabled: true
+    min_trades: 10
+    min_risk_adjusted_ratio: 1.0
+    deterioration_leverage: 1.0
+  strategy_staleness_guard:
+    enabled: true
+    reclaim_idle_hours: 48
+    min_trades: 5
+    reclaim_target: 0.05
+  health_crash_guard:
+    enabled: true
+    crash_threshold: 20
+    min_trades: 10
+    deterioration_leverage: 1.0
+  decision_oscillation_guard:
+    enabled: true
+    cooldown_cycles: 3
+  net_exposure_guard:
+    enabled: true
+    imbalance_ratio_threshold: 0.6
+    min_gross_exposure: 1.0
+    reduce_target: 0.15
+  account_leverage_guard:
+    enabled: true
+    soft_threshold_ratio: 0.8
+    reduce_target: 0.15
+  pending_margin_guard:
+    enabled: true
+    ratio_threshold: 0.15
+    reduce_target: 0.15
+  confidence_adaptation:
+    enabled: true
+    adapt_span: 0.15
+  cost_budget_adaptation:
+    enabled: true
+    adapt_span: 0.15
+  volatility_budget_guard:
+    enabled: true
+    volatility_budget: 50.0
+    min_trades: 10
+    deterioration_leverage: 1.0
+  decision_quality_guard:
+    enabled: true
+    quality_threshold: 0.3
+    min_samples: 5
+    recovery_after_cycles: 8
+    recovery_boost_scale: 0.5
+    regime_conditioned: true
+    use_cycle_pnl_delta: true
+    ignore_zero_cycle_pnl: true
+  portfolio_stress_guard:
+    enabled: true
+    stress_scenario_pct: 0.2
+    stress_loss_budget: 0.5
+    reduce_target: 0.15
+    severe_scenario_pct: 0.4
+    severe_loss_budget: 0.8
+  decision_lineage:
+    enabled: true
+    max_entries: 200
+    path: data/agi_decision_lineage.json
+  offensive_allocation:
+    enabled: true
+    min_regime_strength: 0.6
+    max_regime_strength: 0.95
+    min_regime_confidence: 0.5
+    signal_resonance: true
+    trend_confirmation_cycles: 2
+    max_drawdown_pct: 0.05
+    boost_step: 0.05
+    max_target: 0.4
+    min_interval_cycles: 5
+    range_bound_enabled: true
+    range_bound_min_strength: 0.3
+    range_bound_strategies: oscillation_harvest
+    range_bound_boost_step: 0.03
+    range_bound_max_target: 0.25
+    range_bound_min_interval_cycles: 2
+    range_bound_max_offensive_strategies: 1
+    max_offensive_strategies: 2
+    max_total_allocation: 1.0
+    profit_take:
+      enabled: true
+      pnl_threshold: 3.0
+      revert_step: 0.03
+      revert_max_multiplier: 3.0
+      cooldown_cycles: 3
+    stop_loss:
+      enabled: true
+      pnl_threshold: 3.0
+      revert_step: 0.03
+      revert_max_multiplier: 3.0
+      cooldown_cycles: 10
+    momentum_scaling_enabled: true
+    momentum_scaling_min_multiplier: 0.5
+    momentum_scaling_max_multiplier: 1.5
+    attribution_ttl_cycles: 30
+    max_consecutive_offenses: 3
+    available_margin_check_enabled: true
+    min_available_margin_ratio: 0.1
+    min_boost_delta: 0.01
+    recovery_offense_enabled: true
+    recovery_offense_min_multiplier: 0.3
+    rl_feedback_enabled: true
+    rl_adaptation_span: 0.1
+    rl_min_multiplier: 0.5
+    rl_max_multiplier: 1.5
+    rl_ema_alpha: 0.3
+    rl_warm_start_enabled: true
+  strategy_lifecycle:
+    enabled: true
+    pause_permanently_frozen: true
+    pause_dormant: true
+    resume_recovered: true
+  adaptive_risk:
+    enabled: true
+    window: 5
+    min_appetite: 0.2
+    min_boost_ratio: 0.3
+    drawdown_aware: true
+    drawdown_scale: 0.2
+  action_reconciliation:
+    enabled: true
+    min_confidence: 0.5
+  timescale:
+    enabled: true
+    slow_cycle_interval: 10
+  diversification:
+    enabled: true
+    reduce_target: 0.2
+  correlation:
+    enabled: true
+    high_corr_threshold: 0.7
+    reduce_target: 0.2
+  cost_guard:
+    enabled: true
+    min_delta: 0.02
+  health_trend_guard:
+    enabled: true
+    window: 3
+    deterioration_leverage: 1.0
+  regime_shift_guard:
+    enabled: true
+    cooldown_cycles: 3
+  give_back_guard:
+    enabled: true
+    give_back_threshold: 0.2
+    reduce_target: 0.1
+    severe_enabled: true
+    severe_threshold: 0.5
+    severe_reduce_target: 0.02
+    critical_enabled: true
+    critical_threshold: 0.8
+    peak_reset_on_resume: true
+    peak_reset_on_critical: true
+    peak_decay_cycles: 0
+  cost_awareness:
+    enabled: true
+    fee_ratio_threshold: 0.3
+    reduce_target: 0.1
+  strategy_fee_ratio_guard:
+    enabled: true
+    fee_ratio_threshold: 0.3
+    reduce_target: 0.1
+  strategy_fee_ratio_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.1
+  funding_cost_guard:
+    enabled: true
+    funding_ratio_threshold: 0.3
+    reduce_target: 0.1
+  funding_cost_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.1
+  long_short_imbalance_guard:
+    enabled: true
+    min_trades: 10
+    loss_ratio_threshold: 0.3
+    deterioration_leverage: 1.0
+  strategy_direction_bias_guard:
+    enabled: true
+    min_trades: 10
+    bias_ratio_threshold: 0.9
+    deterioration_leverage: 1.0
+  take_profit_ratio_guard:
+    enabled: true
+    min_trades: 10
+    min_take_profit_ratio: 0.5
+    deterioration_leverage: 1.0
+  win_loss_ratio_guard:
+    enabled: true
+    min_trades: 10
+    min_win_loss_ratio: 1.0
+    deterioration_leverage: 1.0
+  take_profit_pnl_ratio_guard:
+    enabled: true
+    min_trades: 10
+    min_take_profit_pnl_ratio: 1.0
+    deterioration_leverage: 1.0
+  execution_cost_guard:
+    enabled: true
+    cost_ratio_threshold: 0.3
+    reduce_target: 0.1
+  execution_cost_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.1
+  pnl_momentum_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  pnl_momentum_guard:
+    enabled: true
+    min_momentum_ratio: 0.7
+    min_trades: 10
+    deterioration_leverage: 1.0
+  pnl_per_trade_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  pnl_per_trade_guard:
+    enabled: true
+    min_pnl_per_trade: 0.0
+    min_trades: 10
+    deterioration_leverage: 1.0
+  pnl_projection:
+    enabled: true
+    horizon_cycles: 5
+    accuracy_window: 20
+    min_accuracy_samples: 5
+    regime_correction_max_age_cycles: 100
+    min_correction: 0.5
+    max_correction: 2.0
+    trend_weight: 0.3
+    max_trend_adj_ratio: 0.5
+    confidence_level: 0.95
+    projection_adaptation_span: 0.2
+    projection_min_mult: 0.5
+    projection_max_mult: 1.5
+    fail_closed_loss_threshold: 0.05
+    offensive_projection_loss_threshold: 0.0
+    projection_unit_pnl: 1.0
+    min_attribution_trades: 20
+  simulation_safety:
+    enabled: false
+    fail_closed_streak_threshold: 3
+    bear_case_reduce_ratio: 0.25
+  delta_pnl_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  delta_pnl_guard:
+    enabled: true
+    loss_threshold: 0.02
+    min_trades: 10
+    deterioration_leverage: 1.0
+  momentum_guard:
+    enabled: true
+    max_consecutive_up: 3
+  utilization_guard:
+    enabled: true
+    high_utilization_threshold: 0.8
+    reduce_target: 0.15
+  unrealized_loss_guard:
+    enabled: true
+    loss_threshold: 0.03
+    reduce_target: 0.0
+  realized_loss_guard:
+    enabled: true
+    loss_threshold: 0.03
+    reduce_target: 0.1
+  unrealized_loss_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.1
+  unrealized_profit_ratio_guard:
+    enabled: true
+    ratio_threshold: 0.8
+    reduce_target: 0.1
+  unrealized_profit_ratio_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.1
+  drawdown_acceleration_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.1
+  downside_momentum_guard:
+    enabled: true
+    max_consecutive_down: 3
+    reduce_target: 0.1
+  equity_mode_guard:
+    enabled: true
+    emergency_reduce_target: 0.0
+    decline_reduce_target: 0.1
+  win_rate_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  win_rate_guard:
+    enabled: true
+    min_win_rate: 0.35
+    min_trades: 10
+    deterioration_leverage: 1.0
+  sharpe_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  sharpe_ratio_guard:
+    enabled: true
+    min_sharpe_ratio: 0.0
+    min_trades: 10
+    deterioration_leverage: 1.0
+  consecutive_losses_guard:
+    enabled: true
+    loss_threshold: 3
+    deterioration_leverage: 1.0
+  stop_loss_frequency_guard:
+    enabled: true
+    loss_ratio_threshold: 0.5
+    min_trades: 10
+    deterioration_leverage: 1.0
+  profit_factor_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  profit_factor_guard:
+    enabled: true
+    min_profit_factor: 1.0
+    min_trades: 10
+    deterioration_leverage: 1.0
+  max_drawdown_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  max_drawdown_guard:
+    enabled: true
+    max_drawdown_threshold: 0.2
+    min_trades: 10
+    deterioration_leverage: 1.0
+  drawdown_duration_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  drawdown_duration_guard:
+    enabled: true
+    max_drawdown_hours: 168.0
+    min_trades: 10
+    deterioration_leverage: 1.0
+  capital_return_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  capital_return_guard:
+    enabled: true
+    capital_return_threshold: -10.0
+    min_trades: 10
+    deterioration_leverage: 1.0
+  volatility_trend_guard:
+    enabled: true
+    window: 3
+    min_trades: 10
+    deterioration_leverage: 1.0
+  resonance_guard:
+    enabled: true
+    resonance_threshold: 2
+    resonance_leverage: 0.5
+  recovery_purity_guard:
+    enabled: true
+  profit_concentration_guard:
+    enabled: true
+    concentration_threshold: 0.8
+  tail_risk_guard:
+    enabled: true
+    tail_risk_threshold: 0.15
+    reduce_target: 0.1
+  synergy_guard:
+    enabled: true
+    synergy_threshold: 0.3
+    min_strategies: 2
+    reduce_target: 0.15
+  synergy_trend_guard:
+    enabled: true
+    window: 3
+    min_strategies: 2
+    reduce_target: 0.15
+  portfolio_risk_resonance_guard:
+    enabled: true
+    resonance_threshold: 2
+    reduce_target: 0.1
+  portfolio_health_guard:
+    enabled: true
+    health_threshold: 45
+    min_sample: 10
+    reduce_target: 0.15
+  portfolio_health_trend_guard:
+    enabled: true
+    window: 3
+    min_sample: 10
+    reduce_target: 0.15
+  portfolio_concentration_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.2
+  portfolio_correlation_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.2
+  portfolio_tail_risk_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.2
+  profit_concentration_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.2
+  utilization_trend_guard:
+    enabled: true
+    window: 3
+    reduce_target: 0.15
+  portfolio_efficiency_guard:
+    enabled: true
+    reduce_target: 0.15
+  portfolio_efficiency_trend_guard:
+    enabled: true
+    window: 3
+    min_sample: 10
+    reduce_target: 0.15
+ops_self_heal:
+  enabled: true
+  cooldown_seconds: 60
+top_level_agi:
+  enabled: true
+  cooldown_seconds: 60
+  concentration_high_threshold: 0.6
+
+# ── 信号预过滤链配置 ───────────────────────────────────────────────────────
+signal_pre_filter:
+  # 趋势确认过滤器（TrendConfirmationFilter）参数
+  # 单边行情处理模式：reject（硬拒，默认）或 reduce（降仓）
+  trend_confirmation_one_sided_mode: reject
+  # 单边行情降仓比例（仅 mode=reduce 时生效）
+  trend_confirmation_one_sided_reduce_ratio: 0.5
+  # 背离降仓比例（趋势方向与 DI 方向相反时）
+  trend_confirmation_divergence_reduce_ratio: 0.7
+
+  idle_high_threshold: 0.3
+
+# ── 策略优化器配置 ───────────────────────────────────────────────────────
+strategy_optimizer:
+  # 样本外验证（防止过拟合）：将历史交易按时间拆分为训练集/测试集，
+  # 仅在测试集上验证通过的参数变更才会被应用
+  oos_validation_enabled: true
+  # 训练集占比（0.7 = 前70%交易用于生成推荐，后30%用于验证）
+  oos_train_ratio: 0.7
+  # 测试集最小交易数（低于此值则跳过验证，直接应用推荐）
+  oos_min_test_trades: 10
+
+# ── 策略相关性组合回测配置 ─────────────────────────────────────────────────
+portfolio_backtest:
+  # 参与组合回测的策略列表
+  strategies:
+    - trend
+    - scalping
+    - grid
+  # 收益对齐时间桶（小时）
+  time_bucket_hours: 1
+  # 高相关性告警阈值
+  high_correlation_threshold: 0.7

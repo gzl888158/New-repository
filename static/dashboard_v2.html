@@ -76,7 +76,7 @@
         .status-dot.online { animation: pulse 2s infinite; }
         .refresh-time { font-size: 10px; color: var(--text-muted); }
 
-        .top-right { display: flex; align-items: center; gap: 10px; }
+        .top-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
         .top-btn {
             background: var(--bg-elevated); color: var(--text-secondary);
             border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -120,6 +120,7 @@
         .acct-value {
             font-family: 'IBM Plex Mono', monospace;
             font-size: 16px; font-weight: 600; line-height: 1.2;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
         .acct-value.green { color: var(--green); }
         .acct-value.red { color: var(--red); }
@@ -129,30 +130,45 @@
             font-size: 9px; color: var(--text-secondary); margin-top: 1px;
         }
 
-        /* ─── Tab Navigation ─── */
-        .tab-nav {
-            display: flex; gap: 0;
+        /* ─── 主布局：分组侧边栏 + 主内容区 ─── */
+        .main-layout { flex: 1; display: flex; overflow: hidden; }
+
+        .sidebar {
+            width: 176px; flex-shrink: 0;
             background: var(--bg-card);
-            border-bottom: 1px solid var(--border);
-            flex-shrink: 0; padding: 0 16px;
-            overflow-x: auto;
+            border-right: 1px solid var(--border);
+            display: flex; flex-direction: column;
+            overflow-y: auto; padding: 8px 0 16px;
+        }
+        .sidebar-group { margin-bottom: 4px; }
+        .sidebar-group-title {
+            font-size: 9px; color: var(--text-muted);
+            text-transform: uppercase; letter-spacing: 1px;
+            padding: 10px 16px 5px; font-weight: 600;
         }
         .tab-btn {
-            padding: 8px 16px; font-size: 11px; font-weight: 500;
-            color: var(--text-muted); cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s; white-space: nowrap;
-            display: flex; align-items: center; gap: 6px;
+            padding: 8px 14px; font-size: 12px; font-weight: 500;
+            color: var(--text-secondary); cursor: pointer;
+            border-left: 2px solid transparent;
+            transition: background 0.15s, color 0.15s;
+            white-space: nowrap; display: flex; align-items: center; gap: 8px;
         }
-        .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
-        .tab-btn:hover { color: var(--text); }
-        .tab-icon { font-size: 13px; }
+        .tab-btn:hover { color: var(--text); background: var(--bg-hover); }
+        .tab-btn.active {
+            color: var(--text); background: var(--bg-elevated);
+            border-left-color: var(--blue); font-weight: 600;
+        }
+        .tab-icon { font-size: 14px; width: 18px; text-align: center; }
         .tab-badge {
             font-size: 9px; padding: 0 5px; border-radius: 8px;
             background: var(--red-bg); color: var(--red);
-            font-weight: 600; line-height: 16px;
+            font-weight: 600; line-height: 16px; margin-left: auto;
         }
         .tab-badge.ok { background: var(--green-bg); color: var(--green); }
+
+        /* ─── 主内容区 ─── */
+        .main-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .content-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
 
         /* ─── Tab Content ─── */
         .tab-content { flex: 1; overflow: hidden; display: none; }
@@ -165,7 +181,9 @@
         .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0; flex: 1; overflow: hidden; }
         .grid-2x2 { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 0; flex: 1; overflow: hidden; }
         .grid-rows-2 { display: flex; flex-direction: column; gap: 0; flex: 1; overflow: hidden; }
-        .grid-rows-2 > * { flex: 1; overflow: hidden; }
+        /* 子元素改为 overflow: auto：当内部内容（如 stats-grid 多行 stat-card）
+           超出 grid 单元格高度时，可纵向滚动查看，避免被裁剪。 */
+        .grid-rows-2 > * { flex: 1; overflow: auto; overflow-x: hidden; }
 
         /* ─── Risk Tab 布局（风险监控：顶部总览 + 底部防护引擎，纵向可滚动） ─── */
         #tab-risk { flex: 1 1 0%; min-height: 0; flex-direction: column; overflow-y: auto; overflow-x: hidden; padding: 8px; gap: 8px; }
@@ -178,6 +196,7 @@
         #tab-positions,
         #tab-capital,
         #tab-market,
+        #tab-events,
         #tab-rejections {
             flex: 1 1 0%;
             min-height: 0;
@@ -194,23 +213,27 @@
         #tab-market > .grid-2x2,
         #tab-events > .grid-rows-2 {
             flex: 0 0 auto;
-            overflow: hidden;
+            /* 改为 visible：允许内部 panel/grid 的内容超出时由 #tab-* 容器统一滚动，
+               避免 grid 自身裁剪掉首屏外的内容（综合概览/历史表现等被截断）。 */
+            overflow: visible;
         }
-        /* 综合概览：上下两行各自固定高度 */
+        /* 综合概览：上下两行自适应高度，首屏尽量完整展示 */
         #tab-overview .grid-rows-2 > * { flex: 0 0 auto; }
-        #tab-overview .grid-2-1 { height: clamp(320px, 44vh, 520px); }
-        #tab-overview .grid-3 { height: clamp(280px, 38vh, 460px); }
-        /* 事件溯源：上下两行固定高度 */
-        #tab-events .grid-rows-2 { height: clamp(520px, 86vh, 880px); }
-        #tab-events .grid-1-2 { height: clamp(150px, 24vh, 240px); }
-        #tab-events .grid-2-1 { flex: 1; overflow: hidden; }
-        /* 四宫格 Tab：整体固定高度，超出时纵向滚动 */
+        #tab-overview .grid-2-1 { height: clamp(280px, 38vh, 440px); }
+        #tab-overview .grid-3 { height: clamp(240px, 32vh, 380px); }
+        /* 事件溯源：上下两行自适应高度，避免 86vh 过高导致首屏只看到顶部 */
+        #tab-events .grid-rows-2 { flex: 1 1 auto; min-height: 0; gap: 8px; }
+        #tab-events .grid-1-2 { height: clamp(150px, 22vh, 220px); }
+        /* grid-2-1 保持 overflow: hidden：内部 table-wrapper 已自带 overflow: auto，
+           避免外层与 table-wrapper 出现双重滚动条。 */
+        #tab-events .grid-2-1 { flex: 1 1 auto; min-height: clamp(280px, 50vh, 600px); overflow: hidden; }
+        /* 四宫格 Tab：整体高度适配视口，首屏尽量完整展示 */
         #tab-strategy > .grid-2x2,
         #tab-positions > .grid-2x2,
         #tab-capital > .grid-2x2,
         #tab-market > .grid-2x2,
         #tab-rejections > .grid-2x2 {
-            height: clamp(520px, 86vh, 880px);
+            height: clamp(480px, 72vh, 760px);
         }
 
         .panel {
@@ -267,9 +290,16 @@
         .util-banner.emergency_blocked .ub-title, .util-banner.unknown .ub-title { color: var(--red); }
 
         .panel-body {
-            flex: 1; position: relative; padding: 8px; overflow: hidden;
+            /* 改为 auto：当内部 stats-grid / heatmap / marketOverview 等内容超出
+               panel-body 高度时，可纵向滚动查看，避免被裁剪。
+               canvas panel 由 .panel-body canvas { width/height: 100% } 自适应大小，
+               不会触发滚动条。 */
+            flex: 1; position: relative; padding: 8px;
+            overflow: auto; overflow-x: hidden;
         }
         .panel-body canvas { width: 100% !important; height: 100% !important; }
+        /* canvas 直接子元素的 panel-body：保持隐藏滚动条，避免 canvas 周边出现空白滚动区域 */
+        .panel-body:has(> canvas) { overflow: hidden; }
 
         /* ─── Stats Cards ─── */
         .stats-grid {
@@ -278,6 +308,31 @@
         }
         .stats-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
         .stats-grid.cols-5 { grid-template-columns: repeat(5, 1fr); }
+        .stats-grid.cols-6 { grid-template-columns: repeat(6, 1fr); }
+
+        /* ─── 权益曲线 + 历史表现：横向滚动修复 ───
+           问题：panel-body 全局 overflow-x:hidden + canvas 子元素 overflow:hidden，
+           导致内容被裁剪却没有横向滚动条；stats-grid 用 1fr 强制压缩不溢出。
+           修复：仅针对这两个面板放开横向滚动，并让内容真实超出容器以触发滚动条。 */
+        .panel-body:has(> #equityChart),
+        .panel-body:has(> #histStats) {
+            overflow: auto;          /* 覆盖 :has(> canvas) 的 overflow:hidden 与全局 overflow-x:hidden */
+        }
+        #equityChart {
+            min-width: 620px;        /* 图表最小可读宽度，容器更窄时触发横向滚动 */
+        }
+        /* 历史表现 16 项指标：2 行 × 8 列横向滚动，避免卡片被压扁 */
+        #histStats {
+            display: grid !important;
+            grid-auto-flow: column !important;
+            grid-template-rows: repeat(2, minmax(0, 1fr)) !important;
+            grid-template-columns: none !important;
+            gap: 8px;
+            height: 100%;
+        }
+        #histStats .stat-card {
+            min-width: 130px;
+        }
         .stat-card {
             background: var(--bg-elevated); border-radius: var(--radius);
             padding: 10px 12px; display: flex; flex-direction: column;
@@ -297,7 +352,7 @@
         .stat-sub { font-size: 9px; color: var(--text-secondary); }
 
         /* ─── Tables ─── */
-        .table-wrapper { overflow-y: auto; flex: 1; }
+        .table-wrapper { overflow: auto; flex: 1; }
         .data-table {
             width: 100%; border-collapse: collapse; font-size: 10px;
         }
@@ -311,6 +366,7 @@
         .data-table td {
             padding: 5px 8px; border-bottom: 1px solid rgba(37,45,56,0.5);
             font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+            white-space: nowrap;
         }
         .data-table tr:hover { background: var(--bg-hover); }
         .risk-dot {
@@ -442,7 +498,7 @@
 
         /* ─── Token Modal ─── */
         .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.65); display: flex; align-items: center; justify-content: center; z-index: 2000; }
-        .modal-box { background: var(--bg-elevated); border: 1px solid var(--border-light); border-radius: var(--radius); padding: 20px; width: 400px; max-width: 92vw; box-shadow: var(--shadow); }
+        .modal-box { background: var(--bg-elevated); border: 1px solid var(--border-light); border-radius: var(--radius); padding: 20px; width: 400px; max-width: 92vw; max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow); }
         .modal-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
         .modal-desc { font-size: 11px; color: var(--text-secondary); margin-bottom: 14px; line-height: 1.5; }
         .modal-desc code { background: var(--bg); padding: 1px 5px; border-radius: 3px; font-family: 'IBM Plex Mono', monospace; font-size: 10px; }
@@ -482,13 +538,28 @@
                 overflow-y: auto !important;
             }
             .grid-rows-2 { overflow-y: auto !important; }
-            .stats-grid, .stats-grid.cols-3, .stats-grid.cols-5 {
+            .stats-grid, .stats-grid.cols-3, .stats-grid.cols-5, .stats-grid.cols-6 {
+                grid-template-columns: repeat(2, 1fr) !important;
+            }
+            .gauges-grid, .gauges-grid.cols-3, .gauges-grid.cols-4 {
                 grid-template-columns: repeat(2, 1fr) !important;
             }
             .tab-content.active { overflow-y: auto; }
             .top-bar { flex-wrap: wrap; height: auto; padding: 6px 10px; row-gap: 6px; }
             .account-strip { flex-wrap: wrap; }
             .acct-item { min-width: 90px; }
+            /* 侧边栏在窄屏折叠为顶部横向分组导航 */
+            .main-layout { flex-direction: column; }
+            .sidebar {
+                width: 100%; flex-direction: row; overflow-x: auto;
+                border-right: none; border-bottom: 1px solid var(--border);
+                padding: 0; flex-shrink: 0;
+            }
+            .sidebar-group { display: flex; margin: 0; }
+            .sidebar-group-title { display: none; }
+            .tab-btn { border-left: none; border-bottom: 2px solid transparent; padding: 8px 12px; }
+            .tab-btn.active { border-left-color: transparent; border-bottom-color: var(--blue); }
+            .tab-badge { margin-left: 0; }
         }
     </style>
 </head>
@@ -524,29 +595,40 @@
         </div>
     </div>
 
-    <!-- Account Strip -->
-    <div class="account-strip" id="accountStrip">
-        <div class="acct-item"><div class="acct-label">总权益</div><div class="acct-value" id="valEquity">--</div><div class="acct-sub" id="valEquity24h">--</div></div>
-        <div class="acct-item"><div class="acct-label">可用资金</div><div class="acct-value" id="valAvailable">--</div><div class="acct-sub">USDT</div></div>
-        <div class="acct-item"><div class="acct-label">浮盈浮亏</div><div class="acct-value" id="valPnL">--</div><div class="acct-sub" id="valPnLPct">--</div></div>
-        <div class="acct-item"><div class="acct-label">已用保证金</div><div class="acct-value" id="valMargin">--</div><div class="acct-sub" id="valMarginPct">--</div></div>
-        <div class="acct-item"><div class="acct-label">今日已实现</div><div class="acct-value" id="valRealized">--</div><div class="acct-sub">USDT</div></div>
-        <div class="acct-item"><div class="acct-label">保证金率</div><div class="acct-value" id="valMarginRatio">--</div><div class="acct-sub">安全边际</div></div>
-        <div class="acct-item"><div class="acct-label">维持保证金</div><div class="acct-value" id="valMaintMargin">--</div><div class="acct-sub">USDT</div></div>
-        <div class="acct-item"><div class="acct-label">夏普比率</div><div class="acct-value" id="valSharpe">--</div><div class="acct-sub">30日</div></div>
-    </div>
-
-    <!-- Tab Navigation -->
-    <div class="tab-nav" id="tabNav">
-        <span class="tab-btn active" data-tab="overview"><span class="tab-icon">📊</span>综合概览</span>
-        <span class="tab-btn" data-tab="strategy"><span class="tab-icon">📈</span>策略分析</span>
-        <span class="tab-btn" data-tab="positions"><span class="tab-icon">💼</span>持仓分布</span>
-        <span class="tab-btn" data-tab="risk"><span class="tab-icon">🛡️</span>风险监控<span class="tab-badge" id="riskTabBadge" style="display:none;">0</span></span>
-        <span class="tab-btn" data-tab="capital"><span class="tab-icon">💰</span>资金效率</span>
-        <span class="tab-btn" data-tab="market"><span class="tab-icon">🌐</span>市场数据</span>
-        <span class="tab-btn" data-tab="events"><span class="tab-icon">🧾</span>事件溯源</span>
-        <span class="tab-btn" data-tab="rejections"><span class="tab-icon">🚫</span>拒单分析</span>
-    </div>
+    <!-- 主布局：分组侧边栏 + 主内容区 -->
+    <div class="main-layout">
+        <nav class="sidebar" id="tabNav">
+            <div class="sidebar-group">
+                <div class="sidebar-group-title">监控</div>
+                <span class="tab-btn active" data-tab="overview"><span class="tab-icon">📊</span>综合概览</span>
+                <span class="tab-btn" data-tab="positions"><span class="tab-icon">💼</span>持仓分布</span>
+                <span class="tab-btn" data-tab="risk"><span class="tab-icon">🛡️</span>风险监控<span class="tab-badge" id="riskTabBadge" style="display:none;">0</span></span>
+            </div>
+            <div class="sidebar-group">
+                <div class="sidebar-group-title">分析</div>
+                <span class="tab-btn" data-tab="strategy"><span class="tab-icon">📈</span>策略分析</span>
+                <span class="tab-btn" data-tab="capital"><span class="tab-icon">💰</span>资金效率</span>
+                <span class="tab-btn" data-tab="market"><span class="tab-icon">🌐</span>市场数据</span>
+            </div>
+            <div class="sidebar-group">
+                <div class="sidebar-group-title">审计</div>
+                <span class="tab-btn" data-tab="events"><span class="tab-icon">🧾</span>事件溯源</span>
+                <span class="tab-btn" data-tab="rejections"><span class="tab-icon">🚫</span>拒单分析</span>
+            </div>
+        </nav>
+        <div class="main-area">
+            <!-- Account Strip -->
+            <div class="account-strip" id="accountStrip">
+                <div class="acct-item"><div class="acct-label">总权益</div><div class="acct-value" id="valEquity">--</div><div class="acct-sub" id="valEquity24h">--</div></div>
+                <div class="acct-item"><div class="acct-label">可用资金</div><div class="acct-value" id="valAvailable">--</div><div class="acct-sub">USDT</div></div>
+                <div class="acct-item"><div class="acct-label">浮盈浮亏</div><div class="acct-value" id="valPnL">--</div><div class="acct-sub" id="valPnLPct">--</div></div>
+                <div class="acct-item"><div class="acct-label">已用保证金</div><div class="acct-value" id="valMargin">--</div><div class="acct-sub" id="valMarginPct">--</div></div>
+                <div class="acct-item"><div class="acct-label">今日已实现</div><div class="acct-value" id="valRealized">--</div><div class="acct-sub">USDT</div></div>
+                <div class="acct-item"><div class="acct-label">保证金率</div><div class="acct-value" id="valMarginRatio">--</div><div class="acct-sub">安全边际</div></div>
+                <div class="acct-item"><div class="acct-label">维持保证金</div><div class="acct-value" id="valMaintMargin">--</div><div class="acct-sub">USDT</div></div>
+                <div class="acct-item"><div class="acct-label">夏普比率</div><div class="acct-value" id="valSharpe">--</div><div class="acct-sub">30日</div></div>
+            </div>
+            <div class="content-wrap">
 
     <!-- Tab 1: 综合概览 -->
     <div class="tab-content active" id="tab-overview">
@@ -584,6 +666,14 @@
             <div class="panel">
                 <div class="panel-header"><span class="panel-title">策略盈亏趋势</span></div>
                 <div class="panel-body"><canvas id="strategyPnlTrend"></canvas></div>
+            </div>
+            <div class="panel" style="grid-column: span 2;">
+                <div class="panel-header"><span class="panel-title">AGI 推算偏差趋势</span><span class="panel-badge blue" id="projectionBiasCount">0 样本</span></div>
+                <div class="panel-body"><canvas id="projectionBiasChart"></canvas></div>
+            </div>
+            <div class="panel" style="grid-column: span 2;">
+                <div class="panel-header"><span class="panel-title">策略归因明细</span><span class="panel-badge amber">方向/成本/退出</span></div>
+                <div class="panel-body"><div class="table-wrapper"><table class="data-table" id="strategyAttributionTable"><thead><tr><th>策略</th><th>多单盈亏</th><th>空单盈亏</th><th>手续费</th><th>资金费</th><th>滑点</th><th>止损笔数</th><th>止损盈亏</th><th>止盈笔数</th><th>止盈盈亏</th></tr></thead><tbody></tbody></table></div></div>
             </div>
         </div>
     </div>
@@ -780,6 +870,50 @@
                 </div>
                 <div class="panel-body">
                     <div class="stats-grid" id="rejectionSummaryStats"><div class="empty-state" style="grid-column:1/-1;">加载中…</div></div>
+                    <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">🛡️ RegimeGate 门控（进程内实时）</div>
+                        <div class="stats-grid" id="regimeGateStats"><div class="empty-state" style="grid-column:1/-1;">加载中…</div></div>
+                    </div>
+                    <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">🧠 感知侧闭环（Regime门控 + 信号质量）</div>
+                        <div class="stats-grid" id="perceptionStats"><div class="empty-state" style="grid-column:1/-1;">加载中…</div></div>
+                        <div class="table-wrapper" style="margin-top:8px; max-height:160px;">
+                            <table class="data-table">
+                                <thead><tr><th>Regime</th><th>放行</th><th>门控拒绝</th><th>质量拒绝</th><th>降级</th></tr></thead>
+                                <tbody id="perceptionRegimeTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">🔧 运维自愈闭环（监控告警 → 根因 → 恢复）</div>
+                        <div class="stats-grid" id="opsSelfHealStats"><div class="empty-state" style="grid-column:1/-1;">加载中…</div></div>
+                        <div class="table-wrapper" style="margin-top:8px; max-height:160px;">
+                            <table class="data-table">
+                                <thead><tr><th>根因</th><th>总数</th><th>自动恢复</th><th>成功</th><th>失败</th><th>仅告警</th></tr></thead>
+                                <tbody id="opsSelfHealRootCauseTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">⚙️ 自动寻优闭环（参数优化 → 回测 → 上线 → 反馈）</div>
+                        <div class="stats-grid" id="autoOptimizationStats"><div class="empty-state" style="grid-column:1/-1;">加载中…</div></div>
+                        <div class="table-wrapper" style="margin-top:8px; max-height:160px;">
+                            <table class="data-table">
+                                <thead><tr><th>策略</th><th>总数</th><th>上线</th><th>已优化</th><th>上线拒绝</th></tr></thead>
+                                <tbody id="autoOptimizationStrategyTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                        <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">🧠 顶层 AGI 联动（跨闭环编排）</div>
+                        <div class="stats-grid" id="topLevelAgiStats"><div class="empty-state" style="grid-column:1/-1;">加载中…</div></div>
+                        <div class="table-wrapper" style="margin-top:8px; max-height:160px;">
+                            <table class="data-table">
+                                <thead><tr><th>联动类型</th><th>次数</th></tr></thead>
+                                <tbody id="topLevelAgiTypeTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
                     <div class="table-wrapper" style="margin-top:8px; max-height:200px;">
                         <table class="data-table">
                             <thead><tr><th>策略</th><th>拒单数</th></tr></thead>
@@ -811,6 +945,9 @@
             </div>
         </div>
     </div>
+            </div><!-- /content-wrap -->
+        </div><!-- /main-area -->
+    </div><!-- /main-layout -->
 </div>
 
 <!-- Auth Modal（手机验证码登录 / Token 授权） -->
@@ -1166,6 +1303,16 @@ function fmtUSD4(v) { return v >= 0 ? `$${v.toFixed(4)}` : `-$${Math.abs(v).toFi
 function fmtPct(v) { return v >= 0 ? `+${(v*100).toFixed(2)}%` : `${(v*100).toFixed(2)}%`; }
 function fmtPctPlain(v) { return `${(v*100).toFixed(1)}%`; }
 function fmtNum(v, d) { return v?.toFixed(d) || '--'; }
+function fmtAge(sec) {
+    if (sec == null || isNaN(sec)) return '';
+    sec = Math.floor(sec);
+    if (sec < 60) return `${sec}秒前`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}分钟前`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}小时${min % 60}分前`;
+    return `${Math.floor(hr / 24)}天前`;
+}
 
 // ─── Main Render ───
 function renderDashboard(data) {
@@ -1202,6 +1349,7 @@ function _doRender(data) {
     renderStrategyHeatmap(data.strategy_heatmap);
     renderStrategyDetail(data.strategy_comparison);
     renderStrategyPnlTrend(data.strategy_comparison);
+    renderProjectionBiasHistory(data.pnl_projection_panel);
     renderPositionDistribution(data.position_distribution);
     renderFundingTrend(data.funding_trend);
     renderOrderbook(data.orderbook_summary);
@@ -1219,15 +1367,26 @@ function _doRender(data) {
 // ─── Account Strip ───
 function renderAccountStrip(acct) {
     if (!acct) return;
-    document.getElementById('valEquity').textContent = acct.total_equity?.toFixed(2) || '--';
+    const eqEl = document.getElementById('valEquity');
+    eqEl.textContent = acct.total_equity?.toFixed(2) || '--';
 
     const sub24 = document.getElementById('valEquity24h');
-    const chg24 = acct.equity_change_24h || 0;
-    const chgPct24 = acct.equity_change_24h_pct || 0;
-    if (chg24 !== 0) {
-        sub24.textContent = `${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)} (${fmtPct(chgPct24)})`;
-        sub24.style.color = chg24 >= 0 ? 'var(--green)' : 'var(--red)';
-    } else { sub24.textContent = 'USDT'; sub24.style.color = 'var(--text-secondary)'; }
+    // 实时 OKX 账户 API 失败时会回退到 DB 陈旧快照，此时必须明确标记数据延迟，
+    // 避免把 6 小时前的旧权益值当作实时值展示（否则会误导用户）。
+    if (acct.is_stale) {
+        const age = fmtAge(acct.data_age_seconds);
+        sub24.textContent = '⚠ 数据延迟' + (age ? '（' + age + '）' : '');
+        sub24.style.color = 'var(--amber)';
+        eqEl.style.color = 'var(--amber)';
+    } else {
+        eqEl.style.color = '';
+        const chg24 = acct.equity_change_24h || 0;
+        const chgPct24 = acct.equity_change_24h_pct || 0;
+        if (chg24 !== 0) {
+            sub24.textContent = `${chg24 >= 0 ? '+' : ''}${chg24.toFixed(2)} (${fmtPct(chgPct24)})`;
+            sub24.style.color = chg24 >= 0 ? 'var(--green)' : 'var(--red)';
+        } else { sub24.textContent = 'USDT'; sub24.style.color = 'var(--text-secondary)'; }
+    }
 
     document.getElementById('valAvailable').textContent = acct.available_balance?.toFixed(2) || '--';
 
@@ -1257,6 +1416,66 @@ function renderAccountStrip(acct) {
     if (isOnline) {
         dot.className = 'status-dot ' + (acct.health_level === 'danger' ? 'warning' : 'online');
     }
+}
+
+function renderProjectionBiasHistory(data) {
+    const rawHistory = Array.isArray(data?.bias_history) ? data.bias_history.slice(-20) : [];
+    const history = rawHistory.map(value => {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    });
+    const labels = history.map((_, index) => String(index + 1));
+    const badge = document.getElementById('projectionBiasCount');
+    if (badge) badge.textContent = `${history.filter(value => value !== null).length} 样本`;
+
+    updateOrCreateChart('projectionBiasChart', 'line', function() {
+        return {
+            data: {
+                labels,
+                datasets: [
+                    {
+                        label: '实际/推算偏差比',
+                        data: history,
+                        borderColor: '#8B5CF6',
+                        backgroundColor: 'rgba(139,92,246,0.12)',
+                        fill: true,
+                        tension: 0.25,
+                        pointRadius: 2,
+                        borderWidth: 2
+                    },
+                    {
+                        label: '无偏基线',
+                        data: history.map(() => 1),
+                        borderColor: '#64748B',
+                        borderDash: [4, 4],
+                        fill: false,
+                        pointRadius: 0,
+                        borderWidth: 1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: context => `${context.dataset.label}: ${Number(context.raw).toFixed(3)}`
+                        }
+                    }
+                },
+                scales: {
+                    x: { display: false },
+                    y: {
+                        display: true,
+                        grid: { color: 'rgba(37,45,56,0.35)' },
+                        ticks: { maxTicksLimit: 4 }
+                    }
+                }
+            }
+        };
+    }, {history});
 }
 
 // ─── Equity Curve ───
@@ -1502,6 +1721,44 @@ function renderStrategyPnlTrend(data) {
             }
         };
     }, {strategies});
+}
+
+// ─── Strategy Attribution ───
+function renderStrategyAttribution(data) {
+    const strategies = data?.strategies || [];
+    const tbody = document.querySelector('#strategyAttributionTable tbody');
+    if (!tbody) return;
+    if (strategies.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="empty-state">暂无归因数据</td></tr>';
+        return;
+    }
+    tbody.innerHTML = strategies.map(s => {
+        const longPnl = s.long_pnl || 0, shortPnl = s.short_pnl || 0;
+        const slPnl = s.stop_loss_pnl || 0, tpPnl = s.take_profit_pnl || 0;
+        return `<tr>
+            <td style="font-weight:600;">${escHtml(s.strategy || '--')}</td>
+            <td style="color:${longPnl>=0?'var(--green)':'var(--red)'}">${fmtUSD4(longPnl)}</td>
+            <td style="color:${shortPnl>=0?'var(--green)':'var(--red)'}">${fmtUSD4(shortPnl)}</td>
+            <td style="color:var(--text-secondary)">${fmtUSD4(s.total_fees||0)}</td>
+            <td style="color:var(--text-secondary)">${fmtUSD4(s.total_funding_cost||0)}</td>
+            <td style="color:var(--text-secondary)">${fmtUSD4(s.total_slippage_cost||0)}</td>
+            <td>${s.stop_loss_count||0}</td>
+            <td style="color:${slPnl>=0?'var(--green)':'var(--red)'}">${fmtUSD4(slPnl)}</td>
+            <td>${s.take_profit_count||0}</td>
+            <td style="color:${tpPnl>=0?'var(--green)':'var(--red)'}">${fmtUSD4(tpPnl)}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function loadContributionAttribution() {
+    try {
+        const resp = await fetch(`${API_BASE}/api/contribution/health`, { headers: authHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        renderStrategyAttribution(data);
+    } catch (err) {
+        console.warn('loadContributionAttribution failed', err);
+    }
 }
 
 // ─── Position Distribution ───
@@ -1757,13 +2014,15 @@ function renderCapitalUtilization(cu) {
     const target = cu.target_utilization ?? 0.85;
     const boost = cu.position_boost ?? 1.0;
     const eff = cu.capital_efficiency ?? 0;
+    const efficiencyValid = cu.capital_efficiency_valid === true;
+    const marginMismatch = cu.margin_reconciliation_ok === false;
     const action = cu.recommended_action || 'none';
     const tier = cu.utilization_tier || '--';
 
     const CONF = {
         normal:        { icon: '✅', title: '资金利用率正常', msg: '资金利用率处于健康区间，按目标仓位正常运作。' },
         low:           { icon: '🟦', title: '资金利用率偏低', msg: '大量闲置资金未被部署，可考虑适度加仓。' },
-        warming_up:    { icon: '🔵', title: '资金利用率预热中', msg: '系统正在逐步提升资金利用率至目标。' },
+        warming_up:    { icon: '🔵', title: '启动观察期', msg: '系统按有效信号和风险约束运行，不会为达到利用率目标而强制开仓。' },
         high:          { icon: '🟠', title: '资金利用率偏高', msg: '保证金占用接近上限，注意强平风险。' },
         force_rebalance: { icon: '⚠️', title: '资本效率过低 · 触发强制再平衡', msg: '' },
         emergency_blocked: { icon: '🚨', title: '紧急冻结', msg: '权益进入紧急模式，新开仓已被冻结。' },
@@ -1779,9 +2038,10 @@ function renderCapitalUtilization(cu) {
         `利用率 <b>${fmtPctPlain(rate)}</b>`,
         `目标 <b>${fmtPctPlain(target)}</b>`,
         `仓位乘数 <b>${boost.toFixed(2)}</b>`,
-        `资本效率 <b>${eff.toFixed(2)}</b>`,
+        `资本效率 <b>${efficiencyValid ? eff.toFixed(2) : '不可用'}</b>`,
         `推荐动作 <b>${action}</b>`,
         `层级 <b>${tier}</b>`,
+        ...(marginMismatch ? ['<b>保证金口径待核对</b>'] : []),
     ].map(s => `<span class="ub-chip">${s}</span>`).join('');
 
     el.style.display = 'flex';
@@ -2459,10 +2719,188 @@ function renderEventOrphans(orphans) {
 }
 
 // ─── 拒单分析（开仓全链路可观测） ───
+// 辅助：当子面板数据源不可用（如独立 dashboard 进程无法访问主进程的
+// signal_processor 等「进程内实时」组件，后端返回 503）时，把「加载中…」占位符
+// 替换为明确的不可用提示，避免面板长期卡在「加载中」误导用户。
+function markLoadFailed(elId, hint) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    // 仅在仍处于「加载中」占位符时才覆盖，避免清掉已成功渲染的数据
+    if (el.querySelector('.empty-state') && el.textContent.includes('加载中')) {
+        el.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">${hint}</div>`;
+    }
+}
+
 async function loadRejectionStats() {
     const data = await fetchAPI('/api/rejections/stats');
     if (data && data.success) renderRejectionStats(data);
     else if (data) showToast('拒单统计加载失败：' + (data.error || 'unknown'), 'warning');
+    else markLoadFailed('rejectionSummaryStats', '拒单统计不可用');
+    loadRegimeGateStats();
+}
+
+async function loadRegimeGateStats() {
+    const data = await fetchAPI('/api/regime_gate/stats');
+    if (data && data.success) renderRegimeGateStats(data);
+    else markLoadFailed('regimeGateStats', 'RegimeGate 统计暂不可用');
+    loadPerceptionStats();
+}
+
+async function loadPerceptionStats() {
+    const data = await fetchAPI('/api/perception/stats');
+    if (data && data.success) renderPerceptionStats(data);
+    else markLoadFailed('perceptionStats', '感知侧闭环统计暂不可用');
+    loadOpsSelfHeal();
+}
+
+async function loadOpsSelfHeal() {
+    const data = await fetchAPI('/api/ops_self_heal/summary');
+    if (data && data.success) renderOpsSelfHeal(data);
+    else markLoadFailed('opsSelfHealStats', '运维自愈统计暂不可用');
+    loadAutoOptimization();
+}
+
+async function loadAutoOptimization() {
+    const data = await fetchAPI('/api/auto_optimization/summary');
+    if (data && data.success) renderAutoOptimization(data);
+    else markLoadFailed('autoOptimizationStats', '自动寻优统计暂不可用');
+    loadTopLevelAgi();
+}
+
+async function loadTopLevelAgi() {
+    const data = await fetchAPI('/api/top_level_agi/status');
+    if (data && data.success) renderTopLevelAgi(data);
+    else markLoadFailed('topLevelAgiStats', '顶层 AGI 状态暂不可用');
+}
+
+function renderTopLevelAgi(d) {
+    const el = document.getElementById('topLevelAgiStats');
+    if (!el) return;
+    const linkage = d.linkage_state || {};
+    const stats = d.stats || {};
+    const cards = [
+        ['编排循环', stats.total_cycles ?? 0, ''],
+        ['联动动作', stats.linkage_actions ?? 0, 'blue'],
+        ['资金侧重评估', linkage.funding_rebalance_needed ? '是' : '否', linkage.funding_rebalance_needed ? 'amber' : ''],
+        ['寻优暂停建议', linkage.optimization_pause_advised ? '是' : '否', linkage.optimization_pause_advised ? 'amber' : ''],
+        ['健康度', linkage.health_grade ?? 'N/A', linkage.health_grade === 'F' ? 'red' : (linkage.health_grade === 'D' ? 'amber' : '')],
+    ];
+    el.innerHTML = cards.map(([label, val, cls]) =>
+        `<div class="stat-card"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${val}</div></div>`
+    ).join('');
+
+    const byType = stats.by_type || {};
+    const typeMap = { funding_rebalance: '寻优→资金', optimization_pause_advised: '运维→寻优', health_degraded: '资金→全局' };
+    const tbody = document.getElementById('topLevelAgiTypeTable');
+    if (tbody) {
+        const entries = Object.entries(byType);
+        tbody.innerHTML = entries.length
+            ? entries.map(([k, v]) => `<tr><td>${escHtml(typeMap[k] || k)}</td><td>${v}</td></tr>`).join('')
+            : '<tr><td colspan="2" style="text-align:center;color:var(--text-muted);padding:12px;">暂无联动</td></tr>';
+    }
+}
+
+function renderAutoOptimization(d) {
+    const el = document.getElementById('autoOptimizationStats');
+    if (!el) return;
+    const stats = d.stats || {};
+    const cards = [
+        ['寻优总数', stats.total_cycles ?? 0, ''],
+        ['已上线', stats.deployed ?? 0, ''],
+        ['已优化', stats.optimized ?? 0, 'blue'],
+        ['上线拒绝', stats.deploy_rejected ?? 0, 'red'],
+        ['冷却跳过', stats.skipped ?? 0, 'amber'],
+    ];
+    el.innerHTML = cards.map(([label, val, cls]) =>
+        `<div class="stat-card"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${val}</div></div>`
+    ).join('');
+
+    const byStrategy = stats.by_strategy || {};
+    const tbody = document.getElementById('autoOptimizationStrategyTable');
+    if (tbody) {
+        const entries = Object.entries(byStrategy).sort((a, b) => (b[1].total ?? 0) - (a[1].total ?? 0));
+        tbody.innerHTML = entries.length
+            ? entries.map(([k, v]) =>
+                `<tr><td>${escHtml(k)}</td><td>${v.total ?? 0}</td><td>${v.deployed ?? 0}</td><td>${v.optimized ?? 0}</td><td>${v.deploy_rejected ?? 0}</td></tr>`
+              ).join('')
+            : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:12px;">暂无寻优数据</td></tr>';
+    }
+}
+
+function renderOpsSelfHeal(d) {
+    const el = document.getElementById('opsSelfHealStats');
+    if (!el) return;
+    const stats = d.stats || {};
+    const cards = [
+        ['事件总数', stats.total_events ?? 0, ''],
+        ['自动恢复', stats.auto_recovered ?? 0, 'blue'],
+        ['恢复成功', stats.recovered_success ?? 0, ''],
+        ['恢复失败', stats.recovered_failed ?? 0, 'red'],
+        ['仅告警', stats.alert_only ?? 0, 'amber'],
+        ['冷却跳过', stats.cooldown_skip ?? 0, ''],
+    ];
+    el.innerHTML = cards.map(([label, val, cls]) =>
+        `<div class="stat-card"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${val}</div></div>`
+    ).join('');
+
+    const byRootCause = stats.by_root_cause || {};
+    const tbody = document.getElementById('opsSelfHealRootCauseTable');
+    if (tbody) {
+        const entries = Object.entries(byRootCause).sort((a, b) => (b[1].total ?? 0) - (a[1].total ?? 0));
+        tbody.innerHTML = entries.length
+            ? entries.map(([k, v]) =>
+                `<tr><td>${escHtml(k)}</td><td>${v.total ?? 0}</td><td>${v.auto_recovered ?? 0}</td><td>${v.recovered_success ?? 0}</td><td>${v.recovered_failed ?? 0}</td><td>${v.alert_only ?? 0}</td></tr>`
+              ).join('')
+            : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:12px;">暂无自愈事件</td></tr>';
+    }
+}
+
+function renderPerceptionStats(d) {
+    const el = document.getElementById('perceptionStats');
+    if (!el) return;
+    if (!d.enabled) {
+        el.innerHTML = '<div class="empty-state" style="grid-column:1/-1;">感知闭环未启用</div>';
+        return;
+    }
+    const cards = [
+        ['感知总数', d.total_perceived ?? 0, ''],
+        ['放行', d.passed ?? 0, ''],
+        ['门控拒绝', d.reject_gate ?? 0, 'red'],
+        ['质量拒绝', d.reject_quality ?? 0, 'amber'],
+        ['降级', d.degraded ?? 0, 'blue'],
+        ['异常', d.errors ?? 0, 'red'],
+    ];
+    el.innerHTML = cards.map(([label, val, cls]) =>
+        `<div class="stat-card"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${val}</div></div>`
+    ).join('');
+
+    const byRegime = d.by_regime || {};
+    const tbody = document.getElementById('perceptionRegimeTable');
+    if (tbody) {
+        const entries = Object.entries(byRegime).sort((a, b) => (b[1].total ?? 0) - (a[1].total ?? 0));
+        tbody.innerHTML = entries.length
+            ? entries.map(([k, v]) =>
+                `<tr><td>${escHtml(k)}</td><td>${v.passed ?? 0}</td><td>${v.reject_gate ?? 0}</td><td>${v.reject_quality ?? 0}</td><td>${v.degraded ?? 0}</td></tr>`
+              ).join('')
+            : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:12px;">暂无感知数据</td></tr>';
+    }
+}
+
+function renderRegimeGateStats(d) {
+    const el = document.getElementById('regimeGateStats');
+    if (!el) return;
+    const byRegime = d.by_regime || {};
+    const trendRejects = (byRegime.trend_bullish ?? 0) + (byRegime.trend_bearish ?? 0);
+    const highRiskRejects = (byRegime.extreme_volatility ?? 0) + (byRegime.funding_crush ?? 0) + (byRegime.liquidity_crisis ?? 0);
+    const cards = [
+        ['门控拒绝', d.rejected ?? 0, 'red'],
+        ['评估异常', d.errors ?? 0, 'amber'],
+        ['拒(震荡窄幅)', byRegime.range_bound ?? 0, ''],
+        ['拒(趋势/高风险)', trendRejects + highRiskRejects, 'blue'],
+    ];
+    el.innerHTML = cards.map(([label, val, cls]) =>
+        `<div class="stat-card"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${val}</div></div>`
+    ).join('');
 }
 
 function renderRejectionStats(d) {
@@ -2617,6 +3055,9 @@ refreshResetHistory();
 startSSE();
 if (refreshMs > 0) refreshTimer = setInterval(refresh, refreshMs);
 window.addEventListener('resize', resizeAllCharts);
+// 策略归因数据低频刷新（分析窗口 7d，避免拖累 5s 主循环）
+loadContributionAttribution();
+setInterval(loadContributionAttribution, 60000);
 </script>
 </body>
 </html>

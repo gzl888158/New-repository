@@ -69,10 +69,26 @@ class ParameterDef:
             v = round(v)
         elif self.step > 0:
             v = round(v / self.step) * self.step
-        return min(max(v, self.low), self.high)
+        return self.clamp(v)
 
     def clamp(self, value: float) -> float:
-        v = min(max(value, self.low), self.high)
+        if value is None:
+            value = self.low
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = self.low
+        if not math.isfinite(value):
+            value = self.low
+        if not math.isfinite(self.low):
+            low = 0.0
+        else:
+            low = self.low
+        if not math.isfinite(self.high):
+            high = low
+        else:
+            high = self.high
+        v = min(max(value, low), high)
         if self.type == "int":
             v = round(v)
         elif self.step > 0:
@@ -125,20 +141,32 @@ class GAOptimizationResult:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
+        def _finite(v: Any, default: float = 0.0) -> Any:
+            """将数值安全转为有限 float；非数值（如字符串类别）原样保留，NaN/Inf 归零。"""
+            if isinstance(v, bool):
+                return v
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return v
+            return f if math.isfinite(f) else default
+
         return {
-            "best_params": self.best_params,
-            "best_fitness": round(self.best_fitness, 6),
+            "best_params": {k: _finite(v) for k, v in self.best_params.items()},
+            "best_fitness": _finite(self.best_fitness),
             "convergence_reason": self.convergence_reason.value,
-            "convergence_generation": self.convergence_generation,
-            "total_evaluations": self.total_evaluations,
-            "total_time_seconds": round(self.total_time_seconds, 2),
+            "convergence_generation": _finite(self.convergence_generation),
+            "total_evaluations": _finite(self.total_evaluations),
+            "total_time_seconds": _finite(self.total_time_seconds),
             "generation_count": len(self.generation_stats),
             "final_population_size": len(self.final_population),
             "pareto_front_size": len(self.pareto_front),
-            "fitness_history": [round(f, 6) for f in self.fitness_history[-20:]],
+            "fitness_history": [round(f, 6) for f in self.fitness_history[-20:] if math.isfinite(f)],
             "timeline": [
-                {"gen": s.generation, "best": round(s.best_fitness, 4),
-                 "avg": round(s.avg_fitness, 4), "diversity": round(s.population_diversity, 4)}
+                {"gen": s.generation,
+                 "best": _finite(s.best_fitness),
+                 "avg": _finite(s.avg_fitness),
+                 "diversity": _finite(s.population_diversity)}
                 for s in self.generation_stats
             ],
             "timestamp": self.timestamp,
@@ -263,7 +291,10 @@ class GeneticOptimizer:
             result = self._fitness_fn(params)
             if hasattr(result, '__await__'):
                 result = await result
-            return float(result)
+            value = float(result)
+            if not math.isfinite(value):
+                return float('-inf')
+            return value
         except Exception as e:
             logger.debug(f"Fitness evaluation error: {e}")
             return float('-inf')
@@ -276,8 +307,14 @@ class GeneticOptimizer:
             for ind, r in zip(population, results):
                 if isinstance(r, Exception):
                     ind.fitness = float('-inf')
+                elif r is None:
+                    ind.fitness = float('-inf')
                 else:
-                    ind.fitness = float(r) if r is not None else float('-inf')
+                    try:
+                        v = float(r)
+                    except (TypeError, ValueError):
+                        v = float('-inf')
+                    ind.fitness = v if math.isfinite(v) else float('-inf')
                 self._eval_count += 1
         else:
             for ind in population:
@@ -288,16 +325,26 @@ class GeneticOptimizer:
 
     def _tournament_select(self, population: List[Individual]) -> Individual:
         """锦标赛选择"""
-        k = min(self._tournament_size, len(population))
+        if not population:
+            raise ValueError("Cannot select from empty population")
+        k = max(1, min(self._tournament_size, len(population)))
         candidates = random.sample(population, k)
         return max(candidates, key=lambda x: x.fitness)
 
     def _roulette_select(self, population: List[Individual]) -> Individual:
         """轮盘赌选择"""
-        min_fit = min(ind.fitness for ind in population)
-        shifted = [max(ind.fitness - min_fit + 1e-10, 1e-10) for ind in population]
+        if not population:
+            raise ValueError("Cannot select from empty population")
+        finite_fits = [ind.fitness for ind in population if math.isfinite(ind.fitness)]
+        if not finite_fits:
+            return random.choice(population)
+        min_fit = min(finite_fits)
+        shifted = []
+        for ind in population:
+            f = ind.fitness if math.isfinite(ind.fitness) else min_fit
+            shifted.append(max(f - min_fit + 1e-10, 1e-10))
         total = sum(shifted)
-        if total <= 0:
+        if total <= 0 or not math.isfinite(total):
             return random.choice(population)
         pick = random.random() * total
         cumulative = 0
@@ -309,6 +356,8 @@ class GeneticOptimizer:
 
     def _rank_select(self, population: List[Individual]) -> Individual:
         """排名选择（线性排名）"""
+        if not population:
+            raise ValueError("Cannot select from empty population")
         sorted_pop = sorted(population, key=lambda x: x.fitness)
         n = len(sorted_pop)
         ranks = [i + 1 for i in range(n)]  # 1 = worst, n = best
@@ -332,17 +381,29 @@ class GeneticOptimizer:
     # ── 交叉操作 ──────────────────────────────────────────────
 
     def _sbx_crossover(self, p1: Individual, p2: Individual) -> Tuple[Individual, Individual]:
-        """模拟二进制交叉 (Simulated Binary Crossover)"""
+        """模拟二进制交叉 (Simulated Binary Crossover)
+
+        强化：分类参数不能做算术交叉（否则产生非法取值），改为按交叉率交换。
+        """
         n = len(p1.genes)
         c1_genes, c2_genes = [], []
         for i in range(n):
+            pd = self._param_defs[i] if i < len(self._param_defs) else None
+            if pd and pd.type == "categorical":
+                # 分类参数：交换保持合法取值
+                if random.random() < self._crossover_rate:
+                    c1_genes.append(p2.genes[i])
+                    c2_genes.append(p1.genes[i])
+                else:
+                    c1_genes.append(p1.genes[i])
+                    c2_genes.append(p2.genes[i])
+                continue
             if random.random() < self._crossover_rate:
                 u = random.random()
                 if u <= 0.5:
-                    beta = (2.0 * u) ** (1.0 / (self._sbx_eta + 1))
+                    beta = (2.0 * u) ** (1.0 / (max(self._sbx_eta, 0) + 1))
                 else:
-                    beta = (1.0 / (2.0 * (1.0 - u))) ** (1.0 / (self._sbx_eta + 1))
-                pd = self._param_defs[i] if i < len(self._param_defs) else None
+                    beta = (1.0 / (2.0 * (1.0 - u))) ** (1.0 / (max(self._sbx_eta, 0) + 1))
                 v1 = 0.5 * ((1 + beta) * p1.genes[i] + (1 - beta) * p2.genes[i])
                 v2 = 0.5 * ((1 - beta) * p1.genes[i] + (1 + beta) * p2.genes[i])
                 if pd:
@@ -371,7 +432,7 @@ class GeneticOptimizer:
 
     def _single_point_crossover(self, p1: Individual, p2: Individual) -> Tuple[Individual, Individual]:
         """单点交叉"""
-        if random.random() < self._crossover_rate:
+        if random.random() < self._crossover_rate and len(p1.genes) > 1:
             point = random.randint(1, len(p1.genes) - 1)
             c1_genes = p1.genes[:point] + p2.genes[point:]
             c2_genes = p2.genes[:point] + p1.genes[point:]
@@ -389,16 +450,22 @@ class GeneticOptimizer:
     # ── 变异操作 ──────────────────────────────────────────────
 
     def _polynomial_mutation(self, ind: Individual, mutation_rate: float) -> Individual:
-        """多项式变异"""
+        """多项式变异
+
+        强化：分类参数不做算术变异，改为重新采样一个随机类别。
+        """
         genes = ind.genes.copy()
         for i in range(len(genes)):
             if random.random() < mutation_rate:
+                pd = self._param_defs[i] if i < len(self._param_defs) else None
+                if pd and pd.type == "categorical":
+                    genes[i] = pd.sample()
+                    continue
                 u = random.random()
                 if u <= 0.5:
-                    delta = (2.0 * u) ** (1.0 / (self._pm_eta + 1)) - 1.0
+                    delta = (2.0 * u) ** (1.0 / (max(self._pm_eta, 0) + 1)) - 1.0
                 else:
-                    delta = 1.0 - (2.0 * (1.0 - u)) ** (1.0 / (self._pm_eta + 1))
-                pd = self._param_defs[i] if i < len(self._param_defs) else None
+                    delta = 1.0 - (2.0 * (1.0 - u)) ** (1.0 / (max(self._pm_eta, 0) + 1))
                 if pd:
                     range_val = pd.high - pd.low
                     genes[i] = pd.clamp(genes[i] + delta * range_val * self._mutation_strength)
@@ -413,24 +480,26 @@ class GeneticOptimizer:
         if len(population) <= 1:
             return 0.0
         n = len(population[0].genes)
-        gene_matrix = np.array([ind.genes for ind in population])
+        gene_matrix = np.array([ind.genes for ind in population], dtype=float)
+        gene_matrix = np.nan_to_num(gene_matrix, nan=0.0, posinf=0.0, neginf=0.0)
         stds = np.std(gene_matrix, axis=0)
         # 归一化各参数标准差
         for i, pd in enumerate(self._param_defs[:n]):
             range_val = pd.high - pd.low if pd.high > pd.low else 1.0
             stds[i] = stds[i] / max(range_val, 1e-10)
-        return float(np.mean(stds))
+        result = float(np.mean(stds))
+        return result if math.isfinite(result) else 0.0
 
     # ── 收敛检测 ──────────────────────────────────────────────
 
     def _check_convergence(self, gen: int) -> Optional[ConvergenceReason]:
         if gen >= self._generations:
             return ConvergenceReason.MAX_GENERATIONS
-        if self._best_individual and self._best_individual.fitness >= self._target_fitness:
+        if self._best_individual and math.isfinite(self._best_individual.fitness) and self._best_individual.fitness >= self._target_fitness:
             return ConvergenceReason.TARGET_REACHED
         if len(self._fitness_history) >= self._convergence_patience:
-            recent = self._fitness_history[-self._convergence_patience:]
-            if max(recent) - min(recent) < self._convergence_variance:
+            recent = [f for f in self._fitness_history[-self._convergence_patience:] if math.isfinite(f)]
+            if len(recent) >= 2 and max(recent) - min(recent) < self._convergence_variance:
                 return ConvergenceReason.LOW_VARIANCE
             if len(recent) > 5:
                 improvements = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
@@ -440,19 +509,24 @@ class GeneticOptimizer:
 
     def _compute_adaptive_mutation_rate(self, gen: int, diversity: float) -> float:
         """自适应变异率：多样性低时增加变异"""
+        mutation_rate = self._mutation_rate if math.isfinite(self._mutation_rate) else 0.1
+        min_mutation_rate = self._min_mutation_rate if math.isfinite(self._min_mutation_rate) else 0.01
         if not self._adaptive_mutation:
-            return self._mutation_rate
+            return mutation_rate
+        if not math.isfinite(diversity):
+            diversity = 0.0
         # 基于代数的指数衰减
-        gen_factor = self._mutation_rate * (1.0 - 0.3 * gen / max(self._generations, 1))
+        gen_factor = mutation_rate * (1.0 - 0.3 * gen / max(self._generations, 1))
         # 基于多样性的反比调整
-        div_threshold = self._diversity_threshold
+        div_threshold = self._diversity_threshold if math.isfinite(self._diversity_threshold) else 0.05
         if diversity < div_threshold * 0.5:
             div_factor = 2.5  # 极度低多样性
         elif diversity < div_threshold:
             div_factor = 1.5  # 低多样性
         else:
             div_factor = 1.0
-        return max(self._min_mutation_rate, gen_factor * div_factor)
+        result = max(min_mutation_rate, gen_factor * div_factor)
+        return result if math.isfinite(result) else min_mutation_rate
 
     def _should_restart(self, diversity: float, gen: int) -> bool:
         """判断是否需要重启种群"""
@@ -463,15 +537,15 @@ class GeneticOptimizer:
         patience_half = max(self._convergence_patience // 2, 5)
         if len(self._fitness_history) < patience_half:
             return False
-        recent = self._fitness_history[-patience_half:]
-        if max(recent) - min(recent) < self._convergence_variance * 10:
+        recent = [f for f in self._fitness_history[-patience_half:] if math.isfinite(f)]
+        if len(recent) >= 2 and max(recent) - min(recent) < self._convergence_variance * 10:
             logger.info(f"Restarting population at gen {gen} due to stagnation")
             return True
         return False
 
     def _inject_random_individuals(self, population: List[Individual], count: int):
         """注入随机新个体保持多样性"""
-        for i in range(count):
+        for i in range(min(count, len(population))):
             genes = [pd.sample() for pd in self._param_defs]
             population[i] = Individual(genes=genes)
 
@@ -479,6 +553,8 @@ class GeneticOptimizer:
 
     def _compute_pareto_front(self, population: List[Individual]) -> List[Individual]:
         """计算 Pareto 前沿（多目标）"""
+        if not population:
+            return []
         if not any(ind.objectives for ind in population):
             return [max(population, key=lambda x: x.fitness)]
         # NSGA-II 风格非支配排序
@@ -521,6 +597,8 @@ class GeneticOptimizer:
             raise ValueError("No parameter definitions set")
         if not self._fitness_fn:
             raise ValueError("No fitness function set")
+        if self._population_size < 1 or self._generations < 1:
+            raise ValueError("population_size and generations must be positive")
 
         start_time = time.time()
         # 重置运行状态，避免多次调用累积污染
@@ -579,14 +657,22 @@ class GeneticOptimizer:
 
             # 统计
             fitnesses = [ind.fitness for ind in self._population]
+            finite_fitnesses = [f for f in fitnesses if math.isfinite(f)]
+            if finite_fitnesses:
+                avg_fitness = float(np.mean(finite_fitnesses))
+                median_fitness = float(np.median(finite_fitnesses))
+                worst_fitness = float(np.min(finite_fitnesses))
+                std_fitness = float(np.std(finite_fitnesses))
+            else:
+                avg_fitness = median_fitness = worst_fitness = std_fitness = 0.0
             diversity = self._compute_diversity(self._population)
             stats = GenerationStats(
                 generation=gen,
                 best_fitness=self._best_individual.fitness,
-                avg_fitness=float(np.mean(fitnesses)),
-                median_fitness=float(np.median(fitnesses)),
-                worst_fitness=float(np.min(fitnesses)),
-                std_fitness=float(np.std(fitnesses)),
+                avg_fitness=avg_fitness,
+                median_fitness=median_fitness,
+                worst_fitness=worst_fitness,
+                std_fitness=std_fitness,
                 population_diversity=diversity,
                 elapsed_seconds=time.time() - start_time,
                 evaluations=len(self._population),

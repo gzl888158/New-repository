@@ -17,6 +17,7 @@ def _make_target():
     """绕过 GridStrategy 重型 __init__，仅装配 _calculate_adx 所需状态。"""
     g = object.__new__(GridStrategy)
     g._dx_history = {}
+    g._trend_confirmation_mode = "regime_aware"
     return g
 
 
@@ -66,3 +67,72 @@ def test_downtrend_minus_di_dominant():
     highs, lows, closes = _synth(closes, 2.0, 2.0)
     _, plus_di, minus_di = _make_target()._calculate_adx(highs, lows, closes, "T")
     assert minus_di > plus_di
+
+
+# ── P33 门禁「趋势模式下才启用」修复 ─────────────────────────
+
+def _klines(n=50, high=100.0, low=90.0, close=95.0):
+    """构造 n 根 K 线：[ts, open, high, low, close, vol]。"""
+    return [[i, close, high, low, close, 1.0] for i in range(n)]
+
+
+def _target_with_adx(adx, plus_di, minus_di):
+    from unittest.mock import MagicMock
+    g = _make_target()
+    g.okx_client = MagicMock()
+    g.okx_client.get_kline = MagicMock(return_value=_klines())
+    g._calculate_adx = MagicMock(return_value=(adx, plus_di, minus_di))
+    return g
+
+
+@pytest.mark.asyncio
+async def test_p33_ranging_allows_entry():
+    """震荡市（ADX<20）放行，不再被 ADX 门槛拒绝。"""
+    g = _target_with_adx(adx=10.0, plus_di=20.0, minus_di=20.0)
+    assert await g._check_trend_ready_for_entry("T", "buy", 95.0) is True
+    assert await g._check_trend_ready_for_entry("T", "sell", 95.0) is True
+
+
+@pytest.mark.asyncio
+async def test_p33_trend_buy_against_di_rejected():
+    """趋势市（ADX>=20）做多但 +DI<=-DI → 拒绝（逆势）。"""
+    g = _target_with_adx(adx=30.0, plus_di=15.0, minus_di=25.0)
+    assert await g._check_trend_ready_for_entry("T", "buy", 95.0) is False
+
+
+@pytest.mark.asyncio
+async def test_p33_trend_sell_against_di_rejected():
+    """趋势市（ADX>=20）做空但 -DI<=+DI → 拒绝（逆势）。"""
+    g = _target_with_adx(adx=30.0, plus_di=25.0, minus_di=15.0)
+    assert await g._check_trend_ready_for_entry("T", "sell", 95.0) is False
+
+
+@pytest.mark.asyncio
+async def test_p33_trend_aligned_allows():
+    """趋势市顺势（+DI>-DI 且价格位置合理）→ 放行。"""
+    g = _target_with_adx(adx=30.0, plus_di=25.0, minus_di=15.0)
+    assert await g._check_trend_ready_for_entry("T", "buy", 95.0) is True
+
+
+@pytest.mark.asyncio
+async def test_p33_trend_buy_price_too_high_rejected():
+    """趋势市顺势但价格在近期高位（追高）→ 拒绝。"""
+    g = _target_with_adx(adx=30.0, plus_di=25.0, minus_di=15.0)
+    assert await g._check_trend_ready_for_entry("T", "buy", 99.0) is False
+
+
+@pytest.mark.asyncio
+async def test_p33_strict_ranging_rejected():
+    """strict 模式：震荡市（ADX<20）直接拒绝（旧行为，可回退）。"""
+    g = _target_with_adx(adx=10.0, plus_di=20.0, minus_di=20.0)
+    g._trend_confirmation_mode = "strict"
+    assert await g._check_trend_ready_for_entry("T", "buy", 95.0) is False
+    assert await g._check_trend_ready_for_entry("T", "sell", 95.0) is False
+
+
+@pytest.mark.asyncio
+async def test_p33_strict_trend_aligned_allows():
+    """strict 模式：趋势市（ADX>=20）顺势仍放行。"""
+    g = _target_with_adx(adx=30.0, plus_di=25.0, minus_di=15.0)
+    g._trend_confirmation_mode = "strict"
+    assert await g._check_trend_ready_for_entry("T", "buy", 95.0) is True

@@ -26,6 +26,30 @@ import numpy as np
 from loguru import logger
 
 
+def _is_finite(x) -> bool:
+    """判断是否为有限数值（拒绝 None/bool/NaN/Inf）。"""
+    if x is None or isinstance(x, bool):
+        return False
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return False
+    return not (math.isnan(v) or math.isinf(v))
+
+
+def _safe_float(x, default: float = 0.0) -> float:
+    """将输入安全转换为有限 float，None/NaN/Inf/非法值返回 default。"""
+    if x is None or isinstance(x, bool):
+        return default
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
+
+
 # ═══════════════════════════════════════════════════════════════
 # 枚举与数据模型
 # ═══════════════════════════════════════════════════════════════
@@ -268,35 +292,38 @@ class RiskBudgetEngine:
         self._lock = asyncio.Lock()
 
         # ── 风险预算配置 ──
-        rb_cfg = config.get("risk_budget", {})
+        rb_cfg = config.get("risk_budget", {}) or {}
         self._enabled = rb_cfg.get("enabled", True)
-        self._daily_risk_budget_pct = rb_cfg.get("daily_risk_budget_pct", 0.03)
-        self._hourly_max_loss = rb_cfg.get("hourly_max_loss_pct", 0.015)
-        self._max_per_trade_risk = rb_cfg.get("max_per_trade_risk_pct", 0.008)
+        self._daily_risk_budget_pct = _safe_float(rb_cfg.get("daily_risk_budget_pct"), 0.03)
+        self._hourly_max_loss = _safe_float(rb_cfg.get("hourly_max_loss_pct"), 0.015)
+        self._max_per_trade_risk = _safe_float(rb_cfg.get("max_per_trade_risk_pct"), 0.008)
 
         # 策略风险预算分配
-        self._strategy_budget_pcts: Dict[str, float] = rb_cfg.get("strategy_budgets", {
+        _budgets = rb_cfg.get("strategy_budgets", {
             "scalping": 0.40, "trend": 0.25, "grid": 0.20, "arbitrage": 0.15,
-        })
+        }) or {}
+        self._strategy_budget_pcts: Dict[str, float] = {
+            str(k): _safe_float(v, 0.0) for k, v in _budgets.items()
+        }
 
         # 再分配配置
-        realloc_cfg = rb_cfg.get("reallocation", {})
+        realloc_cfg = rb_cfg.get("reallocation", {}) or {}
         self._realloc_enabled = realloc_cfg.get("enabled", True)
-        self._realloc_interval = realloc_cfg.get("interval_minutes", 60)
-        self._max_shift_ratio = realloc_cfg.get("max_shift_ratio", 0.15)
-        self._transfer_winrate_threshold = realloc_cfg.get("transfer_out_winrate_threshold", 0.35)
-        self._transfer_drawdown_threshold = realloc_cfg.get("transfer_out_drawdown_threshold", 0.08)
+        self._realloc_interval = int(_safe_float(realloc_cfg.get("interval_minutes"), 60))
+        self._max_shift_ratio = _safe_float(realloc_cfg.get("max_shift_ratio"), 0.15)
+        self._transfer_winrate_threshold = _safe_float(realloc_cfg.get("transfer_out_winrate_threshold"), 0.35)
+        self._transfer_drawdown_threshold = _safe_float(realloc_cfg.get("transfer_out_drawdown_threshold"), 0.08)
 
         # 集中度限制
-        conc_cfg = rb_cfg.get("concentration", {})
-        self._max_symbol_risk = conc_cfg.get("max_single_symbol_risk_pct", 0.008)
-        self._max_correlated_risk = conc_cfg.get("max_correlated_group_risk_pct", 0.02)
+        conc_cfg = rb_cfg.get("concentration", {}) or {}
+        self._max_symbol_risk = _safe_float(conc_cfg.get("max_single_symbol_risk_pct"), 0.008)
+        self._max_correlated_risk = _safe_float(conc_cfg.get("max_correlated_group_risk_pct"), 0.02)
 
         # 连续亏损惩罚
-        streak_cfg = rb_cfg.get("loss_streak", {})
-        self._max_consecutive_losses = streak_cfg.get("max_consecutive_losses", 5)
-        self._loss_reduce_pct = streak_cfg.get("loss_streak_reduce_pct", 0.50)
-        self._recovery_wins = streak_cfg.get("recovery_consecutive_wins", 3)
+        streak_cfg = rb_cfg.get("loss_streak", {}) or {}
+        self._max_consecutive_losses = int(_safe_float(streak_cfg.get("max_consecutive_losses"), 5))
+        self._loss_reduce_pct = _safe_float(streak_cfg.get("loss_streak_reduce_pct"), 0.50)
+        self._recovery_wins = int(_safe_float(streak_cfg.get("recovery_consecutive_wins"), 3))
 
         # ── 风险平价参数 ──
         self._risk_parity_lambda = 0.5          # 风险厌恶系数
@@ -334,8 +361,8 @@ class RiskBudgetEngine:
         self._strategy_leverage_caps: Dict[str, float] = {}
 
         # ── 增强：相关性阈值 ──
-        self._high_correlation_threshold = rb_cfg.get("high_correlation_threshold", 0.70)
-        self._extreme_correlation_threshold = rb_cfg.get("extreme_correlation_threshold", 0.85)
+        self._high_correlation_threshold = _safe_float(rb_cfg.get("high_correlation_threshold"), 0.70)
+        self._extreme_correlation_threshold = _safe_float(rb_cfg.get("extreme_correlation_threshold"), 0.85)
 
         # ── 外部依赖 ──
         self._portfolio_optimizer = None
@@ -347,6 +374,9 @@ class RiskBudgetEngine:
             f"strategies={len(self._strategy_budget_pcts)}, "
             f"realloc={'enabled' if self._realloc_enabled else 'disabled'}"
         )
+
+        # 状态恢复：重启后加载历史快照/杠杆帽/漂移状态（失败仅告警，不阻断启动）
+        self._load_state()
 
     # ── 依赖注入 ─────────────────────────────────────────────
 
@@ -379,10 +409,12 @@ class RiskBudgetEngine:
 
     def update_strategy_returns(self, name: str, returns: List[float]):
         """更新策略收益率序列"""
-        self._strategy_returns[name] = returns[-252:]  # 保留最多252天
+        clean = [r for r in returns if _is_finite(r)] if returns else []
+        self._strategy_returns[name] = clean[-252:]  # 保留最多252天
 
     def update_daily_pnl(self, name: str, pnl: float):
         """更新策略日盈亏，同时用于VaR回测"""
+        pnl = _safe_float(pnl, 0.0)
         if name not in self._daily_pnl_map:
             self._daily_pnl_map[name] = []
         self._daily_pnl_map[name].append(pnl)
@@ -399,6 +431,7 @@ class RiskBudgetEngine:
 
     def update_var_prediction(self, name: str, var_predicted: float):
         """更新VaR预测值（用于回测）"""
+        var_predicted = _safe_float(var_predicted, 0.0)
         if name not in self._var_predictions:
             self._var_predictions[name] = []
         self._var_predictions[name].append(var_predicted)
@@ -407,7 +440,7 @@ class RiskBudgetEngine:
 
     def update_consumed_budget(self, name: str, var_consumed: float):
         """更新策略已消耗的风险预算"""
-        self._consumed_budget[name] = var_consumed
+        self._consumed_budget[name] = _safe_float(var_consumed, 0.0)
 
     # ═══════════════════════════════════════════════════════════
     # 核心：完整风险预算方案计算
@@ -437,11 +470,21 @@ class RiskBudgetEngine:
             完整风险预算方案
         """
         async with self._lock:
-            if total_equity <= 0:
-                return RiskBudgetPlan(total_equity=total_equity)
-
+            total_equity = _safe_float(total_equity, 0.0)
+            strategy_names = list(strategy_names or [])
             strategy_metrics = strategy_metrics or {}
-            current_risk_consumed = current_risk_consumed or {}
+            current_risk_consumed = {
+                str(k): _safe_float(v, 0.0)
+                for k, v in (current_risk_consumed or {}).items()
+            }
+
+            if total_equity <= 0:
+                plan = RiskBudgetPlan(total_equity=total_equity)
+                plan.warnings.append(
+                    "Invalid or non-positive total equity; risk budget computation aborted (fail-closed)"
+                )
+                self._last_plan = plan
+                return plan
 
             plan = RiskBudgetPlan(
                 total_equity=total_equity,
@@ -506,6 +549,8 @@ class RiskBudgetEngine:
             self._auto_snapshot(plan)
 
             self._last_plan = plan
+            # 状态变更后立即持久化（fail-closed 状态可重启恢复）
+            self._save_state()
             return plan
 
     # ── Step 1: 前向风险估计（EWMA波动率）──────────────────
@@ -526,7 +571,7 @@ class RiskBudgetEngine:
 
         for name in strategy_names:
             # 优先使用实时收益率序列
-            returns = self._strategy_returns.get(name, [])
+            returns = [r for r in self._strategy_returns.get(name, []) if _is_finite(r)]
             if len(returns) >= 20:
                 # EWMA 波动率
                 ewma_var = 0.0
@@ -536,13 +581,15 @@ class RiskBudgetEngine:
                     ewma_var += w * (r ** 2)
                     weights_sum += w
                 if weights_sum > 0:
-                    ann_vol = math.sqrt(ewma_var / weights_sum) * math.sqrt(365)
-                    forward_vols[name] = max(0.001, ann_vol)
-                    continue
+                    ewma_sq = ewma_var / weights_sum
+                    if _is_finite(ewma_sq) and ewma_sq > 0:
+                        ann_vol = math.sqrt(ewma_sq) * math.sqrt(365)
+                        forward_vols[name] = max(0.001, ann_vol)
+                        continue
 
             # 回退：使用策略指标中的波动率
-            m = metrics.get(name, {})
-            ann_vol = m.get("ann_volatility", m.get("volatility_30d", 0.02))
+            m = metrics.get(name, {}) or {}
+            ann_vol = _safe_float(m.get("ann_volatility", m.get("volatility_30d", 0.02)), 0.02)
             forward_vols[name] = max(0.001, ann_vol)
 
             # 缓存用于后续计算
@@ -574,6 +621,8 @@ class RiskBudgetEngine:
         n = len(strategy_names)
         if n == 0:
             return {}
+
+        forward_vols = {name: _safe_float(vol, 0.02) for name, vol in forward_vols.items()}
 
         if covariance_matrix is None or covariance_matrix.size == 0 or covariance_matrix.shape[0] != n:
             # 简化：权重 ∝ 1/σ
@@ -671,28 +720,33 @@ class RiskBudgetEngine:
         风险分解：VaR分解 + 边际风险贡献 + 成分风险贡献
         """
         n = len(strategy_names)
-        weights = np.array([target_budget_pcts.get(name, 0) for name in strategy_names])
+        weights = np.array([_safe_float(target_budget_pcts.get(name, 0), 0.0)
+                            for name in strategy_names], dtype=np.float64)
 
         # 计算组合波动率
         if covariance_matrix is not None and covariance_matrix.size > 0 and covariance_matrix.shape[0] == n:
-            port_var = weights @ covariance_matrix @ weights
+            port_var = float(weights @ covariance_matrix @ weights)
+            if not _is_finite(port_var):
+                port_var = 0.0
             port_vol = math.sqrt(max(port_var, 1e-12))
         else:
             # 无协方差：简化为独立假设
-            diag_var = sum((w * forward_vols.get(name, 0.02)) ** 2
+            diag_var = sum((w * _safe_float(forward_vols.get(name, 0.02), 0.02)) ** 2
                          for name, w in zip(strategy_names, weights))
+            if not _is_finite(diag_var):
+                diag_var = 0.0
             port_vol = math.sqrt(max(diag_var, 1e-12))
 
         # 分散化比率
-        sum_vols = sum(forward_vols.get(name, 0.02) * w
+        sum_vols = sum(_safe_float(forward_vols.get(name, 0.02), 0.02) * w
                       for name, w in zip(strategy_names, weights))
         plan.diversification_ratio = sum_vols / max(port_vol, 1e-12)
 
         # 逐策略分解
         for i, name in enumerate(strategy_names):
-            w = weights[i]
-            vol = forward_vols.get(name, 0.02)
-            budget_pct = target_budget_pcts.get(name, 0)
+            w = float(weights[i])
+            vol = _safe_float(forward_vols.get(name, 0.02), 0.02)
+            budget_pct = _safe_float(target_budget_pcts.get(name, 0), 0.0)
 
             position_value = plan.total_equity * budget_pct
 
@@ -719,6 +773,11 @@ class RiskBudgetEngine:
                 var_99 = position_value * daily_vol * z_99
                 cvar_95 = position_value * daily_vol * 2.063  # 正态CVaR95近似
 
+            # 数值防御：确保险值有限，避免 NaN/Inf 污染汇总
+            var_95 = _safe_float(var_95, 0.0)
+            var_99 = _safe_float(var_99, 0.0)
+            cvar_95 = _safe_float(cvar_95, 0.0)
+
             # 边际风险贡献：∂σ/∂w_i = (cov @ w)_i / σ
             if covariance_matrix is not None and covariance_matrix.size > 0 and covariance_matrix.shape[0] == n:
                 mrc = float((covariance_matrix @ weights)[i] / max(port_vol, 1e-12))
@@ -730,7 +789,7 @@ class RiskBudgetEngine:
             rc_pct = crc / max(port_vol, 1e-12) if port_vol > 0 else 0
 
             # 已消耗风险
-            consumed = current_consumed.get(name, 0)
+            consumed = _safe_float(current_consumed.get(name, 0), 0.0)
 
             # 该策略的风险预算金额
             budget_amount = plan.total_risk_budget * budget_pct
@@ -768,16 +827,16 @@ class RiskBudgetEngine:
     ):
         """计算风险调整绩效指标"""
         for name, rb in plan.strategy_budgets.items():
-            m = strategy_metrics.get(name, {})
-            returns = self._strategy_returns.get(name, [])
+            m = strategy_metrics.get(name, {}) or {}
+            returns = [r for r in self._strategy_returns.get(name, []) if _is_finite(r)]
 
             if returns and len(returns) >= 10:
-                ret_arr = np.array(returns[-90:])
+                ret_arr = np.array(returns[-90:], dtype=np.float64)
                 mean_daily = float(np.mean(ret_arr))
                 std_daily = float(np.std(ret_arr, ddof=1))
 
                 # Sharpe
-                if std_daily > 0:
+                if std_daily > 0 and _is_finite(mean_daily):
                     rb.sharpe = float(mean_daily / std_daily * math.sqrt(365))
 
                 # Sortino
@@ -788,8 +847,8 @@ class RiskBudgetEngine:
                         rb.sortino = float(mean_daily / downside_std * math.sqrt(365))
 
             # Calmar：年化收益 / 最大回撤
-            md = m.get("max_drawdown", 0.01)
-            ann_ret = m.get("annualized_return", m.get("expected_return", 0))
+            md = _safe_float(m.get("max_drawdown"), 0.01)
+            ann_ret = _safe_float(m.get("annualized_return", m.get("expected_return", 0)), 0.0)
             if md > 0:
                 rb.calmar = float(ann_ret / md)
 
@@ -820,26 +879,29 @@ class RiskBudgetEngine:
             if not rb:
                 continue
 
-            m = metrics.get(name, {})
+            m = metrics.get(name, {}) or {}
+            win_rate = _safe_float(m.get("win_rate", 0.5), 0.5)
+            max_drawdown = _safe_float(m.get("max_drawdown", 0), 0.0)
+            consec_losses = int(_safe_float(m.get("consecutive_losses", 0), 0))
+            sharpe = _safe_float(m.get("sharpe_ratio", 0), 0.0)
 
             # ── 触发1: 胜率过低 ──
-            if m.get("win_rate", 0.5) < self._transfer_winrate_threshold:
+            if win_rate < self._transfer_winrate_threshold:
                 reduction = -self._max_shift_ratio * 0.5
                 adjustments[name] = reduction
                 plan.adjustment_triggers.append(
-                    f"{name}: low win_rate ({m['win_rate']:.1%}) → reduce {abs(reduction):.1%}"
+                    f"{name}: low win_rate ({win_rate:.1%}) → reduce {abs(reduction):.1%}"
                 )
 
             # ── 触发2: 回撤超限 ──
-            if m.get("max_drawdown", 0) > self._transfer_drawdown_threshold:
+            if max_drawdown > self._transfer_drawdown_threshold:
                 reduction = -self._max_shift_ratio * 0.7
                 adjustments[name] = adjustments.get(name, 0) + reduction
                 plan.adjustment_triggers.append(
-                    f"{name}: drawdown ({m['max_drawdown']:.1%}) → reduce {abs(reduction):.1%}"
+                    f"{name}: drawdown ({max_drawdown:.1%}) → reduce {abs(reduction):.1%}"
                 )
 
             # ── 触发3: 连续亏损 ──
-            consec_losses = m.get("consecutive_losses", 0)
             if consec_losses >= self._max_consecutive_losses:
                 reduction = -self._loss_reduce_pct
                 adjustments[name] = max(adjustments.get(name, 0), reduction)
@@ -848,7 +910,6 @@ class RiskBudgetEngine:
                 )
 
             # ── 触发4: 高Sharpe → 增加预算 ──
-            sharpe = m.get("sharpe_ratio", 0)
             if sharpe > 2.0:
                 increase = min(self._max_shift_ratio, (sharpe - 1.5) * 0.05)
                 adjustments[name] = adjustments.get(name, 0) + increase
@@ -857,7 +918,7 @@ class RiskBudgetEngine:
                 )
 
             # ── 触发5: 预算即将耗尽 → 预警 ──
-            utilization = current_consumed.get(name, 0) / max(rb.budget_amount, 1)
+            utilization = _safe_float(current_consumed.get(name, 0), 0.0) / max(rb.budget_amount, 1)
             if utilization >= 0.90:
                 rb.is_critical = True
                 rb.warning_reason = "Risk budget > 90% consumed"
@@ -916,11 +977,11 @@ class RiskBudgetEngine:
 
                     # 从相关性数据中查找
                     corr_info = corr_data.get(pair_key) or corr_data.get(pair_key_alt) or {}
-                    correlations = corr_info.get("correlations", {})
+                    correlations = corr_info.get("correlations", {}) or {}
 
-                    pearson = correlations.get("pearson", 0)
-                    spearman = correlations.get("spearman", 0)
-                    ewma_corr = correlations.get("ewma_correlation", 0)
+                    pearson = _safe_float(correlations.get("pearson"), 0.0)
+                    spearman = _safe_float(correlations.get("spearman"), 0.0)
+                    ewma_corr = _safe_float(correlations.get("ewma_correlation"), 0.0)
 
                     # 使用最高的相关度量来判断
                     max_corr = max(abs(pearson), abs(spearman), abs(ewma_corr))
@@ -951,7 +1012,7 @@ class RiskBudgetEngine:
     ):
         """汇总风险利用率"""
         total_budget = plan.total_risk_budget
-        total_consumed = sum(current_consumed.values())
+        total_consumed = sum(_safe_float(v, 0.0) for v in current_consumed.values())
         plan.overall_utilization = total_consumed / max(total_budget, 1)
 
         for name, rb in plan.strategy_budgets.items():
@@ -1061,10 +1122,11 @@ class RiskBudgetEngine:
 
         比标准正态VaR更能捕捉厚尾风险
         """
-        if len(returns) < 20:
+        clean = [r for r in returns if _is_finite(r)] if returns else []
+        if len(clean) < 20:
             return 0.0
 
-        ret_arr = np.array(returns[-252:])
+        ret_arr = np.array(clean[-252:], dtype=np.float64)
         mu = float(np.mean(ret_arr))
         sigma = float(np.std(ret_arr, ddof=1))
         if sigma <= 0:
@@ -1112,10 +1174,11 @@ class RiskBudgetEngine:
         通过拟合收益率分布 + 蒙特卡洛模拟来估计ES，
         比参数法更稳健地捕捉尾部风险。
         """
-        if len(returns) < 20:
+        clean = [r for r in returns if _is_finite(r)] if returns else []
+        if len(clean) < 20:
             return 0.0
 
-        ret_arr = np.array(returns[-252:])
+        ret_arr = np.array(clean[-252:], dtype=np.float64)
         mu = float(np.mean(ret_arr))
         sigma = float(np.std(ret_arr, ddof=1))
         if sigma <= 0:
@@ -1332,8 +1395,8 @@ class RiskBudgetEngine:
                 continue
 
             # 基础杠杆帽 = 预算占比 * 波动率调整
-            budget_pct = rb.budget_pct
-            vol = rb.ann_volatility or 0.02
+            budget_pct = _safe_float(rb.budget_pct, 0.0)
+            vol = _safe_float(rb.ann_volatility, 0.02) or 0.02
 
             # 波动率越高，杠杆应越低
             vol_penalty = min(1.0, 0.02 / max(vol, 0.005))
@@ -1369,7 +1432,7 @@ class RiskBudgetEngine:
     ):
         """追踪实际风险占比与目标预算的漂移"""
         total_rc = sum(
-            plan.strategy_budgets.get(name, RiskBudget("")).rc_pct
+            _safe_float(plan.strategy_budgets.get(name, RiskBudget("")).rc_pct, 0.0)
             for name in strategy_names
         ) or 1.0
 
@@ -1378,8 +1441,8 @@ class RiskBudgetEngine:
             if not rb:
                 continue
 
-            target = rb.budget_pct
-            actual = rb.rc_pct / max(total_rc, 0.01)
+            target = _safe_float(rb.budget_pct, 0.0)
+            actual = _safe_float(rb.rc_pct, 0.0) / max(total_rc, 0.01)
 
             drift = actual - target
 
@@ -1678,13 +1741,18 @@ class RiskBudgetEngine:
             (approved, reason, details)
         """
         async with self._lock:
+            strategy_name = strategy_name or ""
+            trade_var = _safe_float(trade_var, 0.0)
+            total_equity = _safe_float(total_equity, 0.0)
+
+            # fail-closed：无法确认权益时拒绝，避免在未知账户状态下放行
+            if total_equity <= 0:
+                return False, "Invalid or non-positive total equity (fail-closed)", {}
+
             plan = self._last_plan
             if not plan or strategy_name not in plan.strategy_budgets:
-                # 无计划时使用宽松默认值
-                max_trade = total_equity * self._max_per_trade_risk
-                if trade_var > max_trade:
-                    return False, f"Trade VaR {trade_var:.0f} exceeds max per-trade risk {max_trade:.0f}", {}
-                return True, "Approved (no plan)", {}
+                # fail-closed：无法定位策略风险预算时拒绝，而非放行
+                return False, f"No risk budget plan for strategy {strategy_name} (fail-closed)", {}
 
             rb = plan.strategy_budgets[strategy_name]
 
@@ -1757,10 +1825,11 @@ class RiskBudgetEngine:
             for name, m in strategy_metrics.items():
                 if name not in current_budgets:
                     continue
+                m = m or {}
 
                 # 转出条件
-                win_rate = m.get("win_rate", 0.5)
-                max_dd = m.get("max_drawdown", 0)
+                win_rate = _safe_float(m.get("win_rate", 0.5), 0.5)
+                max_dd = _safe_float(m.get("max_drawdown", 0), 0.0)
 
                 if win_rate < self._transfer_winrate_threshold:
                     donors[name] = current_budgets[name] * 0.5
@@ -1768,7 +1837,7 @@ class RiskBudgetEngine:
                     donors[name] = current_budgets[name] * 0.3
 
                 # 转入条件
-                sharpe = m.get("sharpe_ratio", 0)
+                sharpe = _safe_float(m.get("sharpe_ratio", 0), 0.0)
                 if sharpe > 2.0:
                     receivers.append(name)
 

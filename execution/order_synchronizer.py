@@ -443,12 +443,18 @@ class OrderStateSynchronizer:
         repaired_positions = 0
 
         try:
-            # 获取交易所挂单
-            exchange_orders = await asyncio.to_thread(
-                self.okx_client.get_orders
-            )
+            # 获取交易所挂单（fail-closed：查询失败显式标记不一致，绝不当作一致）
+            try:
+                exchange_orders = await asyncio.to_thread(
+                    self.okx_client.get_orders
+                )
+            except Exception as e:
+                logger.error(f"Reconciliation: failed to fetch exchange orders: {e}")
+                result.is_consistent = False
+                result.order_mismatches.append({"type": "query_failed", "error": str(e)})
+                exchange_orders = None
 
-            if exchange_orders and isinstance(exchange_orders, list):
+            if exchange_orders is not None and isinstance(exchange_orders, list):
                 result.orders_checked = len(exchange_orders)
 
                 exchange_order_ids = set()
@@ -507,19 +513,31 @@ class OrderStateSynchronizer:
                                         OrderState.LIVE, OrderState.PARTIALLY_FILLED):
                                     self._orders[local_id].state = OrderState.CANCELLED
                             repaired_orders += 1
+            elif exchange_orders is not None:
+                logger.error("Reconciliation: get_orders returned non-list response")
+                result.is_consistent = False
+                result.order_mismatches.append(
+                    {"type": "invalid_response", "error": "get_orders returned non-list"}
+                )
 
-            # 持仓对账
-            exchange_positions = await asyncio.to_thread(
-                self.okx_client.get_positions
-            )
+            # 持仓对账（fail-closed：查询失败显式标记不一致）
+            try:
+                exchange_positions = await asyncio.to_thread(
+                    self.okx_client.get_positions
+                )
+            except Exception as e:
+                logger.error(f"Reconciliation: failed to fetch exchange positions: {e}")
+                result.is_consistent = False
+                result.position_mismatches.append({"type": "query_failed", "error": str(e)})
+                exchange_positions = None
 
-            if exchange_positions and isinstance(exchange_positions, list):
+            if exchange_positions is not None and isinstance(exchange_positions, list):
                 result.positions_checked = len(exchange_positions)
 
                 for pd in exchange_positions:
                     symbol = pd.get("instId")
                     pos_side = pd.get("posSide", "net")
-                    exchange_qty = abs(float(pd.get("pos", 0)))
+                    exchange_qty = abs(float(pd.get("pos") or 0))
 
                     if not symbol or exchange_qty <= 0:
                         continue
@@ -560,12 +578,20 @@ class OrderStateSynchronizer:
                         # 主动修复：以交易所为准更新本地持仓数量
                         if self._auto_repair:
                             async with self._position_lock:
-                                local_pos.quantity = float(pd.get("pos", 0))
+                                local_pos.quantity = float(pd.get("pos") or 0)
                                 local_pos.last_update = time.time()
                             repaired_positions += 1
+            elif exchange_positions is not None:
+                logger.error("Reconciliation: get_positions returned non-list response")
+                result.is_consistent = False
+                result.position_mismatches.append(
+                    {"type": "invalid_response", "error": "get_positions returned non-list"}
+                )
 
         except Exception as e:
             logger.error(f"Error performing reconciliation: {e}")
+            result.is_consistent = False
+            result.order_mismatches.append({"type": "reconciliation_error", "error": str(e)})
 
         if self._auto_repair and (repaired_orders or repaired_positions):
             logger.info(f"Reconciliation auto-repaired {repaired_orders} orders, "

@@ -25,6 +25,17 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from loguru import logger
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """安全数值转换：None/非法字符串/NaN/Inf 统一回退到 default。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if f != f or f in (float("inf"), float("-inf")):  # NaN/Inf
+        return default
+    return f
+
+
 # ═══════════════════════════════════════════════════════════════
 # 数据模型
 # ═══════════════════════════════════════════════════════════════
@@ -130,9 +141,56 @@ class EquityMonitor:
         self._consecutive_down_threshold: int = self._eq_cfg.get("trend_confirm_bars", 5)
 
         # ── 紧急模式 ──
-        self._emergency_drop_threshold: float = self._eq_cfg.get("emergency_drop_pct", 0.10)  # 10%
+        # 硬下限 0.01 防止阈值被配成 0 导致后续 severity/mode_confidence 除零
+        self._emergency_drop_threshold: float = max(
+            _safe_float(self._eq_cfg.get("emergency_drop_pct"), 0.10), 0.01
+        )  # 10%
         self._emergency_recovery_threshold: float = self._eq_cfg.get("emergency_recovery_pct", 0.05)  # 从低点恢复 5%
         self._emergency_low_watermark: float = 0.0
+
+        # ── 分级回撤护栏（在 EMERGENCY 冻结前渐进降风险，避免回撤一次性累积到硬冻结）──
+        tg_cfg = self._eq_cfg.get("tiered_drawdown_guard", {}) or {}
+        self._tiered_guard_enabled = bool(tg_cfg.get("enabled", False))
+        self._tiered_levels: List[Tuple[float, float, float, int]] = []
+        for lv in tg_cfg.get("levels", []) or []:
+            if not isinstance(lv, dict):
+                continue
+            self._tiered_levels.append((
+                _safe_float(lv.get("drawdown_pct"), 0.0),
+                _safe_float(lv.get("position_multiplier"), 1.0),
+                _safe_float(lv.get("risk_budget_ratio"), 1.0),
+                int(_safe_float(lv.get("max_positions"), 10)),
+            ))
+        # 升序排列，保证按回撤递增匹配最高档位
+        self._tiered_levels.sort(key=lambda x: x[0])
+
+        # ── 账户级利润留存（账户盈利达阈值后自动降仓位锁利，防止账面利润整体回吐）──
+        pr_cfg = self._eq_cfg.get("profit_reserve", {}) or {}
+        self._profit_reserve_enabled = bool(pr_cfg.get("enabled", False))
+        self._profit_reserve_activation_pct = _safe_float(pr_cfg.get("activation_pct"), 0.02)
+        self._profit_reserve_max_pct = _safe_float(pr_cfg.get("max_pct"), 0.10)
+        self._profit_reserve_max_reduction = _safe_float(pr_cfg.get("max_position_multiplier_reduction"), 0.30)
+        # 留存基准：优先用初始资本（trading.total_capital），否则运行时以首次权益初始化
+        self._profit_reserve_baseline = _safe_float(
+            self._config.get("trading", {}).get("total_capital"), 0.0
+        )
+
+        # ── 回撤速度预警（drawdown_velocity）：短窗口内急跌 → 快速降仓，
+        #     在 EMERGENCY 硬冻结前抢先收敛敞口，避免回撤一次性累积到硬冻结 ──
+        dv_cfg = self._eq_cfg.get("drawdown_velocity", {}) or {}
+        self._dv_enabled = bool(dv_cfg.get("enabled", False))
+        self._dv_window = max(3, int(_safe_float(dv_cfg.get("window"), 10)))
+        self._dv_drop_pct = _safe_float(dv_cfg.get("drop_pct_per_window"), 0.03)
+        self._dv_position_multiplier = _safe_float(dv_cfg.get("position_multiplier"), 0.5)
+
+        # ── 恢复期渐进加仓（recovery_ramp）：紧急解除后仓位乘数按 bar 逐步回升，
+        #     避免从冻结的 0 一次性跳回高位（自愈闭环，默认关闭保持原行为）──
+        rr_cfg = self._eq_cfg.get("recovery_ramp", {}) or {}
+        self._recovery_ramp_enabled = bool(rr_cfg.get("enabled", False))
+        self._recovery_ramp_floor = max(0.1, _safe_float(rr_cfg.get("floor"), 0.3))
+        self._recovery_ramp_ceiling = max(self._recovery_ramp_floor, _safe_float(rr_cfg.get("ceiling"), 1.0))
+        self._recovery_ramp_step = max(0.0, _safe_float(rr_cfg.get("step_per_bar"), 0.05))
+        self._recovery_bars = 0
 
         # ── 充值/提现检测 ──
         self._deposit_threshold: float = self._eq_cfg.get("deposit_detect_pct", 0.05)  # 5%
@@ -227,6 +285,9 @@ class EquityMonitor:
         """
         if equity <= 0:
             return None
+
+        if self._profit_reserve_enabled and self._profit_reserve_baseline <= 0:
+            self._profit_reserve_baseline = equity
 
         now = datetime.now()
         event: Optional[EquityEvent] = None
@@ -663,6 +724,12 @@ class EquityMonitor:
         drawdown = snapshot.drawdown_pct
         tier = self._account_tier
 
+        # 恢复期 bar 计数：仅在 RECOVERY 模式累计，退出即归零（渐进加仓用）
+        if self._current_mode == EquityMode.RECOVERY:
+            self._recovery_bars += 1
+        else:
+            self._recovery_bars = 0
+
         # ── 模式权重 ──
         if self._current_mode == EquityMode.EMERGENCY:
             self._adaptive_params.update({
@@ -698,8 +765,17 @@ class EquityMonitor:
         elif self._current_mode == EquityMode.RECOVERY:
             # 恢复模式：谨慎加仓
             recovery_pct = (equity - self._trough_equity) / self._peak_equity if self._peak_equity > 0 else 0
+            if self._recovery_ramp_enabled:
+                # 渐进加仓：按 bar 逐步从 floor 回升到 ceiling，避免一次性跳回高位
+                pm = min(
+                    self._recovery_ramp_ceiling,
+                    self._recovery_ramp_floor + self._recovery_bars * self._recovery_ramp_step,
+                )
+                pm = max(0.1, pm)
+            else:
+                pm = 0.3 + 0.4 * recovery_pct
             self._adaptive_params.update({
-                "position_multiplier": 0.3 + 0.4 * recovery_pct,
+                "position_multiplier": pm,
                 "signal_quality_offset": 0.10 - 0.05 * recovery_pct,
                 "risk_budget_ratio": 0.3 + 0.5 * recovery_pct,
                 "max_positions": max(3, int(5 + 10 * recovery_pct)),
@@ -730,6 +806,97 @@ class EquityMonitor:
             self._adaptive_params["position_multiplier"], cap
         )
         self._adaptive_params["account_tier"] = tier
+
+        # ── 分级回撤护栏：在非 EMERGENCY 模式下按回撤程度渐进收紧 ──
+        self._apply_tiered_drawdown_guard(drawdown)
+
+        # ── 账户级利润留存：盈利达阈值后自动降仓位锁利 ──
+        self._apply_profit_reserve(equity)
+
+        # ── 回撤速度预警：短窗口急跌 → 快速降仓 ──
+        self._apply_drawdown_velocity_guard()
+
+    def _apply_tiered_drawdown_guard(self, drawdown: float) -> None:
+        """分级回撤护栏：在 EMERGENCY 硬冻结之前，按回撤程度渐进收紧风险。
+
+        仅在非 EMERGENCY 模式生效（EMERGENCY 已把仓位乘数冻结为 0，无需叠加）。
+        与模式参数取更保守值（min），确保回撤护栏不因模式切换而放宽。
+        """
+        if not self._tiered_guard_enabled or not self._tiered_levels:
+            return
+        if self._current_mode == EquityMode.EMERGENCY:
+            return
+
+        applied = None
+        for dd, pm, rb, mp in self._tiered_levels:
+            if drawdown >= dd:
+                applied = (pm, rb, mp)
+        if applied is None:
+            return
+
+        pm, rb, mp = applied
+        self._adaptive_params["position_multiplier"] = min(
+            _safe_float(self._adaptive_params.get("position_multiplier"), 1.0), pm
+        )
+        self._adaptive_params["risk_budget_ratio"] = min(
+            _safe_float(self._adaptive_params.get("risk_budget_ratio"), 1.0), rb
+        )
+        self._adaptive_params["max_positions"] = min(
+            int(_safe_float(self._adaptive_params.get("max_positions"), 10)), mp
+        )
+
+    def _apply_profit_reserve(self, equity: float) -> None:
+        """账户级利润留存：账户较基准盈利达阈值后，渐进降低仓位乘数以锁定利润。
+
+        当 equity 相对基准增长超过 activation_pct 时启动，增长到 max_pct 时达到
+        最大留存力度（仓位乘数最多下调 max_position_multiplier_reduction 比例）。
+        仅在盈利（growth > 0）时生效，且不把仓位乘数降到 0（留存而非冻结）。
+        """
+        if not self._profit_reserve_enabled:
+            return
+        baseline = self._profit_reserve_baseline
+        if baseline <= 0:
+            return
+        growth_pct = (equity - baseline) / baseline
+        if growth_pct <= self._profit_reserve_activation_pct:
+            return
+
+        span = max(self._profit_reserve_max_pct - self._profit_reserve_activation_pct, 1e-6)
+        intensity = min(1.0, (growth_pct - self._profit_reserve_activation_pct) / span)
+        reduction = self._profit_reserve_max_reduction * intensity
+
+        current_multiplier = _safe_float(self._adaptive_params.get("position_multiplier"), 1.0)
+        self._adaptive_params["position_multiplier"] = max(
+            current_multiplier * (1.0 - reduction), 0.1
+        )
+
+    def _apply_drawdown_velocity_guard(self) -> None:
+        """回撤速度预警：最近 window 个快照内权益跌幅超过阈值 → 快速降仓。
+
+        与分级回撤护栏互补：分级护栏看「距峰值回撤幅度」，本护栏看「回撤速度」，
+        能在急跌初期（尚未触及深度回撤档位）就抢先收敛仓位乘数，避免一次性砸到
+        EMERGENCY 硬冻结。仅在非 EMERGENCY 模式生效，且只下调（取 min）不上调。
+        """
+        if not self._dv_enabled or self._current_mode == EquityMode.EMERGENCY:
+            return
+        if len(self._history) < self._dv_window:
+            return
+        window_snaps = list(self._history)[-self._dv_window:]
+        start_equity = window_snaps[0].total_equity
+        end_equity = window_snaps[-1].total_equity
+        if start_equity <= 0:
+            return
+        drop_pct = (start_equity - end_equity) / start_equity
+        if drop_pct < self._dv_drop_pct:
+            return
+        self._adaptive_params["position_multiplier"] = min(
+            _safe_float(self._adaptive_params.get("position_multiplier"), 1.0),
+            self._dv_position_multiplier,
+        )
+        logger.warning(
+            f"DRAWDOWN VELOCITY: -{drop_pct:.1%} over {self._dv_window} bars → "
+            f"position_multiplier <= {self._dv_position_multiplier}"
+        )
 
     def _detect_account_tier(self) -> str:
         """检测账户规模等级"""
@@ -762,13 +929,15 @@ class EquityMonitor:
         return {
             "current_equity": self._last_known_equity,
             "peak_equity": self._peak_equity,
-            "trough_equity": self._trough_equity,
+            "trough_equity": _safe_float(self._trough_equity, 0.0),  # inf 哨兵 → 0.0，JSON 安全
             "max_drawdown_pct": self._max_drawdown_pct,
             "sma_short": self._sma_short,
             "sma_long": self._sma_long,
             "ema": self._ema,
             "mode": self._current_mode.value,
             "mode_since": self._mode_start_time.isoformat() if self._mode_start_time else None,
+            "position_multiplier": self.get_position_multiplier(),
+            "recovery_bars": self._recovery_bars,
             "account_tier": self._account_tier,
             "crossed_milestones": sorted(list(self._crossed_milestones)),
             "consecutive_up": self._consecutive_up,
@@ -834,7 +1003,7 @@ class EquityMonitor:
             state = {
                 "peak_equity": self._peak_equity,
                 "peak_equity_time": self._peak_equity_time.isoformat() if self._peak_equity_time else None,
-                "trough_equity": self._trough_equity,
+                "trough_equity": _safe_float(self._trough_equity, 0.0),
                 "max_drawdown_pct": self._max_drawdown_pct,
                 "last_known_equity": self._last_known_equity,
                 "last_known_upl": self._last_known_upl,
@@ -853,11 +1022,12 @@ class EquityMonitor:
                 "recent_external_flows": list(self._recent_external_flows),
                 "baseline_equity": self._baseline_equity,
                 "baseline_updated_at": self._baseline_updated_at.isoformat() if self._baseline_updated_at else None,
+                "profit_reserve_baseline": self._profit_reserve_baseline,
                 "saved_at": datetime.now().isoformat(),
             }
             os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
             with open(self._state_path, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+                json.dump(state, f, ensure_ascii=False, indent=2, default=str)
         except Exception as e:
             logger.debug(f"EquityMonitor save error: {e}")
 
@@ -896,6 +1066,9 @@ class EquityMonitor:
             if isinstance(flows, list):
                 self._recent_external_flows = deque(flows[-20:], maxlen=20)
             self._baseline_equity = state.get("baseline_equity", 0.0)
+            self._profit_reserve_baseline = _safe_float(
+                state.get("profit_reserve_baseline"), self._profit_reserve_baseline
+            )
             baseline_updated = state.get("baseline_updated_at")
             if baseline_updated:
                 try:

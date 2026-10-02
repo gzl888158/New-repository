@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 from datetime import datetime
+import math
 
 @dataclass
 class TickData:
@@ -55,6 +56,7 @@ class Position:
     leverage: int
     maintenance_margin_rate: float
     notional_usd: float = 0.0  # OKX API返回的名义价值(USD)，已正确计入合约乘数ctVal
+    liquidation_price: float = 0.0  # OKX API返回的强平价(liqPx)；0=未提供，下游风控需回退估算
     timestamp: datetime = field(default_factory=datetime.now)
 
 @dataclass
@@ -87,6 +89,21 @@ class Signal:
         # 防御显式传入 None 的历史调用，避免下游 .isoformat() 崩溃
         if self.timestamp is None:
             self.timestamp = datetime.now()
+
+        if self.direction not in {"long", "short", "buy", "sell"}:
+            raise ValueError("direction must be one of: long, short, buy, sell")
+
+        for field_name in ("price", "quantity", "confidence"):
+            value = getattr(self, field_name)
+            try:
+                finite = math.isfinite(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field_name} must be a finite number") from exc
+            if not finite:
+                raise ValueError(f"{field_name} must be a finite number")
+
+        if not 0 <= self.confidence <= 1:
+            raise ValueError("confidence must be between 0 and 1")
 
 @dataclass
 class FundingRate:

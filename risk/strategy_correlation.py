@@ -11,15 +11,54 @@
 仅依赖 Python 标准库 + numpy + loguru + asyncio，所有统计量手工实现。
 """
 import asyncio
+import json
 import math
+import os
 import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """将任意输入安全转换为有限浮点数；None/NaN/Inf/非法值回退 default。"""
+    try:
+        if value is None:
+            return default
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """安全转换为整数；None/NaN/Inf/非法值回退 default。"""
+    try:
+        if value is None:
+            return default
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _finite_array(values: List[float]) -> np.ndarray:
+    """将序列过滤为有限浮点数组；None/NaN/Inf 被剔除。"""
+    out = []
+    for x in values:
+        v = _safe_float(x, default=None)
+        if v is not None:
+            out.append(v)
+    return np.array(out, dtype=float)
 
 
 # ==============================================================================
@@ -253,10 +292,10 @@ class RollingCorrelationAnalyzer:
 
     def __init__(self, config: Dict[str, Any]):
         cfg = config.get("strategy_correlation", {})
-        self._rolling_window: int = int(cfg.get("rolling_window", 30))
-        self._ewma_half_life: int = int(cfg.get("ewma_half_life", 20))
-        self._regime_shift_threshold: float = float(cfg.get("regime_shift_threshold", 0.15))
-        self._min_observations: int = int(cfg.get("min_observations", 10))
+        self._rolling_window: int = _safe_int(cfg.get("rolling_window"), 30)
+        self._ewma_half_life: int = _safe_int(cfg.get("ewma_half_life"), 20)
+        self._regime_shift_threshold: float = _safe_float(cfg.get("regime_shift_threshold"), 0.15)
+        self._min_observations: int = _safe_int(cfg.get("min_observations"), 10)
 
         # EWMA alpha: alpha = 1 - exp(-ln(2) / half_life)
         self._ewma_alpha = 1.0 - math.exp(-math.log(2) / max(self._ewma_half_life, 1))
@@ -268,8 +307,8 @@ class RollingCorrelationAnalyzer:
 
     def compute_pairwise(self, returns_x: List[float], returns_y: List[float]) -> float:
         """计算两个收益序列之间的 Pearson 滚动相关系数"""
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
         min_len = min(len(arr_x), len(arr_y))
         if min_len < self._min_observations:
             return 0.0
@@ -280,8 +319,8 @@ class RollingCorrelationAnalyzer:
 
     def compute_spearman(self, returns_x: List[float], returns_y: List[float]) -> float:
         """计算两个收益序列之间的 Spearman 等级相关系数"""
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
         min_len = min(len(arr_x), len(arr_y))
         if min_len < self._min_observations:
             return 0.0
@@ -290,8 +329,8 @@ class RollingCorrelationAnalyzer:
 
     def compute_kendall(self, returns_x: List[float], returns_y: List[float]) -> float:
         """计算两个收益序列之间的 Kendall tau 相关系数"""
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
         min_len = min(len(arr_x), len(arr_y))
         if min_len < self._min_observations:
             return 0.0
@@ -318,8 +357,8 @@ class RollingCorrelationAnalyzer:
 
         for i in range(n):
             for j in range(i + 1, n):
-                arr_i = np.array(strategy_returns[names[i]], dtype=float)
-                arr_j = np.array(strategy_returns[names[j]], dtype=float)
+                arr_i = _finite_array(strategy_returns[names[i]])
+                arr_j = _finite_array(strategy_returns[names[j]])
                 min_len = min(len(arr_i), len(arr_j))
                 if min_len < self._min_observations:
                     r = 0.0
@@ -338,8 +377,8 @@ class RollingCorrelationAnalyzer:
         self, returns_x: List[float], returns_y: List[float]
     ) -> float:
         """计算指数加权移动平均相关系数（近期数据权重更高）"""
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
         min_len = min(len(arr_x), len(arr_y))
         if min_len < self._min_observations:
             return 0.0
@@ -360,8 +399,8 @@ class RollingCorrelationAnalyzer:
 
         每一步利用过去 rolling_window 个观察值计算相关系数，生成序列。
         """
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
         n = min(len(arr_x), len(arr_y))
         if n < self._rolling_window + 1:
             return []
@@ -418,6 +457,8 @@ class RollingCorrelationAnalyzer:
             for j in range(i + 1, n):
                 key = f"{names[i]}:{names[j]}"
                 new_val = float(correlation_matrix[i, j])
+                if math.isnan(new_val) or math.isinf(new_val):
+                    continue
                 if key in cached:
                     cached[key] = 0.7 * cached[key] + 0.3 * new_val
                 else:
@@ -443,8 +484,8 @@ class TailDependenceAnalyzer:
 
     def __init__(self, config: Dict[str, Any]):
         cfg = config.get("strategy_correlation", {})
-        self._tail_percentile: float = float(cfg.get("tail_percentile", 0.10))
-        self._min_observations: int = int(cfg.get("min_observations", 10))
+        self._tail_percentile: float = _safe_float(cfg.get("tail_percentile"), 0.10)
+        self._min_observations: int = _safe_int(cfg.get("min_observations"), 10)
 
     def compute_lower_tail_dependence(
         self, returns_x: List[float], returns_y: List[float]
@@ -453,11 +494,13 @@ class TailDependenceAnalyzer:
 
         使用经验分位数，取底部 tail_percentile 的观测。
         """
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
-        n = len(arr_x)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
+        n = min(len(arr_x), len(arr_y))
         if n < self._min_observations:
             return 0.0
+        arr_x = arr_x[:n]
+        arr_y = arr_y[:n]
 
         qx = _quantile(arr_x, self._tail_percentile)
         qy = _quantile(arr_y, self._tail_percentile)
@@ -475,11 +518,13 @@ class TailDependenceAnalyzer:
         self, returns_x: List[float], returns_y: List[float]
     ) -> float:
         """计算上尾依赖系数: P(X > q | Y > q)"""
-        arr_x = np.array(returns_x, dtype=float)
-        arr_y = np.array(returns_y, dtype=float)
-        n = len(arr_x)
+        arr_x = _finite_array(returns_x)
+        arr_y = _finite_array(returns_y)
+        n = min(len(arr_x), len(arr_y))
         if n < self._min_observations:
             return 0.0
+        arr_x = arr_x[:n]
+        arr_y = arr_y[:n]
 
         qx = _quantile(arr_x, 1.0 - self._tail_percentile)
         qy = _quantile(arr_y, 1.0 - self._tail_percentile)
@@ -539,8 +584,8 @@ class ClusterAnalyzer:
 
     def __init__(self, config: Dict[str, Any]):
         cfg = config.get("strategy_correlation", {})
-        self._rolling_window: int = int(cfg.get("rolling_window", 30))
-        self._min_observations: int = int(cfg.get("min_observations", 10))
+        self._rolling_window: int = _safe_int(cfg.get("rolling_window"), 30)
+        self._min_observations: int = _safe_int(cfg.get("min_observations"), 10)
         # 历次聚类的 label 记录，用于稳定性评估
         self._cluster_history: List[Dict[str, int]] = []
 
@@ -810,7 +855,7 @@ class EffectiveN:
 
     def __init__(self, config: Dict[str, Any]):
         cfg = config.get("strategy_correlation", {})
-        self._min_observations: int = int(cfg.get("min_observations", 10))
+        self._min_observations: int = _safe_int(cfg.get("min_observations"), 10)
         self._history: List[float] = []
 
     def compute(
@@ -826,6 +871,7 @@ class EffectiveN:
         if weights is None:
             weights = [1.0 / n] * n
         else:
+            weights = [_safe_float(w, 0.0) for w in weights]
             total_w = sum(weights)
             if total_w != 0:
                 weights = [w / total_w for w in weights]
@@ -836,7 +882,10 @@ class EffectiveN:
         for i in range(n):
             for j in range(n):
                 if i != j:
-                    cross_term += weights[i] * weights[j] * correlation_matrix[i, j]
+                    corr = float(correlation_matrix[i, j])
+                    if math.isnan(corr) or math.isinf(corr):
+                        corr = 0.0
+                    cross_term += weights[i] * weights[j] * corr
 
         denom = sum_w_sq + cross_term
         if denom <= 0:
@@ -911,10 +960,11 @@ class StrategyCorrelationAnalyzer:
         self.config = config
         cfg = config.get("strategy_correlation", {})
 
-        self._rolling_window: int = int(cfg.get("rolling_window", 30))
-        self._high_corr_threshold: float = float(cfg.get("high_correlation_threshold", 0.7))
-        self._extreme_corr_threshold: float = float(cfg.get("extreme_correlation_threshold", 0.85))
-        self._min_observations: int = int(cfg.get("min_observations", 10))
+        self._rolling_window: int = _safe_int(cfg.get("rolling_window"), 30)
+        self._high_corr_threshold: float = _safe_float(cfg.get("high_correlation_threshold"), 0.7)
+        self._extreme_corr_threshold: float = _safe_float(cfg.get("extreme_correlation_threshold"), 0.85)
+        self._min_observations: int = _safe_int(cfg.get("min_observations"), 10)
+        self._data_dir = cfg.get("data_dir", "./data")
 
         # 子分析器
         self._rolling_analyzer = RollingCorrelationAnalyzer(config)
@@ -928,6 +978,9 @@ class StrategyCorrelationAnalyzer:
         self._strategy_returns: Dict[str, List[float]] = {}
         self._last_result: Optional[CorrelationResult] = None
         self._market_regime: str = "unknown"
+
+        # 重启恢复：加载收益序列与 regime 相关性缓存
+        self._load_state()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -974,11 +1027,12 @@ class StrategyCorrelationAnalyzer:
             for name, rets in strategy_returns.items():
                 if name not in self._strategy_returns:
                     self._strategy_returns[name] = []
-                self._strategy_returns[name].extend(rets)
+                self._strategy_returns[name].extend(_finite_array(rets).tolist())
                 # 限制历史长度
                 max_len = self._rolling_window * 5
                 if len(self._strategy_returns[name]) > max_len:
                     self._strategy_returns[name] = self._strategy_returns[name][-max_len:]
+            self._save_state()
 
         result = await self.analyze()
         return {
@@ -1093,6 +1147,7 @@ class StrategyCorrelationAnalyzer:
             )
 
             self._last_result = result
+            self._save_state()
 
             return {
                 "timestamp": result.timestamp,
@@ -1344,6 +1399,7 @@ class StrategyCorrelationAnalyzer:
             if self._market_regime != regime:
                 logger.info(f"Market regime changed: {self._market_regime} -> {regime}")
             self._market_regime = regime
+            self._save_state()
 
     def get_market_regime(self) -> str:
         """获取当前市场状态"""
@@ -1354,7 +1410,67 @@ class StrategyCorrelationAnalyzer:
         async with self._lock:
             self._strategy_returns.clear()
             self._last_result = None
+            self._save_state()
             logger.info("StrategyCorrelationAnalyzer history cleared")
+
+    def _save_state(self) -> None:
+        """持久化收益序列、市场状态与最近相关性缓存，重启后可恢复。"""
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            state_path = os.path.join(self._data_dir, "strategy_correlation_state.json")
+            state = {
+                "last_updated": datetime.now().isoformat(),
+                "market_regime": self._market_regime,
+                "strategy_returns": {
+                    k: _finite_array(v).tolist() for k, v in self._strategy_returns.items()
+                },
+                "last_result": self._last_result_summary(),
+            }
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save strategy correlation state: {e}")
+
+    def _load_state(self) -> bool:
+        """从磁盘恢复收益序列与市场状态；失败不影响启动。"""
+        try:
+            state_path = os.path.join(self._data_dir, "strategy_correlation_state.json")
+            if not os.path.isfile(state_path):
+                return False
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                return False
+            raw_returns = state.get("strategy_returns", {})
+            if isinstance(raw_returns, dict):
+                restored: Dict[str, List[float]] = {}
+                for name, rets in raw_returns.items():
+                    if isinstance(rets, list):
+                        clean = _finite_array(rets).tolist()
+                        if clean:
+                            restored[str(name)] = clean
+                self._strategy_returns = restored
+            regime = state.get("market_regime")
+            if isinstance(regime, str):
+                self._market_regime = regime
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load strategy correlation state: {e}")
+            return False
+
+    def _last_result_summary(self) -> Dict[str, Any]:
+        """提取最近一次相关性分析的摘要字段用于持久化。"""
+        r = self._last_result
+        if r is None:
+            return {}
+        return {
+            "average_correlation": _safe_float(r.average_correlation, 0.0),
+            "max_pair_correlation": _safe_float(r.max_pair_correlation, 0.0),
+            "correlation_regime": r.correlation_regime,
+            "effective_n": _safe_float(r.effective_n, 0.0),
+            "diversification_erosion": bool(r.diversification_erosion),
+            "timestamp": r.timestamp,
+        }
 
     # ------------------------------------------------------------------
     # 内部工具

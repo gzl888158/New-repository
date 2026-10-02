@@ -86,6 +86,7 @@ class FillQualityTracker:
 
     def _persist_fill(self, record: Dict[str, Any]):
         """持久化到 fill_quality 表"""
+        conn = None
         try:
             conn = sqlite3.connect(self._db_path)
             conn.execute("""
@@ -121,12 +122,15 @@ class FillQualityTracker:
                 record["timestamp"]
             ))
             conn.commit()
-            conn.close()
         except Exception as e:
             logger.error(f"Error persisting fill quality: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
 
     def get_statistics(self, hours: int = 24) -> Dict[str, Any]:
         """获取最近N小时的成交质量统计"""
+        conn = None
         try:
             conn = sqlite3.connect(self._db_path)
             conn.row_factory = sqlite3.Row
@@ -181,8 +185,6 @@ class FillQualityTracker:
             slippages = sorted([r["abs_slippage"] for r in cursor.fetchall()])
             p95_slippage = slippages[int(len(slippages) * 0.95)] if slippages else 0
 
-            conn.close()
-
             return {
                 "hours": hours,
                 "overall": {
@@ -203,6 +205,9 @@ class FillQualityTracker:
         except Exception as e:
             logger.error(f"Error getting fill statistics: {e}")
             return {"error": str(e)}
+        finally:
+            if conn is not None:
+                conn.close()
 
     def export_status(self) -> Dict[str, Any]:
         """导出当前状态供dashboard读取"""

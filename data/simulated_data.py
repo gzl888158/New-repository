@@ -185,6 +185,9 @@ class SimulatedDataGenerator:
         return prices
     
     def generate_market_cycles(self, symbol: str, cycle_count: int = 5) -> List[Dict[str, Any]]:
+        if symbol not in self._base_prices:
+            logger.error(f"Unknown symbol: {symbol}")
+            return []
         cycles = []
         base_price = self._base_prices[symbol]
         volatility = self._volatility[symbol]
@@ -240,6 +243,9 @@ class SimulatedDataGenerator:
         return interval_map.get(interval, 3600000)
     
     def generate_strategy_signals(self, symbol: str, count: int) -> List[Dict[str, Any]]:
+        if symbol not in self._base_prices:
+            logger.error(f"Unknown symbol: {symbol}")
+            return []
         signals = []
         base_price = self._base_prices[symbol]
         volatility = self._volatility[symbol]

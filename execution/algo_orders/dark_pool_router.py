@@ -1,6 +1,8 @@
 """
 暗池路由器 (Dark Pool Router)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 将大订单路由到隐蔽执行场所，避免市场冲击：
   - 暗池搜索：通过OKX的隐藏订单、大宗交易等方式模拟暗池
   - 隐藏订单管理：使用OKX的冰山单/IOC/FOK等订单类型
@@ -20,6 +22,8 @@ from enum import Enum
 from typing import Dict, Any, Optional, List, Callable, Set
 import numpy as np
 from loguru import logger
+
+from core.direction_unifier import DirectionUnifier
 
 
 class DarkPoolVenue(Enum):
@@ -145,17 +149,17 @@ class DarkPoolRouter:
         order.status = "active"
 
         symbol = order.symbol
-        opposite_side = "sell" if order.side == "buy" else "buy"
+        opposite_side = DirectionUnifier.opposite(order.side)
 
         # 查找匹配的反向订单
         matches = []
         for existing in self._internal_book.get(symbol, []):
             if existing.side == opposite_side and existing.status == "active":
                 # 检查价格交叉
-                if order.side == "buy" and existing.limit_price:
+                if DirectionUnifier.is_long(order.side) and existing.limit_price:
                     if order.limit_price and order.limit_price < existing.limit_price:
                         continue
-                elif order.side == "sell" and existing.limit_price:
+                elif DirectionUnifier.is_short(order.side) and existing.limit_price:
                     if order.limit_price and order.limit_price > existing.limit_price:
                         continue
                 matches.append(existing)
@@ -233,35 +237,51 @@ class DarkPoolRouter:
         order.status = "active"
         start_time = time.time()
 
-        if order_executor:
-            try:
-                params = {
-                    "symbol": order.symbol,
-                    "side": order.side,
-                    "quantity": order.quantity,
-                    "order_type": "limit",
-                    "price": order.limit_price,
-                    "hidden": True,  # OKX不直接支持hidden，用冰山模拟
-                }
-                result = order_executor(params)
-                if hasattr(result, '__await__'):
-                    result = await result
+        if not order_executor:
+            # fail-closed：无执行器注入时不得静默保持 active 状态
+            logger.error(f"Dark pool hidden order {order.order_id}: no order executor injected, fail-closed")
+            order.status = "cancelled"
+            order.venue_latency_ms = (time.time() - start_time) * 1000
+            return DarkPoolFill(
+                fill_id=f"ho_{order.order_id}",
+                order_id=order.order_id,
+                quantity=0.0,
+                price=0.0,
+                venue=DarkPoolVenue.HIDDEN_ORDER,
+                counterparty="none",
+                saved_bps=0.0,
+            )
 
-                if result:
-                    order.filled_quantity = float(result.get("filled", 0))
-                    order.avg_fill_price = float(result.get("avg_price", market_price))
-                    order.status = "filled" if order.filled_quantity >= order.quantity * 0.95 else "partial"
-                    order.filled_at = datetime.now()
-            except Exception as e:
-                logger.warning(f"Hidden order failed: {e}")
-                order.status = "cancelled"
+        try:
+            params = {
+                "symbol": order.symbol,
+                "side": order.side,
+                "pos_side": DirectionUnifier.to_pos_side(order.side),
+                "quantity": order.quantity,
+                "order_type": "limit",
+                "price": order.limit_price,
+                "hidden": True,  # OKX不直接支持hidden，用冰山模拟
+                "trace_id": f"algo_{order.order_id}_{uuid.uuid4().hex[:8]}",
+            }
+            result = order_executor(params)
+            if hasattr(result, '__await__'):
+                result = await result
+
+            if result:
+                order.filled_quantity = float(result.get("filled", 0))
+                order.avg_fill_price = float(result.get("avg_price", market_price))
+                order.status = "filled" if order.filled_quantity >= order.quantity * 0.95 else "partial"
+                order.filled_at = datetime.now()
+        except Exception as e:
+            logger.warning(f"Hidden order failed: {e}")
+            order.status = "cancelled"
 
         order.venue_latency_ms = (time.time() - start_time) * 1000
 
         saved = 0.0
         if order.avg_fill_price > 0 and market_price > 0:
             slip_bps = (order.avg_fill_price - market_price) / market_price * 10000
-            if order.side == "sell":
+            if DirectionUnifier.is_short(order.side):
                 slip_bps *= -1
             saved = max(0, slip_bps)
 
@@ -298,9 +318,11 @@ class DarkPoolRouter:
                     params = {
                         "symbol": symbol,
                         "side": side,
+                        "pos_side": DirectionUnifier.to_pos_side(side),
                         "quantity": probe_qty,
                         "order_type": "limit",
                         "price": mid_price,
+                        "trace_id": f"probe_{symbol}_{uuid.uuid4().hex[:8]}",
                     }
                     result = order_executor(params)
                     if hasattr(result, '__await__'):

@@ -29,23 +29,46 @@ class RiskLimits:
         self._symbol_margins: Dict[str, float] = {}
         
         self._violations: List[Dict[str, Any]] = []
+        self._monitor_task = None
 
     async def start(self):
-        asyncio.create_task(self._monitor_loop())
+        # 幂等启动：避免重复调用创建多套监控循环
+        if self._monitor_task is not None and not self._monitor_task.done():
+            return
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("Risk limits service started")
 
     async def shutdown(self):
+        task = self._monitor_task
+        self._monitor_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         logger.info("Risk limits service shutdown")
 
     async def _monitor_loop(self):
         while True:
-            await self._update_margins()
-            await self._check_daily_hourly_limits()
+            try:
+                await self._update_margins()
+                await self._check_daily_hourly_limits()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in risk limits monitor loop: {e}")
             await asyncio.sleep(10)
 
     async def _update_margins(self):
         try:
-            positions = self._okx_client.get_positions()
+            checked_query = getattr(self._okx_client, "get_positions_checked", None)
+            positions = (
+                checked_query()
+                if callable(checked_query)
+                else self._okx_client.get_positions()
+            )
+            if positions is None:
+                # 查询失败：保留旧 margins，避免清空后跳过保证金限额检查（fail-closed）
+                logger.warning("get_positions returned None, keeping previous margins")
+                return
             self._strategy_margins = {}
             self._symbol_margins = {}
             
@@ -79,14 +102,39 @@ class RiskLimits:
     def check_signal(self, signal_data: Dict[str, Any]) -> bool:
         symbol = signal_data.get("symbol", "")
         strategy_name = signal_data.get("strategy_name", "")
-        leverage = signal_data.get("leverage", 1)
-        quantity = signal_data.get("quantity", 0)
-        price = signal_data.get("price", 0)
+        try:
+            leverage = float(signal_data.get("leverage", 1) or 1)
+            quantity = float(signal_data.get("quantity", 0) or 0)
+            price = float(signal_data.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            logger.error(f"Invalid numeric fields in signal: {signal_data}")
+            self._record_violation("invalid_signal_fields", symbol, "non-numeric quantity/price/leverage")
+            return False
+        
+        if leverage <= 0:
+            logger.warning(f"Invalid leverage {leverage} in signal, rejecting (fail-closed)")
+            self._record_violation("invalid_leverage", symbol, f"leverage={leverage}")
+            return False
         
         margin_needed = (quantity * price) / leverage
         
-        account_info = self._okx_client.get_account_info()
-        total_equity = float(account_info.get("totalEq", 0)) if account_info else 0
+        try:
+            account_info = self._okx_client.get_account_info()
+        except Exception as e:
+            logger.error(f"Failed to fetch account info during signal check (fail-closed): {e}")
+            self._record_violation("account_unavailable", symbol, str(e))
+            return False
+        
+        try:
+            total_equity = float(account_info.get("totalEq") or 0) if account_info else 0.0
+        except (TypeError, ValueError):
+            total_equity = 0.0
+        
+        # fail-closed：无法确认账户权益时拒绝，避免保证金限额检查被静默跳过
+        if not account_info or total_equity <= 0:
+            logger.warning(f"Account equity unavailable (equity={total_equity}), rejecting signal (fail-closed)")
+            self._record_violation("account_equity_unavailable", symbol, f"equity={total_equity}")
+            return False
         
         if total_equity > 0:
             new_symbol_margin = self._symbol_margins.get(symbol, 0) + margin_needed
@@ -135,18 +183,25 @@ class RiskLimits:
             self._violations = self._violations[-100:]
         
         if self._alert_manager:
-            asyncio.create_task(
-                self._alert_manager.send_alert(
-                    "RISK_LIMIT_VIOLATION",
-                    f"{violation_type}: {detail}",
-                    severity="WARNING",
-                    symbol=symbol
+            try:
+                asyncio.create_task(
+                    self._alert_manager.send_alert(
+                        "RISK_LIMIT_VIOLATION",
+                        f"{violation_type}: {detail}",
+                        severity="WARNING",
+                        symbol=symbol
+                    )
                 )
-            )
+            except Exception:
+                # 告警失败不得影响风控判定结果（fail-safe 非关键路径）
+                pass
 
     def get_limits_status(self) -> Dict[str, Any]:
-        account_info = self._okx_client.get_account_info()
-        total_equity = float(account_info.get("totalEq", 0)) if account_info else 0
+        try:
+            account_info = self._okx_client.get_account_info()
+            total_equity = float(account_info.get("totalEq") or 0) if account_info else 0.0
+        except (TypeError, ValueError):
+            total_equity = 0.0
         
         return {
             "limits": self._limits,

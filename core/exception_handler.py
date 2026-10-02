@@ -232,7 +232,7 @@ def handle_exceptions(
     module: str = "",
     severity: str = ExceptionSeverity.MEDIUM,
     category: str = ExceptionCategory.SYSTEM,
-    reraise: bool = False
+    reraise: bool = True  # 默认重新抛出异常，避免静默吞噬
 ):
     """
     异常处理装饰器

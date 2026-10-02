@@ -1,6 +1,8 @@
 """
 执行质量监控 (Execution Quality Monitor)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 多维度评估订单执行质量，对标行业最佳实践：
   - 实现缺口分析 (Implementation Shortfall): 决策价格 vs 实际成交价
   - VWAP滑点分析: 成交均价 vs 市场VWAP
@@ -22,6 +24,8 @@ from enum import Enum
 from typing import Dict, Any, Optional, List, Tuple, Callable
 import numpy as np
 from loguru import logger
+
+from core.direction_unifier import DirectionUnifier
 
 
 class QualityGrade(Enum):
@@ -294,7 +298,7 @@ class ExecutionQualityMonitor:
         # 到达价格滑点
         if arrival_price > 0 and execution_price > 0:
             arrival_slip = (execution_price - arrival_price) / arrival_price * 10000
-            if side == "sell":
+            if DirectionUnifier.is_short(side):
                 arrival_slip *= -1
             self._arrival_slips.append(arrival_slip)
         else:
@@ -303,7 +307,7 @@ class ExecutionQualityMonitor:
         # VWAP滑点
         if vwap_price > 0 and execution_price > 0:
             vwap_slip = (execution_price - vwap_price) / vwap_price * 10000
-            if side == "sell":
+            if DirectionUnifier.is_short(side):
                 vwap_slip *= -1
             self._vwap_slips.append(vwap_slip)
         else:
@@ -841,7 +845,7 @@ class EnhancedExecutionQualityMonitor(ExecutionQualityMonitor):
         )
 
         notional = quantity * execution_price
-        side_mult = -1 if side == "sell" else 1
+        side_mult = -1 if DirectionUnifier.is_short(side) else 1
 
         # ─ 1. 市场冲击分解 ─
         if decision_price > 0 and arrival_price > 0:

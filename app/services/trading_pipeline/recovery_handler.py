@@ -1,5 +1,7 @@
 """
 故障恢复处理模块，创建并执行重试、降级、回滚等恢复任务。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
 """
 from enum import Enum
 from datetime import datetime, timedelta

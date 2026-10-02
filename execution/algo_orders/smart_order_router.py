@@ -1,6 +1,8 @@
 """
 智能订单路由器 (Smart Order Router) v2
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 多维度智能路由决策：
   - 多场所路由：限价单/市价单/冰山单/算法单
   - 实时场所排名：订单簿不平衡、流动性加权深度、容量感知
@@ -20,6 +22,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from loguru import logger
+
+from core.direction_unifier import DirectionUnifier
 
 
 class VenueType(Enum):
@@ -357,7 +361,7 @@ class SmartOrderRouter:
         for v in self._venues.values():
             if not v.is_available:
                 continue
-            depth = v.ask_depth if side == "buy" else v.bid_depth
+            depth = v.ask_depth if DirectionUnifier.is_long(side) else v.bid_depth
             if depth < min_depth_usd:
                 continue
             available.append(v)
@@ -424,7 +428,7 @@ class SmartOrderRouter:
             spread_score = max(0, 1.0 - venue.spread_bps / 50.0) if venue.spread_bps > 0 else 1.0
 
             # 2. 深度评分：深度越大越好
-            depth = venue.ask_depth if side == "buy" else venue.bid_depth
+            depth = venue.ask_depth if DirectionUnifier.is_long(side) else venue.bid_depth
             depth_score = min(1.0, depth / max(notional * 2, 1.0))
 
             # 3. 费率评分：费率越低越好
@@ -517,7 +521,7 @@ class SmartOrderRouter:
                     quantity=total_qty,
                     notional=notional,
                     price_limit=self._calc_limit_price(price, side, best),
-                    order_type="limit",
+                    order_type=self.recommend_order_type(symbol, urgency),
                     sequence=0,
                 ))
             plan.total_slices = 1
@@ -559,7 +563,7 @@ class SmartOrderRouter:
                 quantity=round(qty, 4),
                 notional=round(qty * price, 2),
                 price_limit=self._calc_limit_price(price, side, venue_ranking),
-                order_type="limit",
+                order_type=self.recommend_order_type(symbol, urgency),
                 sequence=i,
                 delay_after_ms=round(delay, 0),
             ))
@@ -584,10 +588,32 @@ class SmartOrderRouter:
                           ranking: VenueRanking) -> Optional[float]:
         """计算限价"""
         spread = ranking.venue.spread_bps / 10000.0
-        if side == "buy":
+        if DirectionUnifier.is_long(side):
             return mid * (1 + spread * 0.3)   # 偏买价30%
         else:
             return mid * (1 - spread * 0.3)   # 偏卖价30%
+
+    def recommend_order_type(self, symbol: str, urgency: OrderUrgency) -> str:
+        """分级推荐挂单类型（滑点/波动率分级细化）。
+
+        按紧急程度 + 市场波动率综合分派，避免紧急单挂限价不成交、也避免急变行情下限价失效：
+        - IMMEDIATE / HIGH → market（保证成交）
+        - NORMAL：市场波动率 ≥ market_order_volatility_threshold → market（急变行情限价易不成交）
+          否则 → limit（省价差、降冲击）
+        - LOW → limit（被动挂单）
+        """
+        if urgency in (OrderUrgency.IMMEDIATE, OrderUrgency.HIGH):
+            return "market"
+        if urgency == OrderUrgency.NORMAL:
+            state = self._market_state.get(symbol, {})
+            vol_pct = state.get("volatility_pct", 1.0)
+            try:
+                vol_pct = float(vol_pct)
+            except (TypeError, ValueError):
+                vol_pct = 1.0
+            if vol_pct >= self._market_order_volatility_threshold:
+                return "market"
+        return "limit"
 
     # ── 主路由决策 ────────────────────────────────────────────
 
@@ -762,6 +788,8 @@ class SmartOrderRouter:
         # 市场冲击模型
         self._impact_coefficient = cfg.get("impact_coefficient", 0.1)
         self._participation_rate_max = cfg.get("participation_rate_max", 0.05)
+        # 挂单类型分级：NORMAL 紧急度下市场波动率（volatility_pct，%）≥ 此阈值 → 转 market
+        self._market_order_volatility_threshold = cfg.get("market_order_volatility_threshold", 5.0)
 
         self._venues: Dict[str, ExecutionVenue] = {}
         self._venue_history: Dict[str, List[VenueRanking]] = defaultdict(list)
@@ -846,7 +874,10 @@ class SmartOrderRouter:
         return max(0.3, 1.0 - vol_pct / 20.0)
 
     def _is_market_state_stale(self, symbol: str) -> bool:
-        """检查市场状态是否过期（超过TTL未更新）"""
+        """检查市场状态是否过期（超过TTL未更新）。
+
+        未知/从未更新的 symbol 视为过期（stale=True），因为增强排名缺少可靠市场状态。
+        """
         state = self._market_state.get(symbol, {})
         updated_at = state.get("updated_at", 0)
         return (time.time() - updated_at) > self._MARKET_STATE_TTL
@@ -890,14 +921,14 @@ class SmartOrderRouter:
         for venue in available:
             # 基础评分维度
             spread_score = max(0, 1.0 - venue.spread_bps / 50.0) if venue.spread_bps > 0 else 1.0
-            depth = venue.ask_depth if side == "buy" else venue.bid_depth
+            depth = venue.ask_depth if DirectionUnifier.is_long(side) else venue.bid_depth
             depth_score = min(1.0, depth / max(notional * 2, 1.0))
             fee_score = max(0, 1.0 - venue.fee_rate / 0.002)
             latency_score = max(0, 1.0 - venue.latency_ms / 500.0)
             fill_score = venue.fill_rate
 
             # v2: 订单簿不平衡修正
-            if side == "buy":
+            if DirectionUnifier.is_long(side):
                 imbalance_penalty = max(0.5, 1.0 + imbalance * 0.5)
             else:
                 imbalance_penalty = max(0.5, 1.0 - imbalance * 0.5)
@@ -1020,7 +1051,7 @@ class SmartOrderRouter:
                     quantity=total_qty,
                     notional=notional,
                     price_limit=self._calc_limit_price(price, side, best),
-                    order_type="limit",
+                    order_type=self.recommend_order_type(symbol, urgency),
                     sequence=0,
                 ))
             plan.total_slices = 1
@@ -1082,7 +1113,7 @@ class SmartOrderRouter:
 
             # 容量约束
             max_capacity = min(vr.venue.max_order_size,
-                              vr.venue.ask_depth if side == "buy" else vr.venue.bid_depth)
+                              vr.venue.ask_depth if DirectionUnifier.is_long(side) else vr.venue.bid_depth)
             if max_capacity > 0 and qty > max_capacity:
                 qty = max_capacity
 
@@ -1105,17 +1136,26 @@ class SmartOrderRouter:
                 quantity=qty,
                 notional=round(qty * price, 2),
                 price_limit=self._calc_limit_price(price, side, vr),
-                order_type="limit",
+                order_type=self.recommend_order_type(symbol, urgency),
                 sequence=global_seq,
                 delay_after_ms=round(delay, 0),
             ))
 
-        # 补充尾部不足量
+        # ─ v2: 反博弈扰动后归一化 —— 确保切片总量精确等于 total_qty ─
+        # 扰动会引入随机正负偏差，若不加约束会导致「超额下单」或「欠额下单」；
+        # 企业级要求：拆分计划的总量必须精确等于原始委托量，仅在切片间重新分配。
         filled_qty = sum(s.quantity for s in plan.slices)
-        if plan.slices and filled_qty < total_qty:
-            remainder = total_qty - filled_qty
-            plan.slices[-1].quantity += remainder
-            plan.slices[-1].notional += remainder * price
+        if plan.slices and filled_qty > 0:
+            scale = total_qty / filled_qty
+            for s in plan.slices:
+                s.quantity = round(s.quantity * scale, 4)
+                s.notional = round(s.quantity * price, 2)
+            # 修正浮点/rounding 残差，补/减到最后一片
+            residual = round(total_qty - sum(s.quantity for s in plan.slices), 4)
+            if residual:
+                last = plan.slices[-1]
+                last.quantity = round(last.quantity + residual, 4)
+                last.notional = round(last.quantity * price, 2)
 
         plan.total_slices = len(plan.slices)
         direct_cost = notional * 0.001
@@ -1147,9 +1187,16 @@ class SmartOrderRouter:
 
         # ── 生产级：市场状态过期检测 ──
         state_stale = self._is_market_state_stale(symbol)
-        if state_stale:
+        has_market_state = self._market_state.get(symbol, {}).get("updated_at", 0) > 0
+        if state_stale and use_enhanced and has_market_state:
+            # fail-closed：增强排名依赖市场状态，状态「曾经更新过但已过期」时拒绝路由；
+            # 从未更新过的 symbol（历史行为）走空预计算兜底，避免误杀无状态的正常路由
+            logger.error(f"SOR v2 market state stale for {symbol} "
+                         f"(TTL={self._MARKET_STATE_TTL}s), fail-closed - refusing to route")
+            raise ValueError(f"market state stale for {symbol} (fail-closed)")
+        elif state_stale:
             logger.warning(f"SOR v2 market state stale for {symbol} "
-                          f"(TTL={self._MARKET_STATE_TTL}s), using defaults")
+                          f"(TTL={self._MARKET_STATE_TTL}s); basic ranking does not consume market state")
 
         # 预计算市场状态 (避免 rank_venues_enhanced 和 audit 各算一次)
         precomputed = {

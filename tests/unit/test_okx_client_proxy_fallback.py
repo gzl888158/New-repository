@@ -95,11 +95,14 @@ def _make_client(proxy="http://127.0.0.1:7897"):
     c._ws_public_connected = True
     c._ws_private_connected = True
 
-    # 代理健康管理状态
-    c._proxy_fail_count = 0
-    c._proxy_disabled_until = 0.0
+    # 多代理源自动切换状态
+    c._proxy_list = [proxy]
+    c._proxy_states = {proxy: {"fail_count": 0, "disabled_until": 0.0, "disable_cycle": 0}}
+    c._current_proxy_idx = 0
+    c._proxy_fail_threshold = 3
     c._proxy_disable_duration = 60.0
-    c._proxy_disable_cycle = 0
+    c._proxy_max_disable = 600.0
+    c.allow_direct_fallback = True  # 默认沿用旧降级行为（代理失败回退直连），新行为见下方专项测试
 
     # 重试风暴 / 限流
     c._retry_storm_count = 0
@@ -130,7 +133,8 @@ def _make_client(proxy="http://127.0.0.1:7897"):
 
 def test_async_proxy_failure_falls_back_to_direct():
     """代理故障时，异步请求应立即直连重试并成功返回。"""
-    c = _make_client()
+    proxy = "http://127.0.0.1:7897"
+    c = _make_client(proxy)
     result = asyncio.run(
         c._async_make_request_inner("GET", "/api/v5/market/ticker?instId=BTC-USDT-SWAP")
     )
@@ -138,19 +142,129 @@ def test_async_proxy_failure_falls_back_to_direct():
     assert result is not None
     assert result.get("code") == "0"
     assert result["data"][0]["last"] == "60000"
-    # 直连成功 → 代理失败计数重置
-    assert c._proxy_fail_count == 0
+    # 直连成功 → 代理状态不变（直连成功不代表代理恢复，不重置代理计数）
     # 网络成功回调被触发
     c._on_network_success.assert_called()
 
 
 def test_async_proxy_failure_increments_fail_count():
-    """代理与直连均失败时，代理失败计数应累计。"""
-    c = _make_client()
+    """代理与直连均失败时，代理失败计数应累计（按代理独立计数）。"""
+    proxy = "http://127.0.0.1:7897"
+    c = _make_client(proxy)
     # 直连也失败
     c._async_session_direct = _DirectSession(_FakeResp(500, {"code": "500", "data": {}}))
 
     asyncio.run(c._async_make_request_inner("GET", "/api/v5/market/ticker?instId=BTC-USDT-SWAP"))
 
     # 代理失败计数 >= 1（直连 500 不算连接成功，不重置计数）
-    assert c._proxy_fail_count >= 1
+    assert c._proxy_states[proxy]["fail_count"] >= 1
+
+
+def test_no_direct_fallback_retries_proxy_only():
+    """allow_direct_fallback=False 时，代理失败不回退直连，仅冷却单个代理。
+
+    境内直连被墙（WinError 64 / 超时）时，直连回退是必败死路。
+    修复后代理失败绝不切直连；单代理连续失败达阈值后冷却该代理（不是全局禁用），
+    冷却到期自动恢复，不会触发死亡螺旋。
+    """
+    proxy = "http://127.0.0.1:7897"
+    c = _make_client(proxy)
+    c.allow_direct_fallback = False
+
+    result = asyncio.run(
+        c._async_make_request_inner("GET", "/api/v5/market/ticker?instId=BTC-USDT-SWAP")
+    )
+
+    # 代理 session 一直失败且未回退直连 → 重试耗尽后返回 None
+    assert result is None
+    # 代理失败计数累计，达阈值后该代理被冷却（disabled_until > 0）
+    assert c._proxy_states[proxy]["fail_count"] >= c._proxy_fail_threshold
+    assert c._proxy_states[proxy]["disabled_until"] > 0.0
+    # 关键：allow_direct_fallback=False 时，即使代理被冷却，_get_active_proxy 仍返回该代理（强制走代理）
+    assert c._get_active_proxy() == proxy
+
+
+def test_multi_proxy_auto_switch_on_failure():
+    """多代理源：当前代理失败达阈值后自动切换到下一个健康代理。"""
+    proxy_a = "http://127.0.0.1:7897"
+    proxy_b = "http://127.0.0.1:7898"
+    c = _make_client(proxy_a)
+    c._proxy_list = [proxy_a, proxy_b]
+    c._proxy_states = {
+        proxy_a: {"fail_count": 0, "disabled_until": 0.0, "disable_cycle": 0},
+        proxy_b: {"fail_count": 0, "disabled_until": 0.0, "disable_cycle": 0},
+    }
+    c._current_proxy_idx = 0
+    c.allow_direct_fallback = False
+
+    # 模拟 proxy_a 连续失败达阈值
+    for _ in range(c._proxy_fail_threshold):
+        c._mark_proxy_failed(proxy_a)
+
+    # proxy_a 被冷却，应自动切换到 proxy_b
+    assert c._proxy_states[proxy_a]["disabled_until"] > 0.0
+    assert c._get_active_proxy() == proxy_b
+    assert c.proxy == proxy_b
+
+    # proxy_b 成功后重置其状态
+    c._mark_proxy_success(proxy_b)
+    assert c._proxy_states[proxy_b]["fail_count"] == 0
+    assert c._proxy_states[proxy_b]["disabled_until"] == 0.0
+
+
+def test_proxy_list_empty_means_direct():
+    """proxy_list 为空时，_get_active_proxy 返回 None（直连）。"""
+    c = _make_client()
+    c._proxy_list = []
+    c._proxy_states = {}
+    assert c._get_active_proxy() is None
+
+
+def _make_refused_and_timeout_exc():
+    """构造「连接被拒」与「超时」两类异常（urllib3 若可用则按其真实包装形态构造）。"""
+    try:
+        from urllib3.exceptions import ProxyError, NewConnectionError
+        timeout_exc = ProxyError("Cannot connect to proxy.", TimeoutError("_ssl.c:983: The handshake operation timed out"))
+        refused_exc = NewConnectionError(None, "Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。")
+        return timeout_exc, refused_exc
+    except ImportError:
+        return TimeoutError("timed out"), ConnectionRefusedError(10061, "connection refused")
+
+
+def test_is_connection_refused_distinguishes_refused_from_timeout():
+    """_is_connection_refused 应区分「连接被拒(无监听)」与「超时(半死)」。
+
+    urllib3 的 ProxyError 对两者 message 都是 "Cannot connect to proxy."，不能据此判断；
+    必须下钻到底层 TimeoutError vs ConnectionRefusedError/10061。
+    """
+    timeout_exc, refused_exc = _make_refused_and_timeout_exc()
+    assert OKXClient._is_connection_refused(timeout_exc) is False
+    assert OKXClient._is_connection_refused(refused_exc) is True
+    assert OKXClient._is_connection_refused(ConnectionRefusedError(111, "Connection refused")) is True
+    assert OKXClient._is_connection_refused(None) is False
+
+
+def test_mark_proxy_failed_hard_fail_uses_max_disable():
+    """hard_fail=True（连接被拒/无监听）时，禁用冷却直接拉满 _proxy_max_disable。"""
+    import time
+    proxy = "http://127.0.0.1:7897"
+    c = _make_client(proxy)
+    for _ in range(c._proxy_fail_threshold):
+        c._mark_proxy_failed(proxy, hard_fail=True)
+    remaining = c._proxy_states[proxy]["disabled_until"] - time.time()
+    # 拉满：remaining 应接近 _proxy_max_disable（600s），远大于软失败基础时长 60s
+    assert 0 < remaining <= c._proxy_max_disable
+    assert remaining > c._proxy_disable_duration * 2
+
+
+def test_mark_proxy_failed_soft_fail_exponential_backoff():
+    """hard_fail=False（超时/半死）时，首个禁用周期按基础时长指数退避（60s）。"""
+    import time
+    proxy = "http://127.0.0.1:7897"
+    c = _make_client(proxy)
+    for _ in range(c._proxy_fail_threshold):
+        c._mark_proxy_failed(proxy, hard_fail=False)
+    remaining = c._proxy_states[proxy]["disabled_until"] - time.time()
+    # 首个 disable_cycle=1 → backoff = _proxy_disable_duration * 2^0 = 60s
+    assert 0 < remaining <= c._proxy_disable_duration + 1.0
+

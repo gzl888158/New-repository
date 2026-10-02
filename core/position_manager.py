@@ -155,12 +155,21 @@ class PositionManager:
         self._okx_client = okx_client
         self._sqlite_storage = sqlite_storage
         self._redis_cache = redis_cache
+        self._alert_manager = None
 
         pm_cfg = config.get("position_manager", {})
 
         # ── 配置 ──
         self._enabled = pm_cfg.get("enabled", True)
         self._sync_interval = pm_cfg.get("sync_interval_sec", 3)
+        try:
+            self._sync_failure_threshold = max(
+                1, int(pm_cfg.get("sync_failure_threshold", 3))
+            )
+        except (TypeError, ValueError):
+            self._sync_failure_threshold = 3
+        self._sync_fail_streak = 0
+        self._sync_degraded = False
         self._risk_check_interval = pm_cfg.get("risk_check_interval_sec", 5)
         self._max_total_positions = pm_cfg.get("max_total_positions", 6)
         self._max_positions_per_symbol = pm_cfg.get("max_positions_per_symbol", 2)
@@ -192,6 +201,7 @@ class PositionManager:
         self._positions_by_strategy: Dict[str, List[str]] = defaultdict(list)  # strategy -> [keys]
         self._positions_by_symbol: Dict[str, List[str]] = defaultdict(list)  # symbol -> [keys]
         self._position_history: List[PositionSnapshot] = []
+        self._data_stale: bool = False  # 持仓数据过期标记（解析失败时置True）
 
         # ── 账户风险 ──
         self._account_risk = AccountRiskSnapshot()
@@ -202,6 +212,7 @@ class PositionManager:
         # ── 回调 ──
         self._risk_event_callbacks: List[RiskEventCallback] = []
         self._position_change_callbacks: List[PositionChangeCallback] = []
+        self._position_removal_callbacks: List[callable] = []  # (symbol, side) -> None
 
         # ── 运行控制 ──
         self._running = False
@@ -244,6 +255,10 @@ class PositionManager:
             f"risk_check={self._risk_check_interval}s"
         )
 
+    def set_alert_manager(self, alert_manager):
+        """注入告警管理器"""
+        self._alert_manager = alert_manager
+
     # ═══════════════════════════════════════════════════════════════
     # 回调注册
     # ═══════════════════════════════════════════════════════════════
@@ -255,6 +270,10 @@ class PositionManager:
     def on_position_change(self, callback: PositionChangeCallback):
         """注册持仓变化回调"""
         self._position_change_callbacks.append(callback)
+
+    def on_position_removal(self, callback):
+        """注册持仓移除回调 (symbol, side) -> None，用于手动平仓/同步删除时触发清理"""
+        self._position_removal_callbacks.append(callback)
 
     def _notify_risk_event(self, event: RiskEvent):
         """通知风险事件"""
@@ -351,15 +370,67 @@ class PositionManager:
                 break
             except Exception as e:
                 logger.error(f"Position sync error: {e}")
+                self._record_sync_failure(str(e))
             await asyncio.sleep(self._sync_interval)
+
+    @property
+    def sync_degraded(self) -> bool:
+        """Whether repeated REST position-sync failures require blocking new entries."""
+        return self._sync_degraded
+
+    @property
+    def sync_fail_streak(self) -> int:
+        """Number of consecutive failed REST position-sync attempts."""
+        return self._sync_fail_streak
+
+    def _record_sync_failure(self, error: str) -> None:
+        self._sync_fail_streak += 1
+        if (
+            not self._sync_degraded
+            and self._sync_fail_streak >= self._sync_failure_threshold
+        ):
+            self._sync_degraded = True
+            logger.critical(
+                "Position synchronization degraded after "
+                f"{self._sync_fail_streak} consecutive failures; "
+                "new entries must be blocked"
+            )
+        else:
+            logger.warning(
+                f"Position sync failure streak {self._sync_fail_streak}/"
+                f"{self._sync_failure_threshold}: {error}"
+            )
+
+    def _record_sync_success(self) -> None:
+        was_degraded = self._sync_degraded
+        self._sync_fail_streak = 0
+        self._sync_degraded = False
+        if was_degraded:
+            logger.info("Position synchronization recovered; new entries may resume")
 
     async def _sync_positions(self):
         """从OKX同步持仓数据"""
         if not self._okx_client:
-            return
+            error = "OKX client is unavailable"
+            logger.error(f"Position sync aborted: {error}")
+            self._record_sync_event("position_rest", success=False, error=error)
+            self._record_sync_failure(error)
+            return False
 
         try:
-            positions = self._okx_client.get_positions()
+            checked_query = getattr(self._okx_client, "get_positions_checked", None)
+            positions = (
+                checked_query()
+                if callable(checked_query)
+                else self._okx_client.get_positions()
+            )
+            if positions is None:
+                error = "exchange position query failed; keeping local snapshot"
+                logger.error(f"Position sync aborted: {error}")
+                self._record_sync_event("position_rest", success=False, error=error)
+                self._record_sync_failure(error)
+                return False
+
             if not positions:
                 # 空持仓列表：清除所有本地持仓记录
                 if self._positions:
@@ -368,21 +439,25 @@ class PositionManager:
                     self._positions_by_strategy.clear()
                     self._positions_by_symbol.clear()
                     self._notify_position_change()
-                return
+                self._data_stale = False
+                self._record_sync_success()
+                self._record_sync_event("position_rest", success=True, entities=[])
+                return True
 
             previous_keys = set(self._positions.keys())
-            current_keys = set()
+            snapshots: Dict[str, PositionSnapshot] = {}
             changed = False
 
             for pos_data in positions:
                 try:
                     pos = self._okx_client._parse_position(pos_data)
-                    if not pos or abs(pos.quantity) == 0:
+                    if not pos:
+                        raise ValueError("position parser rejected exchange record")
+                    if abs(pos.quantity) == 0:
                         continue
 
                     side = PositionSide.LONG if pos.side == "long" else PositionSide.SHORT
                     key = f"{pos.symbol}:{side.value}"
-                    current_keys.add(key)
 
                     snapshot = PositionSnapshot(
                         symbol=pos.symbol,
@@ -398,29 +473,34 @@ class PositionManager:
                         entry_time=time.time(),
                     )
 
-                    # 保留已有的策略信息
-                    if key in self._positions:
-                        old = self._positions[key]
-                        snapshot.strategy_name = old.strategy_name
-                        snapshot.entry_time = old.entry_time
-                        snapshot.status = old.status
-                        snapshot.tags = list(old.tags)
-
-                    # 检测变化
-                    if key not in self._positions or self._positions_changed(self._positions[key], snapshot):
-                        changed = True
-
-                    self._positions[key] = snapshot
-
-                    # 更新索引
-                    if snapshot.strategy_name:
-                        if key not in self._positions_by_strategy[snapshot.strategy_name]:
-                            self._positions_by_strategy[snapshot.strategy_name].append(key)
-                    if key not in self._positions_by_symbol[pos.symbol]:
-                        self._positions_by_symbol[pos.symbol].append(key)
-
+                    snapshots[key] = snapshot
                 except Exception as e:
-                    logger.debug(f"Failed to parse position: {e}")
+                    error = f"invalid exchange position response: {e}"
+                    logger.error(f"Position sync aborted: {error}; keeping local snapshot (marked stale)")
+                    self._data_stale = True
+                    self._record_sync_event("position_rest", success=False, error=error)
+                    self._record_sync_failure(error)
+                    return False
+
+            current_keys = set(snapshots)
+
+            for key, snapshot in snapshots.items():
+                old = self._positions.get(key)
+                if old:
+                    snapshot.strategy_name = old.strategy_name
+                    snapshot.entry_time = old.entry_time
+                    snapshot.status = old.status
+                    snapshot.tags = list(old.tags)
+                    if self._positions_changed(old, snapshot):
+                        changed = True
+                else:
+                    changed = True
+                self._positions[key] = snapshot
+
+                if snapshot.strategy_name and key not in self._positions_by_strategy[snapshot.strategy_name]:
+                    self._positions_by_strategy[snapshot.strategy_name].append(key)
+                if key not in self._positions_by_symbol[snapshot.symbol]:
+                    self._positions_by_symbol[snapshot.symbol].append(key)
 
             # 清理已不存在的持仓
             removed_keys = previous_keys - current_keys
@@ -439,6 +519,12 @@ class PositionManager:
                     ]
                     changed = True
                     logger.info(f"Position removed: {removed.symbol} {removed.side.value}")
+                    # P0-手动平仓清理链：通知监听者（OrderExecutor）触发止损/策略/状态清理
+                    for cb in self._position_removal_callbacks:
+                        try:
+                            cb(removed.symbol, removed.side.value)
+                        except Exception as cb_err:
+                            logger.warning(f"Position removal callback error: {cb_err}")
 
             if changed:
                 self._notify_position_change()
@@ -449,12 +535,17 @@ class PositionManager:
                 self._position_history = self._position_history[-self._max_snapshots * 10:]
 
             # ── 企业级同步：记录 REST 通道同步事件 ──
+            self._data_stale = False
+            self._record_sync_success()
             self._record_sync_event("position_rest", success=True,
                                     entities=[f"{k}" for k in current_keys])
+            return True
 
         except Exception as e:
             logger.error(f"Failed to sync positions: {e}")
             self._record_sync_event("position_rest", success=False, error=str(e))
+            self._record_sync_failure(str(e))
+            return False
 
     def _positions_changed(self, old: PositionSnapshot, new: PositionSnapshot) -> bool:
         """检测持仓是否发生显著变化"""
@@ -903,6 +994,18 @@ class PositionManager:
 
         except Exception as e:
             logger.error(f"Failed to save position state: {e}")
+            if self._alert_manager:
+                try:
+                    import asyncio
+                    asyncio.create_task(self._alert_manager.send_alert(
+                        alert_type="system_error",
+                        message=f"持仓状态持久化失败（可能导致重启后仓位丢失）: {e}",
+                        severity="WARNING",
+                        symbol="SYSTEM",
+                        metadata={"error": str(e)},
+                    ))
+                except Exception:
+                    pass
 
     def _restore_state(self):
         """从文件恢复仓位状态"""
@@ -991,6 +1094,10 @@ class PositionManager:
     def get_account_risk(self) -> AccountRiskSnapshot:
         """获取账户风险快照"""
         return self._account_risk
+
+    def is_data_stale(self) -> bool:
+        """持仓数据是否过期（解析失败后未成功同步）"""
+        return self._data_stale
 
     def get_risk_events(self, limit: int = 50) -> List[RiskEvent]:
         """获取最近的风险事件"""

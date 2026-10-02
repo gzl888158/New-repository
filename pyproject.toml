@@ -89,10 +89,12 @@ show_missing = true
 skip_covered = false
 
 [tool.ruff]
-select = ["E", "W", "F", "B", "I"]
-ignore = ["E501"]
 line-length = 120
 exclude = ["__pycache__", ".venv", "docs", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "B", "I"]
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

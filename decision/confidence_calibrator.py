@@ -1,4 +1,7 @@
-"""置信度校准器：通过 Platt 缩放与保序回归校准模型预测置信度。"""
+"""置信度校准器：通过 Platt 缩放与保序回归校准模型预测置信度。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
+"""
 from collections import deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple

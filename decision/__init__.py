@@ -1,4 +1,9 @@
-"""决策模块包：汇总并导出决策协调、规则、集成、校验与质量评估等组件。"""
+"""决策模块包：汇总并导出决策协调、规则、集成、校验与质量评估等组件。
+
+.. deprecated::
+    本包所有模块均为实验性代码，未接入生产交易链路。
+    实际交易决策流: signal_processor.py → order_executor.py（直接执行）。
+"""
 from .decision_coordinator import DecisionCoordinator
 from .rule_based_engine import RuleBasedEngine
 from .ensemble_decision_maker import EnsembleDecisionMaker

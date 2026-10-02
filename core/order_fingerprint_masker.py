@@ -156,7 +156,11 @@ class OrderFingerprintMasker:
             f"split_min={self._split_min_notional}USDT, "
             f"split_parts={self._split_min_parts}-{self._split_max_parts}"
         )
-    
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled and self._mode != MaskingMode.OFF
+
     def update_config(self, new_config: Dict[str, Any]) -> None:
         """热更新配置"""
         with self._lock:

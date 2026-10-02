@@ -292,8 +292,10 @@ class ArbitrageStrategy(PersistentStrategy):
             status = self._adaptive_controller.get_risk_budget_status()
             if status.get("streak_lock_active"):
                 score += self._risk_lock_quality_boost
-        except Exception:
-            pass
+        except Exception as e:
+            # fail-closed: 风险预算状态查询失败时保守上浮阈值（收紧开仓），而非放行
+            logger.warning(f"[arbitrage] 风险预算状态查询失败，保守上浮机会分数阈值: {e}")
+            score += self._risk_lock_quality_boost
         return score
 
     def _record_filter(self, symbol: str, reason: str):
@@ -310,8 +312,10 @@ class ArbitrageStrategy(PersistentStrategy):
         if self._adaptive_controller:
             try:
                 return self._adaptive_controller.get_allocation("arbitrage")
-            except Exception:
-                pass
+            except Exception as e:
+                # fail-closed: 资金分配查询失败时返回 0，拒绝开仓，避免风险收缩失效
+                logger.warning(f"[arbitrage] 资金分配查询失败，返回 0（fail-closed）: {e}")
+                return 0.0
         return self.config["trading"].get("arbitrage_allocation", 0.15)
 
     def _get_effective_capital(self) -> float:
@@ -321,15 +325,17 @@ class ArbitrageStrategy(PersistentStrategy):
                 details = account_info.get("details", [])
                 for detail in details:
                     if detail.get("ccy") == "USDT":
-                        eq = float(detail.get("eq", 0))
+                        eq = self._safe_float(detail.get("eq"), 0.0)
                         if eq > 0:
                             return eq
-                total_eq = float(account_info.get("totalEq", 0))
+                total_eq = self._safe_float(account_info.get("totalEq"), 0.0)
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
-        return self.config["trading"].get("total_capital", 100.0)
+        except Exception as e:
+            logger.warning(f"[arbitrage] get_account_info failed: {e}")
+        # fail-closed: 账户权益查询失败时返回 0，避免用静态 total_capital 兜底导致仓位失真
+        logger.warning("[arbitrage] 账户权益查询失败，返回 0（fail-closed）")
+        return 0.0
 
     def _calculate_kelly_position(self, arbitrage_type: str, base_position: float, symbol: str = "") -> float:
         """企业级凯利仓位计算（P32：接入 AdaptiveKelly）
@@ -840,9 +846,19 @@ class ArbitrageStrategy(PersistentStrategy):
         try:
             positions = None
             if self._position_provider:
-                positions = self._position_provider()
-            if not positions:
-                positions = await self.okx_client.get_positions_async()
+                try:
+                    positions = self._position_provider()
+                except Exception:
+                    positions = None
+            if positions is None:
+                try:
+                    positions = await self.okx_client.get_positions_async()
+                except Exception:
+                    positions = None
+            if positions is None:
+                # fail-closed: 无法获取交易所仓位时，不执行幽灵清理，避免误清真实持仓
+                logger.warning("[arbitrage] P22 无法获取交易所仓位，跳过幽灵仓位校验（fail-closed）")
+                return {"drifted": False, "corrections": [], "exchange_positions": []}
             if not positions:
                 positions = []
             
@@ -993,16 +1009,24 @@ class ArbitrageStrategy(PersistentStrategy):
 
     async def _forecast_loop(self):
         while True:
-            await self._update_rate_forecasts()
+            try:
+                await self._update_rate_forecasts()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Arbitrage forecast loop error: {e}")
             await asyncio.sleep(self._forecast_interval)
 
     async def _update_rate_forecasts(self):
         for symbol in self._all_symbols:
-            history = self._funding_history.get(symbol, [])
-            if len(history) >= self._rate_forecast_window:
-                oi_history = self._oi_history.get(symbol, None)
-                forecast = self._predict_next_rate(history, oi_history)
-                self._rate_forecast_cache[symbol] = forecast
+            try:
+                history = self._funding_history.get(symbol, [])
+                if len(history) >= self._rate_forecast_window:
+                    oi_history = self._oi_history.get(symbol, None)
+                    forecast = self._predict_next_rate(history, oi_history)
+                    self._rate_forecast_cache[symbol] = forecast
+            except Exception as e:
+                logger.debug(f"[arbitrage] forecast update failed for {symbol}: {e}")
 
     def _predict_next_rate(self, history: List[float], oi_history: List[float] = None) -> float:
         if len(history) < 3:
@@ -1563,7 +1587,8 @@ class ArbitrageStrategy(PersistentStrategy):
                     "confidence": 1.0,
                     "timestamp": datetime.now().isoformat(),
                     "arb_id": arb_id,
-                    "reduce_only": True
+                    "reduce_only": True,
+                    "close_position": True
                 }
             })
             logger.warning(f"Emergency close main position: {close_direction} {symbol} @ {price:.4f}, "
@@ -1772,6 +1797,7 @@ class ArbitrageStrategy(PersistentStrategy):
                         "confidence": 1.0,
                         "timestamp": datetime.now().isoformat(),
                         "reduce_only": True,
+                        "close_position": True,
                         "pair": pair_key
                     }
                 })
@@ -1898,7 +1924,9 @@ class ArbitrageStrategy(PersistentStrategy):
         """
         total_equity = self._get_effective_capital()
         if total_equity <= 0:
-            return True
+            # fail-closed: 无法获取账户权益时无法评估净敞口，禁止新开仓
+            logger.warning("[arbitrage] 账户权益为 0，净敞口硬限制 fail-closed 拦截新开仓")
+            return False
 
         total_net_exposure = 0.0
         exposure_details = []
@@ -1983,7 +2011,7 @@ class ArbitrageStrategy(PersistentStrategy):
         if not funding_data:
             return
 
-        current_rate = float(funding_data["fundingRate"])
+        current_rate = self._safe_float(funding_data.get("fundingRate"), 0.0)
 
         # 费率反转应急
         entry_rate = state.get("entry_rate", 0)
@@ -2014,10 +2042,10 @@ class ArbitrageStrategy(PersistentStrategy):
         if not futures_ticker or not spot_ticker:
             return
 
-        futures_price = float(futures_ticker["last"])
-        spot_price = float(spot_ticker["last"])
+        futures_price = self._safe_float(futures_ticker.get("last"), 0.0)
+        spot_price = self._safe_float(spot_ticker.get("last"), 0.0)
 
-        if spot_price == 0:
+        if spot_price <= 0:
             return
 
         current_basis = (futures_price - spot_price) / spot_price
@@ -2035,7 +2063,7 @@ class ArbitrageStrategy(PersistentStrategy):
         if state["arbitrage_type"] == "funding":
             funding_data = self.okx_client.get_funding_rate(symbol)
             if funding_data:
-                current_rate = float(funding_data["fundingRate"])
+                current_rate = self._safe_float(funding_data.get("fundingRate"), 0.0)
                 next_funding_ms = funding_data.get("nextFundingTime")
                 settled_periods = 0
                 if next_funding_ms:
@@ -2059,8 +2087,8 @@ class ArbitrageStrategy(PersistentStrategy):
             spot_ticker = self.okx_client.get_ticker(spot_symbol)
 
             if futures_ticker and spot_ticker:
-                futures_price = float(futures_ticker["last"])
-                spot_price = float(spot_ticker["last"])
+                futures_price = self._safe_float(futures_ticker.get("last"), 0.0)
+                spot_price = self._safe_float(spot_ticker.get("last"), 0.0)
 
                 if spot_price > 0:
                     current_basis = (futures_price - spot_price) / spot_price
@@ -2074,8 +2102,10 @@ class ArbitrageStrategy(PersistentStrategy):
         if not ticker:
             return
 
-        current_price = float(ticker["last"])
-        entry_price = state["entry_price"]
+        current_price = self._safe_float(ticker.get("last"), 0.0)
+        entry_price = self._safe_float(state.get("entry_price"), 0.0)
+        if current_price <= 0 or entry_price <= 0:
+            return
         movement = abs(current_price - entry_price) / entry_price
 
         if movement > 0.05:
@@ -2090,10 +2120,12 @@ class ArbitrageStrategy(PersistentStrategy):
         if not ticker:
             return
 
-        current_price = float(ticker["last"])
-        entry_price = state["entry_price"]
+        current_price = self._safe_float(ticker.get("last"), 0.0)
+        entry_price = self._safe_float(state.get("entry_price"), 0.0)
         direction = state["direction"]
         arb_type = state.get("arbitrage_type", "funding")
+        if current_price <= 0 or entry_price <= 0:
+            return
 
         # basis类型的止损使用basis deviation
         if arb_type == "basis":
@@ -2167,10 +2199,10 @@ class ArbitrageStrategy(PersistentStrategy):
         if not ticker_a or not ticker_b:
             return
 
-        price_a = float(ticker_a["last"])
-        price_b = float(ticker_b["last"])
+        price_a = self._safe_float(ticker_a.get("last"), 0.0)
+        price_b = self._safe_float(ticker_b.get("last"), 0.0)
 
-        if price_b <= 0:
+        if price_a <= 0 or price_b <= 0:
             return
 
         current_ratio = price_a / price_b
@@ -2219,13 +2251,18 @@ class ArbitrageStrategy(PersistentStrategy):
         if not ticker:
             return
 
-        price = float(ticker["last"])
+        price = self._safe_float(ticker.get("last"), 0.0)
+        entry_price = self._safe_float(state.get("entry_price"), 0.0)
         direction = state["direction"]
         close_direction = "sell" if direction == "long" else "buy"
 
-        pnl = (price - state["entry_price"]) / state["entry_price"] if direction == "long" else (
-                    state["entry_price"] - price) / state["entry_price"]
-        pnl_usdt = pnl * state["quantity"] * state["entry_price"]
+        if price <= 0 or entry_price <= 0:
+            logger.warning(f"[arbitrage] 平仓失败: {symbol} 价格非法 price={price} entry={entry_price}")
+            return
+
+        pnl = (price - entry_price) / entry_price if direction == "long" else (
+                    entry_price - price) / entry_price
+        pnl_usdt = pnl * state["quantity"] * entry_price
         total_return = pnl_usdt + state["actual_earnings"]
 
         signal = Signal(
@@ -2253,7 +2290,9 @@ class ArbitrageStrategy(PersistentStrategy):
                 "stop_loss": None,
                 "take_profit": None,
                 "confidence": signal.confidence,
-                "timestamp": signal.timestamp.isoformat()
+                "timestamp": signal.timestamp.isoformat(),
+                "reduce_only": True,
+                "close_position": True
             }
         })
 
@@ -2318,7 +2357,9 @@ class ArbitrageStrategy(PersistentStrategy):
                     "stop_loss": None,
                     "take_profit": None,
                     "confidence": 0.9,
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
+                    "reduce_only": True,
+                    "close_position": True
                 }
             })
 
@@ -2335,8 +2376,8 @@ class ArbitrageStrategy(PersistentStrategy):
         if not ticker_a or not ticker_b:
             return
 
-        price_a = float(ticker_a["last"])
-        price_b = float(ticker_b["last"])
+        price_a = self._safe_float(ticker_a.get("last"), 0.0)
+        price_b = self._safe_float(ticker_b.get("last"), 0.0)
 
         direction_a, direction_b = state["direction"].split("/")
         close_dir_a = "sell" if direction_a == "long" else "buy"
@@ -2356,7 +2397,9 @@ class ArbitrageStrategy(PersistentStrategy):
                 "stop_loss": None,
                 "take_profit": None,
                 "confidence": 0.9,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "reduce_only": True,
+                "close_position": True
             }
         })
 
@@ -2374,16 +2417,23 @@ class ArbitrageStrategy(PersistentStrategy):
                 "stop_loss": None,
                 "take_profit": None,
                 "confidence": 0.9,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "reduce_only": True,
+                "close_position": True
             }
         })
 
-        pnl_a = (price_a - state["entry_price_a"]) / state["entry_price_a"] if direction_a == "long" else (
-                    state["entry_price_a"] - price_a) / state["entry_price_a"]
-        pnl_b = (price_b - state["entry_price_b"]) / state["entry_price_b"] if direction_b == "long" else (
-                    state["entry_price_b"] - price_b) / state["entry_price_b"]
-        pnl_usdt = pnl_a * state["quantity_a"] * state["entry_price_a"] + pnl_b * state["quantity_b"] * state[
-            "entry_price_b"]
+        entry_price_a = self._safe_float(state.get("entry_price_a"), 0.0)
+        entry_price_b = self._safe_float(state.get("entry_price_b"), 0.0)
+        if price_a <= 0 or price_b <= 0 or entry_price_a <= 0 or entry_price_b <= 0:
+            logger.warning(f"[arbitrage] 相关性平仓失败: {pair_key} 价格非法")
+            return
+
+        pnl_a = (price_a - entry_price_a) / entry_price_a if direction_a == "long" else (
+                    entry_price_a - price_a) / entry_price_a
+        pnl_b = (price_b - entry_price_b) / entry_price_b if direction_b == "long" else (
+                    entry_price_b - price_b) / entry_price_b
+        pnl_usdt = pnl_a * state["quantity_a"] * entry_price_a + pnl_b * state["quantity_b"] * entry_price_b
 
         state["status"] = "closed"
         state["close_price_a"] = price_a

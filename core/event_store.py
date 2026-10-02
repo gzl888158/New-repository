@@ -349,8 +349,6 @@ class EventStore:
                     if len(collected) >= n:
                         collected.reverse()
                         return collected
-                if collected:
-                    break
             collected.reverse()
             return collected
 

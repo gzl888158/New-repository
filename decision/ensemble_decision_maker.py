@@ -1,4 +1,7 @@
-"""集成决策器：融合多信号源（加权投票/排序聚合等）生成综合交易决策。"""
+"""集成决策器：融合多信号源（加权投票/排序聚合等）生成综合交易决策。
+
+.. deprecated:: 实验性模块，未接入生产交易链路。
+"""
 from collections import deque
 from enum import Enum
 import math

@@ -425,6 +425,10 @@ class EventType(Enum):
     POSITION_CLOSED = "position_closed"
     RISK_EVENT = "risk_event"
     RISK_ADJUDICATED = "risk_adjudicated"
+    DECISION_VALIDATED = "decision_validated"  # 决策层：决策验证通过
+    DECISION_APPROVED = "decision_approved"    # 决策层：决策最终批准（准备下单）
+    DECISION_REJECTED = "decision_rejected"    # 决策层：决策验证拒绝
+    DECISION_ENSEMBLE = "decision_ensemble"    # 决策层：集成仲裁（规则引擎+ML+共识）
     CONFIG_CHANGED = "config_changed"
     SYSTEM_HEALTH = "system_health"
     EXCEPTION_OCCURRED = "exception_occurred"
@@ -432,6 +436,10 @@ class EventType(Enum):
     ORDER_REJECTED = "order_rejected"    # 执行层（order_executor）拒绝
     POSITION_OPENED = "position_opened"  # 记账层：开仓落账
     TRADE_RECORDED = "trade_recorded"    # 记账层：平仓落账（成交记账）
+    PIPELINE_STARTED = "pipeline_started"      # 流水线：开始执行
+    PIPELINE_COMPLETED = "pipeline_completed"  # 流水线：成功完成
+    PIPELINE_FAILED = "pipeline_failed"        # 流水线：阶段失败
+    PIPELINE_TIMEOUT = "pipeline_timeout"      # 流水线：整体/阶段超时
 
 
 # 事件 ID 单调计数器（保证同类型事件在同一时刻仍唯一）

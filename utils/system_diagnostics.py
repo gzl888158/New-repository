@@ -17,6 +17,19 @@ class DiagLevel(Enum):
     FAIL = "FAIL"
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """安全 float 转换：None/NaN/Inf/非法值回退 default。"""
+    if value is None:
+        return default
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v or v in (float("inf"), float("-inf")):
+        return default
+    return v
+
+
 @dataclass
 class DiagItem:
     name: str
@@ -274,10 +287,10 @@ class SystemDiagnostics:
                     if isinstance(bal, list):
                         for item in bal:
                             if isinstance(item, dict) and item.get("ccy") == "USDT":
-                                status["balance_usdt"] = float(item.get("availEq", 0))
+                                status["balance_usdt"] = _safe_float(item.get("availEq", 0))
                                 break
                     elif isinstance(bal, dict):
-                        status["balance_usdt"] = float(bal.get("totalEq", 0))
+                        status["balance_usdt"] = _safe_float(bal.get("totalEq", 0))
                 status["checked"] = True
             finally:
                 await client.close()

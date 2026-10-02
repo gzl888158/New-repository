@@ -26,6 +26,7 @@ from loguru import logger
 from core.direction_unifier import DirectionUnifier
 # P0: 持久化全局 Kill Switch（fail-closed，仅禁开仓、平仓穿透）
 from core.kill_switch import KillSwitch
+from utils.helpers import safe_float, safe_finite, safe_div
 
 
 # ============================================================================
@@ -178,9 +179,24 @@ class PreTradeRiskChecker:
         details["equity"] = round(equity, 2)
 
         # 2. 可用保证金检查
-        order_value = signal.get("quantity", 0) * signal.get("price", 0)
-        leverage = signal.get("leverage", 1)
-        margin_required = order_value / leverage if leverage > 0 else order_value
+        # P0 fail-closed：缺价格/数量时 signal.get 默认 0 会让 order_value/margin_required
+        # 恒为 0，从而绕过保证金、单笔上限、仓位上限等所有后续校验。非法订单必须显式拒绝。
+        try:
+            order_qty = safe_float(signal.get("quantity"), 0.0)
+            order_price = safe_float(signal.get("price"), 0.0)
+        except (TypeError, ValueError):
+            order_qty = 0.0
+            order_price = 0.0
+        if order_qty <= 0 or order_price <= 0:
+            return RiskCheckResult(
+                RiskLayer.L1_PRE_TRADE, False, RiskAction.REJECT,
+                f"订单数量或价格非法: quantity={order_qty}, price={order_price}",
+                {"quantity": order_qty, "price": order_price}
+            )
+
+        order_value = order_qty * order_price
+        leverage = safe_float(signal.get("leverage"), 1.0)
+        margin_required = safe_div(order_value, leverage, order_value) if leverage > 0 else order_value
         
         if margin_required > available_margin:
             return RiskCheckResult(
@@ -227,7 +243,7 @@ class PreTradeRiskChecker:
             # 统一使用5x杠杆估算（大部分策略使用5x）
             avg_leverage = max(leverage, 3)  # 至少3x
             total_position_value = existing_margin * avg_leverage + order_value
-            total_leverage = total_position_value / equity if equity > 0 else 0
+            total_leverage = safe_div(total_position_value, equity, 0.0) if equity > 0 else 0
             
             if total_leverage > self._max_total_leverage:
                 return RiskCheckResult(
@@ -239,12 +255,12 @@ class PreTradeRiskChecker:
             details["total_leverage"] = round(total_leverage, 2)
         else:
             total_position_value = sum(self._symbol_positions.values())
-            total_leverage = total_position_value / equity if equity > 0 else 0
+            total_leverage = safe_div(total_position_value, equity, 0.0) if equity > 0 else 0
             details["total_leverage"] = round(total_leverage, 2)
 
         # 6. 单日最大亏损阈值
         if daily_start > 0:
-            daily_loss_pct = -daily_pnl / daily_start if daily_pnl < 0 else 0
+            daily_loss_pct = safe_div(-daily_pnl, daily_start, 0.0) if daily_pnl < 0 else 0
             if daily_loss_pct >= self._daily_max_loss:
                 return RiskCheckResult(
                     RiskLayer.L1_PRE_TRADE, False, RiskAction.REJECT,
@@ -319,9 +335,9 @@ class InTradeRiskChecker:
         # 2. 网络延迟超时拦截
         with self._lock:
             if self._latency_history:
-                avg_latency = sum(self._latency_history) / len(self._latency_history)
+                avg_latency = safe_finite(sum(self._latency_history) / len(self._latency_history), 0.0)
             else:
-                avg_latency = 0
+                avg_latency = 0.0
         
         if avg_latency > self._max_latency_ms:
             return RiskCheckResult(
@@ -334,12 +350,12 @@ class InTradeRiskChecker:
 
         # 3. 滑点阈值拦截
         if market_data:
-            expected_price = signal.get("price", 0)
-            best_bid = market_data.get("bid_price", 0)
-            best_ask = market_data.get("ask_price", 0)
+            expected_price = safe_float(signal.get("price"), 0.0)
+            best_bid = safe_float(market_data.get("bid_price"), 0.0)
+            best_ask = safe_float(market_data.get("ask_price"), 0.0)
             
             if expected_price > 0 and best_ask > 0:
-                slippage = abs(expected_price - best_ask) / best_ask
+                slippage = safe_div(abs(expected_price - best_ask), best_ask, 0.0)
                 if slippage > self._max_slippage_pct:
                     return RiskCheckResult(
                         RiskLayer.L2_IN_TRADE, False, RiskAction.REJECT,
@@ -352,7 +368,7 @@ class InTradeRiskChecker:
 
             # 4. 市价/限价价差校验
             if best_bid > 0 and best_ask > 0:
-                spread_pct = (best_ask - best_bid) / best_bid
+                spread_pct = safe_div(best_ask - best_bid, best_bid, 0.0)
                 if spread_pct > self._max_spread_pct:
                     return RiskCheckResult(
                         RiskLayer.L2_IN_TRADE, False, RiskAction.REJECT,
@@ -401,6 +417,13 @@ class PositionRiskChecker:
         
         self._position_states: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
+        # 手动开单白名单（symbol 集合）：这些持仓由用户手动管理，L3 不自动减仓/平仓
+        self._manual_override_symbols: set = set()
+
+    def set_manual_override_symbols(self, symbols) -> None:
+        """注入手动开单白名单（symbol 集合）。L3 检查时跳过这些持仓，避免误自动平仓。"""
+        with self._lock:
+            self._manual_override_symbols = set(symbols or [])
 
     def update_position(self, symbol: str, entry_price: float, current_price: float,
                         size: float, leverage: float, side: str,
@@ -412,11 +435,11 @@ class PositionRiskChecker:
                 return
             
             unrealized_pnl = (current_price - entry_price) * size * (1 if DirectionUnifier.is_long(side) else -1)
-            pnl_pct = unrealized_pnl / (entry_price * size) if entry_price > 0 else 0
+            pnl_pct = safe_div(unrealized_pnl, entry_price * size, 0.0) if entry_price > 0 else 0.0
             
             # 计算到强平距离
             if liquidation_price > 0 and current_price > 0:
-                liq_distance = abs(current_price - liquidation_price) / current_price
+                liq_distance = safe_div(abs(current_price - liquidation_price), current_price, 0.0)
             else:
                 # OKX维持保证金率约0.5-1%，强平发生在保证金率 = 维持保证金率时
                 # 精确估算: liq_distance ≈ 1/leverage - 维持保证金率(取保守值1.0%)
@@ -451,6 +474,11 @@ class PositionRiskChecker:
             positions = dict(self._position_states)
 
         for symbol, pos in positions.items():
+            # 手动开单白名单：用户手动管理的持仓不纳入 L3 自动减仓/平仓，
+            # 避免时序上先于 orphan 登记被误当普通风险持仓自动处理。
+            if symbol in self._manual_override_symbols:
+                continue
+
             details = {"symbol": symbol}
             
             # 1. 爆仓价格预警
@@ -558,6 +586,9 @@ class DailyRiskChecker:
         self._min_pnl_for_loss = trading.get("min_pnl_for_loss") or 0.001
         # 同秒批量亏损合并：N秒内的连续亏损视为同一笔交易批次
         self._loss_batch_window_sec = trading.get("loss_batch_window_sec") or 3
+        # P0: 连亏暂停自动超时恢复（秒），避免"暂停→无法开仓→无法盈利→无法恢复"死锁
+        # 默认30分钟：超时后自动解除连亏暂停，重新允许开仓（硬亏损暂停不自动恢复）
+        self._consecutive_pause_timeout = trading.get("consecutive_pause_timeout_sec", 1800)
         
         self._daily_trade_count: Dict[str, int] = {}
         self._daily_pnl: Dict[str, float] = {}
@@ -681,11 +712,33 @@ class DailyRiskChecker:
         with self._lock:
             # 检查交易暂停状态
             if self._trading_paused:
-                # P5: 检测是否为平仓信号
-                is_close = self._is_close_signal(signal)
-                
-                # P5: 连续亏损暂停 vs 硬亏损暂停
+                # P0: 连亏暂停自动超时恢复——避免"暂停→无法开仓→无法盈利→无法恢复"死锁
+                # 仅对连续亏损暂停生效；硬亏损暂停需跨日重置或手动 reset
                 is_hard_loss_pause = "单日亏损" in self._pause_reason
+                if not is_hard_loss_pause and self._pause_started_at > 0:
+                    elapsed = time.time() - self._pause_started_at
+                    if elapsed >= self._consecutive_pause_timeout:
+                        old_reason = self._pause_reason
+                        self._trading_paused = False
+                        self._pause_reason = ""
+                        self._pause_started_at = 0.0
+                        self._leverage_reduction_active = False
+                        # 超时恢复时连亏计数减半（非归零：保留风险记忆但给恢复机会）
+                        self._consecutive_losses = self._consecutive_losses // 2
+                        logger.warning(
+                            f"L4 consecutive-loss pause auto-resumed after {elapsed:.0f}s "
+                            f"(timeout={self._consecutive_pause_timeout}s), "
+                            f"consecutive_losses halved: {self._consecutive_losses}, "
+                            f"was: {old_reason}"
+                        )
+                        # 超时恢复后继续执行后续检查（不 return）
+
+                if self._trading_paused:
+                    # P5: 检测是否为平仓信号
+                    is_close = self._is_close_signal(signal)
+                    
+                    # P5: 连续亏损暂停 vs 硬亏损暂停
+                    is_hard_loss_pause = "单日亏损" in self._pause_reason
                 
                 if is_hard_loss_pause:
                     # 硬亏损限制：绝对阻止一切操作
@@ -729,7 +782,7 @@ class DailyRiskChecker:
         # 小账户的百分比限制过于严格（42 USDT的3%只有1.28 USDT），
         # 使用 max(0.5, daily_start * 5%) 作为最小绝对亏损阈值
         if daily_start > 0:
-            daily_loss_pct = -daily_pnl / daily_start if daily_pnl < 0 else 0
+            daily_loss_pct = safe_div(-daily_pnl, daily_start, 0.0) if daily_pnl < 0 else 0.0
             abs_loss = abs(daily_pnl) if daily_pnl < 0 else 0
             
             # P18-2增强: 动态最小绝对亏损阈值
@@ -1110,7 +1163,7 @@ class EmergencyCircuitBreaker:
 
                 if current > 0:
                     # 检测瞬间暴跌
-                    drop_pct = (recent_max - current) / recent_max
+                    drop_pct = safe_div(recent_max - current, recent_max, 0.0)
                     if drop_pct >= self._flash_crash_threshold:
                         # 币种隔离：判断是否需要升级为全局熔断
                         if symbol in self._global_trigger_symbols:
@@ -1145,7 +1198,7 @@ class EmergencyCircuitBreaker:
                                 )
 
                     # 检测瞬间暴涨
-                    surge_pct = (current - recent_min) / recent_min if recent_min > 0 else 0
+                    surge_pct = safe_div(current - recent_min, recent_min, 0.0) if recent_min > 0 else 0.0
                     if surge_pct >= self._flash_crash_threshold:
                         if symbol in self._global_trigger_symbols:
                             self._trigger_emergency("flash_surge",
@@ -1275,6 +1328,7 @@ class RiskGate:
         # P5: 注入 OKX 客户端用于仓位容量查询；缺失时 get_active_position_count 会
         # 因两通道均失败而 fail-closed 拒绝所有开仓信号（历史上「一直没开单」根因）
         self._okx_client = okx_client
+        self._position_manager = None
         
         self._lock = threading.RLock()
         
@@ -1299,6 +1353,18 @@ class RiskGate:
     def set_sqlite_storage(self, storage):
         """注入SQLite存储，用于将风控拦截事件持久化到 risk_events 表"""
         self._sqlite_storage = storage
+
+    def set_okx_client(self, okx_client) -> None:
+        """注入 OKX 客户端（用于 get_active_position_count 仓位容量查询）。
+
+        get_risk_gate 在单例已存在但未注入客户端时补注入，避免两通道查询
+        均失败导致 fail-closed 拒绝所有开仓。此方法此前缺失导致运行时 AttributeError。
+        """
+        self._okx_client = okx_client
+
+    def set_position_manager(self, position_manager) -> None:
+        """注入仓位管理器，以便同步持续失败时冻结新开仓。"""
+        self._position_manager = position_manager
 
     def _record_interception(self, layer: str, action: RiskAction, reason: str, symbol: str = ""):
         """记录风控拦截到统计，并持久化到 risk_events 表"""
@@ -1354,15 +1420,25 @@ class RiskGate:
         results = []
         # P1: 提取 signal 的 symbol 用于风控事件持久化
         _symbol = signal.get("symbol", "") if isinstance(signal, dict) else ""
+        signal_type = (
+            str(signal.get("signal_type", "")).lower()
+            if isinstance(signal, dict)
+            else ""
+        )
+        is_close = bool(is_close)
+        if isinstance(signal, dict):
+            is_close = is_close or bool(signal.get("reduce_only", False))
+        if not is_close:
+            close_keywords = (
+                "close", "exit", "reduce", "stop_loss", "take_profit",
+                "trailing", "tp", "sl", "liquidation", "margin_call",
+            )
+            is_close = any(keyword in signal_type for keyword in close_keywords)
 
         # L0 全局 Kill Switch（最高优先级，先于 L5）
         # fail-closed：仅禁止开仓，平仓/减仓/止损/止盈等降风险信号穿透放行
         if self._kill_switch.is_enabled():
-            _sig_type0 = str(signal.get("signal_type", "")).lower() if isinstance(signal, dict) else ""
-            _reduce_only0 = signal.get("reduce_only", False) if isinstance(signal, dict) else False
-            _close_kws0 = ("close", "exit", "reduce", "stop_loss", "take_profit", "trailing", "tp", "sl", "liquidation", "margin_call")
-            _is_close_sig0 = bool(is_close) or bool(_reduce_only0) or any(kw in _sig_type0 for kw in _close_kws0)
-            if not _is_close_sig0:
+            if not is_close:
                 l0_result = RiskCheckResult(
                     RiskLayer.L0_KILL_SWITCH, False, RiskAction.FREEZE,
                     f"全局 Kill Switch 已启用，禁止开仓: {self._kill_switch.get_reason()}",
@@ -1377,6 +1453,76 @@ class RiskGate:
                     blocked_layer=RiskLayer.L0_KILL_SWITCH, results=results,
                     summary=f"L0 KillSwitch 拦截: {l0_result.reason}"
                 )
+
+        if (
+            not is_close
+            and self._position_manager is not None
+            and bool(getattr(self._position_manager, "sync_degraded", False))
+        ):
+            reason = (
+                "持仓同步连续失败，持仓状态未知，暂停新开仓 "
+                f"(连续失败 {getattr(self._position_manager, 'sync_fail_streak', 'N/A')} 次)"
+            )
+            sync_result = RiskCheckResult(
+                RiskLayer.L1_PRE_TRADE,
+                False,
+                RiskAction.FREEZE,
+                reason,
+                {
+                    "position_sync_degraded": True,
+                    "sync_fail_streak": getattr(
+                        self._position_manager, "sync_fail_streak", None
+                    ),
+                },
+            )
+            results.append(sync_result)
+            self._total_rejections += 1
+            self._rejections_by_layer[RiskLayer.L1_PRE_TRADE.value] += 1
+            self._record_interception(
+                RiskLayer.L1_PRE_TRADE.value,
+                sync_result.action,
+                sync_result.reason,
+                _symbol,
+            )
+            return RiskGateResult(
+                passed=False,
+                action=sync_result.action,
+                blocked_layer=RiskLayer.L1_PRE_TRADE,
+                results=results,
+                summary=f"L1持仓同步降级拦截: {sync_result.reason}",
+            )
+
+        # 持仓数据过期（解析失败后未成功同步）：fail-closed，拒绝新开仓
+        if (
+            not is_close
+            and self._position_manager is not None
+            and callable(getattr(self._position_manager, "is_data_stale", None))
+            and self._position_manager.is_data_stale()
+        ):
+            reason = "持仓数据过期（解析失败），持仓状态不可信，暂停新开仓"
+            stale_result = RiskCheckResult(
+                RiskLayer.L1_PRE_TRADE,
+                False,
+                RiskAction.FREEZE,
+                reason,
+                {"position_data_stale": True},
+            )
+            results.append(stale_result)
+            self._total_rejections += 1
+            self._rejections_by_layer[RiskLayer.L1_PRE_TRADE.value] += 1
+            self._record_interception(
+                RiskLayer.L1_PRE_TRADE.value,
+                stale_result.action,
+                stale_result.reason,
+                _symbol,
+            )
+            return RiskGateResult(
+                passed=False,
+                action=stale_result.action,
+                blocked_layer=RiskLayer.L1_PRE_TRADE,
+                results=results,
+                summary=f"L1持仓数据过期拦截: {stale_result.reason}",
+            )
 
         # L5 紧急熔断（最高优先级，先检查）—— 平仓信号也需检查（熔断冷却期内禁止一切操作）
         l5_result = self._l5.check(signal)
@@ -1404,16 +1550,25 @@ class RiskGate:
                 summary=f"L4单日风控拦截: {l4_result.reason}"
             )
 
+        # L1/L2/L3 并行校验（三者独立，无数据依赖）
         # L1 事前风控 —— 平仓/减仓信号跳过（平仓释放保证金，不占用）
-        # 自动检测平仓信号：从 signal 的 reduce_only 和 signal_type 判断
-        if not is_close:
-            sig_type = str(signal.get("signal_type", "")).lower() if isinstance(signal, dict) else ""
-            is_close = signal.get("reduce_only", False) if isinstance(signal, dict) else False
+        # L2 事中风控 —— 平仓信号也需检查（API频率/延迟/滑点对平仓同样适用）
+        # L3 持仓实时风控（不拦截开仓，但产生预警）
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
             if not is_close:
-                close_keywords = ["close", "exit", "reduce", "stop_loss", "take_profit", "trailing", "tp", "sl", "liquidation"]
-                is_close = any(kw in sig_type for kw in close_keywords)
-        if not is_close:
-            l1_result = self._l1.check(signal)
+                futures["L1"] = executor.submit(self._l1.check, signal)
+            futures["L2"] = executor.submit(self._l2.check, signal, market_data)
+            futures["L3"] = executor.submit(self._l3.check, signal)
+
+            # 收集结果并按优先级处理（L1 > L2 > L3）
+            l1_result = futures["L1"].result() if "L1" in futures else None
+            l2_result = futures["L2"].result()
+            l3_results = futures["L3"].result()
+
+        # L1 结果处理
+        if l1_result is not None:
             results.append(l1_result)
             if not l1_result.passed:
                 self._total_rejections += 1
@@ -1425,8 +1580,7 @@ class RiskGate:
                     summary=f"L1事前风控拦截: {l1_result.reason}"
                 )
 
-        # L2 事中风控 —— 平仓信号也需检查（API频率/延迟/滑点对平仓同样适用）
-        l2_result = self._l2.check(signal, market_data)
+        # L2 结果处理
         results.append(l2_result)
         if not l2_result.passed:
             self._total_rejections += 1
@@ -1438,9 +1592,8 @@ class RiskGate:
                 summary=f"L2事中风控拦截: {l2_result.reason}"
             )
 
-        # L3 持仓实时风控（不拦截开仓，但产生预警）
+        # L3 结果处理（不拦截开仓，但产生预警）
         # 只对同symbol的风险持仓产生拦截，不对其他symbol的close_all动作阻断当前信号
-        l3_results = self._l3.check(signal)
         signal_symbol = signal.get("symbol", "") if isinstance(signal, dict) else ""
         signal_sig_type = str(signal.get("signal_type", "")).lower() if isinstance(signal, dict) else ""
         is_close_signal = any(kw in signal_sig_type for kw in ["close", "stop_loss", "take_profit", "reduce", "exit", "liquidation"])
@@ -1471,6 +1624,10 @@ class RiskGate:
             blocked_layer=None, results=results,
             summary=summary
         )
+
+    def set_manual_override_symbols(self, symbols) -> None:
+        """注入手动开单白名单（symbol 集合），委托给 L3 在检查时跳过这些持仓。"""
+        self._l3.set_manual_override_symbols(symbols)
 
     def check_positions(self) -> List[RiskCheckResult]:
         """单独执行L3持仓风控检查（用于后台监控循环）"""
@@ -1591,17 +1748,22 @@ class RiskGate:
                 positions = self._l1.get_cached_positions()
                 if positions is not None:
                     return sum(1 for p in positions
-                             if abs(float(p.get("pos", 0) or p.get("position", 0) or 0)) > 0)
+                             if abs(safe_float(p.get("pos") or p.get("position"), 0.0)) > 0)
         except Exception as e:
             logger.warning(f"L1 cached positions query failed: {e}")
         
         # 回退：从 OKX 客户端获取
         try:
             if hasattr(self, '_okx_client') and self._okx_client:
-                positions = self._okx_client.get_positions()
+                checked_query = getattr(self._okx_client, "get_positions_checked", None)
+                positions = (
+                    checked_query()
+                    if callable(checked_query)
+                    else self._okx_client.get_positions()
+                )
                 if positions is not None:
                     return sum(1 for p in positions
-                             if abs(float(p.get("pos", 0) or p.get("position", 0) or 0)) > 0)
+                             if abs(safe_float(p.get("pos") or p.get("position"), 0.0)) > 0)
         except Exception as e:
             logger.warning(f"OKX positions query failed: {e}")
         
@@ -1658,6 +1820,19 @@ class RiskGate:
                 "L3_position": self._l3.get_position_summary(),
                 "L4_daily": self._l4.to_dict(),
                 "L5_emergency": self._l5.to_dict(),
+                "position_sync": {
+                    "degraded": bool(
+                        self._position_manager
+                        and getattr(
+                            self._position_manager, "sync_degraded", False
+                        )
+                    ),
+                    "failure_streak": (
+                        getattr(self._position_manager, "sync_fail_streak", 0)
+                        if self._position_manager
+                        else 0
+                    ),
+                },
                 "trading_paused": self.is_trading_paused()
             }
 

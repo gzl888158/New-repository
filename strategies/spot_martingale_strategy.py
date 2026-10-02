@@ -1,5 +1,6 @@
 """现货马丁格尔策略：价格下跌时按比例分批加仓摊薄成本，反弹后分批止盈。"""
 import asyncio
+import math
 import time
 import numpy as np
 from datetime import datetime, timedelta
@@ -110,21 +111,24 @@ class SpotMartingaleStrategy(PersistentStrategy):
         self.config.setdefault("strategies", {})["spot_martingale"] = strategy_cfg
 
         attr_map = {
-            "max_layers": "max_layers",
-            "price_drop_pct": "price_drop_pct",
-            "take_profit_pct": "take_profit_pct",
-            "stop_loss_pct": "stop_loss_pct",
-            "min_signal_quality": "min_signal_quality",
-            "martingale_coefficient": "martingale_coefficient",
-            "max_hold_time_hours": "max_hold_time_hours",
-            "base_position_ratio": "base_position_ratio",
-            "bear_market_suspend": "bear_market_suspend",
-            "partial_close_enabled": "partial_close_enabled",
+            "max_layers": "_max_layers",
+            "price_drop_pct": "_price_drop_pct",
+            "take_profit_pct": "_take_profit_pct",
+            "stop_loss_pct": "_stop_loss_pct",
+            "min_signal_quality": "_min_signal_quality",
+            "martingale_coefficient": "_martingale_coefficient",
+            "max_hold_time_hours": "_max_hold_time_hours",
+            "base_position_ratio": "_base_position_ratio",
+            "bear_market_suspend": "_bear_market_suspend",
+            "partial_close_enabled": "_partial_close_enabled",
         }
         for cfg_key, attr_name in attr_map.items():
             if cfg_key in updates:
                 setattr(self, attr_name, updates[cfg_key])
                 logger.info(f"SpotMartingale config hot-updated: {attr_name}={updates[cfg_key]}")
+        # take_profit_pct 需同步更新动态止盈基准，否则动态止盈仍沿用旧值
+        if "take_profit_pct" in updates:
+            self._take_profit_base = updates["take_profit_pct"]
 
     def set_signal_callback(self, callback):
         self._signal_callback = callback
@@ -132,13 +136,17 @@ class SpotMartingaleStrategy(PersistentStrategy):
     def _get_allocation(self) -> float:
         if self._adaptive_controller:
             try:
-                return self._adaptive_controller.get_allocation("spot_martingale")
-            except Exception:
-                pass
+                alloc = self._adaptive_controller.get_allocation("spot_martingale")
+                if alloc is not None and alloc > 0:
+                    return alloc
+            except Exception as e:
+                # fail-closed: 资金分配查询失败时返回 0，拒绝开仓
+                logger.error(f"Spot Martingale _get_allocation failed: {e}")
+                return 0.0
         return self.config["trading"].get("spot_martingale_allocation", 0.15)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital"""
+        """获取有效资金：仅使用实际账户权益；查询失败时 fail-closed 返回 0 拒绝开仓"""
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -151,9 +159,9 @@ class SpotMartingaleStrategy(PersistentStrategy):
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
-        return self.config["trading"].get("total_capital", 100.0)
+        except Exception as e:
+            logger.error(f"Spot Martingale _get_effective_capital failed: {e}")
+        return 0.0
 
     def apply_param_update(self, params: Dict[str, Any]):
         applied = []
@@ -183,7 +191,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
     async def start(self):
         if not self._enabled:
             logger.info("Spot Martingale strategy is disabled")
-            return
+            return False
 
         logger.info("Starting Spot Martingale Strategy")
         # P0-2 / P0-6: 启动时优先恢复持久化状态（_active_positions 等）
@@ -228,10 +236,10 @@ class SpotMartingaleStrategy(PersistentStrategy):
         try:
             klines = self.okx_client.get_kline(symbol, "1H", limit=20)
             if len(klines) < 15:
-                return
+                return False
             closes = np.array([float(k[4]) for k in klines], dtype=float)
             if np.any(np.isnan(closes)) or np.any(np.isinf(closes)):
-                return
+                return False
             rsi = self._calculate_rsi(closes, 14)
             if 0 <= rsi <= 100:
                 self._rsi_cache[symbol] = float(rsi)
@@ -269,9 +277,14 @@ class SpotMartingaleStrategy(PersistentStrategy):
     async def _update_indicators_loop(self):
         """更新ATR和EMA指标"""
         while True:
-            for symbol in self._all_symbols:
-                await self._update_atr(symbol)
-                await self._update_ema(symbol)
+            try:
+                for symbol in self._all_symbols:
+                    await self._update_atr(symbol)
+                    await self._update_ema(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Spot Martingale _update_indicators_loop error: {e}")
             await asyncio.sleep(300)  # 5分钟更新一次
 
     async def _update_atr(self, symbol: str):
@@ -279,7 +292,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
         try:
             klines = self.okx_client.get_kline(symbol, "1H", limit=self._atr_period + 1)
             if len(klines) < self._atr_period + 1:
-                return
+                return False
 
             highs = np.array([float(kline[2]) for kline in klines])
             lows = np.array([float(kline[3]) for kline in klines])
@@ -453,8 +466,17 @@ class SpotMartingaleStrategy(PersistentStrategy):
         """
         for symbol in self._all_symbols:
             holdings = self._get_current_holdings(symbol)
+            if holdings is None:
+                logger.warning(f"Spot Martingale {symbol}: holdings unavailable, skip reconciliation")
+                continue
             ticker = self.okx_client.get_ticker(symbol)
-            current_price = float(ticker["last"]) if ticker else 0.0
+            try:
+                current_price = float(ticker.get("last", 0) or 0) if ticker else 0.0
+            except (TypeError, ValueError):
+                current_price = 0.0
+            if not math.isfinite(current_price) or current_price <= 0:
+                logger.warning(f"Spot Martingale {symbol}: invalid ticker price, skip position reconciliation")
+                continue
 
             # 无持仓：清理任何残留状态
             if holdings <= 0:
@@ -526,9 +548,15 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
     async def _monitor_ticks(self):
         while True:
-            for symbol in self._all_symbols:
-                await self._process_tick(symbol)
-            await asyncio.sleep(0.5)
+            try:
+                for symbol in self._all_symbols:
+                    await self._process_tick(symbol)
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Spot Martingale _monitor_ticks error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _process_tick(self, symbol: str):
         tick = self.redis_cache.get_tick(symbol)
@@ -683,7 +711,8 @@ class SpotMartingaleStrategy(PersistentStrategy):
             )
             return False
 
-        await self._place_martingale_order(symbol, "buy", price, position["quantity"], 1)
+        if not await self._place_martingale_order(symbol, "buy", price, position["quantity"], 1):
+            return False
 
         # P0-1: 初始化 base_layer_usdt + total_cost_usdt
         self._active_positions[symbol] = {
@@ -739,8 +768,8 @@ class SpotMartingaleStrategy(PersistentStrategy):
                 boost = self._adaptive_controller.get_position_boost()
                 if boost > 1.0:
                     base_usdt *= boost
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[spot_martingale] get_position_boost failed: {e}")
 
         min_margin = self.config["trading"].get("min_margin_per_trade", 0.5)
 
@@ -764,13 +793,16 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
         quantity = base_usdt / price
 
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "0.001"))
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             logger.debug(f"Spot Martingale {symbol}: quantity {quantity:.6f} < min lot {min_lot_size}")
             return None
 
         quantity_precision = self._get_quantity_precision(symbol)
         quantity = round(quantity, quantity_precision)
+        if quantity <= 0:
+            logger.debug(f"Spot Martingale {symbol}: quantity {quantity} <= 0 after rounding, skip entry")
+            return None
 
         return {"quantity": quantity, "usdt_value": quantity * price}
 
@@ -792,6 +824,9 @@ class SpotMartingaleStrategy(PersistentStrategy):
             max_price_since_open = price
         # 同步最新持仓量（外部可能加减仓）
         actual_holdings = self._get_current_holdings(symbol)
+        if actual_holdings is None:
+            logger.warning(f"Spot Martingale {symbol}: holdings unavailable, skip position update")
+            return
         if actual_holdings > 0 and abs(actual_holdings - total_quantity) / max(total_quantity, 1e-9) > 0.01:
             pos["total_quantity"] = actual_holdings
             total_quantity = actual_holdings
@@ -808,7 +843,17 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
         # 优化：最大持仓时间检查
         create_time = pos.get("create_time", datetime.now())
-        hold_hours = (datetime.now() - create_time).total_seconds() / 3600
+        if isinstance(create_time, str):
+            try:
+                create_time = datetime.fromisoformat(create_time)
+            except ValueError:
+                create_time = datetime.now()
+                pos["create_time"] = create_time
+        if not isinstance(create_time, datetime):
+            create_time = datetime.now()
+            pos["create_time"] = create_time
+        now = datetime.now(create_time.tzinfo) if create_time.tzinfo else datetime.now()
+        hold_hours = (now - create_time).total_seconds() / 3600
         if hold_hours >= self._max_hold_time_hours:
             logger.warning(f"Spot Martingale max hold time exceeded: {symbol} held {hold_hours:.1f}h")
             await self._close_position(symbol, price, "max_hold_time")
@@ -910,15 +955,19 @@ class SpotMartingaleStrategy(PersistentStrategy):
             return
 
         new_quantity = layer_usdt / price
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "0.001"))
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if new_quantity < min_lot_size:
             logger.debug(f"Spot Martingale {symbol}: new quantity {new_quantity:.6f} < min lot {min_lot_size}")
             return
 
         quantity_precision = self._get_quantity_precision(symbol)
         new_quantity = round(new_quantity, quantity_precision)
+        if new_quantity <= 0:
+            logger.debug(f"Spot Martingale {symbol}: layer new_quantity {new_quantity} <= 0 after rounding, skip")
+            return
 
-        await self._place_martingale_order(symbol, "buy", price, new_quantity, current_layers + 1)
+        if not await self._place_martingale_order(symbol, "buy", price, new_quantity, current_layers + 1):
+            return
 
         new_total = total_quantity + new_quantity
         new_avg = (total_quantity * avg_entry + new_quantity * price) / new_total
@@ -942,27 +991,36 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
     async def _partial_close(self, symbol: str, price: float, quantity: float, layers: int):
         """分批平仓"""
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "0.001"))
+        position = self._active_positions.get(symbol)
+        if not position or position.get("status") != "active":
+            return
+        quantity = min(quantity, float(position.get("total_quantity", 0) or 0))
+        balance = self.okx_client.get_spot_balance(symbol.replace("-USDT", ""))
+        if not isinstance(balance, dict) or "available" not in balance:
+            logger.warning(f"Spot Martingale {symbol}: holdings unavailable, skip partial close")
+            return
+        try:
+            quantity = min(quantity, max(0.0, float(balance["available"])))
+        except (TypeError, ValueError):
+            logger.warning(f"Spot Martingale {symbol}: invalid available balance, skip partial close")
+            return
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             return
 
         quantity_precision = self._get_quantity_precision(symbol)
         quantity = round(quantity, quantity_precision)
+        if quantity <= 0:
+            logger.debug(f"Spot Martingale {symbol}: partial close quantity {quantity} <= 0 after rounding, skip")
+            return
 
-        await self._place_martingale_order(symbol, "sell", price, quantity, layers)
+        if not await self._place_martingale_order(symbol, "sell", price, quantity, layers):
+            return
 
-        # 更新持仓
-        if symbol in self._active_positions:
-            pos = self._active_positions[symbol]
-            old_qty = float(pos.get("total_quantity", 0) or 0)
-            remaining_qty = old_qty - quantity
-            if remaining_qty > 0:
-                pos["total_quantity"] = remaining_qty
-                pos["current_layers"] = max(1, layers - 1)
-                # P2: 保持原始avg_entry_price不变，不缩放total_cost
-                pos["total_cost_usdt"] = pos.get("avg_entry_price", price) * remaining_qty
-            else:
-                del self._active_positions[symbol]
+        position["status"] = "closing"
+        position["pending_close_quantity"] = quantity
+        position["pending_close_partial"] = True
+        position["close_requested_at"] = datetime.now()
 
         logger.info(f"Spot Martingale partial close: {symbol} @ {price:.4f} x {quantity:.6f}")
 
@@ -970,25 +1028,36 @@ class SpotMartingaleStrategy(PersistentStrategy):
         pos = self._active_positions[symbol]
         quantity = pos["total_quantity"]
 
-        holdings = self._get_current_holdings(symbol)
-        if holdings < quantity:
-            quantity = holdings
-
-        if quantity <= 0:
+        balance = self.okx_client.get_spot_balance(symbol.replace("-USDT", ""))
+        if not isinstance(balance, dict) or "available" not in balance:
+            logger.warning(f"Spot Martingale {symbol}: holdings unavailable, keep position state")
+            return
+        holdings = float(balance.get("total", balance["available"]) or 0)
+        available_holdings = float(balance["available"] or 0)
+        if holdings <= 0:
             logger.debug(f"Spot Martingale {symbol}: no holdings to close")
             del self._active_positions[symbol]
             return
+        if available_holdings < quantity:
+            quantity = available_holdings
 
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "0.001"))
+        if quantity <= 0:
+            logger.warning(f"Spot Martingale {symbol}: holdings are frozen or unavailable for closing")
+            return
+
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             logger.debug(f"Spot Martingale {symbol}: quantity {quantity:.6f} < min lot {min_lot_size}")
-            del self._active_positions[symbol]
             return
 
         quantity_precision = self._get_quantity_precision(symbol)
         quantity = round(quantity, quantity_precision)
+        if quantity <= 0:
+            logger.debug(f"Spot Martingale {symbol}: close quantity {quantity} <= 0 after rounding, skip order")
+            return
 
-        await self._place_martingale_order(symbol, "sell", price, quantity, pos["current_layers"])
+        if not await self._place_martingale_order(symbol, "sell", price, quantity, pos["current_layers"]):
+            return
 
         avg_entry = pos["avg_entry_price"]
         profit = (price - avg_entry) * quantity
@@ -996,11 +1065,15 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
         logger.info(f"Spot Martingale close ({reason}): {symbol} exit={price:.4f} entry={avg_entry:.4f}, profit={profit:.4f} ({profit_pct:.2f}%), layers={pos['current_layers']}")
 
-        del self._active_positions[symbol]
+        pos["status"] = "closing"
+        pos["pending_close_quantity"] = quantity
+        pos["pending_close_partial"] = False
+        pos["close_reason"] = reason
+        pos["close_requested_at"] = datetime.now()
         # 止损冷却由调用方（_check_existing_position）设置；这里清理同币种开仓冷却以便重新建仓后立即可用
         # 注意：不清理 _cooldown_until，它由止损路径显式设置
 
-    async def _place_martingale_order(self, symbol: str, side: str, price: float, quantity: float, layer: int):
+    async def _place_martingale_order(self, symbol: str, side: str, price: float, quantity: float, layer: int) -> bool:
         # 企业级：参数前置校验，非法输入直接拒绝并埋点
         if not self._validate_symbol(symbol) or not self._validate_direction(side) \
                 or not self._validate_price(price) or not self._validate_quantity(quantity):
@@ -1009,7 +1082,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
                 f"symbol={symbol!r} side={side!r} price={price!r} quantity={quantity!r}"
             )
             self._increment_metric("spot_martingale_signal_rejected_total", 1.0, {"reason": "invalid_params", "symbol": symbol})
-            return
+            return False
 
         precision = get_price_precision(symbol)
         quantity_precision = self._get_quantity_precision(symbol)
@@ -1017,12 +1090,21 @@ class SpotMartingaleStrategy(PersistentStrategy):
         quantity = round(quantity, quantity_precision)
         price = round(price, precision)
 
-        confidence = 0.6 + (1 - layer * 0.05)
+        # 纵深防御：round 后数量可能归零（极端精度下），拒绝发零量信号
+        if quantity <= 0:
+            logger.warning(
+                f"Martingale order rejected: quantity {quantity} <= 0 after rounding "
+                f"symbol={symbol!r} side={side!r}"
+            )
+            self._increment_metric("spot_martingale_signal_rejected_total", 1.0, {"reason": "quantity_round_zero", "symbol": symbol})
+            return False
+
+        confidence = max(0.5, min(0.95, 0.6 + (1 - layer * 0.05)))
 
         signal = Signal(
             symbol=symbol,
             strategy_name="spot_martingale",
-            signal_type="spot_martingale_trade",
+            signal_type="spot_martingale_close" if side == "sell" else "spot_martingale_trade",
             direction=side,
             price=price,
             quantity=quantity,
@@ -1033,11 +1115,18 @@ class SpotMartingaleStrategy(PersistentStrategy):
             timestamp=datetime.now()
         )
 
-        if self._signal_callback:
-            await self._signal_callback(signal)
+        if not self._signal_callback:
+            logger.warning(f"Martingale order not dispatched: no signal callback for {symbol} {side}")
+            return False
+        dispatch_result = await self._signal_callback(signal)
+        if dispatch_result is not True:
+            logger.warning(f"Martingale signal rejected before order routing: {symbol} {side} layer={layer}")
+            return False
 
         self._record_metric("spot_martingale_signal_generated_total", 1.0, {"symbol": symbol, "direction": side, "layer": str(layer)})
         self._record_metric("spot_martingale_signal_confidence", confidence, {"symbol": symbol, "direction": side})
+
+        return True
 
     def _log_throttled(self, symbol: str, message: str):
         """日志节流"""
@@ -1058,18 +1147,23 @@ class SpotMartingaleStrategy(PersistentStrategy):
             logger.error(f"Failed to get USDT balance: {e}")
             return 0
 
-    def _get_current_holdings(self, symbol: str) -> float:
+    def _get_current_holdings(self, symbol: str) -> Optional[float]:
         base_asset = symbol.replace("-USDT", "")
         try:
             balance = self.okx_client.get_spot_balance(base_asset)
-            return float(balance.get("available", 0)) if balance else 0
+            if not isinstance(balance, dict) or "available" not in balance:
+                return None
+            holdings = float(balance.get("total", balance["available"]))
+            if not math.isfinite(holdings) or holdings < 0:
+                return None
+            return holdings
         except Exception as e:
             logger.error(f"Failed to get {base_asset} balance: {e}")
-            return 0
+            return None
 
     def _get_quantity_precision(self, symbol: str) -> int:
         try:
-            info = self.okx_client.get_instrument_info(symbol)
+            info = self.okx_client.get_instrument_info(symbol) or {}
             lot_size = float(info.get("lotSz", "0.001"))
             return len(str(lot_size).split(".")[1]) if "." in str(lot_size) else 0
         except Exception:
@@ -1077,12 +1171,44 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
     async def _check_positions_loop(self):
         while True:
-            await asyncio.sleep(30)
-            for symbol in list(self._active_positions.keys()):
-                holdings = self._get_current_holdings(symbol)
-                if holdings <= 0:
-                    logger.info(f"Spot Martingale {symbol}: no holdings detected, cleaning up")
-                    del self._active_positions[symbol]
+            try:
+                await asyncio.sleep(30)
+                for symbol in list(self._active_positions.keys()):
+                    holdings = self._get_current_holdings(symbol)
+                    if holdings is None:
+                        logger.warning(f"Spot Martingale {symbol}: holdings unavailable, preserve position state")
+                        continue
+                    self._reconcile_closing_position(symbol, holdings)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Spot Martingale _check_positions_loop error: {e}")
+
+    def _reconcile_closing_position(self, symbol: str, holdings: float) -> None:
+        pos = self._active_positions.get(symbol)
+        if holdings <= 0:
+            logger.info(f"Spot Martingale {symbol}: no holdings detected, cleaning up")
+            self._active_positions.pop(symbol, None)
+            return
+        if not pos or pos.get("status") != "closing":
+            return
+
+        tracked_qty = float(pos.get("total_quantity", 0) or 0)
+        close_qty = float(pos.get("pending_close_quantity", 0) or 0)
+        expected_remaining = max(0.0, tracked_qty - close_qty)
+        tolerance = max(1e-8, close_qty * 0.01)
+        if close_qty <= 0 or holdings > expected_remaining + tolerance:
+            return
+
+        pos["total_quantity"] = holdings
+        pos["total_cost_usdt"] = float(pos.get("avg_entry_price", 0) or 0) * holdings
+        if pos.get("pending_close_partial"):
+            pos["current_layers"] = max(1, int(pos.get("current_layers", 1)) - 1)
+        pos["status"] = "active"
+        pos.pop("pending_close_quantity", None)
+        pos.pop("pending_close_partial", None)
+        pos.pop("close_reason", None)
+        pos.pop("close_requested_at", None)
 
     # === P0-6: 状态持久化 ===
     def collect_persistent_state(self) -> Dict[str, Any]:
@@ -1105,6 +1231,10 @@ class SpotMartingaleStrategy(PersistentStrategy):
                 sym: ts.isoformat() if isinstance(ts, datetime) else ts
                 for sym, ts in self._cooldown_until.items()
             },
+            "last_open_time": {
+                sym: ts.isoformat() if isinstance(ts, datetime) else ts
+                for sym, ts in self._last_open_time.items()
+            },
         }
 
     def restore_persistent_state(self, state: Dict[str, Any]):
@@ -1113,7 +1243,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
             ap = state.get("active_positions")
             if isinstance(ap, dict):
                 # 反序列化 datetime 字段
-                datetime_fields = {"create_time", "start_time"}
+                datetime_fields = {"create_time", "start_time", "close_requested_at"}
                 for sym, p in ap.items():
                     if not isinstance(p, dict):
                         continue
@@ -1123,6 +1253,8 @@ class SpotMartingaleStrategy(PersistentStrategy):
                                 p[k] = datetime.fromisoformat(p[k])
                             except (ValueError, TypeError):
                                 pass
+                    if not isinstance(p.get("create_time"), datetime):
+                        p["create_time"] = datetime.now()
                     self._active_positions[sym] = p
             dt = state.get("daily_trades")
             if isinstance(dt, dict):
@@ -1140,6 +1272,16 @@ class SpotMartingaleStrategy(PersistentStrategy):
                             pass
                     elif isinstance(ts, datetime):
                         self._cooldown_until[sym] = ts
+            lo = state.get("last_open_time")
+            if isinstance(lo, dict):
+                for sym, ts in lo.items():
+                    if isinstance(ts, str):
+                        try:
+                            self._last_open_time[sym] = datetime.fromisoformat(ts)
+                        except (ValueError, TypeError):
+                            pass
+                    elif isinstance(ts, datetime):
+                        self._last_open_time[sym] = ts
             logger.info(
                 f"Spot Martingale state restored: positions={len(self._active_positions)}, daily_trades={len(self._daily_trades)}, cooldowns={len(self._cooldown_until)}"
             )

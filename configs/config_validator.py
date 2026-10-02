@@ -73,6 +73,8 @@ class OKXConfig(BaseModel):
     websocket_url: str = "wss://ws.okx.com:8443/ws/v5/public"
     websocket_private_url: str = "wss://ws.okx.com:8443/ws/v5/private"
     proxy: Optional[str] = None
+    proxy_list: Optional[List[str]] = None
+    allow_direct_fallback: bool = False
 
     @model_validator(mode='after')
     def validate_credentials(self):

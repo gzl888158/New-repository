@@ -9,12 +9,12 @@
 import asyncio
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
 from loguru import logger
 
 # P3: 订单状态流转规则收敛到独立状态机（OrderStateMachine），本模块仅负责状态存储与副作用执行
 from core.order_state_machine import (
-    InvalidOrderTransition,
     OrderEvent,
     OrderPhase,
     OrderStateMachine,
@@ -63,6 +63,23 @@ class OrderLifecycleManager:
         self._order_timeout = self._timeout_settings.get("order_timeout", 60)  # P5: 30s->60s，匹配WS重连窗口
         self._tracking_timeout = self._timeout_settings.get("tracking_timeout", 300)
         self._ws_disconnected_timeout_extension = 30  # P5: WS断开时额外延长30s
+        self._timeout_order_handler: Optional[
+            Callable[[Dict[str, Any]], Awaitable[bool]]
+        ] = None
+        self._alert_manager = None
+        self._timeout_handler_retry_interval = max(
+            float(self._timeout_settings.get("handler_retry_interval", 30)), 1.0
+        )
+        self._timeout_handler_retry_after: Dict[str, float] = {}
+        # P0-1: 超时撤单确认失败的重试次数与告警去重，防止僵尸订单无限刷屏
+        self._max_timeout_retries = int(
+            self._timeout_settings.get("max_timeout_retries", 20)
+        )
+        self._timeout_handler_retry_count: Dict[str, int] = {}
+        self._timeout_alert_cooldown = max(
+            float(self._timeout_settings.get("alert_cooldown_seconds", 300)), 30.0
+        )
+        self._last_timeout_alert_at: Dict[str, float] = {}
         
         # 自动恢复配置
         self._recovery_enabled = config.get("execution", {}).get("auto_recovery", True)
@@ -82,6 +99,7 @@ class OrderLifecycleManager:
         }
         self._state_history: Dict[str, list] = {}  # 每个订单的状态变更历史
         self._running = False
+        self._tasks: List[asyncio.Task] = []  # 后台任务引用：start() 创建、stop() cancel+await
         
         # 锁
         self._lock = asyncio.Lock()
@@ -92,14 +110,69 @@ class OrderLifecycleManager:
         """P5: 注入WebSocket状态检查器，用于WS断开时延长订单超时"""
         self._ws_status_checker = checker
 
+    def set_timeout_order_handler(
+        self, handler: Callable[[Dict[str, Any]], Awaitable[bool]]
+    ) -> None:
+        """注入超时撤单及交易所确认处置器。"""
+        self._timeout_order_handler = handler
+
+    def set_alert_manager(self, alert_manager) -> None:
+        """注入超时撤单失败升级告警通道。"""
+        self._alert_manager = alert_manager
+
+    async def _escalate_timeout_cancel_failure(
+        self, order_id: str, order: Dict[str, Any], reason: str
+    ) -> None:
+        symbol = str(order.get("symbol", ""))
+        # P0-1: 告警去重——同一订单在冷却期内只发一次告警，避免僵尸订单刷屏淹没真实告警
+        now = time.monotonic()
+        last_alert = self._last_timeout_alert_at.get(order_id, 0.0)
+        if now - last_alert < self._timeout_alert_cooldown:
+            logger.debug(
+                f"Timeout cancel failure alert suppressed (cooldown): "
+                f"order_id={order_id}, reason={reason}"
+            )
+            return
+        self._last_timeout_alert_at[order_id] = now
+
+        message = (
+            f"订单超时前撤单未能确认，订单继续跟踪并禁止迁移到 TIMEOUT: "
+            f"order_id={order_id}, exchange_order_id="
+            f"{order.get('exchange_order_id') or ''}, symbol={symbol}, "
+            f"reason={reason}"
+        )
+        logger.critical(message)
+        if self._alert_manager is None:
+            logger.error(
+                f"Timeout cancel failure has no alert manager configured: {order_id}"
+            )
+            return
+        try:
+            await self._alert_manager.send_alert(
+                "order_timeout_cancel_failed",
+                message,
+                severity="CRITICAL",
+                symbol=symbol,
+                metadata={
+                    "order_id": order_id,
+                    "exchange_order_id": order.get("exchange_order_id"),
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to escalate timeout cancel failure for {order_id}"
+            )
+
     def _is_ws_connected(self) -> bool:
         """P5: 检查WebSocket是否连接"""
         if hasattr(self, '_ws_status_checker') and self._ws_status_checker:
             try:
                 return self._ws_status_checker()
             except Exception:
-                pass
-        return True  # 默认假设连接正常，不确定时不延长超时
+                logger.warning("WS status checker raised; assuming disconnected")
+                return False  # fail-closed：检查器异常时按断开处理，不静默放行
+        return True  # 未注入检查器时默认连接正常
 
     def register_event_hook(self, event_name: str, hook: callable):
         """注册事件钩子"""
@@ -116,18 +189,25 @@ class OrderLifecycleManager:
                 logger.error(f"Hook {event_name} failed for {order_id}: {e}")
 
     async def start(self):
-        """启动生命周期管理器"""
+        """启动生命周期管理器（幂等）"""
         if self._running:
             return
         self._running = True
-        asyncio.create_task(self._monitor_loop())
-        asyncio.create_task(self._stats_aggregation_loop())
-        asyncio.create_task(self._timeout_check_loop())
+        self._tasks = [
+            asyncio.create_task(self._monitor_loop()),
+            asyncio.create_task(self._stats_aggregation_loop()),
+            asyncio.create_task(self._timeout_check_loop()),
+        ]
         logger.info("OrderLifecycleManager started")
 
     async def stop(self):
-        """停止生命周期管理器"""
+        """停止生命周期管理器：cancel 全部后台任务并等待其结束"""
         self._running = False
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("OrderLifecycleManager stopped")
 
     # ===================== 订单状态管理 =====================
@@ -165,9 +245,9 @@ class OrderLifecycleManager:
         try:
             return self._state_machine.can_reach(old_status, new_status)
         except (TypeError, ValueError):
-            # 未知历史状态：保守放行并告警，避免阻断未知历史状态
+            # 未知历史状态：拒绝（fail-closed），避免静默放行未知状态流转
             logger.warning(f"Unknown order status in transition check: '{old_status}' -> '{new_status}'")
-            return True
+            return False
 
     async def update_status(self, order_id: str, status: OrderStatus, phase: OrderPhase = None):
         """更新订单状态（状态机裁决：非法迁移直接拒绝）。"""
@@ -189,6 +269,7 @@ class OrderLifecycleManager:
                 return
 
             order["status"] = new_status
+            self._timeout_handler_retry_after.pop(order_id, None)
 
             # 阶段耗时（与状态机正交的流程阶段统计）
             self._apply_phase_timing(order_id, phase)
@@ -391,20 +472,20 @@ class OrderLifecycleManager:
                 logger.debug(f"Timeout check error: {e}")
 
     async def _check_timeouts(self):
-        """检查超时订单（内联更新避免死锁，update_status也会获取同一把锁）
-        
-        P5: WS断开时自动延长订单超时，防止WS断连导致订单误判超时
-        """
+        """检查超时订单；生产执行器需先确认交易所状态及撤单结果。"""
         async with self._lock:
             now = datetime.now()
             ws_connected = self._is_ws_connected()
-            
-            for order_id, order in list(self._orders.items()):
+            timed_out = []
+
+            for order_id, order in self._orders.items():
+                if self._timeout_handler_retry_after.get(order_id, 0) > time.monotonic():
+                    continue
                 status = order.get("status", "")
                 created = order.get("timestamps", {}).get("created")
                 if not created:
                     continue
-                
+
                 is_timeout = False
                 if status == OrderStatus.EXECUTING.value:
                     # P5: WS断开时延长超时时间
@@ -414,28 +495,45 @@ class OrderLifecycleManager:
                     is_timeout = (now - created).total_seconds() > effective_timeout
                 elif status == OrderStatus.PENDING.value:
                     is_timeout = (now - created).total_seconds() > self._tracking_timeout
-                
-                if is_timeout:
-                    # P3: 收敛到状态机裁决（TIMEOUT 事件 → TIMEOUT 终态）；避免 update_status 死锁，内联执行副作用
-                    old_status = self._orders[order_id]["status"]
-                    target = self._state_machine.next_state(old_status, OrderEvent.TIMEOUT)
-                    if target is None:
-                        self._stats["illegal_transitions"] = self._stats.get("illegal_transitions", 0) + 1
-                        logger.warning(
-                            f"Illegal timeout transition: {order_id} {old_status} "
-                            f"-({OrderEvent.TIMEOUT.value})-> (rejected)"
-                        )
-                        continue
-                    self._orders[order_id]["status"] = target.value
-                    self._apply_transition_effect(order_id, old_status, target)
-                    self._append_state_history(order_id, old_status, target.value)
-                    logger.warning(f"Order {order_id} timed out (status={old_status} -> {target.value}, ws_connected={ws_connected})")
 
+                if is_timeout:
+                    timed_out.append((order_id, status, created, dict(order)))
+
+        for order_id, status, created, order_snapshot in timed_out:
+            if self._timeout_order_handler is None:
+                await self._handle_timeout_failure(
+                    order_id, order_snapshot, status, created,
+                    "no timeout cancel-and-confirm handler is configured",
+                )
+                continue
+            try:
+                safe_to_timeout = await self._timeout_order_handler(order_snapshot)
+            except Exception as e:
+                await self._handle_timeout_failure(
+                    order_id, order_snapshot, status, created,
+                    f"handler raised: {e}",
+                )
+                continue
+            if not safe_to_timeout:
+                await self._handle_timeout_failure(
+                    order_id, order_snapshot, status, created,
+                    "cancel or terminal-state confirmation failed",
+                )
+                continue
+
+            # 撤单确认成功：迁移到 TIMEOUT 终态
+            await self._transition_to_timeout(order_id, status, created, ws_connected)
+
+        async with self._lock:
             # P0: 清理终态订单防止内存泄漏（保持在锁内，避免竞态）
             for order_id, order in list(self._orders.items()):
                 if self._state_machine.is_terminal(order.get("status")):
                     self._orders.pop(order_id, None)
                     self._state_history.pop(order_id, None)
+                    # 清理超时相关的计数与告警状态
+                    self._timeout_handler_retry_after.pop(order_id, None)
+                    self._timeout_handler_retry_count.pop(order_id, None)
+                    self._last_timeout_alert_at.pop(order_id, None)
 
             # P0: 限制 _orders 最多保留 500 条（在锁内操作，确保不会误删活跃订单）
             if len(self._orders) > 500:
@@ -445,16 +543,118 @@ class OrderLifecycleManager:
                 for key in terminal_keys[:excess]:
                     self._orders.pop(key, None)
                     self._state_history.pop(key, None)
+                    self._timeout_handler_retry_after.pop(key, None)
+                    self._timeout_handler_retry_count.pop(key, None)
+                    self._last_timeout_alert_at.pop(key, None)
                 if excess > 0:
                     logger.warning(f"_orders exceeded 500 limit, pruned {excess} terminal entries")
+
+    async def _handle_timeout_failure(
+        self,
+        order_id: str,
+        order_snapshot: Dict[str, Any],
+        status: str,
+        created: Any,
+        reason: str,
+    ) -> None:
+        """统一处理超时撤单确认失败：告警去重 + 重试计数 + 超限强制终态。
+
+        P0-1: exchange_order_id 为空等永久性失败不能无限重试，超过
+        _max_timeout_retries 后强制迁移到 TIMEOUT 终态并从 _orders 清理，
+        避免僵尸订单每30秒刷屏淹没真实告警。
+        """
+        await self._escalate_timeout_cancel_failure(order_id, order_snapshot, reason)
+
+        retry_count = self._timeout_handler_retry_count.get(order_id, 0) + 1
+        self._timeout_handler_retry_count[order_id] = retry_count
+
+        if retry_count >= self._max_timeout_retries:
+            logger.critical(
+                f"Order {order_id} exceeded max timeout retries "
+                f"({retry_count}/{self._max_timeout_retries}), "
+                f"force-migrating to TIMEOUT terminal state. "
+                f"reason={reason}"
+            )
+            if self._alert_manager is not None:
+                try:
+                    await self._alert_manager.send_alert(
+                        "order_timeout_force_terminal",
+                        f"订单超时撤单重试超限({retry_count}次)，强制标记为 TIMEOUT 终态: "
+                        f"order_id={order_id}, reason={reason}",
+                        severity="CRITICAL",
+                        symbol=str(order_snapshot.get("symbol", "")),
+                        metadata={
+                            "order_id": order_id,
+                            "exchange_order_id": order_snapshot.get("exchange_order_id"),
+                            "retry_count": retry_count,
+                            "reason": reason,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to send force-terminal alert for {order_id}"
+                    )
+            await self._transition_to_timeout(
+                order_id, status, created, self._is_ws_connected(),
+                forced=True,
+            )
+            return
+
+        self._timeout_handler_retry_after[order_id] = (
+            time.monotonic() + self._timeout_handler_retry_interval
+        )
+
+    async def _transition_to_timeout(
+        self,
+        order_id: str,
+        status: str,
+        created: Any,
+        ws_connected: bool,
+        forced: bool = False,
+    ) -> None:
+        """将订单迁移到 TIMEOUT 终态（复用状态机裁决与副作用执行）。"""
+        async with self._lock:
+            order = self._orders.get(order_id)
+            if (
+                order is None
+                or order.get("status") != status
+                or order.get("timestamps", {}).get("created") != created
+            ):
+                return
+
+            self._timeout_handler_retry_after.pop(order_id, None)
+            self._timeout_handler_retry_count.pop(order_id, None)
+            # P3: 通过状态机裁决 TIMEOUT 迁移，再按统一逻辑清理终态记录。
+            old_status = status
+            target = self._state_machine.next_state(old_status, OrderEvent.TIMEOUT)
+            if target is None:
+                self._stats["illegal_transitions"] = self._stats.get("illegal_transitions", 0) + 1
+                logger.warning(
+                    f"Illegal timeout transition: {order_id} {old_status} "
+                    f"-({OrderEvent.TIMEOUT.value})-> (rejected)"
+                )
+                return
+            order["status"] = target.value
+            self._apply_transition_effect(order_id, old_status, target)
+            self._append_state_history(order_id, old_status, target.value)
+            tag = "FORCED " if forced else ""
+            logger.warning(
+                f"Order {order_id} {tag}timed out (status={old_status} -> {target.value}, "
+                f"ws_connected={ws_connected})"
+            )
 
     # ===================== 监控 =====================
 
     async def _monitor_loop(self):
         """监控循环"""
         while self._running:
-            await asyncio.sleep(self._monitor_interval)
-            await self._update_throughput()
+            try:
+                await asyncio.sleep(self._monitor_interval)
+                await self._update_throughput()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Monitor loop error: {e}")
 
     async def _update_throughput(self):
         """更新吞吐量统计"""
@@ -473,8 +673,13 @@ class OrderLifecycleManager:
     async def _stats_aggregation_loop(self):
         """统计聚合循环"""
         while self._running:
-            await asyncio.sleep(self._stats_interval)
-            await self._aggregate_stats()
+            try:
+                await asyncio.sleep(self._stats_interval)
+                await self._aggregate_stats()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Stats aggregation loop error: {e}")
 
     async def _aggregate_stats(self):
         """聚合统计数据"""

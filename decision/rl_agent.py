@@ -1,6 +1,9 @@
 """
 强化学习智能体（RL Agent）— 完善强化版
 
+.. deprecated::
+    实验性模块，未接入生产交易链路。保留供架构演进参考。
+
 核心能力:
   1. Q-learning/SARSA 动态参数调优 — 根据市场状态自适应调整策略参数
   2. 多臂老虎机探索 — 自适应选择最优策略/参数组合
@@ -25,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 from loguru import logger
+from utils.helpers import safe_finite
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -79,6 +83,11 @@ class StateEncoding:
     position_count: int = 0             # 当前持仓数
     strategy_id: str = ""               # 策略标识
     symbol: str = ""                    # 币种标识（用于融合 MarketRegimeEngine 真实状态）
+    factor_score: float = 0.0            # 多因子综合得分 [-1, 1]
+    regime_confidence: float = 0.0       # regime 置信度 [0, 1]
+    utilization_rate: float = 0.0        # 资金利用率 [0, 1]
+    avg_correlation: float = 0.0         # 组合平均相关性 [-1, 1]
+    decision_id: str = ""                # 跨 agent 决策链标识，不进入网络特征
 
 
 @dataclass
@@ -257,7 +266,15 @@ class TradingRLAgent:
         self._enabled = rl_cfg.get("enabled", True)
 
         # ── 状态/动作空间 ──
-        self._n_states = rl_cfg.get("n_states", 8)
+        self._n_states = rl_cfg.get("n_states", 12)
+        self._decision_enabled = bool(rl_cfg.get("decision_enabled", False))
+        self._online_training_enabled = bool(rl_cfg.get("online_training_enabled", False))
+        self._drift_detection_enabled = bool(rl_cfg.get("drift_detection_enabled", True))
+        self._drift_window_size = max(10, int(rl_cfg.get("drift_window_size", 20)))
+        self._drift_min_samples = max(10, int(rl_cfg.get("drift_min_samples", 20)))
+        self._drift_drop_threshold = max(0.0, float(rl_cfg.get("drift_drop_threshold", 0.5)))
+        self._training_frozen = False
+        self._training_freeze_reason = ""
         self._actions = list(RLAction)
         self._n_actions = len(self._actions)
 
@@ -330,6 +347,9 @@ class TradingRLAgent:
 
         # ── 统一市场状态引擎（可选注入，用于真实 regime 状态编码） ──
         self._regime_engine = None
+        self._learning_memory = None
+        self._last_shared_context: Dict[str, Any] = {}
+        self._last_shared_trace_id = ""
 
         # ── 加载已有模型 ──
         self._load()
@@ -348,6 +368,10 @@ class TradingRLAgent:
         """
         self._regime_engine = engine
         logger.info("MarketRegimeEngine injected into TradingRLAgent")
+
+    def set_learning_memory(self, memory) -> None:
+        """Inject shared cross-agent decision and outcome memory."""
+        self._learning_memory = memory
 
     # ═══════════════════════════════════════════════════════
     # 网络构建
@@ -466,6 +490,19 @@ class TradingRLAgent:
         regime_str = data.get("regime")
         if not regime_str or regime_str == "unknown":
             return se
+        factor_scores = data.get("factor_scores")
+        factor_weights = data.get("factor_weights") or {}
+        factor_score = se.factor_score
+        if isinstance(factor_scores, dict) and factor_scores:
+            weighted = []
+            for name, value in factor_scores.items():
+                score = safe_finite(value, 0.0)
+                weight = safe_finite(factor_weights.get(name), 1.0)
+                if weight > 0:
+                    weighted.append((score, weight))
+            total_weight = sum(weight for _, weight in weighted)
+            if total_weight > 0:
+                factor_score = sum(score * weight for score, weight in weighted) / total_weight
         return StateEncoding(
             market_regime=self._map_engine_regime_to_state_str(
                 regime_str, float(data.get("trend_strength", 0.0))),
@@ -477,6 +514,12 @@ class TradingRLAgent:
             position_count=se.position_count,
             strategy_id=se.strategy_id,
             symbol=symbol,
+            factor_score=float(np.clip(factor_score, -1.0, 1.0)),
+            regime_confidence=float(np.clip(
+                safe_finite(data.get("confidence"), se.regime_confidence), 0.0, 1.0
+            )),
+            utilization_rate=se.utilization_rate,
+            avg_correlation=se.avg_correlation,
         )
 
     def encode_state(self, se: StateEncoding) -> np.ndarray:
@@ -496,6 +539,10 @@ class TradingRLAgent:
             np.clip(se.current_drawdown_pct * 10, -1, 1),
             np.clip(se.position_count / 10.0, 0, 1),
             1.0 if se.strategy_id else 0.0,
+            np.clip(se.factor_score, -1, 1),
+            np.clip(se.regime_confidence, 0, 1),
+            np.clip(se.utilization_rate, 0, 1),
+            np.clip(se.avg_correlation, -1, 1),
         ], dtype=np.float64)
         # 确保维度匹配
         if len(state) < self._n_states:
@@ -668,6 +715,8 @@ class TradingRLAgent:
 
     def train_step(self) -> Optional[float]:
         """单步批量训练（支持Dueling + SumTree IS权重 + 矩阵运算 + 梯度裁剪 + N-step TD）"""
+        if self._training_frozen and self.mode == AgentMode.ONLINE_FINETUNE:
+            return None
         if len(self._replay_buffer) < self._batch_size:
             return None
 
@@ -937,13 +986,59 @@ class TradingRLAgent:
         """结束一个episode"""
         with self._lock:
             self._episode_rewards.append(total_reward)
+            if len(self._episode_rewards) > self._drift_window_size:
+                self._episode_rewards = self._episode_rewards[-self._drift_window_size:]
             self._stats.episodes_completed += 1
             self._stats.total_reward += total_reward
             self._stats.avg_reward = self._stats.total_reward / max(self._stats.episodes_completed, 1)
-            if total_reward > self._stats.best_episode_reward:
+            new_best = total_reward > self._stats.best_episode_reward
+            if new_best:
                 self._stats.best_episode_reward = total_reward
-                self._save()  # 保存最佳模型
+            was_frozen = self._training_frozen
+            self._check_training_drift()
+            if new_best or (not was_frozen and self._training_frozen):
+                self._save()
             self._stats.last_update = datetime.now().isoformat()
+            shared_context = dict(self._last_shared_context)
+            shared_trace_id = self._last_shared_trace_id
+            self._last_shared_context = {}
+            self._last_shared_trace_id = ""
+        if self._learning_memory is not None:
+            try:
+                self._learning_memory.record(
+                    agent="rl_agent",
+                    kind="episode_outcome",
+                    trace_id=shared_trace_id or None,
+                    context=shared_context,
+                    outcome={"reward": total_reward},
+                )
+            except Exception as exc:
+                logger.debug(f"Shared RL memory write failed: {exc}")
+
+    def _check_training_drift(self) -> bool:
+        """Freeze online fine-tuning when recent episode rewards materially regress."""
+        if (not self._drift_detection_enabled
+            or not self._online_training_enabled
+                or self.mode != AgentMode.ONLINE_FINETUNE
+                or self._training_frozen
+                or len(self._episode_rewards) < self._drift_min_samples):
+            return self._training_frozen
+        half = max(5, self._drift_min_samples // 2)
+        rewards = self._episode_rewards
+        baseline = float(np.mean(rewards[:-half]))
+        recent = float(np.mean(rewards[-half:]))
+        if baseline - recent >= self._drift_drop_threshold:
+            self._training_frozen = True
+            self._training_freeze_reason = (
+                f"reward_drift baseline={baseline:.4f} recent={recent:.4f}"
+            )
+            logger.error(f"RL online fine-tuning frozen: {self._training_freeze_reason}")
+        return self._training_frozen
+
+    def reset_training_drift_freeze(self) -> None:
+        """Require an explicit operator action to resume drift-frozen online training."""
+        self._training_frozen = False
+        self._training_freeze_reason = ""
 
     # ═══════════════════════════════════════════════════════
     # 奖励计算
@@ -1009,28 +1104,81 @@ class TradingRLAgent:
     # ═══════════════════════════════════════════════════════
 
     def get_parameter_adjustment(self, param_name: str,
-                                  current_value: float) -> float:
+                                  current_value: float,
+                                  state: Optional[StateEncoding] = None) -> float:
         """
         根据Q值推荐参数调整
 
         Args:
             param_name: 参数名称
             current_value: 当前值
+            state: 当前市场状态；缺失时不输出参数建议
 
         Returns:
             调整后的参数值
         """
-        bounds = self._param_bounds.get(param_name, (0, float("inf")))
-        scale = (bounds[1] - bounds[0]) * 0.05  # 每次调整5%
+        if not self._decision_enabled or state is None:
+            return current_value
 
-        # 基于epsilon的概率随机调整
-        if np.random.random() < self._epsilon:
-            delta = np.random.normal(0, scale)
-        else:
-            delta = 0  # 贪心策略：不调整
+        bounds = self._param_bounds.get(param_name)
+        actions = {
+            "leverage": (RLAction.INCREASE_LEVERAGE, RLAction.DECREASE_LEVERAGE),
+            "position_pct": (RLAction.INCREASE_POSITION, RLAction.DECREASE_POSITION),
+            "stop_loss_pct": (RLAction.LOOSEN_STOP, RLAction.TIGHTEN_STOP),
+            "trailing_stop_pct": (RLAction.LOOSEN_STOP, RLAction.TIGHTEN_STOP),
+            "take_profit_pct": (RLAction.INCREASE_TP, RLAction.DECREASE_TP),
+        }
+        if bounds is None or param_name not in actions:
+            return current_value
 
-        adjusted = current_value + delta
-        return round(max(bounds[0], min(bounds[1], adjusted)), 4)
+        shared_context = {
+            "symbol": state.symbol,
+            "strategy": state.strategy_id,
+            "regime": state.market_regime,
+            "confidence": state.regime_confidence,
+            "factor_score": state.factor_score,
+            "utilization_rate": state.utilization_rate,
+            "avg_correlation": state.avg_correlation,
+        }
+        self._last_shared_context = shared_context
+        self._last_shared_trace_id = state.decision_id
+        if (self._learning_memory is not None
+                and self._learning_memory.has_veto(
+                    shared_context, trace_id=state.decision_id or None
+                )):
+            self._learning_memory.record(
+                agent="rl_agent",
+                kind="shared_veto_applied",
+                trace_id=state.decision_id or None,
+                context=shared_context,
+                decision=param_name,
+                outcome="recent_intelligent_agent_rejection",
+            )
+            return current_value
+
+        _, action, _ = self.select_action(
+            self.encode_state(state),
+            explore=False,
+            action_context={param_name: current_value},
+        )
+        increase_action, decrease_action = actions[param_name]
+        direction = 1.0 if action == increase_action else -1.0 if action == decrease_action else 0.0
+        scale = (bounds[1] - bounds[0]) * 0.05
+        adjusted = current_value + direction * scale
+        adjusted = round(max(bounds[0], min(bounds[1], adjusted)), 4)
+        if self._learning_memory is not None:
+            try:
+                self._learning_memory.record(
+                    agent="rl_agent",
+                    kind="parameter_recommendation",
+                    trace_id=state.decision_id or None,
+                    context=shared_context,
+                    decision={"parameter": param_name, "action": action.value},
+                    outcome={"current": current_value, "recommended": adjusted},
+                )
+            except Exception as exc:
+                logger.debug(f"Shared RL recommendation write failed: {exc}")
+        return adjusted
 
     def explore_parameter_space(self, state: Optional[StateEncoding] = None) -> Dict[str, float]:
         """
@@ -1186,6 +1334,8 @@ class TradingRLAgent:
                     "episodes": self._stats.episodes_completed,
                     "avg_reward": self._stats.avg_reward,
                     "best_reward": self._stats.best_episode_reward,
+                    "training_frozen": self._training_frozen,
+                    "training_freeze_reason": self._training_freeze_reason,
                     "updated_at": datetime.now().isoformat(),
                 }, f, indent=2)
             logger.debug(f"RL agent '{self.name}' model saved")
@@ -1200,9 +1350,14 @@ class TradingRLAgent:
         try:
             data = np.load(path, allow_pickle=True)
             loaded = {k: data[k] for k in data.files}
-            if all(k in loaded for k in self._q_network):
-                self._q_network = loaded
-                self._sync_target_network()
+            if not all(k in loaded for k in self._q_network):
+                logger.warning("RL model keys do not match current network; using fresh model")
+                return False
+            if any(loaded[k].shape != self._q_network[k].shape for k in self._q_network):
+                logger.warning("RL model shape mismatch; using fresh model for new state schema")
+                return False
+            self._q_network = loaded
+            self._sync_target_network()
             # 加载元数据
             meta_path = os.path.join(self._persist_dir, f"{self.name}_meta.json")
             if os.path.exists(meta_path):
@@ -1213,6 +1368,8 @@ class TradingRLAgent:
                 self._stats.episodes_completed = meta.get("episodes", 0)
                 self._stats.avg_reward = meta.get("avg_reward", 0)
                 self._stats.best_episode_reward = meta.get("best_reward", float("-inf"))
+                self._training_frozen = bool(meta.get("training_frozen", False))
+                self._training_freeze_reason = str(meta.get("training_freeze_reason", ""))
             logger.info(f"RL agent '{self.name}' model loaded")
             return True
         except Exception as e:
@@ -1229,6 +1386,10 @@ class TradingRLAgent:
                 "name": self.name,
                 "mode": self.mode.value,
                 "enabled": self._enabled,
+                "decision_enabled": self._decision_enabled,
+                "online_training_enabled": self._online_training_enabled,
+                "training_frozen": self._training_frozen,
+                "training_freeze_reason": self._training_freeze_reason,
                 "epsilon": self._epsilon,
                 "total_steps": self._stats.total_steps,
                 "episodes_completed": self._stats.episodes_completed,

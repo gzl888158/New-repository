@@ -1,6 +1,8 @@
 """
 冰山订单执行器 (Iceberg Order Executor)
 
+.. deprecated:: 实验性模块，未接入生产交易链路。
+
 将大订单隐藏在显示的小订单之后，避免暴露真实意图：
   - 显示量控制：仅展示总订单的冰山一角 (tip)
   - 自动刷新：显示量成交后自动补充
@@ -12,12 +14,14 @@ import asyncio
 import math
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Callable
 import numpy as np
 from loguru import logger
 
+from core.direction_unifier import DirectionUnifier
 from execution.algo_orders.algo_execution_engine import (
     AlgoOrderConfig, AlgoExecutionResult, ExecutionSlice,
     AlgoOrderStatus,
@@ -140,12 +144,11 @@ class IcebergOrderExecutor:
     def compute_limit_price(self, mid_price: float, side: str) -> float:
         """计算冰山限价"""
         offset = mid_price * self._limit_offset_bps / 10000.0
-        if side == "buy":
+        if DirectionUnifier.is_long(side):
             # 买单：限价略高于中间价以提高成交
             return round(mid_price + offset, 2)
-        else:
-            # 卖单：限价略低于中间价
-            return round(mid_price - offset, 2)
+        # 卖单：限价略低于中间价
+        return round(mid_price - offset, 2)
 
     def compute_price_improvement(self, current_price: float, side: str,
                                    is_fast_market: bool = False) -> float:
@@ -154,10 +157,9 @@ class IcebergOrderExecutor:
             return current_price
 
         improvement_bps = random.uniform(0.5, 2.0)
-        if side == "buy":
+        if DirectionUnifier.is_long(side):
             return current_price * (1 + improvement_bps / 10000.0)
-        else:
-            return current_price * (1 - improvement_bps / 10000.0)
+        return current_price * (1 - improvement_bps / 10000.0)
 
     # ── 主执行逻辑 ────────────────────────────────────────────
 
@@ -185,123 +187,150 @@ class IcebergOrderExecutor:
             try:
                 market = config.market_data_fn(config.symbol)
                 if market:
-                    mid_price = float(market.get("mid", market.get("last", 0)))
-                    result.arrival_price = mid_price
-            except Exception:
+                    raw = market.get("mid", market.get("last"))
+                    if raw is not None:
+                        mid_price = float(raw)
+                        result.arrival_price = mid_price
+            except (TypeError, ValueError):
                 pass
+
+        # fail-closed：行情失败/异常（含 NaN）不得以 0 价继续下单
+        if mid_price <= 0 or math.isnan(mid_price):
+            logger.error(f"Iceberg {config.order_id}: market data unavailable "
+                         f"(mid_price={mid_price}), fail-closed - refusing to execute")
+            result.status = AlgoOrderStatus.FAILED
+            result.error_message = "market data unavailable (fail-closed)"
+            result.end_time = datetime.now()
+            return result
 
         total_filled = 0.0
         total_cost = 0.0
         sequence = 0
         slices_log: List[IcebergSlice] = []
 
-        while total_filled < total_qty and sequence < self._max_refreshes:
-            remaining = total_qty - total_filled
+        try:
+            while total_filled < total_qty and sequence < self._max_refreshes:
+                remaining = total_qty - total_filled
 
-            # 进度 > auto_market_pct 时切换到市价
-            progress = total_filled / max(total_qty, 1e-10)
-            if progress >= self._auto_market_pct:
+                # 进度 > auto_market_pct 时切换到市价
+                progress = total_filled / max(total_qty, 1e-10)
+                if progress >= self._auto_market_pct:
+                    if config.executor_fn:
+                        try:
+                            order_params = {
+                                "symbol": config.symbol,
+                                "side": config.side,
+                                "pos_side": DirectionUnifier.to_pos_side(config.side),
+                                "quantity": remaining,
+                                "order_type": "market",
+                                "trace_id": f"algo_{config.order_id}_{uuid.uuid4().hex[:8]}",
+                            }
+                            fill = config.executor_fn(order_params)
+                            if hasattr(fill, '__await__'):
+                                fill = await fill
+                            if fill:
+                                q = float(fill.get("filled", 0))
+                                px = float(fill.get("avg_price", 0))
+                                total_filled += q
+                                total_cost += q * px
+                        except Exception as e:
+                            logger.warning(f"Iceberg final sweep failed: {e}")
+                    break
+
+                # 计算显示量
+                display_qty = self.compute_display_quantity(remaining)
+                limit_price = self.compute_limit_price(mid_price, config.side)
+
+                # 通知监控器：切片已排定
+                if config.on_slice_scheduled_fn:
+                    config.on_slice_scheduled_fn(sequence, display_qty, datetime.now())
+
+                # 挂单
+                slice_entry = IcebergSlice(
+                    slice_id=f"iceberg_{config.order_id}_{sequence:03d}",
+                    sequence=sequence,
+                    display_qty=display_qty,
+                    total_displayed=total_filled + display_qty,
+                    price=limit_price,
+                )
+                display_start = time.time()
+
+                # 提交限价单
                 if config.executor_fn:
                     try:
                         order_params = {
                             "symbol": config.symbol,
                             "side": config.side,
-                            "quantity": remaining,
-                            "order_type": "market",
+                            "pos_side": DirectionUnifier.to_pos_side(config.side),
+                            "quantity": display_qty,
+                            "order_type": "limit",
+                            "price": limit_price,
+                            "trace_id": f"algo_{config.order_id}_{uuid.uuid4().hex[:8]}",
                         }
                         fill = config.executor_fn(order_params)
                         if hasattr(fill, '__await__'):
                             fill = await fill
+
+                        # 通知监控器：切片已提交到交易所
+                        if config.on_slice_submitted_fn:
+                            config.on_slice_submitted_fn(sequence, display_qty, limit_price, "limit")
+
                         if fill:
-                            q = float(fill.get("filled", 0))
-                            px = float(fill.get("avg_price", 0))
-                            total_filled += q
-                            total_cost += q * px
+                            filled_qty = float(fill.get("filled", 0))
+                            avg_px = float(fill.get("avg_price", 0))
+                            slice_entry.filled_qty = filled_qty
+                            slice_entry.avg_price = avg_px
+                            slice_entry.display_time = time.time() - display_start
+
+                            total_filled += filled_qty
+                            total_cost += filled_qty * avg_px
+                            slice_entry.status = "filled" if filled_qty >= display_qty * 0.9 else "partial"
+
+                            # 回调
+                            es = ExecutionSlice(
+                                slice_id=slice_entry.slice_id,
+                                sequence=sequence,
+                                quantity=display_qty,
+                                filled_quantity=filled_qty,
+                                avg_fill_price=avg_px,
+                                order_type="limit",
+                                status=slice_entry.status,
+                                submitted_at=datetime.now(),
+                                filled_at=datetime.now(),
+                            )
+                            if on_slice_filled:
+                                await on_slice_filled(config.order_id, es)
+                        else:
+                            slice_entry.status = "rejected"
+
                     except Exception as e:
-                        logger.warning(f"Iceberg final sweep failed: {e}")
-                break
-
-            # 计算显示量
-            display_qty = self.compute_display_quantity(remaining)
-            limit_price = self.compute_limit_price(mid_price, config.side)
-
-            # 通知监控器：切片已排定
-            if config.on_slice_scheduled_fn:
-                config.on_slice_scheduled_fn(sequence, display_qty, datetime.now())
-
-            # 挂单
-            slice_entry = IcebergSlice(
-                slice_id=f"iceberg_{sequence:03d}",
-                sequence=sequence,
-                display_qty=display_qty,
-                total_displayed=total_filled + display_qty,
-                price=limit_price,
-            )
-            display_start = time.time()
-
-            # 提交限价单
-            if config.executor_fn:
-                try:
-                    order_params = {
-                        "symbol": config.symbol,
-                        "side": config.side,
-                        "quantity": display_qty,
-                        "order_type": "limit",
-                        "price": limit_price,
-                    }
-                    fill = config.executor_fn(order_params)
-                    if hasattr(fill, '__await__'):
-                        fill = await fill
-
-                    # 通知监控器：切片已提交到交易所
-                    if config.on_slice_submitted_fn:
-                        config.on_slice_submitted_fn(sequence, display_qty, limit_price, "limit")
-
-                    if fill:
-                        filled_qty = float(fill.get("filled", 0))
-                        avg_px = float(fill.get("avg_price", 0))
-                        slice_entry.filled_qty = filled_qty
-                        slice_entry.avg_price = avg_px
-                        slice_entry.display_time = time.time() - display_start
-
-                        total_filled += filled_qty
-                        total_cost += filled_qty * avg_px
-                        slice_entry.status = "filled" if filled_qty >= display_qty * 0.9 else "partial"
-
-                        # 回调
+                        logger.warning(f"Iceberg slice {sequence} failed: {e}")
+                        slice_entry.status = "error"
                         es = ExecutionSlice(
-                            slice_id=slice_entry.slice_id,
-                            sequence=sequence,
-                            quantity=display_qty,
-                            filled_quantity=filled_qty,
-                            avg_fill_price=avg_px,
-                            order_type="limit",
-                            status=slice_entry.status,
-                            submitted_at=datetime.now(),
-                            filled_at=datetime.now(),
+                            slice_id=slice_entry.slice_id, sequence=sequence,
+                            quantity=display_qty, status="rejected",
+                            error_message=str(e),
                         )
                         if on_slice_filled:
                             await on_slice_filled(config.order_id, es)
-                    else:
-                        slice_entry.status = "rejected"
 
-                except Exception as e:
-                    logger.warning(f"Iceberg slice {sequence} failed: {e}")
-                    slice_entry.status = "error"
-                    es = ExecutionSlice(
-                        slice_id=slice_entry.slice_id, sequence=sequence,
-                        quantity=display_qty, status="rejected",
-                        error_message=str(e),
-                    )
-                    if on_slice_filled:
-                        await on_slice_filled(config.order_id, es)
+                slices_log.append(slice_entry)
+                sequence += 1
 
-            slices_log.append(slice_entry)
-            sequence += 1
-
-            # 刷新延迟
-            delay = self.compute_refresh_delay()
-            await asyncio.sleep(delay)
+                # 刷新延迟
+                delay = self.compute_refresh_delay()
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            # 取消时补算已执行部分的结果后重新抛出，避免丢失执行进度
+            result.filled_quantity = total_filled
+            result.fill_rate = total_filled / max(total_qty, 1e-10)
+            result.avg_execution_price = total_cost / max(total_filled, 1e-10)
+            result.target_price = result.avg_execution_price
+            result.end_time = datetime.now()
+            result.duration_seconds = (result.end_time - start_time).total_seconds()
+            result.status = AlgoOrderStatus.CANCELLED
+            logger.info(f"Iceberg {config.order_id} cancelled mid-execution")
+            raise
 
         # 填充结果
         result.filled_quantity = total_filled
@@ -313,7 +342,7 @@ class IcebergOrderExecutor:
 
         if result.arrival_price > 0 and result.avg_execution_price > 0:
             slip = (result.avg_execution_price - result.arrival_price) / result.arrival_price * 10000
-            if config.side == "sell":
+            if DirectionUnifier.is_short(config.side):
                 slip *= -1
             result.arrival_slippage_bps = slip
 

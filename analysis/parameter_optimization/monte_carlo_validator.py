@@ -23,10 +23,22 @@ from loguru import logger
 from analysis.parameter_optimization.genetic_optimizer import ParameterDef
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """安全转换数值，None/非数值/NaN/Inf 返回默认值。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if np.isfinite(f) else default
+
+
 def _round_metric(v: Any, ndigits: int = 4) -> Any:
     """对数值指标四舍五入，非标量（如置信区间 list）原样保留。"""
     if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return round(v, ndigits)
+        f = float(v)
+        if not np.isfinite(f):
+            return 0.0
+        return round(f, ndigits)
     return v
 
 
@@ -182,8 +194,13 @@ class MonteCarloValidator:
 
     def set_data(self, price_data: np.ndarray):
         self._price_data = price_data
-        if len(price_data) > 1:
-            self._returns = np.diff(price_data) / price_data[:-1]
+        if price_data is None or len(price_data) < 2:
+            self._returns = None
+            return
+        arr = np.asarray(price_data, dtype=float)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rets = np.diff(arr) / arr[:-1]
+        self._returns = rets[np.isfinite(rets)]
 
     # ── 参数扰动 ──────────────────────────────────────────────
 
@@ -191,9 +208,22 @@ class MonteCarloValidator:
         """参数扰动测试：在最优参数附近加扰动，评估性能衰减"""
         samples = []
         base_perf = self._eval(self._best_params, self._price_data)
+        if not np.isfinite(base_perf):
+            base_perf = 0.0
 
         # 编码参数到 [0,1]
         best_arr = self._params_to_array(self._best_params)
+        if len(best_arr) == 0:
+            return [], {
+                "mean_performance": 0.0,
+                "std_performance": 0.0,
+                "min_performance": 0.0,
+                "max_performance": 0.0,
+                "mean_degradation_pct": 0.0,
+                "worse_than_baseline_ratio": 0.0,
+                "performance_ci_95_low": 0.0,
+                "performance_ci_95_high": 0.0,
+            }
 
         for i in range(self._n_perturbation):
             # 从最优参数正态采样
@@ -206,7 +236,10 @@ class MonteCarloValidator:
             except Exception:
                 perf = float('-inf')
 
-            degradation = (base_perf - max(perf, float('-inf'))) / max(abs(base_perf), 1e-10)
+            if np.isfinite(perf):
+                degradation = (base_perf - perf) / max(abs(base_perf), 1e-10)
+            else:
+                degradation = float('nan')
             samples.append(PerturbationSample(
                 params=params,
                 performance=perf,
@@ -243,6 +276,7 @@ class MonteCarloValidator:
         samples = []
         n = len(self._returns)
         sample_size = max(10, int(n * self._bootstrap_ratio))
+        sample_size = min(sample_size, n)
 
         for i in range(self._n_bootstrap):
             # 随机采样（保持时间序列结构）
@@ -272,19 +306,21 @@ class MonteCarloValidator:
         perfs = [s.performance for s in samples]
         perfs_finite = [p for p in perfs if np.isfinite(p)]
         sharpes = [s.sharpe for s in samples]
+        sharpes_finite = [s for s in sharpes if np.isfinite(s)]
         max_dds = [s.max_drawdown for s in samples]
+        max_dds_finite = [d for d in max_dds if np.isfinite(d)]
 
         stats = {
             "mean_performance": float(np.mean(perfs_finite)) if perfs_finite else 0,
             "std_performance": float(np.std(perfs_finite, ddof=1)) if len(perfs_finite) > 1 else 0,
             "performance_ci_95": [float(np.percentile(perfs_finite, 2.5)), float(np.percentile(perfs_finite, 97.5))]
                 if len(perfs_finite) > 1 else [0, 0],
-            "mean_sharpe": float(np.mean(sharpes)),
-            "std_sharpe": float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else 0,
-            "worst_sharpe": float(np.min(sharpes)),
-            "mean_max_drawdown": float(np.mean(max_dds)),
-            "worst_max_drawdown": float(np.max(max_dds)),
-            "negative_performance_ratio": sum(1 for p in perfs if p < 0) / max(len(perfs), 1),
+            "mean_sharpe": float(np.mean(sharpes_finite)) if sharpes_finite else 0,
+            "std_sharpe": float(np.std(sharpes_finite, ddof=1)) if len(sharpes_finite) > 1 else 0,
+            "worst_sharpe": float(np.min(sharpes_finite)) if sharpes_finite else 0,
+            "mean_max_drawdown": float(np.mean(max_dds_finite)) if max_dds_finite else 0,
+            "worst_max_drawdown": float(np.max(max_dds_finite)) if max_dds_finite else 0,
+            "negative_performance_ratio": sum(1 for p in perfs if np.isfinite(p) and p < 0) / max(len(perfs), 1),
         }
 
         return samples, stats
@@ -297,6 +333,8 @@ class MonteCarloValidator:
             return {}
 
         base_perf = self._eval(self._best_params, self._price_data)
+        if not np.isfinite(base_perf):
+            base_perf = 0.0
         levels_results = []
 
         for level in range(self._n_noise_levels):
@@ -321,11 +359,13 @@ class MonteCarloValidator:
 
             valid_perfs = [p for p in perfs_at_level if np.isfinite(p)]
             if valid_perfs:
+                mean_perf = float(np.mean(valid_perfs))
+                std_perf = float(np.std(valid_perfs, ddof=1)) if len(valid_perfs) > 1 else 0.0
                 levels_results.append({
                     "noise_std": round(noise_std, 6),
-                    "mean_performance": float(np.mean(valid_perfs)),
-                    "std_performance": float(np.std(valid_perfs, ddof=1)),
-                    "degradation_pct": (base_perf - float(np.mean(valid_perfs))) / max(abs(base_perf), 1e-10),
+                    "mean_performance": mean_perf,
+                    "std_performance": std_perf,
+                    "degradation_pct": (base_perf - mean_perf) / max(abs(base_perf), 1e-10),
                     "min_performance": float(np.min(valid_perfs)),
                 })
 
@@ -347,6 +387,8 @@ class MonteCarloValidator:
 
     async def _run_cross_validation(self) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
         """K-Fold时间序列交叉验证"""
+        if self._n_cv_folds <= 0:
+            return [], {}
         if self._price_data is None or len(self._price_data) < self._n_cv_folds * 10:
             return [], {}
 
@@ -365,13 +407,18 @@ class MonteCarloValidator:
             train_perf = self._eval(self._best_params, train)
             test_perf = self._eval(self._best_params, test)
 
+            if np.isfinite(train_perf) and np.isfinite(test_perf):
+                ratio = test_perf / max(abs(train_perf), 1e-10)
+            else:
+                ratio = float('nan')
+
             folds.append({
                 "fold": fold,
                 "train_size": len(train),
                 "test_size": len(test),
                 "train_performance": train_perf,
                 "test_performance": test_perf,
-                "performance_ratio": test_perf / max(abs(train_perf), 1e-10),
+                "performance_ratio": ratio,
             })
 
         # 统计
@@ -396,6 +443,12 @@ class MonteCarloValidator:
         arr = np.zeros(len(self._param_defs))
         for i, pd in enumerate(self._param_defs):
             v = params.get(pd.name, (pd.low + pd.high) / 2)
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                v = (pd.low + pd.high) / 2
+            if not np.isfinite(v):
+                v = (pd.low + pd.high) / 2
             if pd.high > pd.low:
                 if pd.log_scale and pd.low > 0:
                     log_low = math.log10(pd.low)
@@ -408,7 +461,10 @@ class MonteCarloValidator:
     def _array_to_params(self, arr: np.ndarray) -> Dict[str, float]:
         result = {}
         for i, pd in enumerate(self._param_defs):
-            t = np.clip(arr[i], 0, 1)
+            raw = arr[i] if i < len(arr) else 0.5
+            if not np.isfinite(raw):
+                raw = 0.5
+            t = np.clip(raw, 0, 1)
             if pd.log_scale and pd.low > 0:
                 log_low = math.log10(pd.low)
                 log_high = math.log10(pd.high)
@@ -422,31 +478,52 @@ class MonteCarloValidator:
         if not self._eval_fn:
             return 0.0
         try:
-            return float(self._eval_fn(params, data))
+            val = float(self._eval_fn(params, data))
         except Exception:
             return float('-inf')
+        if not np.isfinite(val):
+            return float('-inf')
+        return val
 
     @staticmethod
     def _compute_sharpe(returns: np.ndarray) -> float:
-        if len(returns) < 2:
+        if returns is None:
             return 0.0
-        mean = float(np.mean(returns))
-        std = float(np.std(returns, ddof=1))
-        return mean / std * math.sqrt(365) if std > 0 else 0.0
+        rets = np.asarray(returns, dtype=float)
+        rets = rets[np.isfinite(rets)]
+        if len(rets) < 2:
+            return 0.0
+        mean = float(np.mean(rets))
+        std = float(np.std(rets, ddof=1))
+        if not np.isfinite(mean) or not np.isfinite(std) or std <= 0:
+            return 0.0
+        return mean / std * math.sqrt(365)
 
     @staticmethod
     def _compute_max_drawdown(returns: np.ndarray) -> float:
-        if len(returns) < 2:
+        if returns is None:
             return 0.0
-        cum = np.cumprod(1 + returns)
+        rets = np.asarray(returns, dtype=float)
+        rets = rets[np.isfinite(rets)]
+        if len(rets) < 2:
+            return 0.0
+        cum = np.cumprod(1 + rets)
         peak = np.maximum.accumulate(cum)
-        return float(abs(np.min((cum - peak) / np.maximum(peak, 1e-10))))
+        dd = (cum - peak) / np.maximum(peak, 1e-10)
+        dd = dd[np.isfinite(dd)]
+        if len(dd) == 0:
+            return 0.0
+        return float(abs(np.min(dd)))
 
     @staticmethod
     def _compute_win_rate(returns: np.ndarray) -> float:
-        if len(returns) == 0:
+        if returns is None:
             return 0.0
-        return float(np.sum(returns > 0) / len(returns))
+        rets = np.asarray(returns, dtype=float)
+        rets = rets[np.isfinite(rets)]
+        if len(rets) == 0:
+            return 0.0
+        return float(np.sum(rets > 0) / len(rets))
 
     # ── 综合评分 ──────────────────────────────────────────────
 
@@ -454,30 +531,38 @@ class MonteCarloValidator:
         """计算综合稳健性评分"""
         # 1. 稳定性评分（扰动测试）
         worse_ratio = result.perturbation_stats.get("worse_than_baseline_ratio", 1.0)
-        result.stability_score = max(0, 1.0 - worse_ratio / 0.5)
+        if worse_ratio is None or not np.isfinite(worse_ratio):
+            worse_ratio = 1.0
+        result.stability_score = float(np.clip(1.0 - worse_ratio / 0.5, 0.0, 1.0))
 
         # 2. 泛化能力评分（交叉验证）
         cv_ratio = result.cross_val_stats.get("mean_train_test_ratio", 0)
-        result.generalization_score = max(0, min(1.0, cv_ratio))
+        if cv_ratio is None or not np.isfinite(cv_ratio):
+            cv_ratio = 0.0
+        result.generalization_score = float(np.clip(cv_ratio, 0.0, 1.0))
 
         # 3. 抗噪评分
         tolerance = result.noise_injection_results.get("tolerance_noise_std", 0)
-        if tolerance is None:
-            tolerance = self._noise_std_range[1]
         noise_range = self._noise_std_range[1] - self._noise_std_range[0]
-        result.anti_noise_score = max(0, min(1.0, tolerance / max(noise_range, 1e-6)))
+        if tolerance is None or not np.isfinite(tolerance):
+            result.anti_noise_score = 0.0
+        else:
+            result.anti_noise_score = float(np.clip(tolerance / max(noise_range, 1e-6), 0.0, 1.0))
 
         # 4. 一致性评分（Bootstrap）
         bs_negative = result.bootstrap_stats.get("negative_performance_ratio", 1.0)
-        result.consistency_score = max(0, 1.0 - bs_negative)
+        if bs_negative is None or not np.isfinite(bs_negative):
+            bs_negative = 1.0
+        result.consistency_score = float(np.clip(1.0 - bs_negative, 0.0, 1.0))
 
         # 综合稳健性指数 (0-100)
-        result.robustness_index = (
+        result.robustness_index = float(np.clip(
             result.stability_score * 30 +
             result.generalization_score * 25 +
             result.anti_noise_score * 20 +
-            result.consistency_score * 25
-        )
+            result.consistency_score * 25,
+            0.0, 100.0,
+        ))
 
         # 风险评估
         if result.robustness_index >= 70:
@@ -524,6 +609,15 @@ class MonteCarloValidator:
 
         # 基准性能
         result.baseline_performance = self._eval(self._best_params, self._price_data)
+        if not np.isfinite(result.baseline_performance):
+            result.baseline_performance = 0.0
+            result.baseline_metrics = {"evaluation": 0.0}
+            result.is_robust = False
+            result.risk_level = "high"
+            result.summary = "基线评估失败：评估函数返回非法值"
+            result.total_time_seconds = time.time() - start_time
+            logger.warning("MC validation baseline returned non-finite value; failing closed")
+            return result
         result.baseline_metrics = {
             "evaluation": result.baseline_performance,
         }

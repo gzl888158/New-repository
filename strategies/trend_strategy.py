@@ -117,9 +117,9 @@ class TrendStrategy(PersistentStrategy):
         self._volatility_lockout_minutes = config["strategies"]["trend"].get("volatility_lockout_minutes", 30)
         # 动态ADX
         self._dynamic_adx_threshold = config["strategies"]["trend"].get("dynamic_adx_threshold", True)
-        self._adx_vol_high = config["strategies"]["trend"].get("adx_vol_high", 30)
-        self._adx_vol_low = config["strategies"]["trend"].get("adx_vol_low", 20)
-        self._adx_vol_normal = config["strategies"]["trend"].get("adx_vol_normal", 25)
+        self._adx_vol_high = max(20, self._safe_float(config["strategies"]["trend"].get("adx_vol_high", 30), 30))
+        self._adx_vol_low = max(20, self._safe_float(config["strategies"]["trend"].get("adx_vol_low", 20), 20))
+        self._adx_vol_normal = max(20, self._safe_float(config["strategies"]["trend"].get("adx_vol_normal", 25), 25))
         # Chandelier Exit
         self._chandelier_exit_enabled = config["strategies"]["trend"].get("chandelier_exit_enabled", True)
         self._chandelier_atr_period = config["strategies"]["trend"].get("chandelier_atr_period", 22)
@@ -185,7 +185,8 @@ class TrendStrategy(PersistentStrategy):
         # 小账户(<2000 USDT)下 tier1(BTC/ETH) 最小下单保证金过高(约154 USDT)远超单仓额度，
         # 趋势类频繁小单策略跳过 tier1，聚焦 tier2/tier3 低价币（阈值与 signal_processor 一致）
         _total_capital = float(config.get("trading", {}).get("total_capital", 0) or 0)
-        _skip_high_value = _total_capital > 0 and _total_capital < 2000.0
+        _btc_min_equity = float(config.get("trading", {}).get("high_value_equity_threshold", 2000.0) or 2000.0)
+        _skip_high_value = _total_capital > 0 and _total_capital < _btc_min_equity
         for tier in ["tier1", "tier2", "tier3"]:
             if _skip_high_value and tier == "tier1":
                 continue
@@ -216,59 +217,61 @@ class TrendStrategy(PersistentStrategy):
 
         支持的配置键：max_concurrent_positions, initial_position_ratio,
         addition_ratio, max_additions, min_signal_quality, max_stop_loss_pct,
-        leverage, trailing_stop_initial 等
+        trailing_stop_initial 等
         """
         strategy_cfg = self.config.get("strategies", {}).get("trend", {})
         strategy_cfg.update(updates)
         self.config.setdefault("strategies", {})["trend"] = strategy_cfg
 
         attr_map = {
-            "max_concurrent_positions": "max_concurrent_positions",
-            "initial_position_ratio": "initial_position_ratio",
-            "addition_ratio": "addition_ratio",
-            "max_additions": "max_additions",
-            "min_signal_quality": "min_signal_quality",
-            "max_stop_loss_pct": "max_stop_loss_pct",
-            "leverage": "leverage",
-            "trailing_stop_initial": "trailing_stop_initial",
-            "trailing_stop_min": "trailing_stop_min",
-            "take_profit_enabled": "take_profit_enabled",
-            "tp1_ratio": "tp1_ratio", "tp2_ratio": "tp2_ratio", "tp3_ratio": "tp3_ratio",
-            "tp1_pct": "tp1_pct", "tp2_pct": "tp2_pct", "tp3_trailing_pct": "tp3_trailing_pct",
-            "time_exit_enabled": "time_exit_enabled",
-            "time_exit_after_hours": "time_exit_after_hours",
-            "max_hold_hours": "max_hold_hours",
-            "time_exit_partial_pct": "time_exit_partial_pct",
-            "volatility_stop_enabled": "volatility_stop_enabled",
-            "vol_spike_threshold": "vol_spike_threshold",
-            "vol_stop_partial_pct": "vol_stop_partial_pct",
-            "volatility_lockout_minutes": "volatility_lockout_minutes",
-            "divergence_detection": "divergence_detection",
-            "market_structure_enabled": "market_structure_enabled",
-            "chandelier_exit_enabled": "chandelier_exit_enabled",
-            "chandelier_multiplier_base": "chandelier_multiplier_base",
-            "chandelier_profit_threshold": "chandelier_profit_threshold",
-            "dynamic_adx_threshold": "dynamic_adx_threshold",
-            "adx_vol_high": "adx_vol_high",
-            "adx_vol_low": "adx_vol_low",
-            "adx_vol_normal": "adx_vol_normal",
-            "breakeven_trigger_pct": "breakeven_trigger_pct",
-            "breakeven_stop_pct": "breakeven_stop_pct",
-            "false_break_threshold": "false_break_threshold",
-            "profit_protection_max_drawdown": "profit_protection_max_drawdown",
+            "max_concurrent_positions": "_max_concurrent_positions",
+            "initial_position_ratio": "_initial_position_ratio",
+            "addition_ratio": "_addition_ratio",
+            "max_additions": "_max_additions",
+            "min_signal_quality": "_min_signal_quality",
+            "max_stop_loss_pct": "_max_stop_loss_pct",
+            "trailing_stop_initial": "_trailing_stop_initial",
+            "trailing_stop_min": "_trailing_stop_min",
+            "take_profit_enabled": "_take_profit_enabled",
+            "tp1_ratio": "_tp1_ratio", "tp2_ratio": "_tp2_ratio", "tp3_ratio": "_tp3_ratio",
+            "tp1_pct": "_tp1_pct", "tp2_pct": "_tp2_pct", "tp3_trailing_pct": "_tp3_trailing_pct",
+            "time_exit_enabled": "_time_exit_enabled",
+            "time_exit_after_hours": "_time_exit_after_hours",
+            "max_hold_hours": "_max_hold_hours",
+            "time_exit_partial_pct": "_time_exit_partial_pct",
+            "volatility_stop_enabled": "_volatility_stop_enabled",
+            "vol_spike_threshold": "_vol_spike_threshold",
+            "vol_stop_partial_pct": "_vol_stop_partial_pct",
+            "volatility_lockout_minutes": "_volatility_lockout_minutes",
+            "divergence_detection": "_divergence_detection",
+            "market_structure_enabled": "_market_structure_enabled",
+            "chandelier_exit_enabled": "_chandelier_exit_enabled",
+            "chandelier_multiplier_base": "_chandelier_multiplier_base",
+            "chandelier_profit_threshold": "_chandelier_profit_threshold",
+            "dynamic_adx_threshold": "_dynamic_adx_threshold",
+            "adx_vol_high": "_adx_vol_high",
+            "adx_vol_low": "_adx_vol_low",
+            "adx_vol_normal": "_adx_vol_normal",
+            "false_break_threshold": "_false_break_threshold",
+            "profit_protection_max_drawdown": "_profit_protection_max_drawdown",
         }
         for cfg_key, attr_name in attr_map.items():
             if cfg_key in updates:
                 setattr(self, attr_name, updates[cfg_key])
                 logger.info(f"Trend config hot-updated: {attr_name}={updates[cfg_key]}")
 
+        # ADX阈值硬下限：不得低于20（历史教训：ADX<20 趋势无效）
+        self._adx_vol_high = max(20, self._safe_float(self._adx_vol_high, 30))
+        self._adx_vol_low = max(20, self._safe_float(self._adx_vol_low, 20))
+        self._adx_vol_normal = max(20, self._safe_float(self._adx_vol_normal, 25))
+
     def _get_allocation(self) -> float:
         """获取当前资金分配比例：优先使用AdaptiveController动态分配，回退到config"""
         if self._adaptive_controller:
             try:
                 return self._adaptive_controller.get_allocation("trend")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[trend] get_allocation failed, fallback to config: {e}")
         return self.config["trading"].get("trend_allocation", 0.35)
 
     def _get_effective_capital(self) -> float:
@@ -285,8 +288,8 @@ class TrendStrategy(PersistentStrategy):
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
                     return total_eq
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[trend] get_account_info failed, fallback to config total_capital: {e}")
         return self.config["trading"].get("total_capital", 100.0)
 
     def _get_small_cap_multiplier(self, total_capital: float) -> float:
@@ -497,8 +500,8 @@ class TrendStrategy(PersistentStrategy):
         )
 
     async def _monitor_loop(self):
-        try:
-            while True:
+        while True:
+            try:
                 await self._update_indicators()
                 if self._adaptive_enabled:
                     await self._update_market_state()
@@ -534,8 +537,13 @@ class TrendStrategy(PersistentStrategy):
                             )
                 
                 await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            logger.info("Trend _monitor_loop cancelled")
+            except asyncio.CancelledError:
+                logger.info("Trend _monitor_loop cancelled")
+                raise
+            except Exception as e:
+                # 单点异常（脏数据/接口异常）不得终止监控循环，记录后继续
+                logger.error(f"Trend _monitor_loop error: {e}", exc_info=True)
+                await asyncio.sleep(60)
 
     async def _update_indicators(self):
         for symbol in self._all_symbols:
@@ -1645,8 +1653,8 @@ class TrendStrategy(PersistentStrategy):
                 boost = self._adaptive_controller.get_position_boost()
                 if boost > 1.0:
                     base_position *= boost
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[trend] get_position_boost failed: {e}")
 
         price_factor = 1.0
         if tier == "tier2":
@@ -1712,7 +1720,7 @@ class TrendStrategy(PersistentStrategy):
             logger.warning(f"Trend {symbol}: invalid quantity={quantity}, skipping")
             return
         
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "1"))
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = price * min_lot_size / leverage
         
         if base_position < margin_needed_for_min_lot:
@@ -2191,7 +2199,7 @@ class TrendStrategy(PersistentStrategy):
 
         base_position *= price_factor
 
-        min_lot_size = float(self.okx_client.get_instrument_info(symbol).get("lotSz", "1"))
+        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = price * min_lot_size / leverage
 
         if base_position < margin_needed_for_min_lot:
@@ -2453,16 +2461,22 @@ class TrendStrategy(PersistentStrategy):
 
         reversal_score = sum(1 for c in conditions if c)
 
-        if reversal_score >= 4:
-            # 全部平仓
+        # 15m 级别确认：score >= 3 时拉取 15m K线验证反转方向
+        # 15m 确认 → 维持原动作；15m 未确认 → 降级（全平→半仓，半仓→不动）
+        confirmed_15m = False
+        if reversal_score >= 3:
+            confirmed_15m = await self._confirm_reversal_15m(symbol, state["direction"])
+
+        if reversal_score >= 4 and confirmed_15m:
+            # 1H 强反转 + 15m 确认 → 全部平仓
             await self._close_position(symbol, force=True)
             state["status"] = "reversed"
             logger.info(
                 f"Trend reversal (full close) {symbol} {state['direction']}: "
-                f"score={reversal_score}/4, ADX={adx:.1f}, RSI={rsi:.1f}"
+                f"score={reversal_score}/4, 15m=confirmed, ADX={adx:.1f}, RSI={rsi:.1f}"
             )
-        elif reversal_score >= 3:
-            # 平仓 50%
+        elif reversal_score >= 4 and not confirmed_15m:
+            # 1H 强反转但 15m 未确认 → 降级为 50% 平仓
             state["exit_reason"] = "reversal"
             close_qty = state["current_quantity"] * 0.5
             if close_qty > 0:
@@ -2470,10 +2484,54 @@ class TrendStrategy(PersistentStrategy):
                 state["current_quantity"] -= close_qty
                 if state["current_quantity"] <= 0:
                     state["status"] = "reversed"
-                logger.info(
-                    f"Trend reversal (50% close) {symbol} {state['direction']}: "
-                    f"score={reversal_score}/4, ADX={adx:.1f}, RSI={rsi:.1f}"
-                )
+            logger.info(
+                f"Trend reversal (50% close, 15m unconfirmed) {symbol} {state['direction']}: "
+                f"score={reversal_score}/4, 15m=rejected, ADX={adx:.1f}, RSI={rsi:.1f}"
+            )
+        elif reversal_score >= 3 and confirmed_15m:
+            # 1H 中等反转 + 15m 确认 → 平仓 50%
+            state["exit_reason"] = "reversal"
+            close_qty = state["current_quantity"] * 0.5
+            if close_qty > 0:
+                await self._close_partial(symbol, close_qty, record_pnl=True)
+                state["current_quantity"] -= close_qty
+                if state["current_quantity"] <= 0:
+                    state["status"] = "reversed"
+            logger.info(
+                f"Trend reversal (50% close) {symbol} {state['direction']}: "
+                f"score={reversal_score}/4, 15m=confirmed, ADX={adx:.1f}, RSI={rsi:.1f}"
+            )
+        elif reversal_score >= 3 and not confirmed_15m:
+            # 1H 中等反转但 15m 未确认 → 不操作，继续观察
+            logger.info(
+                f"Trend reversal (skipped, 15m unconfirmed) {symbol} {state['direction']}: "
+                f"score={reversal_score}/4, 15m=rejected, ADX={adx:.1f}, RSI={rsi:.1f}"
+            )
+
+    async def _confirm_reversal_15m(self, symbol: str, direction: str) -> bool:
+        """15m 级别反转确认：EMA9/EMA21 交叉 + 近 3 根收盘趋势"""
+        klines_15m = await self.okx_client.get_kline_async(symbol, "15m", limit=24)
+        if len(klines_15m) < 22:
+            return False
+
+        closes_15m = np.array([float(k[4]) for k in klines_15m])
+        ema9 = self._calculate_ema(closes_15m, 9)
+        ema21 = self._calculate_ema(closes_15m, 21)
+
+        # 15m EMA 交叉方向确认
+        if direction == "long":
+            ema_confirms = ema9 < ema21
+        else:
+            ema_confirms = ema9 > ema21
+
+        # 近 3 根 15m 收盘趋势确认
+        recent_3 = closes_15m[-3:]
+        if direction == "long":
+            trend_confirms = recent_3[-1] < recent_3[0]
+        else:
+            trend_confirms = recent_3[-1] > recent_3[0]
+
+        return ema_confirms and trend_confirms
 
     async def _check_multiple_take_profit(self, symbol: str, current_price: float):
         """多级止盈：tp1/tp2/tp3 三级渐进止盈
@@ -3478,22 +3536,28 @@ class TrendStrategy(PersistentStrategy):
             return True  # 出错时不阻塞
 
     async def _check_adx_confirmation(self, symbol: str) -> bool:
-        """ADX 确认：ADX(14) > 20
+        """ADX 确认：多周期取最大 ADX > 20（任一周期确认趋势强度即通过）。
 
-        Returns:
-            bool: 是否通过ADX确认
+        原实现只检查第一个有缓存指标的周期就返回，若该周期（如 4h）恰好弱趋势、
+        而更短周期（1h/15m）已走强，会误杀信号。改为取所有周期最大 ADX 判定。
         """
         try:
-            # 优先使用缓存
+            # 优先使用缓存：多周期取最大 ADX，避免首个周期弱趋势时误判
+            max_adx = 0.0
+            has_cache = False
             for period in self._confirmation_periods:
                 indicators = self._indicator_cache.get(symbol, {}).get(period)
                 if indicators:
+                    has_cache = True
                     adx = indicators.get("adx", 0)
-                    if adx > 20:
-                        return True
-                    else:
-                        logger.debug(f"ADX check {symbol}: ADX={adx:.1f} <= 20 (period={period})")
-                        return False
+                    if adx > max_adx:
+                        max_adx = adx
+
+            if has_cache:
+                passed = max_adx > 20
+                if not passed:
+                    logger.debug(f"ADX check {symbol}: max ADX={max_adx:.1f} <= 20")
+                return passed
 
             # 无缓存时实时计算
             klines = await self.okx_client.get_kline_async(symbol, "1H", limit=120)

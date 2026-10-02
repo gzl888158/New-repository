@@ -14,6 +14,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from loguru import logger
 
+from core.direction_unifier import DirectionUnifier
+
 
 class StaleLevel(Enum):
     """挂单时效等级"""
@@ -54,6 +56,8 @@ class StaleOrderInfo:
     order_type: str                 # limit/market/conditional
     price: float
     quantity: float
+    reduce_only: bool = False        # 是否为平仓保护单
+    close_position: bool = False     # 平仓语义标记（重挂时沿用）
     filled_qty: float = 0.0
     create_time: float = 0.0        # 挂单创建时间 (unix timestamp)
     strategy: str = ""
@@ -362,8 +366,8 @@ class StaleOrderManager:
             # 不高于最高合理价（市价的103%）
             new_price = min(new_price, current_mid * (1 + self._deviation_max_reprice))
 
-        # 确保价格变化有意义（至少0.1%）
-        if abs(new_price - order.price) / order.price < 0.001:
+        # 确保价格变化有意义（至少0.1%）；原价非法时跳过该判断（除零防御）
+        if order.price > 0 and abs(new_price - order.price) / order.price < 0.001:
             if order.side == "buy":
                 new_price = current_mid * 0.998
             else:
@@ -496,11 +500,24 @@ class StaleOrderManager:
             return None
 
         try:
+            # 方向归一化：side(buy/sell)→long/short，pos_side(buy/sell)→long/short
+            direction = order.side
+            try:
+                direction = DirectionUnifier.normalize(order.side)
+            except (ValueError, TypeError):
+                pass
+            pos_side = order.pos_side
+            if pos_side:
+                try:
+                    pos_side = DirectionUnifier.normalize_pos_side(pos_side)
+                except (ValueError, TypeError):
+                    pass
+
             # 构建重挂信号字典（OrderExecutor.handle_signal 期望 Dict[str, Any]）
             signal_data = {
                 "symbol": order.symbol,
                 "signal_type": "reprice",
-                "direction": order.side,
+                "direction": direction,
                 "price": new_price,
                 "quantity": order.quantity,
                 "strategy_name": order.strategy or "stale_reprice",
@@ -508,7 +525,10 @@ class StaleOrderManager:
                 "leverage": order.leverage,
                 "timestamp": datetime.now().isoformat(),
                 "order_type": order.order_type,
-                "pos_side": order.pos_side,
+                "pos_side": pos_side,
+                # 保留原单平仓/保护单语义，避免 reduceOnly 保护单被反向重开
+                "reduce_only": order.reduce_only,
+                "close_position": order.close_position,
             }
 
             # 委托给 OrderExecutor 处理（异步入队，需后续确认是否真正上链）
@@ -575,76 +595,93 @@ class StaleOrderManager:
             self._stats.total_pending_checked += len(pending_orders)
 
             for order_data in pending_orders:
-                order_id = order_data.get("order_id", order_data.get("ordId", ""))
-                if not order_id:
-                    continue
+                try:
+                    order_id = order_data.get("order_id", order_data.get("ordId", ""))
+                    if not order_id:
+                        continue
 
-                # 获取或创建时效信息
-                if order_id not in self._stale_orders:
-                    info = StaleOrderInfo(
-                        order_id=order_id,
-                        symbol=order_data.get("symbol", order_data.get("instId", "")),
-                        side=order_data.get("side", ""),
-                        pos_side=order_data.get("posSide", ""),
-                        order_type=order_data.get("order_type", order_data.get("ordType", "limit")),
-                        price=float(order_data.get("price", order_data.get("px", 0))),
-                        quantity=float(order_data.get("quantity", order_data.get("sz", 0))),
-                        filled_qty=float(order_data.get("filled_qty", order_data.get("accFillSz", 0))),
-                        create_time=float(order_data.get("create_time", order_data.get("cTime", 0))) / 1000.0
-                            if float(order_data.get("create_time", order_data.get("cTime", 0))) > 1e10
-                            else float(order_data.get("create_time", order_data.get("cTime", 0))),
-                        strategy=order_data.get("strategy", order_data.get("tag", "")),
-                        market_price_at_create=float(order_data.get("market_price", 0)),
+                    # 获取或创建时效信息
+                    if order_id not in self._stale_orders:
+                        reduce_only = str(order_data.get("reduceOnly", "")).lower() == "true"
+                        info = StaleOrderInfo(
+                            order_id=order_id,
+                            symbol=order_data.get("symbol", order_data.get("instId", "")),
+                            side=order_data.get("side", ""),
+                            pos_side=order_data.get("posSide", ""),
+                            order_type=order_data.get("order_type", order_data.get("ordType", "limit")),
+                            reduce_only=reduce_only,
+                            close_position=reduce_only,
+                            price=float(order_data.get("price", order_data.get("px", 0)) or 0),
+                            quantity=float(order_data.get("quantity", order_data.get("sz", 0)) or 0),
+                            filled_qty=float(order_data.get("filled_qty", order_data.get("accFillSz", 0)) or 0),
+                            create_time=self._parse_create_time(order_data),
+                            strategy=order_data.get("strategy", order_data.get("tag", "")),
+                            market_price_at_create=float(order_data.get("market_price", 0) or 0),
+                        )
+                        # 继承 reprice 重挂链：新订单延续旧订单的重挂次数，防止绕过 MAX_REPRICE_COUNT
+                        info.repriced_count = self._reprice_chain.pop(order_id, 0)
+                        self._stale_orders[order_id] = info
+                    else:
+                        info = self._stale_orders[order_id]
+                        # 更新成交量和价格
+                        info.filled_qty = float(order_data.get("filled_qty", order_data.get("accFillSz", 0)) or 0)
+                        info.price = float(order_data.get("price", order_data.get("px", info.price)) or 0)
+
+                    # 已撤销的订单跳过
+                    if info.cancelled:
+                        continue
+
+                    # 缺 cTime 视为「未知挂单时间」，跳过陈旧判定（fail-closed，不误撤）
+                    if info.create_time <= 0:
+                        logger.warning(f"Order {order_id} missing create time, skip stale judgement")
+                        continue
+
+                    # 判定时效等级
+                    info.stale_level = self._get_stale_level(info.age_seconds)
+                    if info.stale_level == StaleLevel.NORMAL:
+                        continue
+
+                    # 获取当前市场行情
+                    current_bid, current_ask, current_mid = await self._get_current_prices(info.symbol)
+
+                    # 行情获取失败时不撤销（fail-closed），避免基于缺失行情误撤
+                    if current_mid <= 0:
+                        logger.warning(f"Market data unavailable for {info.symbol}, skip stale action")
+                        continue
+
+                    # 诊断不成交原因
+                    deviation = abs(info.price - current_mid) / current_mid if current_mid > 0 else 0
+                    info.stale_reason = self._diagnose_stale_reason(
+                        info, current_bid, current_ask, current_mid
                     )
-                    # 继承 reprice 重挂链：新订单延续旧订单的重挂次数，防止绕过 MAX_REPRICE_COUNT
-                    info.repriced_count = self._reprice_chain.pop(order_id, 0)
-                    self._stale_orders[order_id] = info
-                else:
-                    info = self._stale_orders[order_id]
-                    # 更新成交量和价格
-                    info.filled_qty = float(order_data.get("filled_qty", order_data.get("accFillSz", 0)))
-                    info.price = float(order_data.get("price", order_data.get("px", info.price)))
 
-                # 已撤销的订单跳过
-                if info.cancelled:
-                    continue
+                    # 决策
+                    action = self._decide_action(info, info.stale_reason, deviation)
 
-                # 判定时效等级
-                info.stale_level = self._get_stale_level(info.age_seconds)
-                if info.stale_level == StaleLevel.NORMAL:
-                    continue
+                    if action == StaleAction.KEEP:
+                        continue
 
-                # 获取当前市场行情
-                current_bid, current_ask, current_mid = await self._get_current_prices(info.symbol)
+                    # 记录统计
+                    self._stats.total_stale_detected += 1
+                    level_key = info.stale_level.name.lower()
+                    self._stats.by_level[level_key] = self._stats.by_level.get(level_key, 0) + 1
 
-                # 诊断不成交原因
-                deviation = abs(info.price - current_mid) / current_mid if current_mid > 0 else 0
-                info.stale_reason = self._diagnose_stale_reason(
-                    info, current_bid, current_ask, current_mid
-                )
+                    # 按币种统计
+                    if info.symbol not in self._stats.by_symbol:
+                        self._stats.by_symbol[info.symbol] = {}
+                    reason_key = info.stale_reason.value
+                    self._stats.by_symbol[info.symbol][reason_key] = (
+                        self._stats.by_symbol[info.symbol].get(reason_key, 0) + 1
+                    )
 
-                # 决策
-                action = self._decide_action(info, info.stale_reason, deviation)
-
-                if action == StaleAction.KEEP:
-                    continue
-
-                # 记录统计
-                self._stats.total_stale_detected += 1
-                level_key = info.stale_level.name.lower()
-                self._stats.by_level[level_key] = self._stats.by_level.get(level_key, 0) + 1
-
-                # 按币种统计
-                if info.symbol not in self._stats.by_symbol:
-                    self._stats.by_symbol[info.symbol] = {}
-                reason_key = info.stale_reason.value
-                self._stats.by_symbol[info.symbol][reason_key] = (
-                    self._stats.by_symbol[info.symbol].get(reason_key, 0) + 1
-                )
-
-                # 执行动作
-                info.last_action = action
-                await self._execute_action(info, action, current_bid, current_ask, current_mid)
+                    # 执行动作
+                    info.last_action = action
+                    await self._execute_action(info, action, current_bid, current_ask, current_mid)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to process pending order "
+                        f"{order_data.get('order_id', order_data.get('ordId', ''))}: {e}"
+                    )
 
             # 清理已撤销或已成交的订单
             self._cleanup_stale_cache()
@@ -698,6 +735,20 @@ class StaleOrderManager:
         except (TypeError, ValueError):
             return 5
         return lev if lev >= 1 else 5
+
+    @staticmethod
+    def _parse_create_time(order_data: Dict[str, Any]) -> float:
+        """解析挂单创建时间（秒）。缺 cTime/非法值返回 0，表示「未知」而非「1970」，
+        避免 age_seconds 被算成 ~1.7e9 秒从而误判 CRITICAL 误撤单。"""
+        raw = order_data.get("create_time", order_data.get("cTime", 0))
+        try:
+            raw = float(raw or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if raw <= 0:
+            return 0.0
+        # OKX cTime 为毫秒，本地/沙箱可能提供秒
+        return raw / 1000.0 if raw > 1e10 else raw
 
     # ==================== 公开接口 ====================
 

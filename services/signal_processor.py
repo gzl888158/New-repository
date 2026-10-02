@@ -3,7 +3,7 @@
 """
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Callable, Optional, List, Set, Tuple
 from loguru import logger
 import uuid
 import time
@@ -11,6 +11,7 @@ import time
 from decision.intelligent_decision_engine import DecisionUrgency, MetaDecisionVerdict
 from core.unified_layer import Event, EventType
 from core.event_id import EventIDGenerator
+from utils.helpers import safe_float, safe_finite, safe_div
 
 
 class SignalProcessor:
@@ -48,11 +49,17 @@ class SignalProcessor:
         # 智能决策核心引擎
         self._intelligent_decision_engine = None
 
+        # 机器学习决策引擎（实时置信度修正），由 scheduler 注入，未注入时不启用
+        self._ml_decision_engine = None
+
         # 五层风控拦截器
         self._risk_gate = None
 
         # P2: 独立风控裁决器（traceID 贯穿 + 裁决事件溯源），由 scheduler 注入
         self._risk_adjudicator = None
+
+        # 相关性风控（开仓前检查同向高相关集中度），由 scheduler 注入
+        self._correlation_risk = None
 
         # 事件总线（开仓全链路拒单溯源：发布 SIGNAL_REJECTED），由 scheduler 注入
         self._event_bus = None
@@ -60,11 +67,19 @@ class SignalProcessor:
         # L0 市场状态总门控（RegimeGate）：由 set_regime_gate 注入，默认 None 表示不启用
         self._regime_gate = None
 
+        # 感知侧闭环协调器（Regime识别门控 + 信号质量 统一感知决策）：由 set_perception_loop 注入
+        self._perception_loop = None
+
         # 统一自适应仓位提供者（callable(signal_dict)->quantity|None），由 scheduler 注入
         self._position_sizing_provider = None
 
         # 资金自适应分配引擎（专一分配硬门控），由 scheduler 注入
         self._capital_allocator = None
+
+        # 组合再平衡器（总敞口硬限制），由 scheduler 注入
+        self._portfolio_rebalancer = None
+        # AGI bear-case projection gate; return a rejection reason for blocked strategies.
+        self._bear_case_open_gate: Optional[Callable[[str], Optional[str]]] = None
 
         self._signal_callback = None
         self._last_signal_time: Dict[str, datetime] = {}
@@ -110,11 +125,25 @@ class SignalProcessor:
         self._max_dead_letters = 100
         
         self._high_value_symbols = {"BTC-USDT-SWAP", "BTC-USDT"}
-        self._high_value_equity_threshold = 2000.0
+        # 资金分级 BTC 阈值显式化：从 trading.high_value_equity_threshold 读取（默认 2000.0）
+        self._high_value_equity_threshold = float(
+            self.config.get("trading", {}).get("high_value_equity_threshold", 2000.0) or 2000.0)
 
         # 低胜率币种黑名单：历史统计胜率<20%或持续亏损的币种，禁止开仓（平仓不受限）
         # 黑名单已清零 - 6U资金场景下仅4个币种，需全部放开
         self._blacklist_symbols = set()
+
+        # L0 RegimeGate 门控统计（拒绝/异常按 regime/策略分类，供 Dashboard 查询门控效果）
+        self._regime_gate_stats: Dict[str, Any] = {
+            "rejected": 0,
+            "errors": 0,
+            "by_regime": {},
+            "by_strategy": {},
+        }
+
+        # P3: 端到端管线延迟追踪
+        from core.apm_monitor import get_pipeline_latency_tracker
+        self._pipeline_latency_tracker = get_pipeline_latency_tracker(config)
 
     def set_regime_engine(self, engine):
         """注入MarketRegimeEngine"""
@@ -131,6 +160,53 @@ class SignalProcessor:
     def set_regime_gate(self, gate):
         """注入L0市场状态总门控（RegimeGate）"""
         self._regime_gate = gate
+
+    def set_perception_loop(self, loop):
+        """注入感知侧闭环协调器（SignalPerceptionCoordinator）。
+
+        注入后，_process_signal 会用 loop.perceive() 统一执行「Regime识别门控 + 信号质量」
+        感知决策，替代分散的 RegimeGate 硬门控与 _evaluate_signal_quality 两处调用。
+        未注入时保持原有分散逻辑不变。
+        """
+        self._perception_loop = loop
+        logger.info("SignalPerceptionCoordinator injected into SignalProcessor (perception loop)")
+
+    def _record_regime_gate_rejection(self, strategy_name: str, gate_result):
+        """统计 RegimeGate 拒绝（按 regime/策略分类），供 Dashboard 观察门控效果。"""
+        try:
+            stats = self._regime_gate_stats
+            stats["rejected"] = int(stats.get("rejected", 0)) + 1
+            regime = getattr(gate_result, "regime", "unknown") or "unknown"
+            stats["by_regime"][regime] = int(stats["by_regime"].get(regime, 0)) + 1
+            stats["by_strategy"][strategy_name] = int(stats["by_strategy"].get(strategy_name, 0)) + 1
+        except Exception as e:
+            logger.debug(f"RegimeGate rejection stats error: {e}")
+
+    def _record_regime_gate_error(self):
+        """统计 RegimeGate 评估异常（fail-open 次数，用于发现引擎故障）。"""
+        try:
+            self._regime_gate_stats["errors"] = int(self._regime_gate_stats.get("errors", 0)) + 1
+        except Exception:
+            pass
+
+    def get_regime_gate_stats(self) -> Dict[str, Any]:
+        """返回 L0 RegimeGate 门控统计（拒绝数/异常数/按 regime/策略分布）。"""
+        stats = dict(self._regime_gate_stats)
+        stats["by_regime"] = dict(stats.get("by_regime", {}))
+        stats["by_strategy"] = dict(stats.get("by_strategy", {}))
+        return stats
+
+    def get_perception_stats(self) -> Dict[str, Any]:
+        """返回感知侧闭环统计（Regime门控 + 信号质量 关联分布），供 Dashboard 展示。"""
+        if self._perception_loop is None:
+            return {"enabled": False}
+        try:
+            stats = self._perception_loop.get_stats()
+            stats["enabled"] = True
+            return stats
+        except Exception as e:
+            logger.debug(f"get_perception_stats error: {e}")
+            return {"enabled": True, "error": str(e)}
 
     def set_normalizer(self, normalizer):
         """注入SignalNormalizer"""
@@ -170,6 +246,11 @@ class SignalProcessor:
         self._risk_adjudicator = adjudicator
         logger.info("RiskAdjudicator injected into SignalProcessor")
 
+    def set_correlation_risk(self, correlation_risk):
+        """注入相关性风控（开仓前检查同向高相关集中度）。"""
+        self._correlation_risk = correlation_risk
+        logger.info("CorrelationRiskControl injected into SignalProcessor")
+
     def set_event_bus(self, event_bus):
         """注入事件总线（开仓全链路拒单溯源：信号层丢弃时发布 SIGNAL_REJECTED）。"""
         self._event_bus = event_bus
@@ -189,10 +270,24 @@ class SignalProcessor:
         self._capital_allocator = allocator
         logger.info("CapitalAdaptiveAllocator injected into SignalProcessor")
 
+    def set_portfolio_rebalancer(self, rebalancer):
+        """注入组合再平衡器（总敞口硬限制门控）。"""
+        self._portfolio_rebalancer = rebalancer
+        logger.info("PortfolioRebalancer injected into SignalProcessor for exposure limit check")
+
+    def set_bear_case_open_gate(self, gate: Optional[Callable[[str], Optional[str]]]) -> None:
+        """Inject a strategy-level gate that rejects new opens under bear-case limits."""
+        self._bear_case_open_gate = gate
+
     def set_intelligent_decision_engine(self, engine):
         """注入智能决策核心引擎"""
         self._intelligent_decision_engine = engine
         logger.info("IntelligentDecisionEngine injected into SignalProcessor")
+
+    def set_ml_decision_engine(self, engine):
+        """注入机器学习决策引擎（实时决策置信度修正，fail-open）。"""
+        self._ml_decision_engine = engine
+        logger.info("MLDecisionEngine injected into SignalProcessor")
 
     def setup_signal_routing(self, strategies: list, redis_cache=None):
         async def direct_signal_handler(signal_data):
@@ -211,7 +306,7 @@ class SignalProcessor:
                     "confidence": getattr(signal_data, 'confidence', 0.5),
                     "timestamp": getattr(signal_data, 'timestamp', datetime.now()),
                 }
-                await self._process_signal(signal_dict)
+                return (await self._process_signal(signal_dict)) is True
             elif isinstance(signal_data, str):
                 # JSON字符串：解析后处理
                 try:
@@ -220,22 +315,24 @@ class SignalProcessor:
                     if isinstance(parsed, dict):
                         # 兼容 {"type":"signal","data":{...}} 包装格式
                         if parsed.get("type") == "signal" and "data" in parsed:
-                            await self._process_signal(parsed["data"])
+                            return (await self._process_signal(parsed["data"])) is True
                         else:
-                            await self._process_signal(parsed)
+                            return (await self._process_signal(parsed)) is True
                     else:
                         logger.warning(f"Signal handler received unparseable string: {signal_data[:100]}")
+                        return False
                 except Exception as e:
                     logger.warning(f"Signal handler JSON parse failed: {e}")
+                    return False
             elif isinstance(signal_data, dict):
                 # 兼容 {"type":"signal","data":{...}} 包装格式
                 if signal_data.get("type") == "signal" and "data" in signal_data:
-                    await self._process_signal(signal_data["data"])
+                    return (await self._process_signal(signal_data["data"])) is True
                 else:
-                    await self._process_signal(signal_data)
+                    return (await self._process_signal(signal_data)) is True
             else:
                 logger.warning(f"Signal handler received unsupported type: {type(signal_data)}")
-                return
+                return False
         
         self._signal_callback = direct_signal_handler
         
@@ -325,12 +422,23 @@ class SignalProcessor:
             logger.debug(f"Failed to push dead letter: {e}")
 
         # 3) 发布 SIGNAL_REJECTED 事件（含 layer/reason_code 归一化）
+        if layer is None or reason_code is None:
+            _layer, _reason_code = self._classify_reject_reason(reject_reason)
+            layer = layer or _layer
+            reason_code = reason_code or _reason_code
+        try:
+            from core.signal_flow_stats import record_signal_flow_event
+            record_signal_flow_event(
+                "signal_rejected",
+                strategy=str(signal_dict.get("strategy_name", signal_dict.get("strategy", "")) or ""),
+                layer=layer or "signal_processor",
+                reason=reason_code or reject_reason,
+            )
+        except Exception as e:
+            logger.debug(f"Signal flow rejection metric failed: {e}")
+
         if self._event_bus is not None:
             try:
-                if layer is None or reason_code is None:
-                    _layer, _reason_code = self._classify_reject_reason(reject_reason)
-                    layer = layer or _layer
-                    reason_code = reason_code or _reason_code
                 signal_type = str(signal_dict.get("signal_type", "") or "")
                 is_close = ("close" in signal_type.lower()
                             or "liquidat" in signal_type.lower()
@@ -378,6 +486,132 @@ class SignalProcessor:
                 return layer, reason
         return "signal_processor", reason
 
+    def _publish_decision_event(self, signal_dict: Dict[str, Any], event_type: EventType,
+                                reason: str = ""):
+        """发布决策层正向事件（DECISION_VALIDATED / DECISION_APPROVED / DECISION_REJECTED）。
+
+        企业级决策溯源：与既有 SIGNAL_REJECTED（负向）互补，补齐「信号→决策→下单」的
+        正向决策链路（验证通过 / 最终批准），使决策层裁决可被 EventStore 重放审计。
+        traceID 贯穿：复用 signal 既有 trace_id，缺失则生成并回写。持久化失败静默降级。
+        """
+        if self._event_bus is None:
+            return
+        try:
+            trace_id = signal_dict.get("trace_id")
+            if not trace_id:
+                trace_id = EventIDGenerator.get_instance().generate()
+                signal_dict["trace_id"] = trace_id
+            self._event_bus.publish_sync(Event(event_type, {
+                "trace_id": trace_id,
+                "symbol": signal_dict.get("symbol", ""),
+                "strategy": signal_dict.get("strategy_name", signal_dict.get("strategy", "")),
+                "signal_type": str(signal_dict.get("signal_type", "") or ""),
+                "direction": signal_dict.get("direction", ""),
+                "confidence": signal_dict.get("confidence", 0.0),
+                "reason": reason,
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to publish {event_type.value} event: {e}")
+
+    @staticmethod
+    def _collect_condition_fields(condition) -> Set[str]:
+        """递归收集规则条件树中引用的所有字段名（用于 fail-open 守卫）。"""
+        fields: Set[str] = set()
+        if not isinstance(condition, dict):
+            return fields
+        if "field" in condition:
+            fields.add(condition["field"])
+        for key in ("and", "or", "not"):
+            node = condition.get(key)
+            if isinstance(node, list):
+                for sub in node:
+                    fields |= SignalProcessor._collect_condition_fields(sub)
+            elif isinstance(node, dict):
+                fields |= SignalProcessor._collect_condition_fields(node)
+        return fields
+
+    def _run_rule_gate(self, signal_dict: Dict[str, Any], confidence: float) -> str:
+        """规则引擎门控：评估规则，REJECT 命中则返回拒绝原因，否则返回空串。
+
+        fail-open 守卫：仅当规则条件引用的字段全部存在（非 None）时才采纳 REJECT，
+        避免字段缺失被规则引擎的 `None→0` 默认值误判（如 risk_min_margin 的
+        margin_after<50 会因缺字段把 0<50 误判为真而拒掉所有信号）。
+        """
+        rule_engine = getattr(self, "_rule_engine", None)
+        if rule_engine is None:
+            return ""
+        try:
+            enriched = dict(signal_dict)
+            enriched.setdefault("confidence", confidence)
+            enriched.setdefault("leverage", signal_dict.get("leverage", 5))
+            enriched.setdefault("direction", self._normalize_direction(signal_dict.get("direction", "")))
+            enriched.setdefault("quantity", signal_dict.get("quantity", 0.0))
+            # 注入真实持仓数（若可获取），使 position_max_count 规则生效
+            try:
+                if getattr(self, "_risk_gate", None) is not None:
+                    cnt = self._risk_gate.get_active_position_count()
+                    if cnt is not None:
+                        enriched["current_position_count"] = int(cnt)
+            except Exception:
+                pass
+
+            for r in rule_engine.evaluate(enriched):
+                if r.get("action") != "reject":
+                    continue
+                rule = rule_engine.get_rule(r.get("rule_id", ""))
+                if rule is None:
+                    continue
+                fields = self._collect_condition_fields(getattr(rule, "condition", {}))
+                if not fields:
+                    continue
+                if any(rule._get_field_value(enriched, f) is None for f in fields):
+                    logger.debug(f"Rule {rule.rule_id} skipped (field missing, fail-open)")
+                    continue
+                return f"rule_{rule.rule_id}"
+        except Exception as e:
+            logger.debug(f"Rule engine gate fail-open: {e}")
+        return ""
+
+    def _decision_ensemble_gate(self, signal_dict: Dict[str, Any], confidence: float) -> Tuple[bool, float, str]:
+        """决策集成仲裁：规则引擎门控 + ML 决策置信度修正（均 fail-open）。
+
+        企业级强化：把此前仅初始化+维护循环、未在 _process_signal 实时决策路径
+        被调用的 RuleBasedEngine / MLDecisionEngine 接入实时决策，形成
+        「规则门控 → ML 置信度修正 → 集成事件溯源」的增量裁决层。
+
+        返回 (pass, adjusted_confidence, reason)；任何引擎未就绪/异常均放行。
+        """
+        symbol = signal_dict.get("symbol", "")
+        direction = self._normalize_direction(signal_dict.get("direction", ""))
+
+        # ── 1. 规则引擎门控 ──
+        reject_reason = self._run_rule_gate(signal_dict, confidence)
+        if reject_reason:
+            self._publish_decision_event(signal_dict, EventType.DECISION_REJECTED, reject_reason)
+            return False, confidence, reject_reason
+
+        # ── 2. ML 决策置信度修正（方向一致性 soft 修正）──
+        ml_direction = ""
+        ml_confidence = 0.0
+        if self._ml_decision_engine is not None:
+            try:
+                pred = self._ml_decision_engine.predict(signal_dict, symbol=symbol)
+                ml_direction = str(getattr(pred, "direction", "hold") or "hold")
+                ml_confidence = float(getattr(pred, "confidence", 0.0) or 0.0)
+                if ml_direction not in ("", "hold") and direction in ("long", "short"):
+                    agree = (ml_direction == "buy" and direction == "long") or \
+                            (ml_direction == "sell" and direction == "short")
+                    confidence = max(0.0, min(1.0, confidence * (1.05 if agree else 0.95)))
+            except Exception as e:
+                logger.debug(f"ML decision engine fail-open: {e}")
+
+        # ── 3. 发布集成仲裁事件（正向溯源，携 ML 方向/置信度）──
+        self._publish_decision_event(
+            signal_dict, EventType.DECISION_ENSEMBLE,
+            f"ml_dir={ml_direction or 'n/a'},ml_conf={ml_confidence:.3f}",
+        )
+        return True, confidence, ""
+
     def get_dead_letters(self, limit: int = 50) -> List[Dict[str, Any]]:
         """获取最近N条死信"""
         return list(self._dead_letters[-limit:])
@@ -424,6 +658,19 @@ class SignalProcessor:
                             logger.error(f"Error processing signal: {e}")
                             logger.error(f"Signal data type: {sd_keys}")
                             logger.error(f"Traceback:\n{traceback.format_exc()}")
+                            if self._alert_manager:
+                                try:
+                                    sym = ""
+                                    if isinstance(signal_data, dict):
+                                        sym = signal_data.get("symbol", "")
+                                    await self._alert_manager.send_alert(
+                                        "signal_process_error",
+                                        f"Signal processing exception: {e}",
+                                        severity="WARNING",
+                                        symbol=sym,
+                                    )
+                                except Exception:
+                                    pass
                 except (ConnectionError, OSError) as e:
                     # P0: Redis断线时自动重连，避免信号监听静默失效
                     reconnect_count += 1
@@ -450,6 +697,16 @@ class SignalProcessor:
 
     async def _process_signal(self, signal_data: Dict[str, Any]):
         _t0 = time.perf_counter()  # 端到端延迟追踪起点：信号到达
+        _pipe_ctx = self._pipeline_latency_tracker.start_cycle(
+            symbol=str(signal_data.get("symbol", "")),
+            strategy=str(signal_data.get("strategy_name", "")),
+        )
+        from core.signal_flow_stats import record_signal_flow_event
+        raw_strategy = str(
+            signal_data.get("strategy_name", signal_data.get("strategy", "")) or ""
+        )
+        record_signal_flow_event("received", strategy=raw_strategy)
+        _pipe_ctx.begin_stage("validation")
         if self._normalizer:
             normalized = self._normalizer.normalize(signal_data)
             is_valid, errors, warnings = self._normalizer.validate(normalized)
@@ -462,39 +719,54 @@ class SignalProcessor:
             signal_dict = self._normalizer.to_dict(normalized)
         else:
             signal_dict = signal_data
-        
+
+        _pipe_ctx.end_stage("validation")
+
         symbol = signal_dict.get("symbol", "")
         strategy_name = signal_dict.get("strategy_name", "")
         direction = signal_dict.get("direction", "")
-        confidence = float(signal_dict.get("confidence") or 0.5)
+        confidence = safe_float(signal_dict.get("confidence"), 0.5)
         
         if not symbol or not strategy_name:
             self._push_dead_letter(signal_dict, "missing_symbol_or_strategy")
             return
 
+        # traceID 贯穿：复用上游 trace_id，缺失则生成并回写（决策层正向溯源 + 全链路追踪）。
+        # 前置生成确保后续 RiskAdjudicator / 决策层事件 / 拒单事件复用同一 trace_id，
+        # 消除正向路径（未拒单）下裁决器另起新 trace_id 导致的链路断裂。
+        if not signal_dict.get("trace_id"):
+            try:
+                signal_dict["trace_id"] = EventIDGenerator.get_instance().generate()
+            except Exception as e:
+                logger.debug(f"trace_id generation failed (fail-open): {e}")
+
         # 接入企业级异常检测（AnomalyDetector）：信号频率/价格/成交量异常追踪
+        _pipe_ctx.begin_stage("anomaly_detection")
         if self._anomaly_detector is not None:
             try:
-                await self._anomaly_detector.detect("signal", {
+                tasks = [self._anomaly_detector.detect("signal", {
                     "symbol": symbol,
                     "strategy": strategy_name,
                     "direction": direction,
                     "signal_type": signal_dict.get("signal_type", ""),
-                })
+                })]
                 if signal_dict.get("price"):
-                    await self._anomaly_detector.detect("price", {
+                    tasks.append(self._anomaly_detector.detect("price", {
                         "symbol": symbol,
                         "price": signal_dict.get("price"),
-                    })
+                    }))
                 if signal_dict.get("volume"):
-                    await self._anomaly_detector.detect("volume", {
+                    tasks.append(self._anomaly_detector.detect("volume", {
                         "symbol": symbol,
                         "volume": signal_dict.get("volume"),
-                    })
+                    }))
+                await asyncio.gather(*tasks)
             except Exception as e:
                 logger.debug(f"AnomalyDetector detection error: {e}")
+        _pipe_ctx.end_stage("anomaly_detection")
 
         # 信号幂等去重：基于signal_id防止Redis重连/网络重试导致的重复下单
+        _pipe_ctx.begin_stage("dedup_check")
         signal_id = signal_dict.get("signal_id", "")
         if not signal_id:
             # 自动生成signal_id（symbol+strategy+direction+timestamp窗口）
@@ -516,9 +788,53 @@ class SignalProcessor:
             logger.info(f"Signal rejected: {symbol} is in blacklist (low win-rate symbol)")
             self._push_dead_letter(signal_dict, "blacklist_symbol")
             return
+        _pipe_ctx.end_stage("dedup_check")
+
+        # 感知侧闭环：Regime识别门控 + 信号质量 统一感知决策（注入时替代下方分散逻辑）
+        _pipe_ctx.begin_stage("quality_assessment")
+        perception_result = None
+        if self._perception_loop is not None:
+            try:
+                perception_result = self._perception_loop.perceive(signal_dict)
+                if perception_result.decision == "reject_gate":
+                    self._record_regime_gate_rejection(strategy_name, perception_result)
+                    logger.info(
+                        f"Perception RegimeGate rejected: {symbol} {strategy_name} "
+                        f"[{perception_result.regime}] {perception_result.reason}"
+                    )
+                    self._push_dead_letter(
+                        signal_dict,
+                        f"regime_gate:{perception_result.reason}",
+                        layer="regime_gate",
+                        reason_code=perception_result.reason,
+                    )
+                    return
+                if perception_result.decision == "reject_quality":
+                    logger.info(
+                        f"Perception quality rejected: {strategy_name} {symbol} {direction} "
+                        f"(score={perception_result.quality_score:.2f})"
+                    )
+                    self._push_dead_letter(signal_dict, "signal_quality_rejected")
+                    return
+            except Exception as e:
+                # 感知闭环异常：fail-open 回退到原有分散逻辑（记录告警，避免误杀全部信号）
+                self._record_regime_gate_error()
+                logger.warning(f"SignalPerceptionCoordinator perceive error (fail-open): {e}")
+                if self._alert_manager:
+                    try:
+                        await self._alert_manager.send_alert(
+                            "regime_gate_degraded",
+                            f"Perception loop error (fail-open): {e}",
+                            severity="WARNING",
+                            symbol=signal_dict.get("symbol", ""),
+                        )
+                    except Exception:
+                        pass
+                perception_result = None
 
         # P1: L0 市场状态总门控 - regime 不匹配的开仓信号直接丢弃（不进入审计）
-        if self._regime_gate is not None:
+        # 感知闭环已注入且成功执行时跳过此处（门控已在 perceive 内完成），避免重复评估。
+        if perception_result is None and self._regime_gate is not None:
             try:
                 gate_result = self._regime_gate.evaluate(
                     symbol,
@@ -528,18 +844,47 @@ class SignalProcessor:
                     confidence=confidence,
                 )
                 if not gate_result.allowed:
+                    self._record_regime_gate_rejection(strategy_name, gate_result)
                     logger.info(
                         f"P1 RegimeGate rejected: {symbol} {strategy_name} "
                         f"[{gate_result.regime}] {gate_result.reason}"
                     )
-                    self._push_dead_letter(signal_dict, f"regime_gate:{gate_result.reason}")
+                    self._push_dead_letter(
+                        signal_dict,
+                        f"regime_gate:{gate_result.reason}",
+                        layer="regime_gate",
+                        reason_code=gate_result.reason,
+                    )
                     return
             except Exception as e:
-                logger.debug(f"RegimeGate evaluate error: {e}")
+                # 门控异常：fail-open 放行但可追溯（引擎故障降级，避免误杀全部信号），
+                # 与静默 debug 不同，这里记 warning + 异常计数，便于发现 regime 引擎故障。
+                self._record_regime_gate_error()
+                logger.warning(f"RegimeGate evaluate error (fail-open): {e}")
+                if self._alert_manager:
+                    try:
+                        await self._alert_manager.send_alert(
+                            "regime_gate_degraded",
+                            f"RegimeGate evaluate error (fail-open): {e}",
+                            severity="WARNING",
+                            symbol=signal_dict.get("symbol", ""),
+                        )
+                    except Exception:
+                        pass
 
         # 币种隔离：检查币种是否被冻结（单币种熔断，冻结的币种禁止开仓但允许平仓）
         sig_type_lower = str(signal_dict.get("signal_type", "")).lower()
-        is_close_sig = any(kw in sig_type_lower for kw in ["close", "stop_loss", "take_profit", "reduce", "exit", "liquidation"])
+        direction_lower = str(signal_dict.get("direction", "")).lower()
+        is_close_sig = (
+            any(kw in sig_type_lower for kw in [
+                "close", "stop_loss", "take_profit", "reduce", "exit", "liquidation"
+            ])
+            or direction_lower in {"close", "reduce", "reduce_only"}
+            or bool(signal_dict.get("reduce_only"))
+        )
+        if self._reject_bear_case_open_signal(signal_dict, is_close_sig):
+            return
+
         if not is_close_sig and self._risk_gate is not None:
             try:
                 if self._risk_gate.is_symbol_frozen(symbol):
@@ -573,7 +918,26 @@ class SignalProcessor:
                     return
             except Exception as e:
                 logger.debug(f"Position capacity check error: {e}")
-        
+
+        # 相关性风控预检查：开仓前检查是否会超过同向高相关集中度上限
+        if not is_close_sig and self._correlation_risk is not None:
+            try:
+                side = "long" if direction.lower() in ("long", "buy") else "short"
+                price = safe_float(signal_dict.get("price"), 0.0)
+                qty = safe_float(signal_dict.get("quantity"), 0.0)
+                leverage = safe_float(signal_dict.get("leverage"), 1.0)
+                estimated_margin = (price * qty / leverage) if leverage > 0 else 0.0
+                if estimated_margin > 0:
+                    allowed, reason = self._correlation_risk.can_open_position(
+                        symbol, side, estimated_margin
+                    )
+                    if not allowed:
+                        logger.info(f"Signal rejected: correlation risk - {reason}")
+                        self._push_dead_letter(signal_dict, f"correlation_risk:{reason}")
+                        return
+            except Exception as e:
+                logger.debug(f"Correlation risk check error (fail-open): {e}")
+
         signal_key = f"{symbol}:{strategy_name}:{direction}"
         now = datetime.now()
         
@@ -591,21 +955,23 @@ class SignalProcessor:
         if not is_close_sig and self._position_sizing_provider is not None:
             try:
                 unified_qty = self._position_sizing_provider(signal_dict)
-                if unified_qty is not None and float(unified_qty) > 0:
-                    old_qty = float(signal_dict.get("quantity", 0) or 0)
-                    signal_dict["quantity"] = float(unified_qty)
+                if unified_qty is not None and safe_float(unified_qty, 0.0) > 0:
+                    old_qty = safe_float(signal_dict.get("quantity"), 0.0)
+                    signal_dict["quantity"] = safe_float(unified_qty, 0.0)
                     signal_dict["position_sizing"] = "unified"
                     logger.debug(
                         f"Unified position sizing: {symbol} {strategy_name} "
-                        f"qty {old_qty:.6f} -> {float(unified_qty):.6f}"
+                        f"qty {old_qty:.6f} -> {safe_float(unified_qty, 0.0):.6f}"
                     )
             except Exception as e:
                 logger.debug(f"Unified position sizing error (fail-open, keep original): {e}")
-        
+        _pipe_ctx.end_stage("quality_assessment")
+
         # ============ 五层风控串行校验（核心拦截层）============
         # L5紧急熔断→L4单日风控→L1事前风控→L2事中风控→L3持仓风控
         # 校验通过：信号下发执行器
         # 校验拦截：直接丢弃信号，记录拦截原因并推送风险告警，不发起任何下单请求
+        _pipe_ctx.begin_stage("risk_check")
         if self._risk_adjudicator is not None or self._risk_gate is not None:
             try:
                 # P2: 独立风控裁决器优先（traceID 贯穿回写 signal + 裁决事件溯源），未注入回退 RiskGate
@@ -620,6 +986,16 @@ class SignalProcessor:
                 # 通过路径：risk_result.passed == True，继续后续流程
             except Exception as e:
                 logger.error(f"RiskGate validation error, falling back to legacy checks: {e}")
+                if self._alert_manager:
+                    try:
+                        await self._alert_manager.send_alert(
+                            "risk_gate_degraded",
+                            f"RiskGate exception, degraded to legacy checks: {e}",
+                            severity="WARNING",
+                            symbol=signal_dict.get("symbol", ""),
+                        )
+                    except Exception:
+                        pass
                 # P0: RiskGate异常时必须走legacy降级，不能让信号绕过所有风控
                 if not self._global_risk.can_trade():
                     logger.warning("Legacy check: trading is paused, signal rejected")
@@ -665,7 +1041,11 @@ class SignalProcessor:
                 self._push_dead_letter(signal_dict, "collaborative_trigger_blocked")
                 return
         
-        quality_pass, quality_breakdown = self._evaluate_signal_quality(signal_dict)
+        if perception_result is not None:
+            quality_pass = perception_result.quality_acceptable
+            quality_breakdown = perception_result.quality_breakdown
+        else:
+            quality_pass, quality_breakdown = self._evaluate_signal_quality(signal_dict)
         
         if not quality_pass:
             logger.info(f"Signal quality rejected: {strategy_name} {symbol} {direction} "
@@ -689,6 +1069,23 @@ class SignalProcessor:
                 logger.info(f"Focused allocation blocked: {strategy_name} {symbol} ({reason})")
                 self._push_dead_letter(signal_dict, f"capital_focus_{reason}")
                 return
+
+        # ── P1: 组合总敞口硬限制（开仓前检查）──
+        if not is_close_sig and self._portfolio_rebalancer is not None:
+            try:
+                qty = abs(float(signal_dict.get("quantity", 0) or 0))
+                price = abs(float(signal_dict.get("price", 0) or 0))
+                additional_notional = qty * price if price > 0 else 0.0
+                eq_result = self._portfolio_rebalancer.check_exposure_limit(additional_notional)
+                if not eq_result.get("allowed", True):
+                    logger.warning(
+                        f"Exposure limit blocked: {strategy_name} {symbol} "
+                        f"({eq_result.get('reason', '')})"
+                    )
+                    self._push_dead_letter(signal_dict, "exposure_limit_exceeded")
+                    return
+            except Exception as e:
+                logger.warning(f"Exposure limit check failed (fail-open): {e}")
         
         self._last_signal_time[signal_key] = now
         
@@ -707,15 +1104,19 @@ class SignalProcessor:
                 data=signal_dict,
                 confidence=confidence,
                 source=strategy_name,
+                trace_id=signal_dict.get("trace_id", ""),
             )
             validation_result, validation_errors = await self._decision_validator.validate(decision)
             
             if validation_result.value == "invalid":
                 logger.warning(f"Decision validation failed for {strategy_name} {symbol}: {[e.code for e in validation_errors]}")
+                self._publish_decision_event(signal_dict, EventType.DECISION_REJECTED, "decision_validation_invalid")
                 self._push_dead_letter(signal_dict, "decision_validation_invalid")
                 return
             elif validation_result.value == "warning":
                 logger.info(f"Decision validation warnings for {strategy_name} {symbol}: {[e.code for e in validation_errors]}")
+            # 决策验证通过 → 发布 DECISION_VALIDATED（决策层正向溯源）
+            self._publish_decision_event(signal_dict, EventType.DECISION_VALIDATED, "validation_passed")
 
         # 智能决策系统：置信度校准
         if self._confidence_calibrator:
@@ -726,6 +1127,8 @@ class SignalProcessor:
                 confidence = calibrated_confidence
 
         # ── P0: 智能决策引擎增强 ──
+        _pipe_ctx.end_stage("risk_check")
+        _pipe_ctx.begin_stage("decision_engine")
         if self._intelligent_decision_engine:
             ide = self._intelligent_decision_engine
             try:
@@ -766,7 +1169,7 @@ class SignalProcessor:
                     logger.info(f"Meta-decision REDUCE_SIZE for {symbol}: {reason}")
                     # 减仓：将仓位降低50%
                     if signal_dict.get("quantity"):
-                        signal_dict["quantity"] = float(signal_dict["quantity"]) * 0.5
+                        signal_dict["quantity"] = safe_float(signal_dict["quantity"], 0.0) * 0.5
                 elif verdict == MetaDecisionVerdict.EMERGENCY_ONLY:
                     if signal_dict.get("signal_type") not in ("stop_loss", "take_profit", "liquidation"):
                         logger.info(f"Meta-decision EMERGENCY_ONLY for {symbol}: {reason}")
@@ -776,8 +1179,8 @@ class SignalProcessor:
                 # 3. 决策成本收益分析（如果有止盈止损价格）
                 tp_price = signal_dict.get("take_profit_price") or signal_dict.get("target_price")
                 sl_price = signal_dict.get("stop_loss_price")
-                entry_price = float(signal_dict.get("price") or 0)
-                qty = float(signal_dict.get("quantity") or 0)
+                entry_price = safe_float(signal_dict.get("price"), 0.0)
+                qty = safe_float(signal_dict.get("quantity"), 0.0)
                 if tp_price and sl_price and entry_price > 0 and qty > 0:
                     cba = ide.analyze_cost_benefit(
                         decision_id=signal_id,
@@ -785,9 +1188,9 @@ class SignalProcessor:
                         direction=direction,
                         quantity=qty,
                         entry_price=entry_price,
-                        target_price=float(tp_price),
-                        stop_price=float(sl_price),
-                        leverage=float(signal_dict.get("leverage", 5)),
+                        target_price=safe_float(tp_price, 0.0),
+                        stop_price=safe_float(sl_price, 0.0),
+                        leverage=safe_float(signal_dict.get("leverage"), 5.0),
                         expected_hold_hours=4.0,
                         win_probability=confidence,
                     )
@@ -859,8 +1262,23 @@ class SignalProcessor:
                 # 引擎异常时不下发信号，保证安全
                 return
 
+        # ── 决策集成仲裁：规则引擎门控 + ML 置信度修正（均 fail-open）──
+        ensemble_pass, confidence, ensemble_reason = self._decision_ensemble_gate(signal_dict, confidence)
+        if not ensemble_pass:
+            self._push_dead_letter(signal_dict, ensemble_reason)
+            return
+        signal_dict["confidence"] = confidence
+        _pipe_ctx.end_stage("decision_engine")
+
+        _pipe_ctx.begin_stage("sizing")
         adjusted_signal = self._apply_dynamic_sizing(signal_dict)
         adjusted_signal["signal_quality"] = quality_breakdown
+        _pipe_ctx.end_stage("sizing")
+
+        _pipe_ctx.begin_stage("execution")
+
+        # 决策层正向溯源：决策通过全部校验（验证+校准+智能决策），最终批准准备下单。
+        self._publish_decision_event(signal_dict, EventType.DECISION_APPROVED, "approved")
 
         # 信号通过所有校验，记录signal_id到已处理集合（幂等去重）
         self._processed_signal_ids.add(signal_id)
@@ -874,35 +1292,87 @@ class SignalProcessor:
                 self._processed_signal_ids -= to_remove
                 self._signal_id_order = self._signal_id_order[keep_count:]
 
+        _pipe_ctx.end_stage("execution")
+        _pipe_ctx.finish()
+
         # 全链路延迟追踪埋点：信号到达 → 风控 → 下单 端到端延迟与 SLA 监控
         total_latency_ms = (time.perf_counter() - _t0) * 1000
+        tasks = []
         if self._execution_monitor is not None:
-            try:
-                from execution.execution_monitor import LatencyType
-                await self._execution_monitor.record_latency(
-                    LatencyType.E2E, total_latency_ms,
-                    order_id=signal_id, symbol=symbol, strategy=strategy_name,
-                )
-            except Exception as e:
-                logger.debug(f"ExecutionMonitor latency record error: {e}")
+            async def _record_latency():
+                try:
+                    from execution.execution_monitor import LatencyType
+                    await self._execution_monitor.record_latency(
+                        LatencyType.E2E, total_latency_ms,
+                        order_id=signal_id, symbol=symbol, strategy=strategy_name,
+                    )
+                except Exception as e:
+                    logger.debug(f"ExecutionMonitor latency record error: {e}")
+            tasks.append(_record_latency())
         if self._anomaly_detector is not None:
-            try:
-                await self._anomaly_detector.detect("latency", {
-                    "latency_ms": total_latency_ms,
-                    "symbol": symbol,
-                })
-            except Exception as e:
-                logger.debug(f"AnomalyDetector latency detection error: {e}")
+            async def _detect_latency():
+                try:
+                    await self._anomaly_detector.detect("latency", {
+                        "latency_ms": total_latency_ms,
+                        "symbol": symbol,
+                    })
+                except Exception as e:
+                    logger.debug(f"AnomalyDetector latency detection error: {e}")
+            tasks.append(_detect_latency())
+        if tasks:
+            await asyncio.gather(*tasks)
         # SLA：>500ms 记录告警（非关键校验降级提示）
         if total_latency_ms > 500:
             logger.warning(
                 f"E2E latency {total_latency_ms:.0f}ms exceeds 500ms SLA for {symbol} {strategy_name}"
             )
 
-        await self._route_signal(adjusted_signal)
+        routed = await self._route_signal(adjusted_signal)
 
         if self._alert_manager:
-            await self._alert_manager.send_trade_signal_alert(adjusted_signal)
+            try:
+                await self._alert_manager.send_trade_signal_alert(adjusted_signal)
+            except Exception as e:
+                logger.error(f"Failed to send trade signal alert for {symbol}: {e}")
+        return routed
+
+    def _reject_bear_case_open_signal(
+        self, signal_dict: Dict[str, Any], is_close_sig: bool
+    ) -> bool:
+        """Reject a new opening signal when the AGI projection crosses its bear-case limit."""
+        gate = self._bear_case_open_gate
+        if is_close_sig or gate is None:
+            return False
+
+        strategy_name = str(signal_dict.get("strategy_name", "") or "")
+        symbol = str(signal_dict.get("symbol", "") or "")
+        try:
+            block_reason = gate(strategy_name)
+        except Exception as exc:
+            logger.exception(
+                f"Bear-case opening gate failed for {strategy_name}; rejecting open signal"
+            )
+            self._push_dead_letter(
+                signal_dict,
+                f"bear_case_gate_unavailable:{type(exc).__name__}",
+                layer="pnl_projection",
+                reason_code="bear_case_gate_unavailable",
+            )
+            return True
+        if not block_reason:
+            return False
+
+        logger.warning(
+            f"Bear-case projection rejected open signal: "
+            f"strategy={strategy_name} symbol={symbol} reason={block_reason}"
+        )
+        self._push_dead_letter(
+            signal_dict,
+            f"bear_case_projection:{block_reason}",
+            layer="pnl_projection",
+            reason_code="bear_case_threshold",
+        )
+        return True
 
     async def _handle_risk_block(self, signal_data: Dict[str, Any], risk_result) -> None:
         """
@@ -975,7 +1445,7 @@ class SignalProcessor:
 
         # 4. 不发起任何下单请求（直接 return，不下发至 order_executor）
 
-    async def _route_signal(self, signal_data: Dict[str, Any]):
+    async def _route_signal(self, signal_data: Dict[str, Any]) -> bool:
         """智能路由：根据信号特性选择最优处理路径"""
         strategy_name = signal_data.get("strategy_name", "")
         signal_type = signal_data.get("signal_type", "")
@@ -987,7 +1457,14 @@ class SignalProcessor:
         # P0: 统一路由所有信号到order_executor（之前三个分支执行相同代码，已简化）
         logger.debug(f"Routing signal: {signal_type} {symbol} priority={priority}")
         try:
-            await self._order_executor.handle_signal(signal_data)
+            routed = await self._order_executor.handle_signal(signal_data)
+            if routed is not False:
+                from core.signal_flow_stats import record_signal_flow_event
+                record_signal_flow_event(
+                    "executor_queued",
+                    strategy=str(signal_data.get("strategy_name", "") or ""),
+                )
+            return routed is not False
         except Exception as e:
             logger.error(f"Order execution failed for {symbol} {strategy_name}: {e}")
             # 接入企业级自愈（RecoveryHandler）：订单执行失败触发恢复处理
@@ -1002,6 +1479,7 @@ class SignalProcessor:
                     })
                 except Exception as re:
                     logger.error(f"RecoveryHandler failed for {symbol}: {re}")
+            return False
 
     def _get_signal_priority(self, signal_data: Dict[str, Any]) -> int:
         """计算信号优先级"""
@@ -1051,15 +1529,15 @@ class SignalProcessor:
         
         merged = signals[0].copy()
         
-        quantities = [s.get("quantity", 0) for s in signals]
+        quantities = [safe_float(s.get("quantity"), 0.0) for s in signals]
         merged["quantity"] = sum(quantities)
         
-        confidences = [s.get("confidence", 0.5) for s in signals]
-        merged["confidence"] = float(sum(confidences) / len(confidences))
+        confidences = [safe_float(s.get("confidence"), 0.5) for s in signals]
+        merged["confidence"] = safe_finite(sum(confidences) / max(len(confidences), 1), 0.5)
         
-        prices = [s.get("price", 0) for s in signals if s.get("price", 0) > 0]
+        prices = [safe_float(s.get("price"), 0.0) for s in signals if safe_float(s.get("price"), 0.0) > 0]
         if prices:
-            merged["price"] = sum(prices) / len(prices)
+            merged["price"] = safe_finite(sum(prices) / len(prices), 0.0)
         
         merged["source"] = "+".join(set(s.get("source", s.get("strategy_name", "")) for s in signals))
         merged["signal_count"] = len(signals)
@@ -1119,8 +1597,11 @@ class SignalProcessor:
         if self._regime_engine:
             try:
                 regime_info = self._regime_engine.get_regime()
-                regime = regime_info.get("regime", "unknown")
-                regime_strength = regime_info.get("strength", 0.0)
+                regime = str(regime_info.get("regime", "unknown")).lower()
+                regime_strength = safe_float(regime_info.get("strength"), 0.0)
+                direction_key = str(direction).lower()
+                is_long = direction_key in ("long", "buy")
+                is_short = direction_key in ("short", "sell")
                 
                 # range_bound 市场 + 网格策略 = 良好
                 # trend 市场 + 网格策略 = 降分
@@ -1145,6 +1626,30 @@ class SignalProcessor:
                     if direction == "long":
                         quality_score -= 0.15
                         issues.append("long_in_funding_crush")
+                elif regime == "breakout":
+                    if is_short:
+                        quality_score -= 0.25
+                        issues.append("short_against_breakout")
+                    elif strategy in ("grid", "spot_grid", "spot_martingale"):
+                        quality_score -= 0.20
+                        issues.append("mean_reversion_in_breakout")
+                elif regime == "breakdown":
+                    if is_long:
+                        quality_score -= 0.25
+                        issues.append("long_against_breakdown")
+                    elif strategy in ("grid", "spot_grid", "spot_martingale"):
+                        quality_score -= 0.20
+                        issues.append("mean_reversion_in_breakdown")
+                elif regime == "reversal":
+                    reversal_direction = str(signal_data.get("reversal_direction", "")).lower()
+                    confirmed = bool(signal_data.get("reversal_confirmed"))
+                    direction_matches = (
+                        (is_long and reversal_direction in ("long", "buy", "bullish"))
+                        or (is_short and reversal_direction in ("short", "sell", "bearish"))
+                    )
+                    if not confirmed or not direction_matches:
+                        quality_score -= 0.25
+                        issues.append("unconfirmed_reversal")
             except Exception:
                 pass
         
@@ -1152,7 +1657,7 @@ class SignalProcessor:
         sl_price = signal_data.get("stop_loss", signal_data.get("stop_loss_price"))
         if sl_price and price > 0 and direction:
             try:
-                sl_pct = abs(float(sl_price) - price) / price
+                sl_pct = safe_div(abs(safe_float(sl_price, 0.0) - price), price, 0.0)
                 if sl_pct < 0.003:
                     quality_score -= 0.15
                     issues.append("stop_loss_too_tight")
@@ -1276,9 +1781,9 @@ class SignalProcessor:
         if signal_data.get("position_sizing") == "unified":
             return dict(signal_data)
 
-        confidence = signal_data.get("confidence", 0.5)
+        confidence = safe_float(signal_data.get("confidence"), 0.5)
         strategy_name = signal_data.get("strategy_name", "")
-        quality_score = signal_data.get("signal_quality", {}).get("overall_score", 0.5)
+        quality_score = safe_float(signal_data.get("signal_quality", {}).get("overall_score"), 0.5)
 
         open_count = len(getattr(self._trade_journal, '_open_positions', {})) if self._trade_journal else 0
         max_positions = self.config["trading"].get("max_concurrent_positions", 4)
@@ -1377,10 +1882,10 @@ class SignalProcessor:
         try:
             account_info = self._account_manager.get_account_info()
             if account_info:
-                return float(account_info.get("totalEq", 0))
+                return safe_float(account_info.get("totalEq"), 0.0)
         except Exception as e:
             logger.debug(f"Failed to get actual equity: {e}")
-        return 0
+        return 0.0
 
     def _normalize_direction(self, direction: str) -> str:
         direction_map = {

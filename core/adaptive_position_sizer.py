@@ -45,7 +45,7 @@ from loguru import logger
 
 from configs.settings import get_currency_tier
 from risk.dynamic_allocator import AdaptiveKelly
-from utils.helpers import map_market_state_to_regime
+from utils.helpers import map_market_state_to_regime, safe_float, safe_int, safe_finite
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -74,14 +74,14 @@ class PositionSizingResult:
         return {
             "symbol": self.symbol,
             "strategy_name": self.strategy_name,
-            "quantity": self.quantity,
-            "notional": round(self.notional, 4),
-            "margin": round(self.margin, 4),
-            "leverage": self.leverage,
-            "risk_amount": round(self.risk_amount, 6),
-            "risk_fraction": round(self.risk_fraction, 6),
-            "kelly_fraction": round(self.kelly_fraction, 6),
-            "position_multiplier": round(self.position_multiplier, 6),
+            "quantity": safe_finite(self.quantity),
+            "notional": round(safe_finite(self.notional), 4),
+            "margin": round(safe_finite(self.margin), 4),
+            "leverage": safe_finite(self.leverage),
+            "risk_amount": round(safe_finite(self.risk_amount), 6),
+            "risk_fraction": round(safe_finite(self.risk_fraction), 6),
+            "kelly_fraction": round(safe_finite(self.kelly_fraction), 6),
+            "position_multiplier": round(safe_finite(self.position_multiplier), 6),
             "allowed": self.allowed,
             "reject_reason": self.reject_reason,
             "mode": self.mode,
@@ -94,23 +94,13 @@ class PositionSizingResult:
 # ═══════════════════════════════════════════════════════════════
 
 def _f(v, default: float = 0.0) -> float:
-    """安全转 float，None/空串/非法值返回默认值。"""
-    try:
-        if v is None or v == "":
-            return default
-        return float(v)
-    except (ValueError, TypeError):
-        return default
+    """安全转 float，None/空串/NaN/Inf/非法值返回默认值。"""
+    return safe_float(v, default)
 
 
 def _i(v, default: int = 0) -> int:
     """安全转 int。"""
-    try:
-        if v is None or v == "":
-            return default
-        return int(v)
-    except (ValueError, TypeError):
-        return default
+    return safe_int(v, default)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:

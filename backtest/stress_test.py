@@ -184,7 +184,8 @@ class StressTestEngine:
                 "drop_pct": drop_pct,
                 "duration_seconds": duration_seconds,
                 "position_count": len(positions),
-                "avg_leverage": np.mean([p.get("leverage", 1) for p in positions]) if positions else 1,
+                # coerce 为 float，避免 leverage 为字符串/None 时 np.mean 抛 TypeError
+                "avg_leverage": float(np.mean([float(p.get("leverage", 1) or 1) for p in positions])) if positions else 1,
             },
         )
 
@@ -217,7 +218,8 @@ class StressTestEngine:
 
             for i in range(n_periods):
                 price_change = np.random.normal(0, vol_increase[i])
-                new_price = prev_price * (1 + price_change)
+                # 价格归零防护：prev_price 可能因极端负收益趋于 0，导致除零
+                new_price = max(prev_price * (1 + price_change), 1e-9)
 
                 period_pnl = (new_price - prev_price) / prev_price * leverage * margin * position_side
                 pnl += period_pnl

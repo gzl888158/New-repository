@@ -188,10 +188,8 @@ class ManualInterventionManager:
             # 1. 撤销所有挂单
             cancel_result = await self._cancel_all_orders_internal()
             
-            # 2. 获取所有持仓
-            positions = self._okx_client.get_positions()
-            if not positions:
-                positions = []
+            # 2. 获取所有持仓（fail-closed：查询失败抛异常，绝不当作“无持仓”）
+            positions = await self._fetch_positions_safe()
             
             close_results = []
             success_count = 0
@@ -211,6 +209,7 @@ class ManualInterventionManager:
                     
                     if result and result.get("success"):
                         success_count += 1
+                        self._mark_local_closed(symbol)
                         close_results.append({"symbol": symbol, "pos_side": pos_side, "success": True})
                     else:
                         fail_count += 1
@@ -261,6 +260,39 @@ class ManualInterventionManager:
         self._operation_history.append(record)
         return record
 
+    def _mark_local_closed(self, symbol: str) -> None:
+        """手动平仓成功后关闭本地 open 记录，避免沉沦为 ghost_close 假数据。
+
+        pnl/fees 由 PnLReconciler 从平仓账单回填，此处仅改状态/标签，不写近似值
+        （防止二次污染手续费与盈亏统计）。
+        """
+        try:
+            storage = getattr(self._order_executor, "sqlite_storage", None)
+            if storage and hasattr(storage, "close_open_record"):
+                storage.close_open_record(symbol, exit_reason="manual_close")
+        except Exception as e:
+            logger.debug(f"manual close mark closed failed for {symbol}: {e}")
+
+    async def _fetch_positions_safe(self) -> List[Dict[str, Any]]:
+        """安全查询持仓：查询失败/响应非法时抛异常，绝不把失败当空仓。
+
+        OKXClient.get_positions() 在异常时会吞掉异常返回 []，与合法空仓不可区分；
+        这里用 asyncio.to_thread 避免阻塞事件循环，并结合网络降级状态做 fail-closed 兜底。
+        """
+        try:
+            positions = await asyncio.to_thread(self._okx_client.get_positions)
+        except Exception as e:
+            raise RuntimeError(f"Failed to query positions: {e}")
+
+        if not isinstance(positions, list):
+            raise RuntimeError(f"Invalid positions response: {type(positions).__name__}")
+
+        # 网络降级时返回空列表，无法区分「无仓」与「查询失败」，按失败处理
+        if not positions and getattr(self._okx_client, "is_network_degraded", False):
+            raise RuntimeError("Positions query returned empty while network is degraded")
+
+        return positions
+
     async def emergency_close_symbol(self, symbol: str, operator: str = "manual",
                                      reason: str = "") -> InterventionRecord:
         """紧急平单币种仓位"""
@@ -278,9 +310,9 @@ class ManualInterventionManager:
             # 撤销该币种挂单
             await self._cancel_symbol_orders_internal(symbol)
             
-            # 获取该币种持仓
-            positions = self._okx_client.get_positions()
-            positions = [p for p in positions if p.get("instId") == symbol] if positions else []
+            # 获取该币种持仓（fail-closed：查询失败抛异常，绝不当作“无持仓”）
+            positions = await self._fetch_positions_safe()
+            positions = [p for p in positions if p.get("instId") == symbol]
             
             close_results = []
             success_count = 0
@@ -297,6 +329,7 @@ class ManualInterventionManager:
                     
                     if result and result.get("success"):
                         success_count += 1
+                        self._mark_local_closed(symbol)
                         close_results.append({"pos_side": pos_side, "success": True})
                     else:
                         msg = result.get("error", "no response") if result else "no response"
@@ -538,7 +571,11 @@ class ManualInterventionManager:
             return {"success": False, "error": str(e)}
 
     async def _cancel_symbol_orders_internal(self, symbol: str) -> Dict[str, Any]:
-        """内部：撤销某币种挂单（普通挂单 + 算法/条件单，按 instId 过滤）"""
+        """内部：撤销某币种挂单（仅撤普通开仓挂单，绝不撤保护单）。
+
+        TP/SL 等算法/条件单（conditional/oco/trigger/move_order_stop）以及
+        reduceOnly=True 的平仓保护单是持仓保护，撤销会导致持仓裸奔，一律跳过。
+        """
         if not self._okx_client:
             return {"success": False, "error": "OKX client not available"}
         
@@ -547,29 +584,24 @@ class ManualInterventionManager:
             cancelled = 0
             errors = []
             
-            # 普通挂单：按 instId 过滤后逐个撤单
+            # 普通挂单：按 instId 过滤后逐个撤单；reduceOnly=True 的平仓保护单跳过
             for order in (self._okx_client.get_orders(inst_type=inst_type) or []):
                 if order.get("instId") != symbol:
                     continue
                 ord_id = order.get("ordId", "")
                 if not ord_id:
                     continue
+                # 平仓保护单（reduceOnly=True）绝不撤销
+                if str(order.get("reduceOnly", "")).lower() == "true":
+                    logger.info(f"跳过平仓保护单，不撤销: {symbol} {ord_id}")
+                    continue
                 if self._okx_client.cancel_order(symbol, ord_id) is not None:
                     cancelled += 1
                 else:
                     errors.append(f"撤单失败: {symbol} {ord_id}")
             
-            # 算法/条件单：直接按 symbol 查询后逐个撤单
-            for ord_type in ("conditional", "oco", "trigger", "move_order_stop"):
-                algos = self._okx_client.get_algo_orders(symbol=symbol, ord_type=ord_type) or []
-                for algo in algos:
-                    algo_id = algo.get("algoId", "")
-                    if not algo_id:
-                        continue
-                    if self._okx_client.cancel_algo_order(symbol, algo_id) is not None:
-                        cancelled += 1
-                    else:
-                        errors.append(f"撤销条件单失败: {symbol} {algo_id}")
+            # 算法/条件单（TP/SL 保护单）绝不撤销，避免持仓失去止盈止损保护
+            logger.info(f"跳过算法/条件单撤销（保护单）: {symbol}")
             
             return {"success": True, "cancelled": cancelled, "errors": errors}
         except Exception as e:
@@ -593,8 +625,8 @@ class ManualInterventionManager:
             # 1. 获取策略关联的币种（从策略配置、持仓追踪、或订单执行器推断）
             strategy_symbols = self._get_strategy_symbols(strategy_name)
             
-            # 2. 获取所有持仓
-            positions = self._okx_client.get_positions()
+            # 2. 获取所有持仓（fail-closed：查询失败抛异常，绝不误报“无持仓”）
+            positions = await self._fetch_positions_safe()
             if not positions:
                 logger.info(f"No positions found for strategy {strategy_name}")
                 return [{"success": True, "message": "No positions to close"}]

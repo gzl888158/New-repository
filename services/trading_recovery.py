@@ -248,13 +248,58 @@ class TradingRecoveryService:
         })
     
     async def _execute_recovery_actions(self):
-        """执行恢复动作"""
+        """执行恢复动作（带回滚追踪）"""
+        executed_actions = []
+        failed_action = None
+        
+        # 预检查阶段：验证所有动作参数
+        for action in self._recovery_actions:
+            if not await self._validate_action(action):
+                logger.error(f"Recovery action validation failed: {action['action']}")
+                failed_action = action
+                break
+        
+        if failed_action:
+            logger.error(f"Aborting recovery batch due to validation failure: {failed_action['action']}")
+            return
+        
+        # 执行阶段：逐个执行，失败时记录已执行动作供回滚
         for action in self._recovery_actions:
             try:
                 await self._execute_action(action)
+                executed_actions.append(action)
                 logger.info(f"Executed recovery action: {action['action']}")
             except Exception as e:
                 logger.error(f"Failed to execute recovery action {action['action']}: {e}")
+                # 记录失败点和已执行动作，供手动回滚
+                logger.error(
+                    f"Recovery batch interrupted. Executed {len(executed_actions)} actions. "
+                    f"Manual rollback may be needed for: {[a['action'] for a in executed_actions]}"
+                )
+                break
+    
+    async def _validate_action(self, action: Dict[str, Any]) -> bool:
+        """预检查动作参数"""
+        action_type = action.get("action")
+        if not action_type:
+            return False
+        
+        params = action.get("params", {})
+        
+        # 参数范围校验
+        if action_type == "reduce_positions":
+            ratio = params.get("ratio", 0.5)
+            if not (0.0 < ratio <= 1.0):
+                logger.error(f"Invalid reduce ratio: {ratio}")
+                return False
+        elif action_type == "reset_drawdown":
+            pass  # 无特殊参数
+        elif action_type in ("reset_strategy_states", "check_strategy_status",
+                             "reset_signal_generation", "clear_pending_orders",
+                             "close_all_positions", "reset_capital_allocation"):
+            pass  # 通用动作，无需特殊校验
+        
+        return True
     
     async def _execute_action(self, action: Dict[str, Any]):
         """执行单个动作"""
@@ -452,7 +497,11 @@ class TradingRecoveryService:
             logger.error(f"Failed to reset signal generation: {e}")
     
     async def _action_clear_pending_orders(self, params: Dict[str, Any]):
-        """清除挂单"""
+        """清除挂单（仅清除非 reduce_only 的开仓挂单）。
+
+        TP/SL 条件单（algo 单）是持仓的保护单，清除会导致持仓裸奔（有仓位无平单委托），
+        因此本动作绝不取消 algo 条件单；普通挂单也只取消开仓方向，平仓保护单保留。
+        """
         logger.info("Clearing pending orders")
         
         if not self._okx_client:
@@ -468,6 +517,9 @@ class TradingRecoveryService:
                 for order in pending_orders:
                     order_id = order.get("ordId", "")
                     symbol = order.get("instId", "")
+                    # 平仓保护单（reduceOnly=True）绝不取消，只清开仓挂单
+                    if str(order.get("reduceOnly", "")).lower() == "true":
+                        continue
                     if order_id and symbol:
                         try:
                             await loop.run_in_executor(
@@ -478,22 +530,8 @@ class TradingRecoveryService:
                         except Exception as e:
                             logger.error(f"Failed to cancel order {order_id}: {e}")
             
-            algo_orders = await loop.run_in_executor(None, self._okx_client.get_algo_orders)
-            if algo_orders:
-                for order in algo_orders:
-                    algo_id = order.get("algoId", "")
-                    symbol = order.get("instId", "")
-                    if algo_id and symbol:
-                        try:
-                            await loop.run_in_executor(
-                                None, self._okx_client.cancel_algo_order, symbol, algo_id
-                            )
-                            cancelled_count += 1
-                            logger.info(f"Cancelled algo order {algo_id} for {symbol}")
-                        except Exception as e:
-                            logger.error(f"Failed to cancel algo order {algo_id}: {e}")
-            
-            logger.info(f"Cleared {cancelled_count} pending orders total")
+            # 注意：不再取消 algo 条件单（TP/SL）。它们是持仓保护单，清除会使持仓失去止损/止盈保护。
+            logger.info(f"Cleared {cancelled_count} pending open orders total")
         except Exception as e:
             logger.error(f"Failed to clear pending orders: {e}")
     

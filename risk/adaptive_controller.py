@@ -10,16 +10,24 @@
 - 风险预算动态绑定
 """
 import asyncio
-import os
+import hashlib
 import json
-import numpy as np
+import math
+import os
+import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 from loguru import logger
 
 from core.capital_utilization_engine import (
-    CapitalUtilizationEngine, UtilizationTier, UtilizationAction, UtilizationReport
+    CapitalUtilizationEngine,
+    UtilizationAction,
+    UtilizationReport,
+    UtilizationTier,
 )
+from core.direction_unifier import DirectionUnifier
 
 
 class AdaptiveController:
@@ -34,13 +42,26 @@ class AdaptiveController:
         self.profit_optimizer = profit_optimizer
         self.account_manager = account_manager
         self._equity_monitor = equity_monitor
-        
-        self._regime_engine = None
+        # 后台监控/自适应 task 引用（防止 create_task 结果被 GC，支持
         self._adaptive_tp_sl_engine = None
         self._adaptive_position_sizer = None
+        self._intelligent_agent = None
+        self._orphan_close_orders: Dict[str, str] = {}
+
+        # ── 企业级资金管理引擎：可部署性感知分配 + 资金流动加速 ──
+        cm_cfg = config.get("capital_management", {})
+        dep_cfg = cm_cfg.get("deployability", {})
+        self._deployability_enabled = bool(dep_cfg.get("enabled", True))
+        self._deployability_exited_factor = float(dep_cfg.get("exited_factor", 0.0))
+        self._deployability_paused_factor = float(dep_cfg.get("paused_factor", 0.15))
+        self._deployability_blacklist_pair_penalty = float(dep_cfg.get("blacklist_pair_penalty", 0.12))
+        self._deployability_max_blacklist_penalty = float(dep_cfg.get("max_blacklist_penalty", 0.7))
+        self._idle_cash_min_deployability = float(cm_cfg.get("idle_cash_min_deployability", 0.3))
+        # 平滑权重：新分配占比越高，低效→高效策略资金转移越快
+        self._allocation_smoothing_new_weight = float(cm_cfg.get("smoothing_new_weight", 0.5))
 
         self._health_check_interval = 60
-        self._rebalance_interval = 3600
+        self._rebalance_interval = int(cm_cfg.get("rebalance_interval", 1800))
         self._optimization_interval = 7200
         self._utilization_check_interval = 120  # 2分钟检查一次资金利用率和idle cash优化
         
@@ -61,14 +82,23 @@ class AdaptiveController:
         self._performance_window_hours = 24
         
         trading_cfg = config.get("trading", {})
-        self._base_allocations = {
-            "grid": trading_cfg.get("grid_allocation", 0.12),
-            "trend": trading_cfg.get("trend_allocation", 0.25),
-            "scalping": trading_cfg.get("scalping_allocation", 0.28),
-            "arbitrage": trading_cfg.get("arbitrage_allocation", 0.13),
-            "spot_grid": trading_cfg.get("spot_grid_allocation", 0.12),
-            "spot_martingale": trading_cfg.get("spot_martingale_allocation", 0.10),
-        }
+        strategies_cfg = config.get("strategies", {})
+        # 动态构建基础分配：优先 trading.{name}_allocation，兜底 strategies.{name}.capital_allocation
+        self._base_allocations: Dict[str, float] = {}
+        for sname in strategies_cfg.keys():
+            base = trading_cfg.get(f"{sname}_allocation")
+            if base is None:
+                base = strategies_cfg.get(sname, {}).get("capital_allocation", 0.1)
+            try:
+                self._base_allocations[sname] = max(0.0, float(base))
+            except (TypeError, ValueError):
+                self._base_allocations[sname] = 0.1
+        # 兜底：config 中无 strategies 段时使用已知策略名
+        if not self._base_allocations:
+            self._base_allocations = {
+                "grid": 0.12, "trend": 0.25, "scalping": 0.28, "arbitrage": 0.13,
+                "spot_grid": 0.12, "spot_martingale": 0.10,
+            }
         self._dynamic_allocations = dict(self._base_allocations)
         
         self._pnl_verification_log: List[Dict[str, Any]] = []
@@ -91,6 +121,10 @@ class AdaptiveController:
         self._min_utilization = config.get("trading", {}).get("min_utilization", 0.5)
         self._utilization_adjustment_factor = 0.1
         self._start_time = datetime.now()
+        # asyncio task 生命周期：保存引用、幂等启停
+        self._tasks: list = []
+        self._started = False
+        self._stopped = False
         self._warmup_minutes = 30
         self._warmup_minutes_with_positions = 10  # P28: 已有持仓时缩短预热期
         
@@ -101,6 +135,7 @@ class AdaptiveController:
         self._idle_cash_strategy_priority = ["scalping", "arbitrage", "grid", "trend"]
         self._idle_cash_position_boost = 1.0
         self._strategy_optimizer = None
+        self._strategy_manager = None  # 由 Scheduler 注入，作为策略名称单一事实来源
 
         # ── 企业级自适应资金利用率引擎 ──
         self._utilization_engine = CapitalUtilizationEngine(config)
@@ -133,6 +168,9 @@ class AdaptiveController:
         # 风险预算系统 —— 从 config.yaml risk_budget 段初始化
         risk_budget_cfg = config.get("risk_budget", {})
         self._risk_budget_enabled = risk_budget_cfg.get("enabled", True)
+        self._risk_budget_state_path = str(
+            risk_budget_cfg.get("state_path", os.path.join("data", "risk_budget_state.json"))
+        )
         self._daily_risk_budget_pct = risk_budget_cfg.get("daily_risk_budget_pct", 0.03)
         self._hourly_max_loss_pct = risk_budget_cfg.get("hourly_max_loss_pct", 0.015)
         self._max_per_trade_risk_pct = risk_budget_cfg.get("max_per_trade_risk_pct", 0.008)
@@ -163,6 +201,12 @@ class AdaptiveController:
         self._max_consecutive_losses = streak_cfg.get("max_consecutive_losses", 5)
         self._streak_reduce_pct = streak_cfg.get("loss_streak_reduce_pct", 0.50)
         self._streak_recovery_wins = streak_cfg.get("recovery_consecutive_wins", 3)
+        self._streak_probe_after_seconds = max(
+            0.0, float(streak_cfg.get("probe_after_seconds", 7200.0))
+        )
+        self._streak_probe_risk_pct = max(
+            0.0, min(0.01, float(streak_cfg.get("probe_max_risk_pct", 0.001)))
+        )
         # 运行时风险跟踪
         self._daily_risk_consumed: Dict[str, float] = {}  # 策略 -> 当日已消耗风险(USDT)
         self._hourly_pnl: float = 0.0  # 当前小时盈亏
@@ -171,6 +215,7 @@ class AdaptiveController:
         self._consecutive_loss_count: int = 0
         self._consecutive_win_count: int = 0
         self._streak_lock_active: bool = False  # 熔断锁
+        self._streak_lock_started_at: Optional[datetime] = None
         self._symbol_risk_exposure: Dict[str, float] = {}  # 币种 -> 风险敞口
         self._risk_budget_log: List[Dict[str, Any]] = []   # 风险预算操作日志
         
@@ -187,6 +232,8 @@ class AdaptiveController:
             "risk_budget": 0.15,
             "utilization": 0.15,
         }
+
+        self._restore_risk_budget_state()
         
         logger.info("AdaptiveController initialized (enhanced)")
 
@@ -204,6 +251,11 @@ class AdaptiveController:
         """注入统一自适应仓位引擎（供策略/上层复用统一仓位口径）"""
         self._adaptive_position_sizer = engine
         logger.info("AdaptivePositionSizer injected into AdaptiveController")
+
+    def set_intelligent_agent(self, agent):
+        """注入IntelligentTradingAgent，用于可部署性感知分配（信号产出/拒单/黑名单）。"""
+        self._intelligent_agent = agent
+        logger.info("IntelligentTradingAgent injected into AdaptiveController")
 
     def compute_adaptive_tp_sl(self, symbol: str, entry_price: float, direction: str, **kwargs) -> dict:
         """基于统一引擎计算自适应止损止盈（策略/上层复用入口）。
@@ -254,19 +306,66 @@ class AdaptiveController:
         self._equity_monitor = monitor
         logger.info("EquityMonitor injected into AdaptiveController")
 
+    def set_strategy_manager(self, strategy_manager) -> None:
+        """注入 StrategyManager 作为策略名称的单一事实来源。
+
+        注入后，所有策略迭代循环将通过 get_enabled_strategy_names() 获取
+        启用的策略列表，避免硬编码遗漏 spot_grid / spot_martingale 等策略。
+        """
+        self._strategy_manager = strategy_manager
+        logger.info(
+            f"StrategyManager injected into AdaptiveController "
+            f"({len(strategy_manager.get_enabled_strategy_names()) if strategy_manager else 0} enabled)"
+        )
+
+    def _get_enabled_strategy_names(self):
+        """返回当前启用的策略名称列表（单一事实来源）。
+
+        优先使用 StrategyManager.get_enabled_strategy_names()；
+        未注入时回退到从 config 直接读取（与 StrategyManager 同口径）。
+        """
+        if self._strategy_manager is not None:
+            try:
+                return list(self._strategy_manager.get_enabled_strategy_names())
+            except Exception as e:
+                logger.debug(f"StrategyManager.get_enabled_strategy_names failed: {e}")
+        strategies_cfg = self.config.get("strategies", {})
+        # 与 StrategyManager 保持一致：未显式 enabled=false 的默认启用
+        return [
+            name for name, cfg in strategies_cfg.items()
+            if cfg.get("enabled", True)
+        ]
+
     async def start(self):
-        """启动所有监控和自适应循环"""
-        asyncio.create_task(self._health_monitor_loop())
-        asyncio.create_task(self._rebalance_loop())
-        asyncio.create_task(self._optimization_loop())
-        asyncio.create_task(self._pnl_verification_loop())
-        asyncio.create_task(self._capital_utilization_loop())
+        """启动所有监控和自适应循环（幂等）"""
+        if self._started:
+            return
+        self._started = True
+        self._stopped = False
+        # 保存 task 引用，避免被 GC 回收/泄漏；后续 stop 可统一 cancel
+        self._tasks = [
+            asyncio.create_task(self._health_monitor_loop()),
+            asyncio.create_task(self._rebalance_loop()),
+            asyncio.create_task(self._optimization_loop()),
+            asyncio.create_task(self._pnl_verification_loop()),
+            asyncio.create_task(self._capital_utilization_loop()),
+        ]
         # 启动企业级资金利用率引擎（加载状态 + 持久化循环）
         await self._utilization_engine.start()
         logger.info("AdaptiveController started")
 
     async def stop(self):
-        """停止所有监控和自适应循环（优雅关闭）"""
+        """停止所有监控和自适应循环（幂等优雅关闭）"""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._started = False
+        tasks = self._tasks
+        self._tasks = []
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self._utilization_engine.stop()
         logger.info("AdaptiveController stopped")
 
@@ -282,6 +381,8 @@ class AdaptiveController:
                 await self._check_position_consistency()
                 self._persist_risk_budget_state()
                 self._health_status["last_check"] = datetime.now().isoformat()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(self._health_check_interval)
@@ -296,8 +397,26 @@ class AdaptiveController:
                 return
 
             account = self.okx_client._parse_account_info(account_info)
-            equity = account.total_equity
-            initial_capital = self.config["trading"].get("total_capital", 100)
+            if account is None:
+                self._health_status["account"] = "unreachable"
+                await self._alert("account_unreachable", "账户信息解析失败", "critical")
+                return
+
+            try:
+                equity = float(account.total_equity)
+            except (TypeError, ValueError):
+                equity = None
+
+            # fail-closed：无法确认账户权益时按不可达处理并告警，不进入后续健康判定
+            if equity is None or not np.isfinite(equity) or equity <= 0:
+                self._health_status["account"] = "unreachable"
+                await self._alert("account_invalid_equity", "账户权益异常或为零，健康检查中止", "critical")
+                return
+
+            try:
+                initial_capital = float(self.config["trading"].get("total_capital", 100))
+            except (TypeError, ValueError):
+                initial_capital = 100.0
 
             # 更新 ProfitOptimizer 权益
             if equity > 0:
@@ -306,7 +425,16 @@ class AdaptiveController:
             # 回撤检查
             stats = self.profit_optimizer.get_stats()
             drawdown = stats.get("drawdown", 0)
-            max_dd = self.config["trading"].get("max_drawdown", 0.12)
+            try:
+                drawdown = float(drawdown) if drawdown is not None else 0.0
+            except (TypeError, ValueError):
+                drawdown = 0.0
+            if not np.isfinite(drawdown):
+                drawdown = 0.0
+            try:
+                max_dd = float(self.config["trading"].get("max_drawdown", 0.12))
+            except (TypeError, ValueError):
+                max_dd = 0.12
 
             if drawdown > max_dd:
                 self._health_status["account"] = "critical"
@@ -320,7 +448,10 @@ class AdaptiveController:
 
             # 每日亏损检查 —— P0: 仅检查负值（亏损），abs()会导致正盈利也触警
             daily_pnl = self._calc_daily_loss()
-            daily_max = self.config["trading"].get("daily_max_loss", 0.04)
+            try:
+                daily_max = float(self.config["trading"].get("daily_max_loss", 0.04))
+            except (TypeError, ValueError):
+                daily_max = 0.04
             if daily_pnl < -initial_capital * daily_max:
                 await self._alert("daily_loss_limit", f"当日亏损 {daily_pnl:.2f} 超过阈值", "warning")
 
@@ -328,16 +459,25 @@ class AdaptiveController:
             # 阈值对齐资金利用率逻辑：85% 是目标利用率（仅 warning）；
             # 只有 >95%（与 _check_capital_utilization 的 high 阈值一致）才视为强平风险 CRITICAL。
             # 注意：这是账户级使用率，单仓位的维持保证金率检查由 global_risk.py 负责
-            if account.margin_rate > 0.95:
-                await self._alert("high_margin_usage", f"保证金使用率过高: {account.margin_rate:.2%}", "critical")
-            elif account.margin_rate > 0.85:
-                await self._alert("high_margin_usage", f"保证金使用率偏高: {account.margin_rate:.2%}", "warning")
+            margin_rate = getattr(account, "margin_rate", None)
+            try:
+                margin_rate = float(margin_rate) if margin_rate is not None else None
+            except (TypeError, ValueError):
+                margin_rate = None
+            if margin_rate is not None and np.isfinite(margin_rate):
+                if margin_rate > 0.95:
+                    await self._alert("high_margin_usage", f"保证金使用率过高: {margin_rate:.2%}", "critical")
+                elif margin_rate > 0.85:
+                    await self._alert("high_margin_usage", f"保证金使用率偏高: {margin_rate:.2%}", "warning")
+            else:
+                logger.warning("Margin rate unavailable/invalid, skipping margin usage check")
 
             # 权益异常检测：对比OKX权益变化与数据库已实现PnL
             await self._check_equity_anomaly(equity)
 
         except Exception as e:
             logger.error(f"Account health check failed: {e}")
+            self._health_status["account"] = "unreachable"
 
     async def _check_equity_anomaly(self, current_equity: float):
         """检测权益异常：对比实际权益变化和数据库记录的PnL"""
@@ -420,7 +560,7 @@ class AdaptiveController:
             checks["okx_api"] = False
 
         # 策略状态
-        for strategy_name in ["grid", "trend", "scalping", "arbitrage"]:
+        for strategy_name in self._get_enabled_strategy_names():
             strategy_cfg = self.config["strategies"].get(strategy_name, {})
             enabled = strategy_cfg.get("enabled", True)
             checks[f"strategy_{strategy_name}"] = "enabled" if enabled else "disabled"
@@ -440,7 +580,31 @@ class AdaptiveController:
     async def _check_position_consistency(self):
         """检查持仓一致性（对账）"""
         try:
-            positions = self.okx_client.get_positions()
+            checked_query = getattr(self.okx_client, "get_positions_checked", None)
+            positions = (
+                checked_query()
+                if callable(checked_query)
+                else self.okx_client.get_positions()
+            )
+            if positions is None:
+                logger.error("Position consistency check aborted: exchange position query failed")
+                return
+
+            db_open = self.sqlite_storage.get_trade_records_by_status("open")
+
+            # P7-4 保护：get_positions() 在异常/网络抖动/代理半死/API 限流时静默返回空列表 []，
+            # 与「账户真实空仓」无法区分。若此时 DB 仍有 open 记录，按空结果对账会把所有真实持仓
+            # 误判为 ghost_close（历史事故：2026-09-15 00:16 SOL/XRP 空单被批量误关，引发
+            # ghost_close→sync 回灌震荡循环，最终平仓关联到 sync 记录、PnL 归属错乱）。
+            # 因此「空结果 + 存在 open 记录」视为查询失败，跳过本次对账（fail-closed，宁可不清理）。
+            if not positions and db_open:
+                logger.warning(
+                    f"P7-4: get_positions returned empty while {len(db_open)} open record(s) "
+                    "exist in DB; skipping reconciliation (suspected API failure, "
+                    "not real empty positions) to avoid ghost_close false-positive"
+                )
+                return
+
             okx_positions = {}
             for pos_data in positions:
                 pos = self.okx_client._parse_position(pos_data)
@@ -448,7 +612,6 @@ class AdaptiveController:
                     key = f"{pos.symbol}:{pos.side}"
                     okx_positions[key] = pos
 
-            db_open = self.sqlite_storage.get_trade_records_by_status("open")
             db_positions = {}
             for rec in db_open:
                 symbol = rec.get("symbol", "")
@@ -474,10 +637,22 @@ class AdaptiveController:
                     updates = {
                         "status": "closed",
                         "close_time": datetime.now().isoformat(),
-                        "exit_reason": "ghost_cleanup",
+                        "exit_reason": "ghost_close",
                     }
                     self.sqlite_storage.update_trade_record(rec.get("id"), updates)
                 logger.info(f"Cleaned {len(ghosts)} ghost positions")
+
+            # Existing sync records represent orphan positions too; re-check their
+            # protective stop on every reconciliation cycle in case it was rejected,
+            # cancelled, or triggered while the position remains open.
+            for key in set(okx_positions).intersection(db_positions):
+                record = db_positions[key]
+                if record.get("strategy_name") == "sync":
+                    await self._place_orphan_stop_loss(
+                        okx_positions[key],
+                        position_token=str(record.get("id") or key),
+                        position_created_at=record.get("create_time"),
+                    )
 
             # 检测丢失持仓（OKX有但数据库没有）
             missing = [k for k in okx_positions if k not in db_positions]
@@ -486,8 +661,11 @@ class AdaptiveController:
                 # P7-4: 自动同步交易所持仓到数据库
                 for m in missing:
                     pos = okx_positions[m]
+                    position_token = str(uuid.uuid4())
+                    position_created_at = datetime.now()
                     try:
-                        self.sqlite_storage.save_trade_record({
+                        saved = self.sqlite_storage.save_trade_record({
+                            "id": position_token,
                             "symbol": pos.symbol,
                             "side": pos.side,
                             "price": pos.avg_cost,
@@ -495,18 +673,469 @@ class AdaptiveController:
                             # 与 trades.quantity 及 order_executor 开仓写入的币数量口径对齐，消除量纲错乱。
                             "quantity": self.okx_client.contracts_to_coins(pos.symbol, abs(pos.quantity)),
                             "leverage": pos.leverage,
-                            "create_time": datetime.now(),
+                            # 修复：漏写 margin 导致 _check_capital_utilization 的 strategy_usage 分母为 0，
+                            # _calc_capital_efficiency 恒返回 0.0（假中性）而掩盖真实负效率，误触发 FORCE_REBALANCE。
+                            "margin": getattr(pos, "margin", 0.0),
+                            "create_time": position_created_at,
                             "status": "open",
                             "strategy_name": "sync",
                             "pnl": 0,
                             "pnl_percent": 0,
                         })
-                        logger.info(f"P7-4: Synced missing position {m} to DB")
+                        if saved:
+                            logger.info(f"P7-4: Synced missing position {m} to DB")
+                        else:
+                            logger.critical(
+                                f"P7-4: Could not persist orphan position {m}; "
+                                "still attempting protective stop placement"
+                            )
+                        # 措施6: 为 sync 孤儿仓自动挂保护性止损，防止无保护放大亏损
+                        await self._place_orphan_stop_loss(
+                            pos,
+                            position_token=position_token,
+                            position_created_at=position_created_at,
+                        )
                     except Exception as sync_err:
                         logger.warning(f"P7-4: Failed to sync missing position {m}: {sync_err}")
 
         except Exception as e:
             logger.error(f"Position consistency check failed: {e}")
+
+    async def _place_orphan_stop_loss(
+        self, pos, position_token: str = "", position_created_at=None
+    ):
+        """措施6: 为 sync 孤儿仓自动挂保护性止损条件单。
+
+        止损触发后若仓位仍存在，确认触发生成的平仓子单已终态，再用
+        reduce-only 市价单退出剩余仓位。
+        """
+        try:
+            exec_cfg = self.config.get("execution", {})
+            if not exec_cfg.get("orphan_stop_loss_enabled", True):
+                return
+            pct = float(exec_cfg.get("orphan_stop_loss_pct", 0.03))
+            if pct <= 0:
+                return
+
+            side = (getattr(pos, "side", "") or "").lower()
+            if side not in ("long", "short"):
+                logger.warning(f"orphan stop loss skipped: unknown side {getattr(pos, 'side', '')!r} for {pos.symbol}")
+                return
+
+            position_key = f"{pos.symbol}:{side}"
+            lifecycle_key = f"{position_key}:{position_token or 'legacy'}"
+            tracked_close_id = getattr(self, "_orphan_close_orders", {}).get(
+                lifecycle_key
+            )
+            if tracked_close_id:
+                try:
+                    close_status = self.okx_client.get_order(
+                        pos.symbol, tracked_close_id
+                    )
+                except Exception as exc:
+                    await self._alert(
+                        f"orphan_stop_close_status_failed:{pos.symbol}:{side}",
+                        f"Cannot verify orphan market-close order {tracked_close_id}: {exc}",
+                        "critical",
+                    )
+                    return
+                if not isinstance(close_status, dict):
+                    await self._alert(
+                        f"orphan_stop_close_status_unknown:{pos.symbol}:{side}",
+                        f"Cannot verify orphan market-close order {tracked_close_id}; "
+                        "will not submit a duplicate close",
+                        "critical",
+                    )
+                    return
+                close_state = str(close_status.get("state", "")).lower()
+                if close_state in {"live", "partially_filled"}:
+                    return
+                self._orphan_close_orders.pop(position_key, None)
+
+            stop_client_id = self._orphan_stop_client_id(
+                pos.symbol, side, position_token
+            )
+
+            # 幂等：查询失败时不能确认止损单是否已存在，因此不继续下单。
+            try:
+                existing = self.okx_client.get_algo_orders(pos.symbol, ord_type="conditional")
+                if existing is None or not isinstance(existing, list):
+                    message = (
+                        f"orphan stop loss dedup query unavailable for {pos.symbol} {side}; "
+                        "skipping placement to avoid duplicate protection orders"
+                    )
+                    logger.error(message)
+                    await self._alert(
+                        f"orphan_stop_loss_dedup_failed:{pos.symbol}:{side}",
+                        message,
+                        "critical",
+                    )
+                    return
+                if any(not isinstance(order, dict) for order in existing):
+                    message = (
+                        f"orphan stop loss dedup response invalid for {pos.symbol} {side}; "
+                        "skipping placement"
+                    )
+                    logger.error(message)
+                    await self._alert(
+                        f"orphan_stop_loss_dedup_invalid:{pos.symbol}:{side}",
+                        message,
+                        "critical",
+                    )
+                    return
+                has_active_stop = False
+                for order in existing:
+                    if (
+                        order.get("posSide", "") == side
+                        and (order.get("slTriggerPx", "") or "0") not in ("", "0")
+                    ):
+                        logger.info(f"orphan {pos.symbol} {side} already has SL, skip placing")
+                        has_active_stop = True
+                        break
+            except Exception as e:
+                message = (
+                    f"orphan stop loss dedup query failed for {pos.symbol} {side}: {e}; "
+                    "skipping placement"
+                )
+                logger.error(message)
+                await self._alert(
+                    f"orphan_stop_loss_dedup_failed:{pos.symbol}:{side}",
+                    message,
+                    "critical",
+                )
+                return
+
+            if not has_active_stop:
+                history_query = getattr(
+                    self.okx_client, "get_algo_order_history", None
+                )
+                if not callable(history_query):
+                    await self._alert(
+                        f"orphan_stop_history_unavailable:{pos.symbol}:{side}",
+                        f"Cannot check whether orphan stop triggered for "
+                        f"{pos.symbol} {side}; refusing to replace it blindly",
+                        "critical",
+                    )
+                    return
+                history = history_query(
+                    symbol=pos.symbol, ord_type="conditional", state="effective"
+                )
+                if history is None or not isinstance(history, list):
+                    await self._alert(
+                        f"orphan_stop_history_failed:{pos.symbol}:{side}",
+                        f"Failed to query orphan stop history for {pos.symbol} "
+                        f"{side}; refusing to replace protection blindly",
+                        "critical",
+                    )
+                    return
+                if any(not isinstance(item, dict) for item in history):
+                    await self._alert(
+                        f"orphan_stop_history_invalid:{pos.symbol}:{side}",
+                        f"Invalid orphan stop history response for {pos.symbol} "
+                        f"{side}; refusing to replace protection blindly",
+                        "critical",
+                    )
+                    return
+
+                triggered = None
+                for item in history:
+                    if str(item.get("state", "")).lower() != "effective":
+                        continue
+                    if item.get("posSide", "") != side:
+                        continue
+                    if item.get("algoClOrdId") != stop_client_id:
+                        if not self._legacy_stop_matches_position(
+                            item, position_created_at
+                        ):
+                            continue
+                    try:
+                        trigger_price = float(item.get("slTriggerPx") or 0)
+                    except (TypeError, ValueError):
+                        trigger_price = 0.0
+                    if not math.isfinite(trigger_price) or trigger_price <= 0:
+                        await self._alert(
+                            f"orphan_stop_history_invalid:{pos.symbol}:{side}",
+                            f"Triggered orphan stop history has invalid trigger price "
+                            f"for {pos.symbol} {side}; refusing to replace protection",
+                            "critical",
+                        )
+                        return
+                    triggered = item
+                    break
+                if triggered:
+                    if not exec_cfg.get(
+                        "orphan_stop_loss_failure_auto_close", False
+                    ):
+                        await self._alert(
+                            f"orphan_stop_triggered_position_open:{pos.symbol}:{side}",
+                            f"Orphan stop triggered but position {pos.symbol} {side} "
+                            "remains open; automatic fallback close is disabled",
+                            "critical",
+                        )
+                        return
+                    await self._close_orphan_position_after_stop_trigger(
+                        pos, triggered, position_key, lifecycle_key
+                    )
+                    return
+
+            ticker = self.okx_client.get_ticker(pos.symbol)
+            last = float(ticker.get("last") or 0) if ticker else 0.0
+            if last <= 0:
+                logger.warning(f"orphan stop loss skipped: no last price for {pos.symbol}")
+                return
+
+            # 触发价：long 挂 last*(1-pct)，short 挂 last*(1+pct)，恒在有效侧（不立即触发）
+            trigger = last * (1 - pct) if side == "long" else last * (1 + pct)
+            close_side = "sell" if side == "long" else "buy"
+            qty_coins = self.okx_client.contracts_to_coins(pos.symbol, abs(getattr(pos, "quantity", 0) or 0))
+            if qty_coins <= 0:
+                logger.warning(f"orphan stop loss skipped: zero quantity for {pos.symbol}")
+                return
+
+            result = self.okx_client.place_order(
+                symbol=pos.symbol,
+                side=close_side,
+                order_type="conditional",
+                quantity=qty_coins,
+                leverage=int(getattr(pos, "leverage", 1) or 1),
+                stop_price=trigger,
+                reduce_only=True,
+                pos_side=side,
+                conditional_type="stop_loss",
+                clOrdId=stop_client_id,
+            )
+
+            if (
+                isinstance(result, dict)
+                and not result.get("_failed", False)
+                and str(result.get("sCode", "0")) == "0"
+            ):
+                oid = result.get("algoId", "") or result.get("ordId", "")
+                if not oid:
+                    message = (
+                        f"orphan stop loss response missing order id for "
+                        f"{pos.symbol} {side}; verify exchange protection"
+                    )
+                    logger.error(message)
+                    await self._alert(
+                        f"orphan_stop_loss_unconfirmed:{pos.symbol}:{side}",
+                        message,
+                        "critical",
+                    )
+                    return
+                logger.info(f"orphan stop loss placed for {pos.symbol} {side} @ {trigger:.6f} (algoId={oid})")
+                await self._alert("orphan_stop_loss_placed",
+                                  f"孤儿仓 {pos.symbol} {side} 已挂保护性止损 {trigger:.6f}", "warning")
+            else:
+                logger.warning(f"orphan stop loss placement failed for {pos.symbol} {side}: {result}")
+        except Exception as e:
+            logger.error(f"orphan stop loss error for {getattr(pos, 'symbol', '?')}: {e}")
+
+    @staticmethod
+    def _orphan_stop_client_id(
+        symbol: str, side: str, position_token: str = ""
+    ) -> str:
+        identity = position_token or f"{symbol}:{side}:legacy"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        return f"ORPHAN{digest}"
+
+    @staticmethod
+    def _legacy_stop_matches_position(
+        stop_order: Dict[str, Any], position_created_at
+    ) -> bool:
+        """Match pre-client-ID stop history only when it postdates this position."""
+        if position_created_at is None:
+            return False
+        try:
+            if isinstance(position_created_at, datetime):
+                position_timestamp = position_created_at.timestamp()
+            else:
+                position_timestamp = datetime.fromisoformat(
+                    str(position_created_at)
+                ).timestamp()
+
+            order_created = stop_order.get("cTime") or stop_order.get("uTime")
+            if order_created is None:
+                return False
+            order_timestamp = float(order_created) / 1000.0
+            return math.isfinite(order_timestamp) and order_timestamp >= position_timestamp
+        except (TypeError, ValueError, OSError):
+            return False
+
+    async def _close_orphan_position_after_stop_trigger(
+        self,
+        pos,
+        triggered_stop: Dict[str, Any],
+        position_key: str,
+        lifecycle_key: str,
+    ) -> None:
+        """Market-close only after the stop's exchange-generated order is terminal."""
+        child_order_ids = triggered_stop.get("ordIdList") or []
+        child_order_id = triggered_stop.get("ordId")
+        if not child_order_id and child_order_ids:
+            child_order_id = child_order_ids[0]
+        if not child_order_id:
+            await self._alert(
+                f"orphan_stop_child_order_missing:{position_key}",
+                f"Orphan stop triggered for {position_key}, but no child order ID "
+                "is available; refusing to submit a duplicate close",
+                "critical",
+            )
+            return
+
+        try:
+            child_status = self.okx_client.get_order(pos.symbol, str(child_order_id))
+        except Exception as exc:
+            await self._alert(
+                f"orphan_stop_child_status_failed:{position_key}",
+                f"Cannot verify triggered orphan stop order {child_order_id}: {exc}",
+                "critical",
+            )
+            return
+        if not isinstance(child_status, dict):
+            await self._alert(
+                f"orphan_stop_child_status_unknown:{position_key}",
+                f"Cannot verify triggered orphan stop order {child_order_id}; "
+                "will not submit a duplicate close",
+                "critical",
+            )
+            return
+
+        child_state = str(child_status.get("state", "")).lower()
+        if child_state in {"live", "partially_filled"}:
+            return
+        if child_state not in {
+            "filled", "canceled", "cancelled", "mmp_canceled", "rejected",
+        }:
+            await self._alert(
+                f"orphan_stop_child_state_unknown:{position_key}",
+                f"Triggered orphan stop child order {child_order_id} has "
+                f"unrecognized state {child_state!r}; refusing duplicate close",
+                "critical",
+            )
+            return
+
+        side = str(getattr(pos, "side", "")).lower()
+        checked_query = getattr(self.okx_client, "get_positions_checked", None)
+        if not callable(checked_query):
+            await self._alert(
+                f"orphan_stop_position_query_unavailable:{position_key}",
+                f"Cannot verify current orphan position {position_key} after its "
+                "protective stop triggered; refusing market-close escalation",
+                "critical",
+            )
+            return
+        try:
+            raw_positions = checked_query()
+        except Exception as exc:
+            await self._alert(
+                f"orphan_stop_position_query_failed:{position_key}",
+                f"Failed to query current orphan position {position_key}: {exc}",
+                "critical",
+            )
+            return
+        if raw_positions is None or not isinstance(raw_positions, list):
+            await self._alert(
+                f"orphan_stop_position_query_failed:{position_key}",
+                f"Could not confirm current orphan position {position_key} after "
+                "its protective stop triggered; refusing market-close escalation",
+                "critical",
+            )
+            return
+
+        current_position = None
+        try:
+            for raw_position in raw_positions:
+                if not isinstance(raw_position, dict):
+                    raise ValueError("position response contains a non-object record")
+                if (
+                    raw_position.get("instId") != pos.symbol
+                    or str(raw_position.get("posSide", "")).lower() != side
+                ):
+                    continue
+                parsed_position = self.okx_client._parse_position(raw_position)
+                if parsed_position is None:
+                    raise ValueError("exchange position could not be parsed")
+                if abs(float(parsed_position.quantity)) > 0:
+                    current_position = parsed_position
+                    break
+        except (TypeError, ValueError, AttributeError) as exc:
+            await self._alert(
+                f"orphan_stop_position_invalid:{position_key}",
+                f"Invalid current orphan position response for {position_key}: {exc}",
+                "critical",
+            )
+            return
+
+        if current_position is None:
+            logger.info(
+                f"Protective stop closed orphan position {position_key}; "
+                "no market-close remainder"
+            )
+            return
+
+        quantity = abs(float(current_position.quantity))
+        if side not in {"long", "short"} or not math.isfinite(quantity) or quantity <= 0:
+            await self._alert(
+                f"orphan_stop_remaining_invalid:{position_key}",
+                f"Invalid remaining orphan position after stop trigger: "
+                f"side={side!r}, quantity={quantity!r}",
+                "critical",
+            )
+            return
+
+        quantity_coins = self.okx_client.contracts_to_coins(
+            current_position.symbol, quantity
+        )
+        if not math.isfinite(quantity_coins) or quantity_coins <= 0:
+            await self._alert(
+                f"orphan_stop_remaining_invalid:{position_key}",
+                f"Invalid converted close quantity for orphan position {position_key}",
+                "critical",
+            )
+            return
+
+        market_side = "sell" if side == "long" else "buy"
+        try:
+            result = self.okx_client.place_order(
+                symbol=current_position.symbol,
+                side=market_side,
+                order_type="market",
+                quantity=quantity_coins,
+                leverage=int(getattr(current_position, "leverage", 1) or 1),
+                reduce_only=True,
+                pos_side=side,
+                clOrdId=f"ORPHANCLOSE{hashlib.sha256(str(child_order_id).encode('utf-8')).hexdigest()[:20]}",
+            )
+        except Exception as exc:
+            result = None
+            error = str(exc)
+        else:
+            error = "exchange did not confirm market-close order"
+
+        if (
+            not isinstance(result, dict)
+            or result.get("_failed", False)
+            or str(result.get("sCode", "0")) != "0"
+            or not result.get("ordId")
+        ):
+            if isinstance(result, dict):
+                error = result.get("sMsg") or result.get("error") or error
+            await self._alert(
+                f"orphan_stop_market_close_failed:{position_key}",
+                f"Protective stop triggered but reduce-only market close failed "
+                f"for {position_key}: {error}",
+                "critical",
+            )
+            return
+
+        self._orphan_close_orders[lifecycle_key] = str(result["ordId"])
+        await self._alert(
+            f"orphan_stop_market_close_submitted:{position_key}",
+            f"Protective stop triggered; submitted reduce-only market close for "
+            f"remaining orphan position {position_key}",
+            "critical",
+        )
 
     async def _emergency_drawdown_protection(self, drawdown: float):
         """紧急回撤保护：降低仓位和杠杆"""
@@ -532,6 +1161,8 @@ class AdaptiveController:
                 await self._enhanced_rebalance_allocations()
                 # 风险预算转移：从表现差的策略转出预算
                 await self._reallocate_risk_budgets()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Rebalance loop error: {e}")
             await asyncio.sleep(self._rebalance_interval)
@@ -668,8 +1299,18 @@ class AdaptiveController:
 
         # 获取当前权益作为计算基准
         total_equity = self._capital_utilization.get("total_equity", 0)
-        if total_equity <= 0:
-            total_equity = self.config.get("trading", {}).get("total_capital", 559.29)
+        try:
+            total_equity = float(total_equity) if total_equity is not None else 0.0
+        except (TypeError, ValueError):
+            total_equity = 0.0
+        if not np.isfinite(total_equity) or total_equity <= 0:
+            fallback = self.config.get("trading", {}).get("total_capital", 559.29)
+            try:
+                total_equity = float(fallback) if fallback is not None else 0.0
+            except (TypeError, ValueError):
+                total_equity = 0.0
+            if not np.isfinite(total_equity):
+                total_equity = 0.0
 
         for strategy in strategy_perf:
             budget_ratio = self._strategy_risk_limits.get(strategy, 0.2)
@@ -805,7 +1446,7 @@ class AdaptiveController:
         performances = {}
         cutoff = datetime.now() - timedelta(days=days)
 
-        for strategy_name in ["grid", "trend", "scalping", "arbitrage"]:
+        for strategy_name in self._get_enabled_strategy_names():
             records = self.sqlite_storage.get_trade_records(
                 strategy_name=strategy_name, limit=200
             )
@@ -931,11 +1572,61 @@ class AdaptiveController:
         return max_dd
 
     def get_allocation(self, strategy_name: str) -> float:
-        """获取策略的动态分配比例"""
-        return self._dynamic_allocations.get(
+        """获取策略的动态分配比例（单一权威读取入口）。
+
+        可部署性门控：即使其它资金模块（allocation_shift / dynamic_allocator / idle_cash）
+        把已退出/暂停策略的权重重新拉起，此处也按硬阻断归零，保证"开不了单"的策略
+        不占用资金权重（fail-closed 单一决策源）。
+        """
+        base = self._dynamic_allocations.get(
             strategy_name,
             self._base_allocations.get(strategy_name, 0.25)
         )
+        if self._strategy_deployability(strategy_name) <= 0.0:
+            return 0.0
+        return base
+
+    def get_allocations(self) -> Dict[str, float]:
+        """获取全部策略的最终可部署分配（单一聚合读取入口，供 dashboard/下游统一口径）。"""
+        return {
+            s: self.get_allocation(s)
+            for s in self._base_allocations
+        }
+
+    def apply_contribution_feedback(self, suggestions: list, blend_factor: float = 0.3) -> Dict[str, float]:
+        """将贡献度分析的重分配建议平滑融合进 _dynamic_allocations。
+
+        blend_factor 控制单次调整幅度（0=不调整，1=直接跳到目标），默认 0.3 表示
+        每次只向目标移动 30%，避免分析噪声导致分配剧烈震荡。
+
+        Returns:
+            调整后的 _dynamic_allocations 快照
+        """
+        if not suggestions:
+            return dict(self._dynamic_allocations)
+
+        old = dict(self._dynamic_allocations)
+        for s in suggestions:
+            sname = s.get("strategy", "")
+            if sname not in self._dynamic_allocations:
+                continue
+            action = s.get("action", "hold")
+            if action == "hold":
+                continue
+            target = float(s.get("target_allocation", self._dynamic_allocations[sname]))
+            current = self._dynamic_allocations[sname]
+            new_val = current + blend_factor * (target - current)
+            self._dynamic_allocations[sname] = max(0.0, new_val)
+
+        enabled = [s for s in self._dynamic_allocations if self._is_strategy_enabled(s)]
+        total = sum(self._dynamic_allocations[s] for s in enabled)
+        if total > 0:
+            for s in enabled:
+                self._dynamic_allocations[s] /= total
+
+        if old != self._dynamic_allocations:
+            logger.info(f"Contribution feedback applied: {old} -> {self._dynamic_allocations}")
+        return dict(self._dynamic_allocations)
 
     def _is_strategy_enabled(self, strategy_name: str) -> bool:
         """判断策略是否启用（未显式配置 enabled 时默认启用）。
@@ -944,6 +1635,50 @@ class AdaptiveController:
         不应占用资金权重，避免其分配被 allocation_shift / dynamic_allocator 重新拉起。
         """
         return bool(self.config.get("strategies", {}).get(strategy_name, {}).get("enabled", True))
+
+    def _strategy_deployability(self, strategy_name: str) -> float:
+        """单一决策源：策略可部署性因子 [0, 1]。
+
+        综合「策略退出 / 策略暂停 / 币种黑名单」评估该策略当前能否真正开单，
+        把资金从"开不了单"的策略动态转移到"能开单"的策略（根治资金闲置）。
+
+        返回 1.0 = 完全可部署；0.0 = 硬阻断（无法开单）。
+        """
+        if not self._deployability_enabled:
+            return 1.0
+        if not self._is_strategy_enabled(strategy_name):
+            return 0.0
+        if self._intelligent_agent is None:
+            return 1.0
+
+        # 1. 策略永久退出 → 完全无法开单
+        try:
+            if self._intelligent_agent.is_strategy_exited(strategy_name):
+                return self._deployability_exited_factor
+        except Exception as e:
+            logger.debug(f"Deployability exit check error for {strategy_name}: {e}")
+
+        # 2. 策略暂停 → 近乎无法开单
+        try:
+            if self._intelligent_agent.is_strategy_paused(strategy_name):
+                return self._deployability_paused_factor
+        except Exception as e:
+            logger.debug(f"Deployability pause check error for {strategy_name}: {e}")
+
+        # 3. 币种黑名单覆盖：该策略被拉黑的 (symbol, strategy) 对越多，可部署性越低
+        try:
+            pairs = self._intelligent_agent.get_blacklisted_strategy_pairs()
+            n_pairs = sum(1 for (_sym, st) in pairs if st == strategy_name)
+            if n_pairs > 0:
+                penalty = min(
+                    self._deployability_max_blacklist_penalty,
+                    n_pairs * self._deployability_blacklist_pair_penalty,
+                )
+                return max(0.0, 1.0 - penalty)
+        except Exception as e:
+            logger.debug(f"Deployability blacklist check error for {strategy_name}: {e}")
+
+        return 1.0
 
     # ===================== 风险预算系统：核心检查与执行 =====================
 
@@ -963,9 +1698,31 @@ class AdaptiveController:
         if not self._risk_budget_enabled:
             return True, "risk_budget_disabled"
 
-        # 1. 连续亏损熔断检查
+        # fail-closed：无法确认权益/风险敞口时一律拒绝，禁止静默放行
+        try:
+            equity = float(equity)
+            trade_risk_usdt = float(trade_risk_usdt)
+        except (TypeError, ValueError):
+            return False, "invalid_risk_inputs"
+        if not np.isfinite(equity) or equity <= 0:
+            return False, "invalid_equity"
+        if not np.isfinite(trade_risk_usdt) or trade_risk_usdt < 0:
+            return False, "invalid_trade_risk"
+
+        # 1. 连续亏损熔断：等待期内完全阻断，之后只允许极小风险观察单。
+        streak_probe = False
         if self._streak_lock_active:
-            return False, f"loss_streak_lock: consecutive_losses={self._consecutive_loss_count}"
+            lock_started = self._streak_lock_started_at or datetime.now()
+            lock_age = max(0.0, (datetime.now() - lock_started).total_seconds())
+            probe_limit = equity * self._streak_probe_risk_pct
+            if lock_age < self._streak_probe_after_seconds:
+                return False, f"loss_streak_lock: consecutive_losses={self._consecutive_loss_count}"
+            if self._streak_probe_risk_pct <= 0.0 or trade_risk_usdt > probe_limit:
+                return False, (
+                    f"loss_streak_probe_limit: risk={trade_risk_usdt:.4f} "
+                    f"limit={probe_limit:.4f}"
+                )
+            streak_probe = True
 
         # 2. 单笔风险上限检查
         max_per_trade_risk = equity * self._max_per_trade_risk_pct
@@ -996,13 +1753,25 @@ class AdaptiveController:
             return False, (f"hourly_loss_limit: pnl={self._hourly_pnl:.4f}, "
                           f"limit={-equity * self._hourly_max_loss_pct:.4f}")
 
-        return True, "approved"
+        return True, "loss_streak_probe_approved" if streak_probe else "approved"
 
     def record_risk_consumption(self, strategy_name: str, symbol: str,
                                  pnl: float, risk_amount: float):
         """记录风险消耗（每次交易完成后调用）"""
         if not self._risk_budget_enabled:
             return
+
+        # 数值防御：None/NaN/非数值输入统一处理，避免比较与 round 抛 TypeError
+        try:
+            pnl = float(pnl) if pnl is not None else 0.0
+            risk_amount = float(risk_amount) if risk_amount is not None else 0.0
+        except (TypeError, ValueError):
+            logger.warning(f"record_risk_consumption: invalid pnl/risk_amount for {strategy_name} {symbol}, skipped")
+            return
+        if not np.isfinite(pnl):
+            pnl = 0.0
+        if not np.isfinite(risk_amount):
+            risk_amount = 0.0
 
         # 累计当日风险消耗（亏损才算消耗）
         if pnl < 0:
@@ -1019,8 +1788,12 @@ class AdaptiveController:
             self._consecutive_loss_count += 1
             self._consecutive_win_count = 0
             # 连续亏损熔断检查
-            if self._consecutive_loss_count >= self._max_consecutive_losses:
+            if (
+                self._consecutive_loss_count >= self._max_consecutive_losses
+                and not self._streak_lock_active
+            ):
                 self._streak_lock_active = True
+                self._streak_lock_started_at = datetime.now()
                 self._apply_loss_streak_lock()
         elif pnl > 0:
             self._consecutive_win_count += 1
@@ -1051,17 +1824,15 @@ class AdaptiveController:
         if len(self._risk_budget_log) > 200:
             self._risk_budget_log = self._risk_budget_log[-200:]
 
+        # 风控状态变更后立即持久化，重启可恢复
+        self._persist_risk_budget_state()
+
     def _apply_loss_streak_lock(self):
         """连续亏损熔断：削减所有策略风险预算"""
         reduce_pct = self._streak_reduce_pct
         for sname in self._strategy_risk_limits:
             old_budget = self._risk_budget.get(sname, 0)
             self._risk_budget[sname] = old_budget * (1 - reduce_pct)
-        # 重新归一化
-        total = sum(self._risk_budget.values())
-        if total > 0:
-            for sname in self._risk_budget:
-                self._risk_budget[sname] /= total
 
         logger.warning(f"[RISK_BUDGET] Loss streak lock activated: "
                        f"{self._consecutive_loss_count} consecutive losses, "
@@ -1076,6 +1847,7 @@ class AdaptiveController:
     def _release_loss_streak_lock(self):
         """连续盈利恢复：恢复原始风险预算"""
         self._streak_lock_active = False
+        self._streak_lock_started_at = None
         strategy_budgets = self.config.get("risk_budget", {}).get("strategy_budgets", {})
         for sname in self._strategy_risk_limits:
             self._risk_budget[sname] = float(strategy_budgets.get(sname, self._strategy_risk_limits.get(sname, 0.2)))
@@ -1153,6 +1925,7 @@ class AdaptiveController:
                 "transfers": transfers,
                 "new_budgets": {s: round(v, 4) for s, v in self._risk_budget.items()},
             })
+            self._persist_risk_budget_state()
 
     def update_symbol_exposure(self, symbol: str, risk_usdt: float, action: str = "add"):
         """更新单币种风险敞口
@@ -1186,8 +1959,18 @@ class AdaptiveController:
     def get_risk_budget_status(self) -> Dict[str, Any]:
         """获取风险预算状态（供 API 和策略查询）"""
         total_equity = self._capital_utilization.get("total_equity", 0)
-        if total_equity <= 0:
-            total_equity = self.config.get("trading", {}).get("total_capital", 559.29)
+        try:
+            total_equity = float(total_equity) if total_equity is not None else 0.0
+        except (TypeError, ValueError):
+            total_equity = 0.0
+        if not np.isfinite(total_equity) or total_equity <= 0:
+            fallback = self.config.get("trading", {}).get("total_capital", 559.29)
+            try:
+                total_equity = float(fallback) if fallback is not None else 0.0
+            except (TypeError, ValueError):
+                total_equity = 0.0
+            if not np.isfinite(total_equity):
+                total_equity = 0.0
 
         strategy_status = {}
         for sname in self._strategy_risk_limits:
@@ -1210,6 +1993,12 @@ class AdaptiveController:
             "total_consumed": round(sum(abs(v) for v in self._daily_risk_consumed.values()), 4),
             "max_per_trade_risk": round(total_equity * self._max_per_trade_risk_pct, 4),
             "streak_lock_active": self._streak_lock_active,
+            "streak_lock_started_at": (
+                self._streak_lock_started_at.isoformat()
+                if self._streak_lock_started_at else None
+            ),
+            "streak_probe_after_seconds": self._streak_probe_after_seconds,
+            "streak_probe_risk_pct": self._streak_probe_risk_pct,
             "consecutive_losses": self._consecutive_loss_count,
             "consecutive_wins": self._consecutive_win_count,
             "hourly_pnl": round(self._hourly_pnl, 4),
@@ -1219,15 +2008,71 @@ class AdaptiveController:
         }
 
     def _persist_risk_budget_state(self):
-        """将风险预算状态持久化到 data/risk_budget_state.json（供 dashboard API 读取）"""
+        """持久化熔断锁和风险预算状态，供重启恢复及 dashboard 查询。"""
         try:
             state = self.get_risk_budget_status()
-            state_path = os.path.join("data", "risk_budget_state.json")
-            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            state["risk_budget"] = dict(self._risk_budget)
+            state_path = self._risk_budget_state_path
+            parent_dir = os.path.dirname(state_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False)
         except Exception as e:
             logger.debug(f"Persist risk budget state error: {e}")
+
+    def _restore_risk_budget_state(self) -> None:
+        """恢复熔断锁；重启不能隐式解除尚未满足恢复条件的连续亏损熔断。"""
+        try:
+            if not os.path.exists(self._risk_budget_state_path):
+                return
+            with open(self._risk_budget_state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict):
+                return
+
+            self._streak_lock_active = bool(state.get("streak_lock_active", False))
+            self._consecutive_loss_count = max(0, int(state.get("consecutive_losses", 0)))
+            self._consecutive_win_count = max(0, int(state.get("consecutive_wins", 0)))
+            started_at = state.get("streak_lock_started_at")
+            if self._streak_lock_active:
+                try:
+                    self._streak_lock_started_at = datetime.fromisoformat(started_at) if started_at else datetime.now()
+                except (TypeError, ValueError):
+                    self._streak_lock_started_at = datetime.now()
+                saved_budgets = state.get("risk_budget", {})
+                restored_budget = False
+                if isinstance(saved_budgets, dict):
+                    for strategy, saved_budget in saved_budgets.items():
+                        if strategy in self._strategy_risk_limits:
+                            budget = float(saved_budget)
+                            if math.isfinite(budget) and budget >= 0.0:
+                                self._risk_budget[strategy] = budget
+                                restored_budget = True
+                if not restored_budget:
+                    for strategy in self._strategy_risk_limits:
+                        self._risk_budget[strategy] = (
+                            self._risk_budget.get(strategy, 0.0) * (1 - self._streak_reduce_pct)
+                        )
+                logger.warning(
+                    f"[RISK_BUDGET] Restored active loss-streak lock "
+                    f"({self._consecutive_loss_count} consecutive losses)"
+                )
+            else:
+                self._streak_lock_started_at = None
+        except Exception as e:
+            self._streak_lock_active = True
+            self._streak_lock_started_at = datetime.now()
+            self._consecutive_loss_count = max(
+                self._consecutive_loss_count, self._max_consecutive_losses
+            )
+            for strategy in self._strategy_risk_limits:
+                self._risk_budget[strategy] = (
+                    self._risk_budget.get(strategy, 0.0) * (1 - self._streak_reduce_pct)
+                )
+            logger.error(
+                f"[RISK_BUDGET] State restore failed; activating fail-closed streak lock: {e}"
+            )
 
     # ===================== 自动调优 =====================
 
@@ -1236,6 +2081,8 @@ class AdaptiveController:
         while True:
             try:
                 await self._auto_tune_parameters()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Optimization loop error: {e}")
             await asyncio.sleep(self._optimization_interval)
@@ -1385,6 +2232,8 @@ class AdaptiveController:
         while True:
             try:
                 await self._verify_pnl_calculation()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"PnL verification error: {e}")
             await asyncio.sleep(self._rebalance_interval)
@@ -1414,14 +2263,23 @@ class AdaptiveController:
                             break
 
                 if matched:
-                    db_entry_price = matched.get("price", 0)
-                    okx_entry_price = pos.avg_cost
+                    # 数值防御：DB 记录与 OKX 仓位字段可能为 None/非数值，先安全转换
+                    try:
+                        db_entry_price = float(matched.get("price") or 0)
+                        okx_entry_price = float(pos.avg_cost or 0)
+                        mark_price = float(pos.mark_price or 0)
+                        quantity = float(pos.quantity or 0)
+                        actual_pnl = float(pos.unrealized_pnl or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if not all(np.isfinite(v) for v in (db_entry_price, okx_entry_price, mark_price, quantity, actual_pnl)):
+                        continue
+
                     price_diff_pct = abs(db_entry_price - okx_entry_price) / okx_entry_price if okx_entry_price > 0 else 0
 
                     # 计算期望PnL vs OKX实际PnL
                     direction = 1 if pos.side == "long" else -1
-                    expected_pnl = (pos.mark_price - okx_entry_price) * abs(pos.quantity) * direction
-                    actual_pnl = pos.unrealized_pnl
+                    expected_pnl = (mark_price - okx_entry_price) * abs(quantity) * direction
                     pnl_diff = abs(expected_pnl - actual_pnl)
 
                     verification_results.append({
@@ -1574,6 +2432,8 @@ class AdaptiveController:
                 await self._check_capital_utilization()
                 await self._optimize_idle_cash_allocation()
                 await self._sync_dynamic_allocator()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Capital utilization check error: {e}")
             await asyncio.sleep(self._utilization_check_interval)
@@ -1730,6 +2590,26 @@ class AdaptiveController:
                 if available <= 0:
                     available = total_equity - used_margin
 
+            # fail-closed：账户权益不可用/异常时，不得按"低利用率"触发加仓/boost
+            # （否则 API 失败会被误判为空仓低利用率而放大敞口）。标记状态并跳过本轮优化。
+            try:
+                total_equity = float(total_equity)
+                used_margin = float(used_margin)
+                available = float(available)
+            except (TypeError, ValueError):
+                total_equity = 0.0
+            if not np.isfinite(total_equity) or total_equity <= 0:
+                self._capital_utilization["status"] = "unavailable"
+                self._capital_utilization["total_equity"] = 0.0
+                self._capital_utilization["utilization_rate"] = 0.0
+                logger.warning("Capital utilization: account equity unavailable/invalid, skipping optimization (fail-closed)")
+                self._persist_utilization_state()
+                return
+            if not np.isfinite(used_margin):
+                used_margin = 0.0
+            if not np.isfinite(available):
+                available = 0.0
+
             utilization_rate = used_margin / total_equity if total_equity > 0 else 0
             
             strategy_usage = {}
@@ -1738,6 +2618,12 @@ class AdaptiveController:
                 strategy = pos.get("strategy_name") or pos.get("strategy") or "unknown"
                 margin = pos.get("margin", 0)
                 strategy_usage[strategy] = strategy_usage.get(strategy, 0) + margin
+            strategy_used_margin = sum(strategy_usage.values())
+            margin_reconciliation_delta = strategy_used_margin - used_margin
+            reconciliation_tolerance = max(
+                1.0, abs(used_margin) * 0.05, abs(strategy_used_margin) * 0.05
+            )
+            margin_reconciliation_ok = abs(margin_reconciliation_delta) <= reconciliation_tolerance
             
             self._capital_utilization = {
                 "total_used": used_margin,
@@ -1764,6 +2650,10 @@ class AdaptiveController:
             atr_ratio = self._get_atr_ratio()
             recent_pnl = self._get_recent_strategy_pnl()
             drawdown_pct = self._get_total_drawdown_pct()
+            efficiency_is_valid = (
+                strategy_used_margin > CapitalUtilizationEngine.MIN_EFFICIENCY_MARGIN
+                and bool(recent_pnl)
+            )
             report = self._utilization_engine.analyze(
                 total_equity=total_equity,
                 used_margin=used_margin,
@@ -1780,6 +2670,10 @@ class AdaptiveController:
             self._capital_utilization["utilization_tier"] = report.utilization_tier.value
             self._capital_utilization["recommended_action"] = report.recommended_action.value
             self._capital_utilization["capital_efficiency"] = report.capital_efficiency
+            self._capital_utilization["capital_efficiency_valid"] = efficiency_is_valid
+            self._capital_utilization["strategy_used_margin"] = strategy_used_margin
+            self._capital_utilization["margin_reconciliation_delta"] = margin_reconciliation_delta
+            self._capital_utilization["margin_reconciliation_ok"] = margin_reconciliation_ok
             self._capital_utilization["utilization_trend"] = report.utilization_trend
             self._capital_utilization["utilization_volatility"] = report.utilization_volatility
             self._capital_utilization["volatility_regime"] = report.volatility_regime
@@ -1879,6 +2773,10 @@ class AdaptiveController:
                 "utilization_tier": self._capital_utilization.get("utilization_tier", "unknown"),
                 "recommended_action": self._capital_utilization.get("recommended_action", "none"),
                 "capital_efficiency": self._capital_utilization.get("capital_efficiency", 0.0),
+                "capital_efficiency_valid": self._capital_utilization.get("capital_efficiency_valid", False),
+                "strategy_used_margin": self._capital_utilization.get("strategy_used_margin", 0.0),
+                "margin_reconciliation_delta": self._capital_utilization.get("margin_reconciliation_delta", 0.0),
+                "margin_reconciliation_ok": self._capital_utilization.get("margin_reconciliation_ok"),
                 "utilization_trend": self._capital_utilization.get("utilization_trend", 0.0),
                 "utilization_volatility": self._capital_utilization.get("utilization_volatility", 0.0),
                 "volatility_regime": self._capital_utilization.get("volatility_regime", "normal"),
@@ -1964,6 +2862,10 @@ class AdaptiveController:
                     if remaining_increase <= 0:
                         break
 
+                    # 闲置资金只投向「能开单」的策略，跳过退出/暂停/重黑名单策略
+                    if self._strategy_deployability(strategy) < self._idle_cash_min_deployability:
+                        continue
+
                     perf = strategy_performances.get(strategy, {})
                     win_rate = perf.get("win_rate", 0.5)
                     current_alloc = self._dynamic_allocations.get(strategy, 0)
@@ -2028,7 +2930,7 @@ class AdaptiveController:
             relaxation = severity * 0.15  # 最多降低15%
             strategies_config = self.config.get("strategies", {})
 
-            for strategy_name in ["grid", "trend", "scalping", "arbitrage"]:
+            for strategy_name in self._get_enabled_strategy_names():
                 # locked_params 锁定的参数（如 min_signal_quality）不允许被放松下调
                 if "min_signal_quality" in self._locked_params.get(strategy_name, set()):
                     continue
@@ -2067,7 +2969,7 @@ class AdaptiveController:
 
             strategies_config = self.config.get("strategies", {})
 
-            for strategy_name in ["grid", "trend", "scalping", "arbitrage"]:
+            for strategy_name in self._get_enabled_strategy_names():
                 # locked_params 锁定的参数（如 min_signal_quality）不允许被放松下调
                 if "min_signal_quality" in self._locked_params.get(strategy_name, set()):
                     continue
@@ -2095,7 +2997,7 @@ class AdaptiveController:
         """恢复到初始信号质量阈值"""
         try:
             strategies_config = self.config.get("strategies", {})
-            for strategy_name in ["grid", "trend", "scalping", "arbitrage"]:
+            for strategy_name in self._get_enabled_strategy_names():
                 initial_quality = self._initial_signal_quality.get(strategy_name, 0.25)
                 if strategy_name in strategies_config:
                     strategies_config[strategy_name]["min_signal_quality"] = initial_quality
@@ -2156,6 +3058,21 @@ class AdaptiveController:
     def get_position_boost(self) -> float:
         """获取空闲资金仓位乘数（供scheduler调用）"""
         return getattr(self, '_idle_cash_position_boost', 1.0)
+
+    def get_signal_relaxation(self) -> float:
+        """获取资金利用率引擎的信号质量放松量（正数=放松/降低门槛，负数=收紧/提高门槛）。
+
+        供策略层（如 grid）在信号门槛计算处读取，把资本层意图传导到信号门；
+        报告未生成时返回 0.0（不放松也不收紧）。
+        """
+        report = self._latest_utilization_report
+        if report is None:
+            return 0.0
+        try:
+            return float(report.signal_relaxation)
+        except (TypeError, ValueError):
+            return 0.0
+
 
     def _cap_position_boost_by_risk_budget(self, boost: float) -> float:
         """给 position_boost 加 risk_budget 封顶，防止风险预算耗尽时仍放大仓位。
@@ -2228,7 +3145,7 @@ class AdaptiveController:
                 self._capital_utilization["position_boost"] = 1.0
 
             strategies_config = self.config.get("strategies", {})
-            for strategy_name in ["grid", "trend", "scalping", "arbitrage"]:
+            for strategy_name in self._get_enabled_strategy_names():
                 # 恢复到初始阈值，而非当前被放松的值
                 initial_quality = self._initial_signal_quality.get(strategy_name, 0.25)
                 if strategy_name in strategies_config:
@@ -2306,13 +3223,44 @@ class AdaptiveController:
         return 1.0
 
     def _get_recent_strategy_pnl(self) -> Dict[str, float]:
-        """提取各策略近期累计盈亏"""
+        """提取各策略近期已平仓交易的累计盈亏（USDT 净额）。
+
+        优先使用 TradeJournal `trades` 表权威口径（pnl_usdt），与 PnL 对账一致，
+        避免 trade_records.pnl 被 ghost_close 污染（约 93% closed 记录 pnl=NULL/0）
+        导致 capital_efficiency 严重失真。当 trades 表无窗口内数据时回退到
+        trade_records 口径（只统计 close_time 落在最近 _performance_window_hours 内）。
+        """
         try:
-            performances = self._get_strategy_performances()
-            return {s: float(p.get("total_pnl", 0) or 0) for s, p in performances.items()}
+            authoritative = self.sqlite_storage.get_recent_strategy_pnl_authoritative(
+                hours=self._performance_window_hours
+            )
+            if authoritative:
+                return authoritative
+        except Exception as e:
+            logger.debug(f"Failed to get authoritative recent pnl, fallback to trade_records: {e}")
+
+        cutoff = datetime.now() - timedelta(hours=self._performance_window_hours)
+        pnl_by_strategy: Dict[str, float] = {}
+        try:
+            records = self.sqlite_storage.get_trade_records_by_status("closed", limit=500)
+            for rec in records:
+                close_time = rec.get("close_time")
+                if close_time is None:
+                    continue
+                if isinstance(close_time, str):
+                    try:
+                        close_time = datetime.fromisoformat(close_time)
+                    except (ValueError, TypeError):
+                        continue
+                if close_time < cutoff:
+                    continue
+                strategy = rec.get("strategy_name") or rec.get("strategy") or "unknown"
+                pnl = rec.get("pnl", 0) or 0
+                pnl_by_strategy[strategy] = pnl_by_strategy.get(strategy, 0.0) + float(pnl)
         except Exception as e:
             logger.debug(f"Failed to get recent strategy pnl: {e}")
             return {}
+        return pnl_by_strategy
 
     def _get_total_drawdown_pct(self) -> float:
         """从 EquityMonitor 提取当前总回撤百分比"""
@@ -2345,8 +3293,17 @@ class AdaptiveController:
             mapping = {
                 "trending_up": MarketRegime.TRENDING_UP,
                 "trending_down": MarketRegime.TRENDING_DOWN,
+                "trend_bullish": MarketRegime.TRENDING_UP,
+                "trend_bearish": MarketRegime.TRENDING_DOWN,
+                "breakout": MarketRegime.BREAKOUT,
+                "breakdown": MarketRegime.BREAKDOWN,
+                "reversal": MarketRegime.REVERSAL,
                 "ranging": MarketRegime.RANGING,
+                "range_bound": MarketRegime.RANGING,
                 "high_volatility": MarketRegime.HIGH_VOLATILITY,
+                "extreme_volatility": MarketRegime.HIGH_VOLATILITY,
+                "funding_crush": MarketRegime.HIGH_VOLATILITY,
+                "liquidity_crisis": MarketRegime.HIGH_VOLATILITY,
                 "low_volatility": MarketRegime.LOW_VOLATILITY,
             }
             return mapping.get(regime_str, MarketRegime.UNKNOWN)
@@ -2699,9 +3656,12 @@ class AdaptiveController:
 
             regime_scores = self._calculate_regime_scores()
             final_alloc = {}
+            deployability = {}
             for s in vol_adjusted:
                 regime_factor = regime_scores.get(s, 0.5)
-                final_alloc[s] = vol_adjusted[s] * (0.7 + regime_factor * 0.6)
+                deployability[s] = self._strategy_deployability(s)
+                # 可部署性感知：无法开单的策略目标权重向 0 收缩
+                final_alloc[s] = vol_adjusted[s] * (0.7 + regime_factor * 0.6) * deployability[s]
 
             final_total = sum(final_alloc.values())
             if final_total > 0:
@@ -2709,10 +3669,15 @@ class AdaptiveController:
                     final_alloc[s] /= final_total
 
             old_alloc = dict(self._dynamic_allocations)
+            new_weight = self._allocation_smoothing_new_weight
             smoothed = {}
             for s in final_alloc:
+                # 硬阻断（可部署性 0）直接归零，不平滑，避免旧权重残留
+                if deployability.get(s, 1.0) <= 0.0:
+                    smoothed[s] = 0.0
+                    continue
                 old = old_alloc.get(s, self._base_allocations.get(s, 0.2))
-                smoothed[s] = old * 0.7 + final_alloc[s] * 0.3
+                smoothed[s] = old * (1 - new_weight) + final_alloc[s] * new_weight
 
             smoothed_total = sum(smoothed.values())
             if smoothed_total > 0:

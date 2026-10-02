@@ -5,7 +5,7 @@ import os
 import json
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, text, Index, func, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 from loguru import logger
 
 from data.sharding import ShardRouter
+from utils.helpers import safe_float, safe_int
 
 Base = declarative_base()
 
@@ -279,7 +280,8 @@ class SQLiteStorage:
                             sa_text(f"PRAGMA table_info({table})")
                         ).fetchall()
                         existing_names = {row[1] for row in existing}
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"PRAGMA table_info({table}) failed: {e}")
                         continue
                     for col in columns:
                         if col not in existing_names:
@@ -306,13 +308,10 @@ class SQLiteStorage:
         margin = trade.get("margin")
 
         if status == "closed" and margin:
-            try:
-                margin_val = float(margin)
-                pnl_val = float(pnl) if pnl is not None else 0.0
-                if margin_val > 0:
-                    trade["pnl_percent"] = (pnl_val / margin_val * 100) if pnl_val != 0 else 0.0
-            except (TypeError, ValueError):
-                pass
+            margin_val = safe_float(margin)
+            pnl_val = safe_float(pnl)
+            if margin_val > 0:
+                trade["pnl_percent"] = (pnl_val / margin_val * 100) if pnl_val != 0 else 0.0
 
         if not trade.get("signal_type"):
             trade["signal_type"] = "unknown"
@@ -349,15 +348,17 @@ class SQLiteStorage:
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save trade record: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
     def save_trade_records_batch(self, trades: List[Dict[str, Any]]):
         if not trades:
-            return
+            return True
         
         session = self._Session()
         try:
@@ -392,13 +393,15 @@ class SQLiteStorage:
             session.add_all(records)
             session.commit()
             logger.debug(f"Saved {len(records)} trade records in batch")
+            return True
         except Exception as e:
             logger.error(f"Failed to save trade records batch: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
-    def save_active_order(self, exchange_order_id: str, order_info: Dict[str, Any]) -> None:
+    def save_active_order(self, exchange_order_id: str, order_info: Dict[str, Any]) -> bool:
         """活跃订单落盘（fill 回执丢失根因修复方案 A）：持久化 pending 订单完整信息，
         供系统重启后恢复 `_active_orders`，根治「重启内存态清空导致成交回执永久丢失」。
 
@@ -412,10 +415,12 @@ class SQLiteStorage:
                     "(exchange_order_id, order_info, updated_at) VALUES (:id, :info, :ts)"
                 ), {"id": exchange_order_id, "info": payload, "ts": datetime.now().isoformat()})
                 conn.commit()
+            return True
         except Exception as e:
             logger.warning(f"save_active_order failed for {exchange_order_id}: {e}")
+            return False
 
-    def delete_active_order(self, exchange_order_id: str) -> None:
+    def delete_active_order(self, exchange_order_id: str) -> bool:
         """删除已处理（成交/撤单/失败）的活跃订单落盘记录。"""
         try:
             with self._engine.connect() as conn:
@@ -423,8 +428,10 @@ class SQLiteStorage:
                     "DELETE FROM active_orders WHERE exchange_order_id = :id"
                 ), {"id": exchange_order_id})
                 conn.commit()
+            return True
         except Exception as e:
             logger.warning(f"delete_active_order failed for {exchange_order_id}: {e}")
+            return False
 
     def load_active_orders(self) -> Dict[str, Dict[str, Any]]:
         """加载全部落盘的活跃订单（用于重启恢复 `_active_orders`）。"""
@@ -454,13 +461,10 @@ class SQLiteStorage:
                 if status_after == "closed" and "pnl" in updates:
                     margin = record.margin
                     if margin:
-                        try:
-                            margin_val = float(margin)
-                            pnl_val = float(updates.get("pnl") or 0.0)
-                            if margin_val > 0:
-                                updates["pnl_percent"] = (pnl_val / margin_val * 100) if pnl_val != 0 else 0.0
-                        except (TypeError, ValueError):
-                            pass
+                        margin_val = safe_float(margin)
+                        pnl_val = safe_float(updates.get("pnl") or 0.0)
+                        if margin_val > 0:
+                            updates["pnl_percent"] = (pnl_val / margin_val * 100) if pnl_val != 0 else 0.0
                 # signal_type 空值兜底
                 if not updates.get("signal_type") and not record.signal_type:
                     updates["signal_type"] = "unknown"
@@ -475,16 +479,24 @@ class SQLiteStorage:
                                 value = _dt.now()
                         setattr(record, key, value)
                 session.commit()
+                return True
             else:
                 logger.warning(f"update_trade_record: trade_id={trade_id} not found")
+                return False
         except Exception as e:
             logger.error(f"Failed to update trade record: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
-    def get_trade_records(self, symbol: str = None, strategy_name: str = None,
-                          limit: int = 100) -> List[Dict[str, Any]]:
+    def get_trade_records_checked(self, symbol: str = None, strategy_name: str = None,
+                                  limit: int = 100) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """带错误状态的交易记录查询：返回 (records, error)。
+
+        error 为 None 表示查询成功（结果可为空列表，即「确实无数据」）；
+        error 非空表示查询失败（区别于空数据，供上层 fail-closed 感知）。
+        """
         session = self._Session()
         try:
             query = session.query(TradeRecord)
@@ -493,12 +505,19 @@ class SQLiteStorage:
             if strategy_name:
                 query = query.filter(TradeRecord.strategy_name == strategy_name)
             records = query.order_by(TradeRecord.create_time.desc()).limit(limit).all()
-            return [self._trade_to_dict(r) for r in records]
+            return [self._trade_to_dict(r) for r in records], None
         except Exception as e:
             logger.error(f"Failed to get trade records: {e}")
-            return []
+            return [], str(e)
         finally:
             session.close()
+
+    def get_trade_records(self, symbol: str = None, strategy_name: str = None,
+                          limit: int = 100) -> List[Dict[str, Any]]:
+        """查询交易记录（向后兼容：异常时返回空列表，调用方无法区分失败与空数据，
+        需要区分时改用 get_trade_records_checked）。"""
+        records, _ = self.get_trade_records_checked(symbol=symbol, strategy_name=strategy_name, limit=limit)
+        return records
 
     def get_trade_records_by_status(self, status: str, limit: int = 200) -> List[Dict[str, Any]]:
         session = self._Session()
@@ -545,7 +564,7 @@ class SQLiteStorage:
             session.close()
 
     def close_open_record(self, symbol: str, strategy_name: str = None,
-                          exit_reason: str = "ghost_cleanup") -> bool:
+                          exit_reason: str = "ghost_close") -> bool:
         """关闭指定 symbol（可选 strategy）的未平仓记录。
 
         用于订单执行失败 / 幽灵持仓时同步数据库状态，防止 trade_records 与
@@ -613,9 +632,9 @@ class SQLiteStorage:
             records = query.all()
             
             total_trades = len(records)
-            winning_trades = sum(1 for r in records if r.pnl > 0)
-            losing_trades = sum(1 for r in records if r.pnl <= 0)
-            total_pnl = sum(r.pnl for r in records)
+            winning_trades = sum(1 for r in records if (r.pnl or 0) > 0)
+            losing_trades = sum(1 for r in records if (r.pnl or 0) <= 0)
+            total_pnl = sum(r.pnl or 0 for r in records)
             
             return {
                 "total_trades": total_trades,
@@ -639,7 +658,7 @@ class SQLiteStorage:
                 func.sum(TradeRecord.pnl).label('total_pnl')
             ).filter(TradeRecord.status == "closed").group_by(TradeRecord.strategy_name).all()
             
-            return {row.strategy_name: row.total_pnl for row in result}
+            return {row.strategy_name: (row.total_pnl or 0.0) for row in result}
         except Exception as e:
             logger.error(f"Failed to get strategy PnL summary: {e}")
             return {}
@@ -676,7 +695,7 @@ class SQLiteStorage:
         session = self._Session()
         try:
             record = PositionHistory(
-                id=position.get("id", ""),
+                id=position.get("id") or str(uuid.uuid4()),
                 symbol=position.get("symbol", ""),
                 side=position.get("side", ""),
                 quantity=position.get("quantity", 0.0),
@@ -689,22 +708,24 @@ class SQLiteStorage:
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save position history: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
     def save_position_history_batch(self, positions: List[Dict[str, Any]]):
         if not positions:
-            return
+            return True
         
         session = self._Session()
         try:
             records = []
             for position in positions:
                 record = PositionHistory(
-                    id=position.get("id", ""),
+                    id=position.get("id") or str(uuid.uuid4()),
                     symbol=position.get("symbol", ""),
                     side=position.get("side", ""),
                     quantity=position.get("quantity", 0.0),
@@ -719,9 +740,11 @@ class SQLiteStorage:
             session.add_all(records)
             session.commit()
             logger.debug(f"Saved {len(records)} position history records in batch")
+            return True
         except Exception as e:
             logger.error(f"Failed to save position history batch: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -729,7 +752,7 @@ class SQLiteStorage:
         session = self._Session()
         try:
             record = AccountHistory(
-                id=account.get("id", ""),
+                id=account.get("id") or str(uuid.uuid4()),
                 total_equity=account.get("total_equity", 0.0),
                 available_balance=account.get("available_balance", 0.0),
                 used_margin=account.get("used_margin", 0.0),
@@ -739,9 +762,11 @@ class SQLiteStorage:
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save account history: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -765,9 +790,11 @@ class SQLiteStorage:
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save PnL reconciliation: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -803,7 +830,7 @@ class SQLiteStorage:
         session = self._Session()
         try:
             record = RiskEvent(
-                id=event.get("id", ""),
+                id=event.get("id") or str(uuid.uuid4()),
                 event_type=event.get("event_type", ""),
                 severity=event.get("severity", "INFO"),
                 message=event.get("message", ""),
@@ -812,9 +839,11 @@ class SQLiteStorage:
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save risk event: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -846,9 +875,11 @@ class SQLiteStorage:
                 )
                 session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to update strategy performance: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -883,8 +914,12 @@ class SQLiteStorage:
             "last_update": record.last_update
         }
 
-    async def cleanup_old_data(self, days_to_keep: int = 30, max_retries: int = 3):
-        """清理旧数据，带异步重试机制防止数据库锁定"""
+    async def cleanup_old_data(self, days_to_keep: int = 30, max_retries: int = 3) -> Dict[str, Any]:
+        """清理旧数据，带异步重试机制防止数据库锁定。
+
+        返回 {"success": bool, "deleted_positions": int, "deleted_account": int}，
+        fail-closed：任何重试失败都不静默吞掉，成功路径必须明确返回。
+        """
         import asyncio
         cutoff_date = datetime.now() - timedelta(days=days_to_keep)
         
@@ -908,7 +943,8 @@ class SQLiteStorage:
                     logger.info(f"Cleaned up {deleted_positions} old position history records")
                 if deleted_account > 0:
                     logger.info(f"Cleaned up {deleted_account} old account history records")
-                return  # 成功则返回
+                return {"success": True, "deleted_positions": deleted_positions,
+                        "deleted_account": deleted_account}
             except Exception as e:
                 session.rollback()
                 if "database is locked" in str(e) and attempt < max_retries - 1:
@@ -916,8 +952,11 @@ class SQLiteStorage:
                     await asyncio.sleep(1.0 * (attempt + 1))  # P3修复：异步退避，避免阻塞事件循环
                 else:
                     logger.error(f"Failed to cleanup old data: {e}")
+                    return {"success": False, "deleted_positions": 0,
+                            "deleted_account": 0}
             finally:
                 session.close()
+        return {"success": False, "deleted_positions": 0, "deleted_account": 0}
 
     def get_connection(self):
         return self._engine.connect()
@@ -1058,7 +1097,7 @@ class SQLiteStorage:
                         f"SELECT COALESCE(SUM(pnl), 0) FROM {shard} "
                         f"WHERE status='closed' AND pnl IS NOT NULL"
                     )).scalar()
-                    total += float(val or 0)
+                    total += safe_float(val)
         except Exception as e:
             logger.error(f"get_db_realized_pnl failed: {e}")
         return total
@@ -1077,12 +1116,36 @@ class SQLiteStorage:
                 val = conn.execute(text(
                     "SELECT COALESCE(SUM(pnl_usdt), 0) FROM trades"
                 )).scalar()
-                authoritative = float(val or 0)
+                authoritative = safe_float(val)
             if authoritative != 0.0:
                 return authoritative
         except Exception as e:
             logger.warning(f"get_authoritative_realized_pnl fallback to trade_records: {e}")
         return self.get_db_realized_pnl()
+
+    def get_recent_strategy_pnl_authoritative(self, hours: int = 24) -> Dict[str, float]:
+        """按策略汇总最近 N 小时的权威已实现盈亏（trades.pnl_usdt 口径）。
+
+        与 get_authoritative_realized_pnl 一致，以 TradeJournal `trades` 表为准，
+        避免用 trade_records.pnl（长期被 ghost_close 污染 pnl=NULL/0 导致低估）
+        计算 capital_efficiency 时口径失真。当 trades 表无窗口内数据时返回空 dict，
+        交由调用方回退到 trade_records 口径。
+        """
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        result: Dict[str, float] = {}
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT COALESCE(strategy_name, 'unknown') AS strategy, "
+                    "COALESCE(SUM(pnl_usdt), 0) AS pnl "
+                    "FROM trades WHERE exit_time >= :cutoff "
+                    "GROUP BY strategy_name"
+                ), {"cutoff": cutoff}).fetchall()
+                for row in rows:
+                    result[str(row[0])] = safe_float(row[1])
+        except Exception as e:
+            logger.warning(f"get_recent_strategy_pnl_authoritative failed: {e}")
+        return result
 
     @staticmethod
     def _parse_dt(value):
@@ -1150,13 +1213,10 @@ class SQLiteStorage:
                         ), {"tid": trade_id}).fetchone()
                         if row and row[1] == "closed":
                             new_margin = row[0]
-                    try:
-                        margin = float(new_margin or 0)
-                        pnl_val = float(filtered.get("pnl") or 0)
-                        if margin > 0:
-                            filtered["pnl_percent"] = (pnl_val / margin * 100) if pnl_val != 0 else 0.0
-                    except (TypeError, ValueError):
-                        pass
+                    margin = safe_float(new_margin)
+                    pnl_val = safe_float(filtered.get("pnl"))
+                    if margin > 0:
+                        filtered["pnl_percent"] = (pnl_val / margin * 100) if pnl_val != 0 else 0.0
                 assignments = ", ".join(f"{k} = :{k}" for k in filtered)
                 params = dict(filtered)
                 params["trade_id"] = trade_id
@@ -1185,23 +1245,25 @@ class SQLiteStorage:
                 threshold=alert.get("threshold", 0.0),
                 state=alert.get("state", "triggered"),
                 actions=_json.dumps(alert.get("actions", []), ensure_ascii=False),
-                metadata=_json.dumps(alert.get("metadata", {}), ensure_ascii=False),
+                alert_metadata=_json.dumps(alert.get("metadata", {}), ensure_ascii=False),
                 create_time=alert.get("create_time", datetime.now()),
                 ack_time=alert.get("ack_time"),
                 resolve_time=alert.get("resolve_time")
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save alert record: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
     def save_alert_records_batch(self, alerts: List[Dict[str, Any]]):
         import json as _json
         if not alerts:
-            return
+            return True
         
         session = self._Session()
         try:
@@ -1220,7 +1282,7 @@ class SQLiteStorage:
                     threshold=alert.get("threshold", 0.0),
                     state=alert.get("state", "triggered"),
                     actions=_json.dumps(alert.get("actions", []), ensure_ascii=False),
-                    metadata=_json.dumps(alert.get("metadata", {}), ensure_ascii=False),
+                    alert_metadata=_json.dumps(alert.get("metadata", {}), ensure_ascii=False),
                     create_time=alert.get("create_time", datetime.now()),
                     ack_time=alert.get("ack_time"),
                     resolve_time=alert.get("resolve_time")
@@ -1228,9 +1290,11 @@ class SQLiteStorage:
                 records.append(record)
             session.add_all(records)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save alert records batch: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -1252,11 +1316,13 @@ class SQLiteStorage:
             for r in records:
                 try:
                     actions = _json.loads(r.actions) if r.actions else []
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to parse alert actions for {r.id}: {e}")
                     actions = []
                 try:
-                    metadata = _json.loads(r.metadata) if r.metadata else {}
-                except Exception:
+                    metadata = _json.loads(r.alert_metadata) if r.alert_metadata else {}
+                except Exception as e:
+                    logger.debug(f"Failed to parse alert metadata for {r.id}: {e}")
                     metadata = {}
                 
                 result.append({
@@ -1308,9 +1374,14 @@ class SQLiteStorage:
                 if resolve_time:
                     record.resolve_time = resolve_time
                 session.commit()
+                return True
+            else:
+                logger.warning(f"update_alert_state: alert_id={alert_id} not found")
+                return False
         except Exception as e:
             logger.error(f"Failed to update alert state: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -1332,9 +1403,11 @@ class SQLiteStorage:
             )
             session.add(record)
             session.commit()
+            return True
         except Exception as e:
             logger.error(f"Failed to save recovery record: {e}")
             session.rollback()
+            return False
         finally:
             session.close()
 
@@ -1354,7 +1427,8 @@ class SQLiteStorage:
             for r in records:
                 try:
                     details = _json.loads(r.details) if r.details else {}
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to parse recovery details for {r.id}: {e}")
                     details = {}
                 
                 result.append({

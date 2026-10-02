@@ -84,9 +84,7 @@ execution:
   fill_reconcile_interval_sec: 30
   price_freshness_max_age_sec: 5.0
   post_only_timeout_sec: 60.0
-  # 回测滑点率（平仓时应用）：5bps，避免回测结果偏乐观
   backtest_slippage_rate: 0.0005
-  # 回测手续费率
   taker_fee: 0.0005
   maker_fee: 0.0002
   funding_rate: 0.0001
@@ -447,7 +445,7 @@ strategies:
     grid_rebuild_cooldown_seconds: 300
     use_fill_driven_position: true
     max_daily_loss_usdt: 0.5
-    leverage: 3.0
+    leverage: 1.0
   scalping:
     enabled: true
     run_hours_start: 0
@@ -455,15 +453,15 @@ strategies:
     min_drop: 0.008
     min_rise: 0.008
     price_deviation: 0.003
-    max_hold_minutes: 7
-    profit_target_min: 0.009
+    max_hold_minutes: 20
+    profit_target_min: 0.013
     profit_target_max: 0.03
-    stop_loss: 0.009
+    stop_loss: 0.014
     momentum_periods: 5
     reversal_threshold: 0.002
-    rsi_period: 14
-    rsi_oversold: 32.0
-    rsi_overbought: 75.0
+    rsi_period: 11
+    rsi_oversold: 23.0
+    rsi_overbought: 79.0
     stoch_period: 10
     volume_delta_threshold: 0.2
     trailing_stop_activation: 0.3
@@ -1266,7 +1264,7 @@ trading:
   taker_fee_rate: 0.0005
   target_return: 1.5
   target_utilization: 0.85
-  total_capital: 221.163628
+  total_capital: 219.221185
   high_value_equity_threshold: 2000.0
   trading_capital_ratio: 0.95
   trailing_profit_lock: 0.04
@@ -1836,9 +1834,8 @@ market_regime:
   extreme_vol_threshold: 0.6
   funding_crush_threshold: 0.5
   liquidity_crisis_threshold: -0.5
-  # P3: Regime 分类准确率验证
   regime_accuracy_validation: true
-  regime_accuracy_window: 20  # 预测后N个周期（每个周期60秒）进行验证
+  regime_accuracy_window: 20
 online_learner:
   learning_mode: online
   learning_rate: 0.01
@@ -2120,7 +2117,7 @@ agi_orchestrator:
   utilization_low_threshold: 0.1
   state_path: data/agi_orchestrator_state.json
   always_require_confirmation:
-    - reallocate
+  - reallocate
   profit_take:
     enabled: true
     activation_pct: 0.03
@@ -2624,37 +2621,19 @@ top_level_agi:
   enabled: true
   cooldown_seconds: 60
   concentration_high_threshold: 0.6
-
-# ── 信号预过滤链配置 ───────────────────────────────────────────────────────
 signal_pre_filter:
-  # 趋势确认过滤器（TrendConfirmationFilter）参数
-  # 单边行情处理模式：reject（硬拒，默认）或 reduce（降仓）
   trend_confirmation_one_sided_mode: reject
-  # 单边行情降仓比例（仅 mode=reduce 时生效）
   trend_confirmation_one_sided_reduce_ratio: 0.5
-  # 背离降仓比例（趋势方向与 DI 方向相反时）
   trend_confirmation_divergence_reduce_ratio: 0.7
-
   idle_high_threshold: 0.3
-
-# ── 策略优化器配置 ───────────────────────────────────────────────────────
 strategy_optimizer:
-  # 样本外验证（防止过拟合）：将历史交易按时间拆分为训练集/测试集，
-  # 仅在测试集上验证通过的参数变更才会被应用
   oos_validation_enabled: true
-  # 训练集占比（0.7 = 前70%交易用于生成推荐，后30%用于验证）
   oos_train_ratio: 0.7
-  # 测试集最小交易数（低于此值则跳过验证，直接应用推荐）
   oos_min_test_trades: 10
-
-# ── 策略相关性组合回测配置 ─────────────────────────────────────────────────
 portfolio_backtest:
-  # 参与组合回测的策略列表
   strategies:
-    - trend
-    - scalping
-    - grid
-  # 收益对齐时间桶（小时）
+  - trend
+  - scalping
+  - grid
   time_bucket_hours: 1
-  # 高相关性告警阈值
   high_correlation_threshold: 0.7

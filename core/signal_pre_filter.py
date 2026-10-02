@@ -20,6 +20,7 @@ RegimeGate + 信号冲突）、risk_gate（L1-L5）的前置过滤逻辑，收�
    1  strategy_pause    策略自动暂停
    2  confidence        自适应置信度阈值
    3  regime            市场状态兼容性
+   4  trend_confirmation 趋势确认因子（ADX/单边检测/背离，统一口径硬门禁）
    4  trend_alignment   趋势方向一致性（软降仓）
    5  consecutive_loss  连续亏损暂停
    5  anti_debounce     统一防抖动/防频繁交易（品种冷却+信号去重+策略冷却+全局冷却+亏损冷却+刷单检测+自适应冷却）
@@ -36,6 +37,8 @@ from dataclasses import dataclass, field
 import time
 
 from loguru import logger
+
+from utils.helpers import safe_float, safe_finite
 
 if TYPE_CHECKING:
     from core.anti_debounce_engine import AntiDebounceEngine
@@ -121,8 +124,9 @@ class BaseSignalFilter:
     priority: int = 100
     source: str = "audit_filter"
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, config: Optional[Dict[str, Any]] = None):
         self.enabled = enabled
+        self.config = config or {}
 
     def check(self, ctx: SignalContext, state: Dict[str, Any]) -> Optional[FilterDecision]:
         """返回 None 表示放行（pass），否则返回命中决策（reject/reduce/delay）。"""
@@ -241,6 +245,105 @@ class TrendAlignmentFilter(BaseSignalFilter):
         return None
 
 
+class TrendConfirmationFilter(BaseSignalFilter):
+    """维度2.5b：趋势确认因子（ADX/单边检测 + 背离），统一口径硬门禁。
+
+    - 单边检测：ADX 强且方向一致（单边行情）时，均值回归/区间/网格类信号失效。
+      行为可配置：one_sided_mode=reject（默认，硬拒）或 reduce（降仓）。
+    - 背离检测：综合方向与 DI 方向符号相反（市场结构不一致），降仓谨慎入场。
+      降仓比例可配置：divergence_reduce_ratio（默认 0.7）。
+    数据源来自 intelligent_agent 注入的 state["trend_confirmation"]，由 MarketRegimeEngine
+    统一计算 ADX/DI，避免与策略内部各自实现 ADX 造成口径漂移。
+    """
+    name = "trend_confirmation"
+    priority = 4
+    source = "audit_trend_confirmation"
+
+    def check(self, ctx, state):
+        if ctx.is_close or ctx.direction not in ("long", "short"):
+            return None
+
+        tc = state.get("trend_confirmation") or {}
+        strategy_name = (ctx.strategy_name or "").lower()
+        signal_type = str(ctx.signal_type or "").lower()
+
+        # 读取配置：单边行情处理模式（reject 或 reduce）
+        filter_cfg = self.config.get("signal_pre_filter", {})
+        one_sided_mode = filter_cfg.get("trend_confirmation_one_sided_mode", "reject")
+        one_sided_reduce_ratio = filter_cfg.get("trend_confirmation_one_sided_reduce_ratio", 0.5)
+        divergence_reduce_ratio = filter_cfg.get("trend_confirmation_divergence_reduce_ratio", 0.7)
+
+        # 均值回归/区间/网格类策略：单边行情下失效
+        mean_reversion_like = (
+            "mean_reversion" in signal_type
+            or "range" in signal_type
+            or "grid" in strategy_name
+        )
+
+        if tc.get("one_sided") and mean_reversion_like:
+            if one_sided_mode == "reduce":
+                # 降仓模式：不硬拒，而是降低仓位
+                reduced_qty = ctx.quantity * one_sided_reduce_ratio
+                return FilterDecision(
+                    action=ACTION_REDUCE,
+                    source=self.source,
+                    reason=(
+                        f"单边行情（ADX={tc.get('adx', 0):.1f}, adx_strength={tc.get('adx_strength', 0):.2f}, "
+                        f"direction={tc.get('trend_direction', 0):.2f}），均值回归/区间/网格信号降仓至{one_sided_reduce_ratio:.0%}: {reduced_qty:.4f}"
+                    ),
+                    confidence=0.7,
+                    level="symbol",
+                    details={
+                        "factor": "one_sided",
+                        "mode": "reduce",
+                        "reduced_quantity": reduced_qty,
+                        "adx": tc.get("adx"),
+                        "adx_strength": tc.get("adx_strength"),
+                        "trend_direction": tc.get("trend_direction"),
+                    },
+                )
+            else:
+                # 硬拒模式（默认）
+                return FilterDecision(
+                    action=ACTION_REJECT,
+                    source=self.source,
+                    reason=(
+                        f"单边行情（ADX={tc.get('adx', 0):.1f}, adx_strength={tc.get('adx_strength', 0):.2f}, "
+                        f"direction={tc.get('trend_direction', 0):.2f}），均值回归/区间/网格信号失效，拒绝开仓"
+                    ),
+                    confidence=0.85,
+                    level="symbol",
+                    details={
+                        "factor": "one_sided",
+                        "mode": "reject",
+                        "adx": tc.get("adx"),
+                        "adx_strength": tc.get("adx_strength"),
+                        "trend_direction": tc.get("trend_direction"),
+                    },
+                )
+
+        if tc.get("divergence"):
+            reduced_qty = ctx.quantity * divergence_reduce_ratio
+            return FilterDecision(
+                action=ACTION_REDUCE,
+                source=self.source,
+                reason=(
+                    f"趋势方向与 DI 方向背离（direction={tc.get('trend_direction', 0):.2f}, "
+                    f"di_dir={tc.get('di_dir', 0):.2f}），仓位降至{divergence_reduce_ratio:.0%}: {reduced_qty:.4f}"
+                ),
+                confidence=0.7,
+                level="symbol",
+                details={
+                    "factor": "divergence",
+                    "reduced_quantity": reduced_qty,
+                    "trend_direction": tc.get("trend_direction"),
+                    "di_dir": tc.get("di_dir"),
+                },
+            )
+
+        return None
+
+
 class ConsecutiveLossFilter(BaseSignalFilter):
     """维度3：连续亏损暂停开仓。"""
     name = "consecutive_loss"
@@ -293,8 +396,9 @@ class AntiDebounceFilter(BaseSignalFilter):
     priority = 5
     source = "audit_anti_debounce"
 
-    def __init__(self, engine: Optional["AntiDebounceEngine"] = None, enabled: bool = True):
-        super().__init__(enabled=enabled)
+    def __init__(self, engine: Optional["AntiDebounceEngine"] = None, enabled: bool = True,
+                 config: Optional[Dict[str, Any]] = None):
+        super().__init__(enabled=enabled, config=config)
         self._engine = engine
 
     def check(self, ctx, state):
@@ -313,8 +417,8 @@ class AntiDebounceFilter(BaseSignalFilter):
 
         # 更新自适应状态
         engine.set_market_state(
-            volatility=float(volatility),
-            drawdown=float(drawdown),
+            volatility=safe_float(volatility, 0.0),
+            drawdown=safe_float(drawdown, 0.0),
             account_tier=str(account_tier),
         )
 
@@ -324,7 +428,7 @@ class AntiDebounceFilter(BaseSignalFilter):
             direction=ctx.direction,
             signal_type=signal_type,
             is_close=ctx.is_close,
-            pnl_usdt=float(pnl_usdt),
+            pnl_usdt=safe_float(pnl_usdt, 0.0),
         )
 
         if result.allowed:
@@ -486,6 +590,7 @@ class SignalPreFilterChain:
         StrategyPauseFilter(),
         ConfidenceFilter(),
         RegimeCompatibilityFilter(),
+        TrendConfirmationFilter(),
         TrendAlignmentFilter(),
         ConsecutiveLossFilter(),
         AntiDebounceFilter(),
@@ -504,7 +609,8 @@ class SignalPreFilterChain:
 
         # 每个链实例需持有独立过滤器实例：DEFAULT_FILTERS 是类级共享的实例列表，
         # 直接 list() 浅拷贝会导致 config.disabled / enabled 状态跨链实例泄漏（污染后续链）。
-        filters = filters if filters is not None else [type(f)() for f in self.DEFAULT_FILTERS]
+        # 传递 config 给过滤器，使其可读取个性化参数（如降仓比例、模式开关等）
+        filters = filters if filters is not None else [type(f)(config=self.config) for f in self.DEFAULT_FILTERS]
         # 应用启用/禁用开关
         for f in filters:
             if f.name in disabled:

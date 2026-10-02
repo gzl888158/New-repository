@@ -406,6 +406,9 @@ def _mask_phone(phone: str) -> str:
 @app.route('/api/auth/send-code', methods=['POST'])
 def auth_send_code():
     """发送登录验证码。"""
+    client_ip = request.remote_addr or "unknown"
+    if not check_rate_limit(f"send_code:{client_ip}", per_minute=5, window=60):
+        return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
     data = request.get_json(silent=True) or {}
     phone = str(data.get("phone", "")).strip()
     if not _PHONE_RE.match(phone):
@@ -427,6 +430,9 @@ def auth_send_code():
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """校验验证码并签发长期会话 Token。"""
+    client_ip = request.remote_addr or "unknown"
+    if not check_rate_limit(f"login:{client_ip}", per_minute=10, window=60):
+        return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
     data = request.get_json(silent=True) or {}
     phone = str(data.get("phone", "")).strip()
     code = str(data.get("code", "")).strip()
@@ -448,6 +454,9 @@ def auth_login():
 @app.route('/api/auth/password-login', methods=['POST'])
 def auth_password_login():
     """账号密码登录，签发长期会话 Token。"""
+    client_ip = request.remote_addr or "unknown"
+    if not check_rate_limit(f"pw_login:{client_ip}", per_minute=10, window=60):
+        return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", ""))
@@ -980,13 +989,18 @@ def get_positions():
             upl = float(pos.get("upl", 0))
             margin = float(pos.get("margin", 0))
             lever = int(pos.get("lever", 1))
+            notional = float(pos.get("notionalUsd", 0) or 0)
+
+            # pos 字段是合约张数，前端"数量"需展示币数（与 trade_records 口径一致）。
+            # 线性U本位：币数 = 名义价值 / 标记价，等价于 pos × ctVal。
+            coin_qty = abs(notional) / mark_px if mark_px > 0 else abs(pos_qty)
 
             pnl_percent = (upl / margin * 100) if margin > 0 else 0
 
             position_list.append({
                 "symbol": pos.get("instId", ""),
                 "side": pos_side,
-                "quantity": abs(pos_qty),
+                "quantity": round(coin_qty, 8),
                 "avg_cost": avg_px,
                 "mark_price": mark_px,
                 "unrealized_pnl": upl,
@@ -996,8 +1010,9 @@ def get_positions():
                 "timestamp": datetime.now().isoformat()
             })
 
-        # 如果API失败，回退到数据库
-        if not position_list:
+        # 仅当 API 调用失败（熔断打开）时才回退到数据库；
+        # API 成功返回空列表（交易所确实无持仓）时直接返回空，避免展示过期 DB 数据。
+        if not position_list and _okx_circuit_open():
             conn = get_db_connection()
             cursor = conn.cursor()
 
@@ -1019,10 +1034,15 @@ def get_positions():
 
             for pos in positions:
                 pnl_percent = (pos['unrealized_pnl'] / pos['margin'] * 100) if pos['margin'] > 0 else 0
+                # position_history.quantity 是合约张数，转回币数（名义价值≈margin×杠杆）
+                _margin = float(pos['margin'] or 0)
+                _lever = float(pos['leverage'] or 1)
+                _mark = float(pos['mark_price'] or 0)
+                _coin_qty = (_margin * _lever) / _mark if _mark > 0 else float(pos['quantity'] or 0)
                 position_list.append({
                     "symbol": pos['symbol'],
                     "side": pos['side'],
-                    "quantity": pos['quantity'],
+                    "quantity": round(_coin_qty, 8),
                     "avg_cost": pos['avg_cost'],
                     "mark_price": pos['mark_price'],
                     "unrealized_pnl": pos['unrealized_pnl'],
@@ -1440,7 +1460,8 @@ def batch_fetch():
                 if real_time_status and real_time_status.get("process_running"):
                     current_equity = real_time_status.get("current_equity", 0)
                     peak_equity = real_time_status.get("peak_equity", current_equity)
-                    drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
+                    effective_peak = real_time_status.get("effective_peak", peak_equity)
+                    drawdown = (effective_peak - current_equity) / effective_peak if effective_peak > 0 else 0
                     result["risk_status"] = {
                         "source": "realtime",
                         "current_equity": current_equity,
@@ -3020,9 +3041,218 @@ def get_rejections_stats():
             "by_reason_code": by_reason_code,
             "by_symbol": by_symbol,
             "by_strategy": by_strategy,
+            "signal_flow": _load_observability_stats().get("signal_flow", {}),
         })
     except Exception as e:
         logger.error(f"Error aggregating rejection stats: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _load_observability_stats() -> Dict[str, Any]:
+    """读取主进程导出的可观测统计（跨进程），文件不存在/过期/损坏返回空 dict。
+
+    dashboard 与主交易进程分离，regime_gate / perception / ops_self_heal /
+    auto_optimization / top_level_agi 等「进程内实时」统计无法通过
+    _get_scheduler_attr 访问；主进程 scheduler 每轮把这些统计汇总到
+    data/observability_stats.json，此处读取该文件作为数据源。
+    """
+    try:
+        path = "./data/observability_stats.json"
+        if not os.path.exists(path):
+            return {}
+        # 过期检测：超过 5 分钟未更新视为 stale，避免展示陈旧数据
+        if time.time() - os.path.getmtime(path) > 300:
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.debug(f"Load observability stats error: {e}")
+        return {}
+
+
+@app.route('/api/regime_gate/stats', methods=['GET'])
+def get_regime_gate_stats_api():
+    """L0 RegimeGate 门控统计：拒绝数/异常数/按 regime/策略分布。
+
+    优先读取主进程导出的跨进程统计文件（独立 dashboard 进程可用），
+    文件缺失/过期时回退到进程内 SignalProcessor 即时统计。
+    """
+    try:
+        exported = _load_observability_stats().get("regime_gate")
+        if exported:
+            return jsonify({"success": True, **exported})
+        sp = _get_scheduler_attr("signal_processor")
+        if sp is None:
+            return jsonify({"success": False, "error": "SignalProcessor unavailable"}), 503
+        if not hasattr(sp, "get_regime_gate_stats"):
+            return jsonify({"success": False, "error": "regime gate stats unavailable"}), 503
+        stats = sp.get_regime_gate_stats()
+        return jsonify({"success": True, **stats})
+    except Exception as e:
+        logger.error(f"Error getting regime gate stats: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/perception/stats', methods=['GET'])
+def get_perception_stats_api():
+    """感知侧闭环统计：Regime识别门控 + 信号质量 统一感知决策的关联分布。
+
+    数据源为 SignalProcessor.get_perception_stats()，反映本进程运行期内的
+    感知决策（放行/门控拒绝/质量拒绝/降级）、异常计数、按 regime/策略关联分布
+    与质量分布，供 Dashboard 观察「市场识别 + 信号质量」感知侧闭环效果。
+    """
+    try:
+        exported = _load_observability_stats().get("perception")
+        if exported:
+            return jsonify({"success": True, **exported})
+        sp = _get_scheduler_attr("signal_processor")
+        if sp is None:
+            return jsonify({"success": False, "error": "SignalProcessor unavailable"}), 503
+        if not hasattr(sp, "get_perception_stats"):
+            return jsonify({"success": False, "error": "perception stats unavailable"}), 503
+        stats = sp.get_perception_stats()
+        return jsonify({"success": True, **stats})
+    except Exception as e:
+        logger.error(f"Error getting perception stats: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/ops_self_heal/summary', methods=['GET'])
+def get_ops_self_heal_summary_api():
+    """运维自愈闭环统计：根因分布、恢复成功率、自动恢复/仅告警/冷却跳过。
+
+    数据源为 OpsSelfHealCoordinator.get_self_heal_summary()，反映本进程运行期内的
+    「监控告警 → 根因分析 → 自动恢复 → 反馈」闭环效果，供 Dashboard 观察自愈效果。
+    """
+    try:
+        exported = _load_observability_stats().get("ops_self_heal")
+        if exported:
+            return jsonify({"success": True, **exported})
+        orch = _get_scheduler_attr("ops_self_heal")
+        if orch is None:
+            return jsonify({"success": False, "error": "OpsSelfHealCoordinator unavailable"}), 503
+        if not hasattr(orch, "get_self_heal_summary"):
+            return jsonify({"success": False, "error": "ops self heal summary unavailable"}), 503
+        summary = orch.get_self_heal_summary()
+        return jsonify({"success": True, **summary})
+    except Exception as e:
+        logger.error(f"Error getting ops self heal summary: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/auto_optimization/summary', methods=['GET'])
+def get_auto_optimization_summary_api():
+    """自动寻优闭环统计：优化/上线/拒绝分布、反馈评分、性能反馈摘要。
+
+    数据源为 AutoOptimizationCoordinator.get_summary()，反映本进程运行期内的
+    「参数优化 → 回测 → 上线 → 反馈调参」闭环效果。
+    """
+    try:
+        exported = _load_observability_stats().get("auto_optimization")
+        if exported:
+            return jsonify({"success": True, **exported})
+        orch = _get_scheduler_attr("auto_optimization")
+        if orch is None:
+            return jsonify({"success": False, "error": "AutoOptimizationCoordinator unavailable"}), 503
+        if not hasattr(orch, "get_summary"):
+            return jsonify({"success": False, "error": "auto optimization summary unavailable"}), 503
+        summary = orch.get_summary()
+        return jsonify({"success": True, **summary})
+    except Exception as e:
+        logger.error(f"Error getting auto optimization summary: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/top_level_agi/status', methods=['GET'])
+def get_top_level_agi_status_api():
+    """顶层 AGI 编排状态：跨闭环联动状态 + 联动计数。
+
+    数据源为 TopLevelAGICoordinator.get_status()，反映本进程运行期内的
+    跨闭环联动（寻优→资金、运维→寻优、资金→全局）触发情况。
+    """
+    try:
+        exported = _load_observability_stats().get("top_level_agi")
+        if exported:
+            return jsonify({"success": True, **exported})
+        orch = _get_scheduler_attr("top_level_agi")
+        if orch is None:
+            return jsonify({"success": False, "error": "TopLevelAGICoordinator unavailable"}), 503
+        if not hasattr(orch, "get_status"):
+            return jsonify({"success": False, "error": "top level agi status unavailable"}), 503
+        status = orch.get_status()
+        return jsonify({"success": True, **status})
+    except Exception as e:
+        logger.error(f"Error getting top level agi status: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _get_agi_pending_path():
+    """受限执行通道待确认队列文件路径（与 scheduler 装配路径保持一致）。"""
+    try:
+        cfg = load_config() or {}
+        return (cfg.get("agi_orchestrator") or {}).get(
+            "pending_path", "data/agi_pending_actions.json"
+        )
+    except Exception:
+        return "data/agi_pending_actions.json"
+
+
+def _get_restricted_channel():
+    """实例化受限执行通道（仅文件读写，不注入 event_store/alert_manager，跨进程安全）。"""
+    from core.restricted_execution_channel import RestrictedExecutionChannel
+    return RestrictedExecutionChannel(pending_path=_get_agi_pending_path())
+
+
+@app.route('/api/agi/pending_actions', methods=['GET'])
+def get_agi_pending_actions_api():
+    """受限执行通道待确认队列：列出待人工确认的高风险 AGI 动作指令。
+
+    数据源为 data/agi_pending_actions.json（跨进程共享）。查询参数 status 默认
+    pending，传空串或 status=all 可查看全部（含 confirmed/rejected）。
+    """
+    try:
+        status = request.args.get("status", "pending")
+        if status in ("all", ""):
+            status = ""
+        items = _get_restricted_channel().list_pending(status)
+        return jsonify({"success": True, "status": status or "all",
+                        "count": len(items), "items": items})
+    except Exception as e:
+        logger.error(f"Error getting agi pending actions: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/agi/pending_actions/confirm', methods=['POST'])
+def confirm_agi_pending_action_api():
+    """人工确认一条待处理 AGI 动作（仅标记 confirmed，绝不触发自动下单）。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        trace_id = str(data.get("trace_id") or "").strip()
+        if not trace_id:
+            return jsonify({"success": False, "error": "trace_id required"}), 400
+        result = _get_restricted_channel().confirm(trace_id)
+        code = 200 if result.get("success") else 404
+        return jsonify(result), code
+    except Exception as e:
+        logger.error(f"Error confirming agi pending action: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/agi/pending_actions/reject', methods=['POST'])
+def reject_agi_pending_action_api():
+    """人工拒绝一条待处理 AGI 动作（标记 rejected 并记录原因）。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        trace_id = str(data.get("trace_id") or "").strip()
+        reason = str(data.get("reason") or "")
+        if not trace_id:
+            return jsonify({"success": False, "error": "trace_id required"}), 400
+        result = _get_restricted_channel().reject(trace_id, reason)
+        code = 200 if result.get("success") else 404
+        return jsonify(result), code
+    except Exception as e:
+        logger.error(f"Error rejecting agi pending action: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -3055,7 +3285,8 @@ def get_risk_status():
             # 使用真实风控状态
             current_equity = real_time_status.get("current_equity", 0)
             peak_equity = real_time_status.get("peak_equity", current_equity)
-            drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
+            effective_peak = real_time_status.get("effective_peak", peak_equity)
+            drawdown = (effective_peak - current_equity) / effective_peak if effective_peak > 0 else 0
             max_drawdown = real_time_status.get("max_drawdown", 0.25)
             is_paused = real_time_status.get("is_paused", False)
             pause_reason = real_time_status.get("pause_reason")
@@ -3110,7 +3341,16 @@ def get_risk_status():
         current_equity = current_row['total_equity'] if current_row else 0
         last_update = current_row['timestamp'] if current_row else None
 
-        drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
+        # 与 realtime（global_risk）保持一致的回撤基准语义：
+        # 历史峰值仅用于审计，阶梯风控使用 effective_peak
+        # （启动回撤已超 tier2 时重置为当前权益，避免历史峰值过高导致死亡螺旋/假暂停）。
+        lifetime_drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
+        tier2_threshold = 0.15
+        if lifetime_drawdown >= tier2_threshold:
+            effective_peak = current_equity
+        else:
+            effective_peak = peak_equity
+        drawdown = (effective_peak - current_equity) / effective_peak if effective_peak > 0 else 0
 
         max_drawdown = config.get("trading", {}).get("max_drawdown", 0.25) if config else 0.25
         daily_max_loss = config.get("trading", {}).get("daily_max_loss", 0.04) if config else 0.04
@@ -3132,6 +3372,8 @@ def get_risk_status():
             "source": "database",  # 标识数据来源
             "current_equity": current_equity,
             "peak_equity": peak_equity,
+            "effective_peak": effective_peak,
+            "lifetime_drawdown": lifetime_drawdown,
             "initial_capital": initial_capital,
             "drawdown": drawdown,
             "drawdown_pct": drawdown * 100,
@@ -3335,11 +3577,21 @@ def get_conditional_orders():
             })
         
         with open(orders_file, 'r', encoding='utf-8') as f:
-            active_orders = json.load(f)
-        
+            state = json.load(f)
+
+        # 新版持久化格式含 version/saved_at/active_orders，旧版直接是订单字典
+        if isinstance(state, dict) and "active_orders" in state:
+            active_orders = state.get("active_orders", {}) or {}
+        elif isinstance(state, dict):
+            active_orders = state
+        else:
+            active_orders = {}
+
         sl_count = 0
         tp_count = 0
         for order_info in active_orders.values():
+            if not isinstance(order_info, dict):
+                continue
             if order_info.get("type") == "stop_loss":
                 sl_count += 1
             else:
@@ -3419,7 +3671,7 @@ def get_profit_lock_audit():
 
         c.execute("""
             SELECT symbol, pos_side, action, exit_reason, phase, entry_price, close_price,
-                   pnl_pct, peak_price, retrace_pct, reversal_score, quantity, notional, created_at
+                   pnl_pct, peak_price, retrace_pct, quantity, notional, created_at
             FROM profit_lock_audit
             WHERE created_at >= datetime('now', 'localtime', '-30 days')
             ORDER BY created_at DESC LIMIT 200
@@ -5009,6 +5261,10 @@ def _compute_capital_utilization(conn):
                 # ── 企业级资金利用率引擎字段 ──
                 "recommended_action": state.get("recommended_action", "none"),
                 "capital_efficiency": float(state.get("capital_efficiency", 0.0) or 0),
+                "capital_efficiency_valid": bool(state.get("capital_efficiency_valid", False)),
+                "strategy_used_margin": float(state.get("strategy_used_margin", 0.0) or 0),
+                "margin_reconciliation_delta": float(state.get("margin_reconciliation_delta", 0.0) or 0),
+                "margin_reconciliation_ok": state.get("margin_reconciliation_ok"),
                 "utilization_tier": state.get("utilization_tier"),
                 "utilization_trend": float(state.get("utilization_trend", 0.0) or 0),
                 "equity_mode": state.get("equity_mode", "normal"),
@@ -5035,7 +5291,7 @@ def _compute_capital_utilization(conn):
         if utilization < 0.5:
             status = "low"
         elif utilization < 0.75:
-            status = "warming_up"
+            status = "low"
         elif utilization <= 0.95:
             status = "normal"
         else:
@@ -5053,6 +5309,10 @@ def _compute_capital_utilization(conn):
             "timestamp": datetime.now().isoformat(),
             "recommended_action": "none",
             "capital_efficiency": 0.0,
+            "capital_efficiency_valid": False,
+            "strategy_used_margin": 0.0,
+            "margin_reconciliation_delta": 0.0,
+            "margin_reconciliation_ok": None,
             "utilization_tier": None,
             "utilization_trend": 0.0,
             "equity_mode": "normal",
@@ -5062,6 +5322,9 @@ def _compute_capital_utilization(conn):
                 "available_balance": 0, "total_equity": 0, "status": "unknown",
                 "position_boost": 1.0, "target_utilization": 0.85, "idle_ratio": 1,
                 "recommended_action": "none", "capital_efficiency": 0.0,
+                "capital_efficiency_valid": False,
+                "strategy_used_margin": 0.0, "margin_reconciliation_delta": 0.0,
+                "margin_reconciliation_ok": None,
                 "utilization_tier": None, "utilization_trend": 0.0, "equity_mode": "normal"}
 
 
@@ -5160,6 +5423,10 @@ def get_capital_utilization():
             "utilization_tier": engine_state.get("utilization_tier"),
             "recommended_action": engine_state.get("recommended_action"),
             "capital_efficiency": engine_state.get("capital_efficiency"),
+            "capital_efficiency_valid": engine_state.get("capital_efficiency_valid", False),
+            "strategy_used_margin": engine_state.get("strategy_used_margin", 0.0),
+            "margin_reconciliation_delta": engine_state.get("margin_reconciliation_delta", 0.0),
+            "margin_reconciliation_ok": engine_state.get("margin_reconciliation_ok"),
             "utilization_trend": engine_state.get("utilization_trend"),
             "utilization_volatility": engine_state.get("utilization_volatility"),
             "volatility_regime": engine_state.get("volatility_regime"),
@@ -5455,23 +5722,41 @@ def intervention_global_resume():
 
 @app.route('/api/intervention/cancel_all_orders', methods=['POST'])
 def intervention_cancel_all_orders():
-    """撤销所有挂单"""
+    """撤销所有挂单（含 TP/SL 条件单）。
+
+    警告：此操作会撤销所有 algo 条件单，包括持仓的 TP/SL 保护单，
+    导致持仓裸奔（有仓位无平单委托）。撤销后 heartbeat 会自动补挂 SL，
+    但 TP 需手动恢复。请在有持仓时谨慎使用。
+    """
     try:
         data = request.get_json(silent=True) or {}
         # 直接调用 OKX API 撤单
         from core.okx_client import OKXClient
         from configs.settings import load_config
         client = OKXClient(load_config())
+
+        # 撤单前检查是否有活跃持仓（警告保护单将被清除）
+        positions = client.get_positions() or []
+        active_positions = [p for p in positions if abs(float(p.get("pos", 0))) > 0]
+        has_algo_orders = bool(client.get_algo_orders() or [])
+
         result = client.cancel_all_orders()
         signal = _write_intervention_signal("cancel_all_orders", {
             "source": "dashboard_web",
             "reason": data.get("reason", "web 撤销所有挂单"),
         })
         _append_intervention_history("cancel_all_orders", signal["reason"])
+
+        warning = ""
+        if active_positions and has_algo_orders:
+            warning = (f"⚠ 已撤销 {len(active_positions)} 个持仓的 TP/SL 保护单！"
+                       f"heartbeat 将自动补挂 SL，但 TP 需手动恢复或等待下一轮 heartbeat。")
+
         return jsonify({
             "success": True,
-            "message": "撤销所有挂单请求已发送",
+            "message": "撤销所有挂单请求已发送" + (f" ({warning})" if warning else ""),
             "okx_result": result,
+            "warning": warning,
             "signal": signal,
         })
     except Exception as e:
@@ -5659,6 +5944,30 @@ def close_position():
         _append_intervention_history("close_position", f"平仓 {symbol} {pos_side}")
         if result and result.get("success"):
             _invalidate_trading_caches()
+            # P0-手动平仓清理链：撤销交易所端该 symbol 的 algo 单（止损/止盈/计划委托）
+            # 避免平仓后 algo 单仍挂着，触发时尝试平仓不存在的仓位 → 51169 错误
+            # 按 pos_side 过滤：双向持仓模式下只撤被平方向的 algo 单，保留另一方向止损
+            try:
+                for algo_type in ("conditional", "oco", "trigger", "move_order_stop"):
+                    algos = client.get_algo_orders(symbol=symbol, ord_type=algo_type) or []
+                    for algo in algos:
+                        algo_id = algo.get("algoId", "")
+                        algo_pos_side = (algo.get("posSide", "") or "").lower()
+                        if not algo_id:
+                            continue
+                        # 净仓模式 pos_side="net" 撤全部；双向模式仅撤匹配 pos_side 的 algo 单
+                        if pos_side != "net" and algo_pos_side and algo_pos_side != pos_side:
+                            continue
+                        client.cancel_algo_order(symbol, algo_id)
+                        logger.info(f"Manual close: cancelled algo {algo_type} {symbol} {algo_id} (pos_side={algo_pos_side})")
+            except Exception as algo_err:
+                logger.warning(f"Manual close: cancel algo failed for {symbol}: {algo_err}")
+            # P-数据质量：手动平仓成功后立即关闭本地 open 记录，避免沉沦为 ghost_close 假数据
+            # （pnl/fees 由 PnLReconciler 从平仓账单回填，此处不写近似值，防止二次污染）。
+            try:
+                _get_sqlite_storage().close_open_record(symbol, exit_reason="manual_close")
+            except Exception as _mark_err:
+                logger.warning(f"close_position: mark local closed failed for {symbol}: {_mark_err}")
             return jsonify({
                 "success": True,
                 "message": f"平仓请求已发送: {symbol} {pos_side}",
@@ -5843,6 +6152,26 @@ def get_apm_health():
     except Exception as e:
         logger.error(f"Error getting APM health: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/latency/pipeline', methods=['GET'])
+def get_latency_pipeline():
+    """端到端交易管线延迟追踪仪表板。
+
+    返回各阶段（validation / anomaly_detection / risk_check / decision_engine /
+    sizing / execution 等）的 P50/P95/P99 延迟分布，以及整体管线瓶颈识别。
+    """
+    try:
+        from core.apm_monitor import get_pipeline_latency_tracker
+        tracker = get_pipeline_latency_tracker()
+        summary = tracker.get_summary()
+        return jsonify({
+            "pipeline_latency": summary,
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        logger.error(f"Error getting pipeline latency: {e}")
+        return jsonify({"pipeline_latency": {}, "error": str(e)}), 500
 
 
 @app.route('/api/global_state', methods=['GET'])
@@ -12114,6 +12443,10 @@ def get_rl_q_values():
             current_drawdown_pct=float(data.get("current_drawdown_pct", 0.0)),
             position_count=int(data.get("position_count", 0)),
             strategy_id=data.get("strategy_id", ""),
+            factor_score=float(data.get("factor_score", 0.0)),
+            regime_confidence=float(data.get("regime_confidence", 0.0)),
+            utilization_rate=float(data.get("utilization_rate", 0.0)),
+            avg_correlation=float(data.get("avg_correlation", 0.0)),
         )
 
         q_values = rl.get_q_values(se)
@@ -12156,6 +12489,10 @@ def get_rl_action():
             current_drawdown_pct=float(data.get("current_drawdown_pct", 0.0)),
             position_count=int(data.get("position_count", 0)),
             strategy_id=data.get("strategy_id", ""),
+            factor_score=float(data.get("factor_score", 0.0)),
+            regime_confidence=float(data.get("regime_confidence", 0.0)),
+            utilization_rate=float(data.get("utilization_rate", 0.0)),
+            avg_correlation=float(data.get("avg_correlation", 0.0)),
         )
 
         state_vec = rl.encode_state(se)
@@ -12203,6 +12540,10 @@ def optimize_strategy_params():
             current_drawdown_pct=float(data.get("current_drawdown_pct", 0.0)),
             position_count=int(data.get("position_count", 0)),
             strategy_id=data.get("strategy_id", ""),
+            factor_score=float(data.get("factor_score", 0.0)),
+            regime_confidence=float(data.get("regime_confidence", 0.0)),
+            utilization_rate=float(data.get("utilization_rate", 0.0)),
+            avg_correlation=float(data.get("avg_correlation", 0.0)),
         )
 
         optimized = rl.optimize_strategy_params(current_params, se, n_iterations)
@@ -12724,6 +13065,7 @@ def inject_dashboard_dependencies(
     state_manager=None,
     account_manager=None,
     strategy_manager=None,
+    agi_orchestrator=None,
 ):
     """注入交易引擎依赖到 DashboardEngine
 
@@ -12743,6 +13085,7 @@ def inject_dashboard_dependencies(
         state_manager=state_manager,
         account_manager=account_manager,
         strategy_manager=strategy_manager,
+        agi_orchestrator=agi_orchestrator,
     )
     logger.info("DashboardEngine dependencies injected from trading process")
 
@@ -12944,6 +13287,22 @@ def dashboard_full():
         return make_error(str(e))
 
 
+@app.route('/api/dashboard/pnl_projection', methods=['GET'])
+def dashboard_pnl_projection():
+    """AGI 前瞻推算与四维归因面板（V5.0 新增）
+
+    返回最近一次推算的三场景（base/bear/bull）、per_strategy 摘要、
+    regime 条件化校正因子、准确度历史与最近 20 个偏差比。
+    """
+    try:
+        engine = get_dashboard_engine()
+        result = engine.get_pnl_projection_panel()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Dashboard pnl_projection API error: {e}")
+        return make_error(str(e))
+
+
 @app.route('/api/dashboard/stream', methods=['GET'])
 def dashboard_stream():
     """SSE 实时数据推送：周期性推送仪表板全量快照（企业级实时推送）
@@ -13027,6 +13386,5 @@ if __name__ == '__main__':
         logger.error(f"启动告警自动评估失败: {e}")
     logger.info("Starting Dashboard API on http://0.0.0.0:8080")
     app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
-
 
 

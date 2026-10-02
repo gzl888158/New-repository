@@ -27,6 +27,7 @@ from risk.profit_optimizer import ProfitOptimizer
 from risk.adaptive_controller import AdaptiveController
 from risk.pnl_reconciler import PnLReconciler
 from risk.correlation_risk import CorrelationRiskControl
+from risk.black_swan_protection import BlackSwanProtection
 from risk.allocation_agent import AllocationAgent
 from risk.contract_risk_analyzer import ContractRiskAnalyzer, RiskLevel
 from review.review_engine import ReviewEngine
@@ -39,6 +40,12 @@ from execution.stale_order_manager import StaleOrderManager
 from execution.order_lifecycle_manager import OrderLifecycleManager
 from execution.execution_monitor import ExecutionMonitor, LatencyType
 from execution.order_synchronizer import OrderStateSynchronizer
+from execution.order_persistence import (
+    OrderStore,
+    TradingGate,
+    OrderStartupSynchronizer,
+    OrderPatrolService,
+)
 from execution.algo_orders import (
     SmartOrderRouter, AlgoExecutionEngine, AlgoOrderType, AlgoOrderConfig,
     TWAPExecutor, VWAPExecutor, IcebergOrderExecutor, DarkPoolRouter,
@@ -52,6 +59,7 @@ from core.conditional_order_manager import ConditionalOrderManager
 from core.adaptive_tp_sl_engine import AdaptiveTpSlEngine
 from core.adaptive_position_sizer import AdaptivePositionSizer
 from core.atomic_writer import atomic_write_json
+from core.order_fingerprint_masker import OrderFingerprintMasker
 from monitoring.alert_manager import AlertManager
 from monitoring.performance_monitor import PerformanceMonitor
 from monitoring.alert_engine import AlertRuleEngine, AlertActionType, AlertState, DynamicThreshold
@@ -97,6 +105,7 @@ from core.strategy_engine import StrategyEngine, get_strategy_engine
 # P0: 资金与仓位管理（资金池分区、币种权重、杠杆分级、盈亏再分配、对冲调度）
 from core.capital_manager import CapitalManager, get_capital_manager, CapitalPoolType
 from core.capital_adaptive_allocator import CapitalAdaptiveAllocator
+from core.position_manager import PositionManager
 
 # P0: 多层级风控拦截（五层串行校验，任意一层拦截直接驳回下单）
 from core.risk_gate import RiskGate, get_risk_gate, RiskAction
@@ -163,6 +172,7 @@ from app.services.adaptive_learning import (
 class TradingScheduler:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self.position_manager = None
         
         # P0: 后台任务注册表，支持优雅关闭和崩溃检测
         self._tasks: Dict[str, asyncio.Task] = {}
@@ -182,6 +192,19 @@ class TradingScheduler:
             logger.info("EventStore wired into event bus (event sourcing enabled)")
         except Exception as e:
             logger.warning(f"EventStore wiring failed (event sourcing disabled): {e}")
+
+        self.agent_learning_memory = None
+        try:
+            from core.agent_learning_memory import AgentLearningMemory
+            memory_cfg = config.get("agent_learning_memory", {})
+            self.agent_learning_memory = AgentLearningMemory(
+                event_store=self.event_store,
+                max_entries=memory_cfg.get("max_entries", 5000),
+                enabled=memory_cfg.get("enabled", True),
+            )
+            logger.info("Shared AgentLearningMemory initialized")
+        except Exception as e:
+            logger.warning(f"Shared AgentLearningMemory unavailable (degraded): {e}")
 
         # P1: 事件溯源重放器——从事件日志重建订单状态（只读对账，不修改业务状态）
         self.event_replayer = None
@@ -238,6 +261,9 @@ class TradingScheduler:
         # 利润锁定审计表（落库锁利动作，供复盘「是否盈利时落袋」）
         self._profit_lock_db_path = self.config.get("sqlite", {}).get("db_path", "./data/trading.db")
         self._init_profit_lock_audit_table()
+        # 利润锁定状态持久化：watchdog 重启后恢复梯度进度（保本/部分落袋/紧追踪），避免锁利进度回退
+        self._init_profit_lock_state_table()
+        self._load_profit_lock_states()
 
         # 同步实际账户权益到配置：解决策略仍按初始小资金计算仓位导致资金利用率低的问题
         # 带超时保护，避免OKX API延迟导致启动卡住
@@ -300,11 +326,45 @@ class TradingScheduler:
         # P1 埋点：注入事件总线到 OrderExecutor（下单/成交/平仓发布事件）
         self.order_executor.set_event_bus(self.unified_layer.event_bus)
 
+        # 黑天鹅保护：必须在 self.order_executor 创建之后构造（依赖 self.order_executor）
+        self.black_swan_protection = BlackSwanProtection(
+            config, self.okx_client,
+            global_risk=self.global_risk,
+            order_executor=self.order_executor,
+        )
+
         # 订单状态同步器（实时同步挂单/成交 + 定期全量对账 + 差异主动修复）
         self.order_state_synchronizer = OrderStateSynchronizer(
             config, self.okx_client, self.alert_manager
         )
         logger.info("OrderStateSynchronizer initialized")
+
+        # ── 重启挂单丢失修复：订单持久化 + 下单闸门 + 启动同步 + 后台巡检 ──
+        order_persistence_cfg = config.get("order_persistence", {})
+        if order_persistence_cfg.get("enabled", True):
+            order_db_path = order_persistence_cfg.get("db_path", "data/orders.db")
+            self.order_store = OrderStore(order_db_path)
+            self.order_gate = TradingGate(initially_open=False)
+            # 注入到 OrderExecutor：下单前检查闸门 + INIT/PENDING/终态落盘
+            self.order_executor.set_order_store(self.order_store)
+            self.order_executor.set_trading_gate(self.order_gate)
+            self.order_startup_synchronizer = OrderStartupSynchronizer(
+                self.order_store, self.order_gate, self.okx_client,
+                alert_manager=self.alert_manager, config=order_persistence_cfg,
+            )
+            self.order_patrol = OrderPatrolService(
+                self.order_store, self.order_gate, self.okx_client,
+                alert_manager=self.alert_manager, config=order_persistence_cfg,
+            )
+            logger.info(
+                f"OrderPersistence initialized: db={order_db_path}, gate=closed (fail-closed)"
+            )
+        else:
+            self.order_store = None
+            self.order_gate = None
+            self.order_startup_synchronizer = None
+            self.order_patrol = None
+            logger.info("OrderPersistence disabled, skip init")
 
         # 注入成交质量追踪器
         self.fill_quality_tracker = FillQualityTracker(config, self.sqlite_storage)
@@ -315,16 +375,26 @@ class TradingScheduler:
         self.order_executor.set_slippage_optimizer(self.slippage_optimizer)
         logger.info("SlippageOptimizer injected into OrderExecutor")
 
+        # P1: 注入订单指纹混淆器（防针对量化第二层防护，默认关闭）
+        # 通过 config.execution.fingerprint_masking_enabled 控制开关
+        self.fingerprint_masker = OrderFingerprintMasker(config)
+        self.order_executor.set_fingerprint_masker(self.fingerprint_masker)
+        logger.info(f"OrderFingerprintMasker injected into OrderExecutor (enabled={self.fingerprint_masker.enabled})")
+
         # 风控前置：注入 order_executor 到 global_risk（平仓/减仓信号走五层风控校验）
         self.global_risk.set_order_executor(self.order_executor)
         # 注入 order_executor 到 correlation_risk（相关性减仓也走五层风控）
         self.correlation_risk.order_executor = self.order_executor
+        self.correlation_risk.set_alert_manager(self.alert_manager)
 
         # P0: 统一止损管理器（确保止损信号直达OrderExecutor）
         self.stop_loss_manager = StopLossManager(config, self.okx_client, self.redis_cache, self.trade_journal, self.order_executor)
+        self.stop_loss_manager.set_alert_callback(self.alert_manager.send_alert)
 
         # P0: 条件单管理器（补挂失败处理、存量仓位风险控制、交易所同步）
         self.conditional_order_manager = ConditionalOrderManager(config, self.okx_client, self.redis_cache)
+        self.conditional_order_manager.set_fill_quality_tracker(self.fill_quality_tracker)
+        self.conditional_order_manager.set_trade_journal(self.trade_journal)
         self.order_executor.set_conditional_manager(self.conditional_order_manager)
         self.stop_loss_manager.set_conditional_manager(self.conditional_order_manager)
 
@@ -355,6 +425,12 @@ class TradingScheduler:
         self.data_cleaner.set_order_queue(self.order_executor._order_queue if hasattr(self.order_executor, '_order_queue') else None)
         logger.info("DataCleaner initialized")
 
+        # 过期残留自动清理器（定时+阈值触发清理过期临时残留；白名单审计数据只归档绝不删除）
+        from core.expired_residue_cleaner import ExpiredResidueCleaner
+        self.residue_cleaner = ExpiredResidueCleaner(config)
+        self.residue_cleaner.set_live_probe(self._has_live_strategy)
+        logger.info("ExpiredResidueCleaner initialized")
+
         # P0: 精准交易成本分析器 - 杜绝磨损型交易
         from core.trade_cost_analyzer import TradeCostAnalyzer
         self.trade_cost_analyzer = TradeCostAnalyzer(config.get("trade_cost", {}))
@@ -381,7 +457,12 @@ class TradingScheduler:
         if "total_capital" not in agent_cfg:
             agent_cfg["total_capital"] = config.get("trading", {}).get("total_capital", 100.0)
         self.intelligent_agent = IntelligentTradingAgent(agent_cfg)
+        if self.agent_learning_memory is not None:
+            self.intelligent_agent.set_learning_memory(self.agent_learning_memory)
+        self.intelligent_agent.set_alert_manager(self.alert_manager)
         self.order_executor.set_intelligent_agent(self.intelligent_agent)
+        # 企业级资金管理：注入智能体到 AdaptiveController，驱动可部署性感知分配
+        self.adaptive_controller.set_intelligent_agent(self.intelligent_agent)
         logger.info("IntelligentTradingAgent initialized and injected into OrderExecutor")
 
         # 提前初始化analyzer和optimizer，供后续策略注册使用
@@ -390,6 +471,7 @@ class TradingScheduler:
 
         # 提前初始化 market_regime_engine（供 StrategyCoordinator 和 StrategyManager 使用）
         self.market_regime_engine = MarketRegimeEngine(config, self.okx_client)
+        self.market_regime_engine.set_alert_manager(self.alert_manager)
         logger.info("MarketRegimeEngine initialized for unified market state fusion")
 
         # P0: 注入 MarketRegimeEngine 到智能体，让智能体的市场状态感知复用多因子融合结果，
@@ -479,6 +561,10 @@ class TradingScheduler:
             self.strategy_manager = None
             logger.info("StrategyManager disabled")
 
+        # 注入 strategy_manager 到 adaptive_controller（策略名称单一事实来源）
+        if self.strategy_manager is not None:
+            self.adaptive_controller.set_strategy_manager(self.strategy_manager)
+
         # 注册策略实例到优化器，支持参数热更新
         if self.strategy_manager:
             all_instances = self.strategy_manager.get_all_instances()
@@ -509,6 +595,11 @@ class TradingScheduler:
             self.scalping_strategy.set_sqlite_storage(self.sqlite_storage)
 
         self.allocation_agent = AllocationAgent(config, self.trade_journal, self.profit_optimizer, self.account_manager)
+        if self.agent_learning_memory is not None:
+            self.allocation_agent.set_learning_memory(self.agent_learning_memory)
+        if self.strategy_manager is not None:
+            self.allocation_agent.set_strategy_manager(self.strategy_manager)
+        self.allocation_agent.set_adaptive_controller(self.adaptive_controller)
         logger.info("AllocationAgent initialized for dynamic capital allocation")
 
         # P0: 初始化策略组合优化引擎（MPT优化、相关性矩阵、VaR、绩效归因、策略组合模板）
@@ -548,6 +639,14 @@ class TradingScheduler:
         self.strategy_engine.initialize()
         logger.info("StrategyEngine initialized for high-frequency strategy computation")
 
+        # P0: 注入真实仓位源到 StrategyContainer，恢复 P22 状态无漂移校验
+        # 修复：set_position_provider 此前从未被调用，_get_exchange_positions 恒返回 None，
+        # 导致 _verify_strategy_positions 不执行 → scalping 幽灵挂单 TTL 清理失效，
+        # pending_entry_exists 持续拦截新开单（账户实际空仓）。
+        if self.okx_client and hasattr(self.okx_client, "get_positions"):
+            self.strategy_engine._strategy_container.set_position_provider(self.okx_client.get_positions)
+            logger.info("PositionProvider injected into StrategyContainer (P22 drift verification restored)")
+
         # 注册策略引擎信号回调（将策略信号传递给信号处理器）
         self.strategy_engine.register_signal_callback(self._on_strategy_signal)
         logger.info("StrategyEngine signal callback registered")
@@ -566,6 +665,19 @@ class TradingScheduler:
         self.risk_gate = get_risk_gate(config, okx_client=self.okx_client)
         logger.info("RiskGate initialized: 5-layer serial risk control")
 
+        # 持仓同步失败达到阈值时由 RiskGate 冻结新开仓。
+        self.position_manager = PositionManager(
+            config,
+            self.okx_client,
+            self.sqlite_storage,
+            self.redis_cache,
+        )
+        self.position_manager.set_alert_manager(self.alert_manager)
+        self.risk_gate.set_position_manager(self.position_manager)
+        # P0-手动平仓清理链：注册持仓移除回调，触发 OrderExecutor 清理止损/策略/状态
+        self.position_manager.on_position_removal(self.order_executor.handle_position_removal)
+        logger.info("PositionManager initialized and connected to RiskGate + OrderExecutor removal callback")
+
         # P1: 注入SQLite存储，持久化风控拦截事件到 risk_events 表（修复审计缺口）
         self.risk_gate.set_sqlite_storage(self.sqlite_storage)
         logger.info("RiskGate SQLite storage injected for risk event persistence")
@@ -583,6 +695,7 @@ class TradingScheduler:
             okx_client=self.okx_client,
             account_manager=self.account_manager,
             capital_manager=self.capital_manager,
+            position_manager=self.position_manager,
             risk_gate=self.risk_gate,
             equity_monitor=self.equity_monitor,
         )
@@ -764,6 +877,7 @@ class TradingScheduler:
         logger.info("IntelligentAnalysisAgent initialized for trading record analysis")
 
         self.confidence_calibrator = ConfidenceCalibrator()
+        self.trade_journal.set_confidence_calibrator(self.confidence_calibrator)
         logger.info("ConfidenceCalibrator initialized for probability calibration")
 
         # ── P0: 智能决策核心引擎 ──
@@ -798,6 +912,8 @@ class TradingScheduler:
         rl_cfg = config.get("rl_agent", {})
         self.rl_agent = get_rl_agent(config) if rl_cfg.get("enabled", True) else None
         if self.rl_agent:
+            if self.agent_learning_memory is not None:
+                self.rl_agent.set_learning_memory(self.agent_learning_memory)
             logger.info(
                 f"TradingRLAgent '{self.rl_agent.name}' initialized: "
                 f"mode={self.rl_agent.mode.value}, epsilon={self.rl_agent._epsilon:.3f}"
@@ -807,6 +923,9 @@ class TradingScheduler:
             if hasattr(self, 'market_regime_engine') and self.market_regime_engine:
                 self.rl_agent.set_regime_engine(self.market_regime_engine)
                 logger.info("MarketRegimeEngine injected into TradingRLAgent")
+            # 注入 RL Agent 到 OrderExecutor，平仓时回写 reward + MAB 评分
+            if hasattr(self, 'order_executor') and self.order_executor:
+                self.order_executor.set_rl_agent(self.rl_agent)
         else:
             logger.info("TradingRLAgent disabled per config")
 
@@ -841,8 +960,28 @@ class TradingScheduler:
         self.recovery_handler = RecoveryHandler(config)
         logger.info("RecoveryHandler initialized for automated recovery")
 
+        # ── 运维自愈闭环协调器（监控告警 → 根因分析 → 自动恢复 → 反馈）──
+        # 新增自动恢复行为，通过 config["ops_self_heal"]["enabled"]=true 显式开启（默认关闭）。
+        ops_self_heal_cfg = config.get("ops_self_heal") or {}
+        self.ops_self_heal = None
+        if ops_self_heal_cfg.get("enabled", False):
+            from core.ops_self_heal import OpsSelfHealCoordinator
+            self.ops_self_heal = OpsSelfHealCoordinator(
+                anomaly_detector=self.anomaly_detector,
+                recovery_handler=self.recovery_handler,
+                alert_manager=self.alert_manager,
+                config=ops_self_heal_cfg,
+            )
+            logger.info("OpsSelfHealCoordinator initialized (ops_self_heal.enabled=true)")
+        else:
+            logger.debug("OpsSelfHealCoordinator disabled (ops_self_heal.enabled=false)")
+
         # ── P0: 订单生命周期管理器 ──
         self.order_lifecycle = OrderLifecycleManager(config)
+        self.order_lifecycle.set_timeout_order_handler(
+            self.order_executor._confirm_lifecycle_timeout
+        )
+        self.order_lifecycle.set_alert_manager(self.alert_manager)
         logger.info("OrderLifecycleManager initialized for order lifecycle tracking")
 
         # ── P0: 执行监控器 ──
@@ -903,6 +1042,10 @@ class TradingScheduler:
         })
         logger.info("Pipeline stage handlers registered")
 
+        # 注入事件总线到流水线编排器，实现生命周期事件溯源（started/completed/failed/timeout）
+        self.pipeline_orchestrator.set_event_bus(self.unified_layer.event_bus)
+        logger.info("EventBus injected into PipelineOrchestrator for lifecycle event sourcing")
+
         self.online_learner = OnlineLearner(config)
         logger.info("OnlineLearner initialized for real-time learning")
 
@@ -915,6 +1058,23 @@ class TradingScheduler:
         self.market_regime_detector = MarketRegimeDetector(config)
         logger.info("MarketRegimeDetector initialized for adaptive market state detection")
         self.stop_loss_manager.set_market_regime_detector(self.market_regime_detector)
+
+        # RegimeArbiter：融合主引擎+检测器输出，统一注入所有下游（含止损）
+        try:
+            from services.regime_arbiter import RegimeArbiter
+            self.regime_arbiter = RegimeArbiter(
+                main_engine=self.market_regime_engine,
+                detector=self.market_regime_detector,
+                config=config.get("regime_arbiter", {}),
+            )
+            self.market_regime_engine.set_regime_arbiter(self.regime_arbiter)
+            self.market_regime_engine.set_detector(self.market_regime_detector)
+            self.stop_loss_manager.set_regime_arbiter(self.regime_arbiter)
+            logger.info("RegimeArbiter initialized and injected into main engine and StopLossManager")
+        except Exception as e:
+            self.regime_arbiter = None
+            self.market_regime_engine.set_detector(self.market_regime_detector)
+            logger.warning(f"RegimeArbiter assembly failed (degraded): {e}")
 
         self.knowledge_base = KnowledgeBase(config)
         logger.info("KnowledgeBase initialized for trading experience storage")
@@ -942,6 +1102,22 @@ class TradingScheduler:
             self.param_optimizer = None
             self.backtest_engine = None
             logger.info("ParameterOptimizationOrchestrator disabled per config")
+
+        # ── 自动寻优闭环协调器（参数优化 → 回测 → 上线 → 反馈调参）──
+        self.auto_optimization = None
+        try:
+            from core.auto_optimization_loop import AutoOptimizationCoordinator
+            self.auto_optimization = AutoOptimizationCoordinator(
+                param_optimizer=self.param_optimizer,
+                optimizer=self.optimizer,
+                performance_feedback=self.performance_feedback,
+                recommendation_builder=self._build_param_opt_recommendation,
+                config=config.get("auto_optimization", {}),
+            )
+            logger.info("AutoOptimizationCoordinator initialized for auto optimization closed loop")
+        except Exception as e:
+            self.auto_optimization = None
+            logger.warning(f"AutoOptimizationCoordinator assembly failed (degraded): {e}")
 
         # P0: 将知识库链接到在线学习器，实现经验闭环
         self.online_learner.set_knowledge_base(self.knowledge_base)
@@ -982,6 +1158,22 @@ class TradingScheduler:
         )
         self.signal_processor.set_regime_gate(self.regime_gate)
         logger.info("RegimeGate (L0) initialized and injected into SignalProcessor")
+
+        # 感知侧闭环：Regime识别门控 + 信号质量 统一感知决策（串成信号级感知闭环）
+        self.signal_perception_loop = None
+        try:
+            from core.signal_perception_loop import SignalPerceptionCoordinator
+            self.signal_perception_loop = SignalPerceptionCoordinator(
+                regime_engine=self.market_regime_engine,
+                regime_gate=self.regime_gate,
+                quality_engine=self.signal_quality_engine,
+                config=config,
+            )
+            self.signal_processor.set_perception_loop(self.signal_perception_loop)
+            logger.info("SignalPerceptionCoordinator (perception loop) initialized and injected into SignalProcessor")
+        except Exception as e:
+            self.signal_perception_loop = None
+            logger.warning(f"SignalPerceptionCoordinator assembly failed (degraded): {e}")
 
         self.signal_processor.set_decision_components(
             decision_coordinator=self.decision_coordinator,
@@ -1029,6 +1221,10 @@ class TradingScheduler:
         self.signal_processor.set_intelligent_decision_engine(self.intelligent_decision_engine)
         logger.info("IntelligentDecisionEngine injected into SignalProcessor")
 
+        # P0: 注入 ML 决策引擎到信号处理器（实时置信度 soft 修正，fail-open）
+        self.signal_processor.set_ml_decision_engine(self.ml_decision_engine)
+        logger.info("MLDecisionEngine injected into SignalProcessor (real-time confidence correction)")
+
         # P0: 注入五层风控拦截器到信号链路（L5→L4→L1→L2→L3 串行校验）
         self.signal_processor.set_risk_gate(self.risk_gate)
         logger.info("RiskGate (5-layer serial risk control) injected into SignalProcessor")
@@ -1036,6 +1232,14 @@ class TradingScheduler:
         # P2: 注入独立风控裁决器到信号链路（信号级裁决 + traceID 生成贯穿全链路）
         self.signal_processor.set_risk_adjudicator(self.risk_adjudicator)
         logger.info("RiskAdjudicator injected into SignalProcessor for signal-level adjudication")
+
+        # P1: 注入相关性风控到信号链路（开仓前检查同向高相关集中度）
+        self.signal_processor.set_correlation_risk(self.correlation_risk)
+        logger.info("CorrelationRiskControl injected into SignalProcessor for pre-trade correlation check")
+
+        # P1: 注入组合再平衡器到信号链路（总敞口硬限制门控）
+        self.signal_processor.set_portfolio_rebalancer(self.portfolio_rebalancer)
+        logger.info("PortfolioRebalancer injected into SignalProcessor for exposure limit check")
 
         self.trading_recovery = TradingRecoveryService(config, okx_client=self.okx_client)
         logger.info("TradingRecoveryService initialized for automatic trading recovery")
@@ -1089,6 +1293,9 @@ class TradingScheduler:
             "intelligent_analysis": loop_cfg.get("intelligent_analysis", 21600),  # 智能交易记录分析（6小时）
             "param_optimization": loop_cfg.get("param_optimization", 86400 * 7),  # 参数优化循环（周）
             "param_optimization_first_delay": loop_cfg.get("param_optimization_first_delay", 3600),  # 参数优化首跑延迟（重启后1小时）
+            "agi_orchestrator": loop_cfg.get("agi_orchestrator", 300),  # 量化AGI自治协调器循环
+            "ops_self_heal": loop_cfg.get("ops_self_heal", 60),  # 运维自愈闭环循环
+            "top_level_agi": loop_cfg.get("top_level_agi", 60),  # 顶层AGI跨闭环联动循环
         }
         logger.info(f"Scheduler loop intervals configured: {self._loop_intervals}")
 
@@ -1107,6 +1314,101 @@ class TradingScheduler:
         self._last_auto_recovery_ts = datetime.min
 
         self._bind_cpu_cores()
+
+        # ── 统一自治协调器（可选装配，默认关闭）──
+        # 编排已有的 regime/contribution/capital/dynamic 组件形成资金侧自治闭环。
+        # 通过 config["agi_orchestrator"]["enabled"]=true 显式开启，不影响现有稳定运行。
+        agi_cfg = config.get("agi_orchestrator") or {}
+        self.agi_orchestrator = None
+        self.restricted_execution_channel = None
+        if agi_cfg.get("enabled", False):
+            try:
+                from core.quant_agi_orchestrator import QuantAGIOrchestrator
+                from core.restricted_execution_channel import RestrictedExecutionChannel
+                self.agi_orchestrator = QuantAGIOrchestrator(
+                    config=config,
+                    regime_engine=getattr(self, "market_regime_engine", None),
+                    contribution_analyzer=getattr(self, "contribution_analyzer", None),
+                    capital_allocator=getattr(self, "capital_adaptive_allocator", None),
+                    dynamic_allocator=getattr(self, "dynamic_allocator", None),
+                    account_manager=getattr(self, "account_manager", None),
+                    equity_monitor=getattr(self, "equity_monitor", None),
+                    strategy_correlation=getattr(self, "strategy_correlation", None),
+                    regime_arbiter=getattr(self, "regime_arbiter", None),
+                    rl_agent=getattr(self, "rl_agent", None),
+                )
+                self.restricted_execution_channel = RestrictedExecutionChannel(
+                    event_store=getattr(self, "event_store", None),
+                    alert_manager=getattr(self, "alert_manager", None),
+                    pending_path=agi_cfg.get("pending_path", "data/agi_pending_actions.json"),
+                    idle_cash_deployer=self._idle_cash_deployer,
+                    autonomous=bool(agi_cfg.get("autonomous", False)),
+                    reallocate_deployer=self._reallocate_deployer,
+                    kill_switch_check=self._is_kill_switch_active,
+                    close_position_deployer=self._close_position_deployer,
+                    param_adjust_deployer=self._param_adjust_deployer,
+                    strategy_pause_deployer=self._strategy_pause_deployer,
+                    strategy_resume_deployer=self._strategy_resume_deployer,
+                    always_require_confirmation=agi_cfg.get("always_require_confirmation", ["reallocate"]),
+                )
+                logger.info("QuantAGIOrchestrator assembled (agi_orchestrator.enabled=true)")
+            except Exception as e:
+                self.agi_orchestrator = None
+                self.restricted_execution_channel = None
+                logger.warning(f"QuantAGIOrchestrator assembly failed (degraded): {e}")
+        else:
+            logger.debug("QuantAGIOrchestrator disabled (agi_orchestrator.enabled=false)")
+
+        if self.agi_orchestrator is not None:
+            self.signal_processor.set_bear_case_open_gate(
+                self.agi_orchestrator.get_bear_case_open_block_reason
+            )
+            logger.info("AGI bear-case opening gate injected into SignalProcessor")
+            try:
+                from dashboard_api import inject_dashboard_dependencies
+                inject_dashboard_dependencies(
+                    okx_client=self.okx_client,
+                    capital_manager=self.capital_manager,
+                    state_manager=self.state_manager,
+                    account_manager=self.account_manager,
+                    strategy_manager=self.strategy_manager,
+                    agi_orchestrator=self.agi_orchestrator,
+                )
+            except Exception as e:
+                logger.warning(f"DashboardEngine dependency injection failed (degraded): {e}")
+
+        # ── 顶层 AGI 编排器（跨闭环联动：聚合四闭环状态 → 联动诊断）──
+        # 通过 config["top_level_agi"]["enabled"]=true 显式开启（默认关闭）。
+        top_agi_cfg = config.get("top_level_agi") or {}
+        self.top_level_agi = None
+        if top_agi_cfg.get("enabled", False):
+            try:
+                from core.top_level_agi import TopLevelAGICoordinator
+                self.top_level_agi = TopLevelAGICoordinator(
+                    quant_agi=getattr(self, "agi_orchestrator", None),
+                    perception=getattr(self, "signal_perception_loop", None),
+                    ops_self_heal=getattr(self, "ops_self_heal", None),
+                    auto_optimization=getattr(self, "auto_optimization", None),
+                    learning_memory=self.agent_learning_memory,
+                    config=top_agi_cfg,
+                )
+                logger.info("TopLevelAGICoordinator assembled (top_level_agi.enabled=true)")
+            except Exception as e:
+                self.top_level_agi = None
+                logger.warning(f"TopLevelAGICoordinator assembly failed (degraded): {e}")
+        else:
+            logger.debug("TopLevelAGICoordinator disabled (top_level_agi.enabled=false)")
+
+    def _has_live_strategy(self) -> bool:
+        """探测是否有实盘策略正在运行（StrategyContainer 的 RUNNING/PAUSED 实例）。"""
+        container = getattr(getattr(self, "strategy_engine", None), "_strategy_container", None)
+        if container is None:
+            return False
+        try:
+            return bool(container.get_active_instances())
+        except Exception:
+            # 探测异常时保守返回 True，宁可跳过清理也不误删
+            return True
     
     def _setup_signal_routing(self):
         strategies = [
@@ -1185,7 +1487,7 @@ class TradingScheduler:
             for pos_data in positions:
                 try:
                     position = self.okx_client._parse_position(pos_data)
-                    if not position or float(position.quantity) <= 0:
+                    if not position or float(position.quantity) == 0:
                         continue
 
                     side = "sell" if position.side == "long" else "buy"
@@ -1952,8 +2254,23 @@ class TradingScheduler:
                 # ============ 2. 同步持仓状态到 RiskGate（L3持仓实时风控 + L1单币种仓位上限依赖）============
                 await self._sync_risk_gate_positions()
 
+                # ============ 2.1 同步总敞口到 PortfolioRebalancer（P1: 总敞口硬限制）============
+                try:
+                    positions = self.okx_client.get_positions() or []
+                    gross_notional = 0.0
+                    for pos_data in positions:
+                        pos = self.okx_client._parse_position(pos_data)
+                        if pos and float(pos.quantity) != 0:
+                            gross_notional += abs(float(pos.notional_usd) or (abs(float(pos.quantity)) * float(pos.mark_price)))
+                    self.portfolio_rebalancer.update_gross_exposure(gross_notional)
+                except Exception as e:
+                    logger.debug(f"Sync gross exposure failed (non-blocking): {e}")
+
                 # ============ 2.5 平仓黑名单币种持仓（释放被锁保证金）============
                 await self._close_blacklisted_positions()
+
+                # ============ 2.6 同步手动开单白名单到 L3，避免手动持仓被自动减仓 ============
+                self._sync_manual_override_to_risk_gate()
 
                 # ============ 3. 执行 L3 持仓实时风控检查 ============
                 results = self.risk_gate.check_positions()
@@ -2071,7 +2388,8 @@ class TradingScheduler:
 
         覆盖手工仓（OKX 网页/App 开的仓，无 strategy_name / 无开仓记录）与策略仓：
         对每个非零持仓按 symbol+posSide 逐 tick 输入梯度引擎，按「保本位移 →
-        部分落袋 → 紧追踪 → 反转落袋」四级梯度逐步锁利，防止盈利回吐导致资金磨损。
+        部分落袋 → 紧追踪」三级梯度逐步锁利，防止盈利回吐导致资金磨损。
+        反转落袋统一由 ReversalTakeProfitEngine 处理；manual_override 持仓在本循环跳过。
         """
         if not self._tp_lock_enabled:
             logger.info("Profit lock engine disabled, loop not started")
@@ -2088,26 +2406,6 @@ class TradingScheduler:
             except Exception as e:
                 logger.error(f"Error in profit lock monitor: {e}")
                 await asyncio.sleep(interval * 2)
-
-    def _compute_reversal_score(self, symbol: str, pos_side: str, entry: float, mark: float) -> float:
-        """轻量反转评分：复用 ReversalTakeProfitEngine 的评分逻辑 + HMM regime（不触发落袋冷却）。"""
-        try:
-            engine = getattr(self, "reversal_take_profit_engine", None)
-            if engine is None:
-                return 0.0
-            detector = getattr(self, "market_regime_detector", None)
-            hmm_result = None
-            if detector is not None and hasattr(detector, "get_regime"):
-                try:
-                    hmm_result = detector.get_regime(symbol)
-                except Exception:
-                    hmm_result = None
-            if hasattr(engine, "reversal_score"):
-                return float(engine.reversal_score(pos_side, hmm_result=hmm_result, ohlcv_data=None))
-            return 0.0
-        except Exception as e:
-            logger.debug(f"_compute_reversal_score error for {symbol}: {e}")
-            return 0.0
 
     def _init_profit_lock_audit_table(self) -> None:
         """初始化利润锁定审计表（记录每次锁利的动作、阶段、价格、pnl 等，供复盘）。"""
@@ -2129,7 +2427,6 @@ class TradingScheduler:
                     pnl_pct FLOAT,
                     peak_price FLOAT,
                     retrace_pct FLOAT,
-                    reversal_score FLOAT,
                     quantity FLOAT,
                     notional FLOAT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -2154,7 +2451,6 @@ class TradingScheduler:
         pnl_pct: float,
         peak_price: float,
         retrace_pct: float,
-        reversal_score: float,
         quantity: float,
         notional: float,
     ) -> None:
@@ -2167,15 +2463,109 @@ class TradingScheduler:
             conn.execute("""
                 INSERT INTO profit_lock_audit
                 (symbol, pos_side, action, exit_reason, phase, entry_price, close_price,
-                 pnl_pct, peak_price, retrace_pct, reversal_score, quantity, notional)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 pnl_pct, peak_price, retrace_pct, quantity, notional)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol, pos_side, action, exit_reason, phase, entry_price, close_price,
-                pnl_pct, peak_price, retrace_pct, reversal_score, quantity, notional,
+                pnl_pct, peak_price, retrace_pct, quantity, notional,
             ))
             conn.commit()
         except Exception as e:
             logger.error(f"Failed to save profit_lock_audit: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _init_profit_lock_state_table(self) -> None:
+        """初始化利润锁定状态持久化表（symbol+pos_side 为唯一键）。"""
+        import sqlite3
+        conn = None
+        try:
+            conn = sqlite3.connect(self._profit_lock_db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS profit_lock_state (
+                    symbol VARCHAR(50),
+                    pos_side VARCHAR(10),
+                    state_json TEXT,
+                    updated_at DATETIME,
+                    PRIMARY KEY (symbol, pos_side)
+                )
+            """)
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to init profit_lock_state table: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _load_profit_lock_states(self) -> None:
+        """启动时从 SQLite 恢复利润锁定梯度状态（跨重启续用）。"""
+        import sqlite3
+        conn = None
+        try:
+            conn = sqlite3.connect(self._profit_lock_db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT symbol, pos_side, state_json FROM profit_lock_state"
+            ).fetchall()
+        except Exception as e:
+            logger.debug(f"No persisted profit_lock state: {e}")
+            return
+        finally:
+            if conn:
+                conn.close()
+
+        state_map: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            try:
+                import json
+                data = json.loads(row["state_json"])
+                state_map[f"{row['symbol']}:{row['pos_side']}"] = data
+            except Exception as e:
+                logger.warning(f"Failed to parse profit_lock state for {row['symbol']}: {e}")
+        if state_map:
+            self.profit_lock_engine.restore_state(state_map)
+
+    def _sync_profit_lock_state(self, active_keys: set) -> None:
+        """把当前活跃持仓的锁利状态 upsert 到 SQLite，并清理已消失持仓的残留状态。
+
+        active_keys 为 `symbol:pos_side` 集合；仅活跃仓位才落库，DB 中不再活跃的 key
+        一并删除，避免重启后恢复幽灵锁利状态（例如已平仓仓位的保本/追踪进度）。
+        """
+        import sqlite3, json
+        conn = None
+        try:
+            conn = sqlite3.connect(self._profit_lock_db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            states = self.profit_lock_engine.dump_state()
+            now = datetime.now().isoformat()
+            # 1. upsert 活跃仓位状态
+            for key, st in states.items():
+                if key not in active_keys:
+                    continue
+                symbol, _, pos_side = key.partition(":")
+                conn.execute(
+                    "INSERT OR REPLACE INTO profit_lock_state "
+                    "(symbol, pos_side, state_json, updated_at) VALUES (?, ?, ?, ?)",
+                    (symbol, pos_side, json.dumps(st, ensure_ascii=False), now),
+                )
+            # 2. 删除 DB 中已无活跃持仓的残留状态
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, pos_side FROM profit_lock_state"
+                ).fetchall()
+            except Exception:
+                rows = []
+            for symbol, pos_side in rows:
+                if f"{symbol}:{pos_side}" not in active_keys:
+                    conn.execute(
+                        "DELETE FROM profit_lock_state WHERE symbol = ? AND pos_side = ?",
+                        (symbol, pos_side),
+                    )
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to sync profit_lock state: {e}")
         finally:
             if conn:
                 conn.close()
@@ -2188,6 +2578,7 @@ class TradingScheduler:
                 positions = []
 
             active_keys = set()
+            manual_symbols = self._manual_override_symbols()
 
             for pos_data in positions:
                 try:
@@ -2200,6 +2591,10 @@ class TradingScheduler:
                 symbol = position.symbol
                 pos_side = position.side  # "long" / "short"
                 if pos_side not in ("long", "short"):
+                    continue
+
+                # S6: 手动开单（manual_override）由用户自行管理，跳过自动锁利平仓
+                if symbol in manual_symbols:
                     continue
 
                 size_contracts = abs(float(position.quantity))
@@ -2218,16 +2613,23 @@ class TradingScheduler:
                 key = f"{symbol}:{pos_side}"
                 active_keys.add(key)
 
-                # 反转评分（轻量，仅 HMM regime）
-                reversal_score = self._compute_reversal_score(symbol, pos_side, entry, mark)
+                # 反转评分不再由本循环计算（S2 收敛：反转落袋统一走 ReversalTakeProfitEngine）
+                # S4: 止损优先仲裁 — 查询止损侧（保命移动止损）是否已进入 trailing 保护态，
+                #     为 True 时利润锁紧追踪全平让位，避免双信号平仓。
+                sl_trailing_active = False
+                try:
+                    if self.order_executor is not None and hasattr(self.order_executor, "is_stop_loss_trailing_active"):
+                        sl_trailing_active = bool(self.order_executor.is_stop_loss_trailing_active(symbol))
+                except Exception as e:
+                    logger.debug(f"Failed to query SL trailing state for {symbol}: {e}")
 
                 decision = self.profit_lock_engine.compute(
                     symbol=symbol,
                     pos_side=pos_side,
                     entry_price=entry,
                     current_price=mark,
-                    reversal_score=reversal_score,
                     breakeven_buffer=self.tp_sl_monitor.breakeven_buffer(),
+                    sl_trailing_active=sl_trailing_active,
                 )
 
                 if decision.action == "none":
@@ -2281,7 +2683,6 @@ class TradingScheduler:
                     pnl_pct=decision.pnl_pct,
                     peak_price=decision.peak_price,
                     retrace_pct=decision.retrace_pct,
-                    reversal_score=decision.reversal_score,
                     quantity=close_qty,
                     notional=notional,
                 )
@@ -2289,6 +2690,8 @@ class TradingScheduler:
 
             # 清理已平仓/消失仓位的梯度状态（防止残留导致误判）
             self.profit_lock_engine.prune(active_keys)
+            # 同步持久化锁利状态（跨重启恢复 + 清理幽灵状态）
+            self._sync_profit_lock_state(active_keys)
         except Exception as e:
             logger.error(f"Error in profit lock check: {e}")
 
@@ -2325,6 +2728,30 @@ class TradingScheduler:
             self.risk_gate._l5.update_heartbeat()
         except Exception as e:
             logger.debug(f"RiskGate account status sync error: {e}")
+
+    def _manual_override_symbols(self) -> set:
+        """返回手动开单（manual_override）白名单涉及的 symbol 集合。
+
+        供全局利润锁定循环（ProfitLock）与 RiskGate L3 复用，确保手动单不会被
+        自动减仓/平仓（历史事故：手动单被误判自动清仓）。
+        """
+        try:
+            executor = getattr(self, "order_executor", None)
+            if executor is None or not hasattr(executor, "get_manual_override_symbols"):
+                return set()
+            return executor.get_manual_override_symbols() or set()
+        except Exception as e:
+            logger.debug(f"Failed to fetch manual_override symbols: {e}")
+            return set()
+
+    def _sync_manual_override_to_risk_gate(self) -> None:
+        """把手动开单白名单同步到 RiskGate L3，避免手动持仓被自动减仓/平仓。"""
+        try:
+            symbols = self._manual_override_symbols()
+            if hasattr(self.risk_gate, "set_manual_override_symbols"):
+                self.risk_gate.set_manual_override_symbols(symbols)
+        except Exception as e:
+            logger.debug(f"Failed to sync manual_override symbols to risk gate: {e}")
 
     async def _sync_risk_gate_positions(self) -> None:
         """同步持仓状态到五层风控拦截器（L3持仓实时风控 + L1单币种仓位上限）"""
@@ -2370,7 +2797,7 @@ class TradingScheduler:
                         size=size,
                         leverage=leverage,
                         side=side,
-                        liquidation_price=0,  # OKX返回的liqPx如可用则传入
+                        liquidation_price=float(getattr(position, "liquidation_price", 0) or 0),
                         funding_rate=0
                     )
 
@@ -2613,6 +3040,8 @@ class TradingScheduler:
         await self.account_manager.start()
         await self.equity_monitor.start()
         await self.trade_journal.start()
+        if self.position_manager is not None:
+            await self.position_manager.start()
         await self.adaptive_controller.start()
         await self.allocation_agent.start()
         await self.risk_monitor.start()
@@ -2629,10 +3058,27 @@ class TradingScheduler:
 
         self._register_task("pnl_reconciler", self.pnl_reconciler.start())
         self._register_task("correlation_risk", self.correlation_risk.start())
+
+        await self.black_swan_protection.start()
+        logger.info("BlackSwanProtection started for extreme market monitoring")
         
         await self._subscribe_market_data()
         
         await self.order_executor.start()
+
+        # ── 重启挂单丢失修复：启动强制同步（双向比对，通过后才开放下单闸门） ──
+        if getattr(self, "order_startup_synchronizer", None) is not None:
+            sync_result = await self.order_startup_synchronizer.run()
+            if not sync_result.get("ok"):
+                logger.critical(
+                    f"[order_persistence] 启动同步未通过，暂停新委托: {sync_result.get('error')}"
+                )
+            else:
+                logger.info("[order_persistence] 启动同步通过，下单闸门已开放")
+                # 后台巡检协程：3-5 秒核对本地与交易所订单，发现不一致暂停新委托
+                if getattr(self, "order_patrol", None) is not None:
+                    self._register_task("order_patrol", self.order_patrol.run_loop())
+                    logger.info("[order_persistence] OrderPatrolService started")
 
         # 启动条件单管理器（补挂失败处理、交易所同步）
         await self.conditional_order_manager.start()
@@ -2645,6 +3091,13 @@ class TradingScheduler:
         # 启动统一数据清理引擎（定期清理DB/文件/内存/Redis）
         await self.data_cleaner.start()
         logger.info("DataCleaner started")
+
+        # 启动过期残留自动清理器（定时+阈值触发；白名单审计数据只归档绝不删除）
+        if getattr(self.residue_cleaner, "enable_cleaner", False):
+            self._register_task("expired_residue_cleaner", self.residue_cleaner.run_loop())
+            logger.info("ExpiredResidueCleaner started")
+        else:
+            logger.info("ExpiredResidueCleaner disabled, skip start")
 
         # 通过策略管理器按依赖顺序统一启动所有已启用策略
         if self.strategy_manager:
@@ -2833,6 +3286,21 @@ class TradingScheduler:
             self._register_task("debounce_stats_export", self._debounce_stats_export_loop())
             logger.info("AntiDebounce stats export loop registered")
 
+        # 量化AGI自治协调器循环（感知→诊断→决策→执行→反馈闭环）
+        if getattr(self, "agi_orchestrator", None) is not None:
+            self._register_task("agi_orchestrator", self._agi_orchestrator_loop())
+            logger.info("QuantAGIOrchestrator loop registered")
+
+        # 运维自愈闭环循环（监控告警→根因分析→自动恢复→反馈）
+        if getattr(self, "ops_self_heal", None) is not None:
+            self._register_task("ops_self_heal", self._ops_self_heal_loop())
+            logger.info("OpsSelfHeal loop registered")
+
+        # 顶层 AGI 编排循环（跨闭环联动：聚合四闭环状态 → 联动诊断）
+        if getattr(self, "top_level_agi", None) is not None:
+            self._register_task("top_level_agi", self._top_level_agi_loop())
+            logger.info("TopLevelAGI loop registered")
+
         logger.info("Trading Scheduler started successfully")
 
     async def _debounce_stats_export_loop(self) -> None:
@@ -2848,6 +3316,440 @@ class TradingScheduler:
                     engine.export_status(filepath)
             except Exception as e:
                 logger.warning(f"AntiDebounce stats export failed: {e}")
+
+    def _record_agent_action_results(self, route_result: Dict[str, Any]) -> None:
+        """Publish restricted execution receipts into shared cross-agent memory."""
+        memory = getattr(self, "agent_learning_memory", None)
+        if memory is None:
+            return
+        for item in route_result.get("action_results") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                memory.record(
+                    agent="restricted_execution_channel",
+                    kind="action_result",
+                    trace_id=item.get("trace_id"),
+                    decision=item.get("type"),
+                    outcome={
+                        "status": item.get("status"),
+                        "reason": item.get("reason", ""),
+                    },
+                    veto=item.get("status") == "rejected",
+                )
+            except Exception as e:
+                logger.debug(f"Shared execution memory write failed: {e}")
+
+    async def _idle_cash_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """低风险闲置资金归集落地：小幅提升 A/B 级核心策略的资金权重。
+
+        - 仅接受 RestrictedExecutionChannel 判定为低风险的 idle_cash_deploy 动作。
+        - 通过 AdaptiveController._apply_allocation_shift 做有界正偏移 + 归一化，
+          不直接下单；真实开仓仍由策略信号 + RiskGate 六层决定。
+        - fail-closed：目标缺失 / 控制器缺失 / 异常时返回未部署，绝不静默放行。
+        """
+        strategy = str(action.get("strategy") or "").strip()
+        if not strategy:
+            return {"deployed": False, "reason": "no_strategy"}
+        ac = getattr(self, "adaptive_controller", None)
+        if ac is None or not hasattr(ac, "_apply_allocation_shift"):
+            return {"deployed": False, "reason": "no_adaptive_controller"}
+        try:
+            # 有界小幅正偏移，_apply_allocation_shift 内部 clamp + 归一化，避免权重漂移
+            try:
+                shift = float((self.config.get("agi_orchestrator") or {}).get("idle_deploy_shift", 0.05))
+            except (TypeError, ValueError):
+                shift = 0.05
+            shift = max(0.01, min(0.15, shift))
+            ac._apply_allocation_shift({strategy: shift})
+            logger.info(f"[AGI] idle cash deploy: boost {strategy} +{shift:.2f}")
+            return {"deployed": True, "strategy": strategy, "shift": shift}
+        except Exception as e:
+            logger.warning(f"[AGI] idle cash deploy failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    def _is_kill_switch_active(self) -> bool:
+        """全局 Kill Switch 熔断检查（供 RestrictedExecutionChannel 完全自主模式查询）。
+
+        fail-closed：无法确认时返回 True（视为熔断），绝不在无法确认安全时放行资金动作。
+        """
+        rg = getattr(self, "risk_gate", None)
+        if rg is None:
+            return False
+        try:
+            return bool(rg.is_kill_switch_enabled())
+        except Exception as e:
+            logger.warning(f"[AGI] kill switch check failed (fail-closed): {e}")
+            return True
+
+    async def _reallocate_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """完全自主：落地 reallocate 动作（把策略权重调整到 target_allocation）。
+
+        - 通过 AdaptiveController._apply_allocation_shift 做有界相对偏移（单步幅度 clamp），
+          不直接下单；真实开仓仍由策略信号 + RiskGate 六层决定。
+        - 仅接受资金池内策略（_dynamic_allocations 中已配置的策略）；
+          sync/manual_override 等占位标签不在池内，返回未部署（降级为通知）。
+        - fail-closed：目标缺失 / 控制器缺失 / 异常时返回未部署，绝不静默放行。
+        """
+        strategy = str(action.get("strategy") or "").strip()
+        target = action.get("target_allocation")
+        if not strategy or target is None:
+            return {"deployed": False, "reason": "missing_strategy_or_target"}
+        ac = getattr(self, "adaptive_controller", None)
+        if ac is None or not hasattr(ac, "_apply_allocation_shift"):
+            return {"deployed": False, "reason": "no_adaptive_controller"}
+        try:
+            target_f = float(target)
+            if strategy not in getattr(ac, "_dynamic_allocations", {}):
+                return {"deployed": False, "reason": f"not_in_pool:{strategy}"}
+            current = float(ac._dynamic_allocations.get(strategy, 0.0))
+            shift = target_f - current
+            ac._apply_allocation_shift({strategy: shift})
+            logger.info(
+                f"[AGI] reallocate deploy: {strategy} -> target {target_f:.4f} "
+                f"(shift {shift:+.4f})"
+            )
+            return {"deployed": True, "strategy": strategy, "target_allocation": target_f}
+        except Exception as e:
+            logger.warning(f"[AGI] reallocate deploy failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    async def _close_position_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """账户级收益落袋平仓落地：按浮盈降序平掉 close_ratio 比例的浮盈持仓。
+
+        - 遍历当前非零持仓，计算每仓浮盈比例，仅挑有浮盈（pnl > 0）的仓位。
+        - 按浮盈比例降序，平掉「累计名义价值达到目标」的仓位（reduce_only 全平单仓），
+          实现账户级利润落袋（优先落袋最肥的仓位）。
+        - 手动单（manual_override）跳过，不触碰。
+        - fail-closed：无 order_executor / 无浮盈持仓 / 异常时返回未部署，绝不静默放行。
+        """
+        try:
+            close_ratio = float(action.get("close_ratio") or 0.0)
+        except (TypeError, ValueError):
+            close_ratio = 0.0
+        if close_ratio <= 0:
+            return {"deployed": False, "reason": "invalid_close_ratio"}
+        executor = getattr(self, "order_executor", None)
+        if executor is None or not hasattr(executor, "handle_signal"):
+            return {"deployed": False, "reason": "no_order_executor"}
+        try:
+            positions = self.okx_client.get_positions()
+            if not positions:
+                return {"deployed": False, "reason": "no_positions"}
+            manual_symbols = self._manual_override_symbols()
+            profitable = []
+            total_notional = 0.0
+            for pos_data in positions:
+                try:
+                    position = self.okx_client._parse_position(pos_data)
+                except Exception:
+                    continue
+                if not position or float(position.quantity) == 0:
+                    continue
+                symbol = position.symbol
+                side = position.side
+                if side not in ("long", "short"):
+                    continue
+                if symbol in manual_symbols:
+                    continue
+                entry = float(position.avg_cost)
+                mark = float(position.mark_price)
+                if entry <= 0 or mark <= 0:
+                    continue
+                pnl_pct = (mark - entry) / entry if side == "long" else (entry - mark) / entry
+                if pnl_pct <= 0:
+                    continue  # 只平有浮盈的仓位
+                notional = float(position.notional_usd)
+                profitable.append({
+                    "symbol": symbol,
+                    "side": side,
+                    "notional": notional,
+                    "pnl_pct": pnl_pct,
+                    "quantity": abs(float(position.quantity)),
+                    "leverage": int(position.leverage) if position.leverage > 0 else 1,
+                })
+                total_notional += notional
+            if not profitable:
+                return {"deployed": False, "reason": "no_profitable_positions"}
+            profitable.sort(key=lambda x: -x["pnl_pct"])
+            target_notional = total_notional * close_ratio
+            closed_notional = 0.0
+            closed = 0
+            for p in profitable:
+                if closed_notional >= target_notional:
+                    break
+                size = self.okx_client.contracts_to_coins(p["symbol"], p["quantity"])
+                if size <= 0:
+                    continue
+                close_signal = {
+                    "signal_type": "take_profit",
+                    "symbol": p["symbol"],
+                    "direction": "sell" if p["side"] == "long" else "buy",
+                    "pos_side": p["side"],
+                    "reduce_only": True,
+                    "close_position": True,
+                    "price": 0.0,
+                    "quantity": size,
+                    "leverage": p["leverage"],
+                    "strategy_name": "agi_profit_take",
+                    "exit_reason": "agi_profit_take",
+                    "reason": (
+                        f"AGI profit take: close profitable {p['symbol']} "
+                        f"({p['pnl_pct']:.2%})"
+                    ),
+                    "priority": 700,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                await executor.handle_signal(close_signal)
+                closed_notional += p["notional"]
+                closed += 1
+            logger.info(
+                f"[AGI] profit take deploy: close_ratio={close_ratio:.2f}, "
+                f"closed={closed} positions, notional~{closed_notional:.2f}"
+            )
+            return {"deployed": True, "closed_positions": closed, "close_ratio": close_ratio}
+        except Exception as e:
+            logger.warning(f"[AGI] profit take close failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    async def _param_adjust_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """策略参数自适应落地：调 strategy_manager.hot_reload_config 下调策略杠杆。
+
+        - 仅接受 RestrictedExecutionChannel 判定为低风险的 param_adjust 动作。
+        - 支持 symbol 维度：action 含 symbol 时落地到 currencies.symbol_overrides，
+          实现 ARB 等币种在 tier 默认参数之上单独定制更精细的杠杆/间距。
+        - 通过策略管理器热重载指定参数（默认 leverage），策略实例自身的 update_config
+          负责生效；参数变更后由 ParameterRollbackGuard 做 30 分钟验证，可回滚。
+        - fail-closed：目标缺失 / 策略未注册 / 热重载失败时返回未部署，绝不静默放行。
+        """
+        strategy = str(action.get("strategy") or "").strip()
+        symbol = str(action.get("symbol") or "").strip()
+        param = str(action.get("param") or "leverage").strip()
+        value = action.get("value")
+        if not strategy and not symbol:
+            return {"deployed": False, "reason": "missing_strategy_or_symbol"}
+        if value is None:
+            return {"deployed": False, "reason": "missing_value"}
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return {"deployed": False, "reason": "invalid_value"}
+
+        # 逐币种维度：落到 currencies.symbol_overrides（grid 读取 live，无需策略重载）
+        if symbol:
+            return self._deploy_symbol_param_adjust(symbol, param, value_f)
+
+        mgr = getattr(self, "strategy_manager", None)
+        if mgr is None or not hasattr(mgr, "hot_reload_config"):
+            return {"deployed": False, "reason": "no_strategy_manager"}
+        try:
+            ok = await mgr.hot_reload_config(
+                strategy, {param: value_f}, reason="agi_param_adaptation"
+            )
+            if ok:
+                logger.info(f"[AGI] param adjust deploy: {strategy}.{param} -> {value_f}")
+                return {"deployed": True, "strategy": strategy, "param": param, "value": value_f}
+            return {"deployed": False, "reason": f"hot_reload_rejected:{strategy}"}
+        except Exception as e:
+            logger.warning(f"[AGI] param adjust deploy failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    def _deploy_symbol_param_adjust(self, symbol: str, param: str, value: float) -> Dict[str, Any]:
+        """逐币种参数调整落地：写入 currencies.symbol_overrides[base][param]。
+
+        - 共享 config 对象：grid 策略通过 get_symbol_config(symbol, self.config) 读取
+          同一份 config，写入后即时生效（无需策略重启）。
+        - fail-closed：config 缺失 / base 提取失败时返回未部署。
+        """
+        base = symbol.replace("-USDT", "").replace("USDT-", "").replace("-SWAP", "").strip()
+        if not base:
+            return {"deployed": False, "reason": "invalid_symbol"}
+        try:
+            currencies = self.config.setdefault("currencies", {})
+            overrides = currencies.setdefault("symbol_overrides", {})
+            entry = overrides.setdefault(base, {})
+            entry[param] = value
+            logger.info(f"[AGI] symbol param deploy: {base}.{param} -> {value}")
+            return {"deployed": True, "symbol": symbol, "param": param, "value": value}
+        except Exception as e:
+            logger.warning(f"[AGI] symbol param deploy failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    async def _strategy_pause_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """策略生命周期落地：调 strategy_manager.pause_strategy 停开新仓。
+
+        - 仅接受 RestrictedExecutionChannel 判定为低风险的 strategy_pause 动作。
+        - 暂停策略实例（停止产生新开仓信号），不触碰已有持仓（孤儿仓仍走人工确认）。
+        - fail-closed：策略未注册 / 暂停失败时返回未部署，绝不静默放行。
+        """
+        strategy = str(action.get("strategy") or "").strip()
+        if not strategy:
+            return {"deployed": False, "reason": "missing_strategy"}
+        mgr = getattr(self, "strategy_manager", None)
+        if mgr is None or not hasattr(mgr, "pause_strategy"):
+            return {"deployed": False, "reason": "no_strategy_manager"}
+        try:
+            ok = await mgr.pause_strategy(strategy)
+            if ok:
+                logger.info(f"[AGI] strategy pause deploy: {strategy}")
+                return {"deployed": True, "strategy": strategy}
+            return {"deployed": False, "reason": f"pause_rejected:{strategy}"}
+        except Exception as e:
+            logger.warning(f"[AGI] strategy pause deploy failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    async def _strategy_resume_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """策略恢复落地：调 strategy_manager.resume_strategy 恢复开仓。
+
+        - 仅接受 RestrictedExecutionChannel 判定为低风险的 strategy_resume 动作。
+        - 恢复策略实例（重新产生开仓信号），resume_strategy 内部有 P2-12 上线门禁
+          （退出/暂停/迷你回测健康）兜底，不直接下单。
+        - fail-closed：策略未注册 / 恢复失败时返回未部署，绝不静默放行。
+        """
+        strategy = str(action.get("strategy") or "").strip()
+        if not strategy:
+            return {"deployed": False, "reason": "missing_strategy"}
+        mgr = getattr(self, "strategy_manager", None)
+        if mgr is None or not hasattr(mgr, "resume_strategy"):
+            return {"deployed": False, "reason": "no_strategy_manager"}
+        try:
+            ok = await mgr.resume_strategy(strategy)
+            if ok:
+                logger.info(f"[AGI] strategy resume deploy: {strategy}")
+                return {"deployed": True, "strategy": strategy}
+            return {"deployed": False, "reason": f"resume_rejected:{strategy}"}
+        except Exception as e:
+            logger.warning(f"[AGI] strategy resume deploy failed (fail-closed): {e}")
+            return {"deployed": False, "reason": str(e)[:200]}
+
+    async def _agi_orchestrator_loop(self) -> None:
+        """量化AGI自治协调器循环：周期性触发 run_cycle 形成感知→诊断→决策→执行→反馈闭环。
+
+        - 由 config["agi_orchestrator"]["enabled"] 控制是否装配；未装配则本循环立即退出。
+        - run_cycle 内部带 cooldown 幂等，循环间隔 >= cooldown 时每次真正执行一次闭环。
+        - 动作指令经 RestrictedExecutionChannel 路由：高风险动作只排队待人工确认，
+          绝不自动下单；低风险降风险动作通过受限 deployer 落地，并把逐动作结果反馈给 AGI。
+        """
+        orchestrator = getattr(self, "agi_orchestrator", None)
+        if orchestrator is None:
+            logger.debug("QuantAGIOrchestrator disabled, _agi_orchestrator_loop exits")
+            return
+        interval = self._get_loop_interval("agi_orchestrator", 300)
+        logger.info(f"QuantAGIOrchestrator loop started (interval={interval}s)")
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                report = await orchestrator.run_cycle()
+                alerts = (report.get("diagnosis") or {}).get("alerts") or []
+                critical = [a for a in alerts if a.get("level") == "critical"]
+                health = (report.get("reflection") or {}).get("health_grade", "N/A")
+
+                # 受限执行通道：路由动作指令（高风险排队待人工确认，低风险告警）
+                channel = getattr(self, "restricted_execution_channel", None)
+                if channel is not None:
+                    try:
+                        route_result = await channel.route(report)
+                        self._record_agent_action_results(route_result)
+                        # 决策→执行→反馈闭环：把执行结果回传 orchestrator，供下一周期诊断感知
+                        if (
+                            route_result.get("status") not in ("cached_report", "no_actions", "no_report")
+                            and hasattr(orchestrator, "report_execution_result")
+                        ):
+                            orchestrator.report_execution_result(route_result)
+                        if route_result.get("queued"):
+                            logger.warning(
+                                f"[AGI] cycle={report.get('cycle')} "
+                                f"queued={route_result['queued']} manual-confirmation-required"
+                            )
+                    except Exception as e:
+                        logger.warning(f"[AGI] restricted execution route failed: {e}")
+
+                if critical:
+                    logger.warning(
+                        f"[AGI] cycle={report.get('cycle')} status={report.get('status')} "
+                        f"critical_alerts={len(critical)}"
+                    )
+                else:
+                    logger.info(
+                        f"[AGI] cycle={report.get('cycle')} status={report.get('status')} health={health}"
+                    )
+            except Exception as e:
+                logger.warning(f"[AGI] orchestrator loop failed (degraded): {e}")
+
+    async def _ops_self_heal_loop(self) -> None:
+        """运维自愈闭环循环：周期性拉取 AnomalyDetector 异常，做根因分析 + 自动恢复。
+
+        - 监控环节：从 anomaly_detector 拉取最近 5 分钟内的异常
+        - 根因分析 + 决策 + 恢复：交由 OpsSelfHealCoordinator.handle_event 完成
+        - 冷却幂等：同一故障类型在冷却期内跳过，避免重复恢复
+        - fail-closed：高风险根因（行情/风险）不自动恢复，仅告警
+        """
+        orchestrator = getattr(self, "ops_self_heal", None)
+        if orchestrator is None:
+            logger.debug("OpsSelfHealCoordinator disabled, _ops_self_heal_loop exits")
+            return
+        interval = self._get_loop_interval("ops_self_heal", 60)
+        logger.info(f"OpsSelfHeal loop started (interval={interval}s)")
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                detector = self.anomaly_detector
+                if detector is None:
+                    continue
+                anomalies = detector.get_anomalies(limit=30)
+                now = datetime.now()
+                recent = [a for a in anomalies if (now - a.timestamp).total_seconds() < 300]
+                for a in recent:
+                    await orchestrator.handle_event(
+                        a.type.value,
+                        {"message": a.message, "severity": a.severity.value, "details": a.details},
+                    )
+            except Exception as e:
+                logger.warning(f"[OpsSelfHeal] loop failed (degraded): {e}")
+
+    async def _top_level_agi_loop(self) -> None:
+        """顶层 AGI 编排循环：周期性聚合四闭环状态并运行跨闭环联动规则。
+
+        - 由 config["top_level_agi"]["enabled"] 控制是否装配；未装配则本循环立即退出。
+        - run_cycle 内部带 cooldown 幂等，且仅产出「低风险标记 + 高风险建议」，
+          不自动执行改参/暂停等危险动作。
+        """
+        orchestrator = getattr(self, "top_level_agi", None)
+        if orchestrator is None:
+            logger.debug("TopLevelAGICoordinator disabled, _top_level_agi_loop exits")
+            return
+        interval = self._get_loop_interval("top_level_agi", 60)
+        logger.info(f"TopLevelAGI loop started (interval={interval}s)")
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                report = orchestrator.run_cycle()
+                actions = report.get("actions") or []
+                if actions:
+                    logger.info(
+                        f"[TopAGI] cycle={report.get('cycle')} linkage_actions={len(actions)}"
+                    )
+                else:
+                    logger.debug(f"[TopAGI] cycle={report.get('cycle')} no linkage actions")
+
+                decision_plan = report.get("decision_plan") or {}
+                if decision_plan.get("auto_execute") and not report.get("cooldown"):
+                    channel = getattr(self, "restricted_execution_channel", None)
+                    if channel is None:
+                        logger.warning(
+                            "[TopAGI] auto-executable action withheld: RestrictedExecutionChannel unavailable"
+                        )
+                    else:
+                        report["decision_id"] = f"top-agi-{report.get('cycle', 0)}"
+                        route_result = await channel.route(report)
+                        self._record_agent_action_results(route_result)
+                        logger.info(
+                            f"[TopAGI] routed cycle={report.get('cycle')} "
+                            f"deployed={route_result.get('deployed', 0)} "
+                            f"rejected={route_result.get('rejected', 0)}"
+                        )
+            except Exception as e:
+                logger.warning(f"[TopAGI] loop failed (degraded): {e}")
 
     async def _compute_feedback_loop(self) -> None:
         """
@@ -2930,6 +3832,49 @@ class TradingScheduler:
             logger.info("Event order state reconcile completed at startup")
         except Exception as e:
             logger.warning(f"Startup event replay reconcile failed: {e}")
+
+        # 启动对账：按交易所真实持仓清理 EnhancedStopLoss 幽灵止损/止盈状态
+        try:
+            self._reconcile_stop_loss_states()
+        except Exception as e:
+            logger.warning(f"Startup stop-loss state reconcile failed: {e}")
+
+    def _reconcile_stop_loss_states(self) -> None:
+        """启动对账：按交易所真实持仓清理 EnhancedStopLoss 的幽灵止损/止盈状态。
+
+        安全保护（fail-safe）：get_positions 返回空列表时无法区分「真空仓」与「API 失败」，
+        此时跳过对账，避免把 API 失败误判为空仓而误删全部止损状态。
+        """
+        if not self.okx_client or not hasattr(self.okx_client, "get_positions"):
+            return
+        if not self.order_executor or not hasattr(self.order_executor, "reconcile_stop_loss_states"):
+            return
+        try:
+            positions = self.okx_client.get_positions() or []
+        except Exception as e:
+            logger.warning(f"Startup stop-loss reconcile: get_positions failed: {e}")
+            return
+        if not positions:
+            logger.info("Startup stop-loss reconcile skipped: no positions returned")
+            return
+        active_symbols: set = set()
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            inst = p.get("instId") or p.get("symbol")
+            if not inst:
+                continue
+            try:
+                pos = float(p.get("pos", 0) or 0)
+            except (ValueError, TypeError):
+                pos = 0.0
+            if pos != 0:
+                active_symbols.add(inst)
+        if not active_symbols:
+            logger.warning("Startup stop-loss reconcile skipped: positions present but no non-zero size")
+            return
+        cleaned = self.order_executor.reconcile_stop_loss_states(active_symbols)
+        logger.info(f"Startup stop-loss reconcile: active={sorted(active_symbols)}, cleaned={cleaned}")
 
     async def _health_scoring_loop(self):
         """健康度评分循环"""
@@ -3087,6 +4032,80 @@ class TradingScheduler:
         except Exception as e:
             logger.debug(f"Risk gate status export error: {e}")
 
+    def _export_observability_stats(self) -> None:
+        """导出「进程内实时」可观测统计到文件，供独立 dashboard 进程读取。
+
+        dashboard 与主交易进程分离，无法通过 _get_scheduler_attr 访问主进程的
+        signal_processor / ops_self_heal / auto_optimization / top_level_agi 等
+        进程内组件（这些组件只在主进程存在）。此方法每轮把这些组件的统计汇总到
+        data/observability_stats.json，dashboard 端点读文件即可展示真实数据，
+        避免「拒单分析」子面板因后端 503 长期卡在「加载中」。
+        """
+        try:
+            import os as _os
+            import json as _json
+            export = {"last_update": datetime.now().isoformat()}
+
+            try:
+                from core.signal_flow_stats import get_signal_flow_stats
+                export["signal_flow"] = get_signal_flow_stats()
+            except Exception as e:
+                logger.debug(f"Signal flow stats export error: {e}")
+
+            sp = getattr(self, "signal_processor", None)
+            if sp is not None and hasattr(sp, "get_regime_gate_stats"):
+                try:
+                    export["regime_gate"] = sp.get_regime_gate_stats()
+                except Exception:
+                    pass
+            if sp is not None and hasattr(sp, "get_perception_stats"):
+                try:
+                    export["perception"] = sp.get_perception_stats()
+                except Exception:
+                    pass
+
+            orch = getattr(self, "ops_self_heal", None)
+            if orch is not None and hasattr(orch, "get_self_heal_summary"):
+                try:
+                    export["ops_self_heal"] = orch.get_self_heal_summary()
+                except Exception:
+                    pass
+
+            orch = getattr(self, "auto_optimization", None)
+            if orch is not None and hasattr(orch, "get_summary"):
+                try:
+                    export["auto_optimization"] = orch.get_summary()
+                except Exception:
+                    pass
+
+            orch = getattr(self, "top_level_agi", None)
+            if orch is not None and hasattr(orch, "get_status"):
+                try:
+                    export["top_level_agi"] = orch.get_status()
+                except Exception:
+                    pass
+
+            orch = getattr(self, "agi_orchestrator", None)
+            if orch is not None and hasattr(orch, "get_last_report"):
+                try:
+                    export["agi_orchestrator"] = orch.get_last_report()
+                except Exception:
+                    pass
+            if orch is not None and hasattr(orch, "get_decision_history"):
+                try:
+                    export["agi_decision_history"] = orch.get_decision_history(limit=50)
+                except Exception:
+                    pass
+
+            path = "./data/observability_stats.json"
+            _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+            # default=str 兜底：组件统计里若混入 numpy/枚举等非 JSON 类型，降级为字符串
+            # 而非整体导出失败，避免影响主循环。
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(export, f, ensure_ascii=False, default=str)
+        except Exception as e:
+            logger.debug(f"Observability stats export error: {e}")
+
     def _reconcile_event_order_state(self, from_ts=None, orphan_timeout_seconds: int = 600) -> None:
         """P1 重放恢复：从事件日志重建订单生命周期并对账（只读，不修改状态）。
 
@@ -3241,6 +4260,13 @@ class TradingScheduler:
                     self._export_risk_gate_status()
                 except Exception as e:
                     logger.debug(f"Risk gate reset/status sync error: {e}")
+
+                # P5: 可观测统计跨进程导出（拒单分析子面板：regime_gate/perception/
+                # ops_self_heal/auto_optimization/top_level_agi）
+                try:
+                    self._export_observability_stats()
+                except Exception as e:
+                    logger.debug(f"Observability stats sync error: {e}")
 
                 # P0: 跨进程 Kill Switch 信号（Dashboard 一键开关）
                 try:
@@ -3565,6 +4591,14 @@ class TradingScheduler:
                 snapshot = self.contribution_analyzer.analyze(window="7d")
                 overall_health = snapshot.overall_health_score
 
+                # P2: 贡献度分析结果回传调整策略权重（闭环反馈）
+                try:
+                    suggestions = self.contribution_analyzer.get_capital_reallocation_suggestions(snapshot=snapshot)
+                    if suggestions and hasattr(self.adaptive_controller, 'apply_contribution_feedback'):
+                        self.adaptive_controller.apply_contribution_feedback(suggestions)
+                except Exception as fb_err:
+                    logger.debug(f"Contribution feedback error (non-blocking): {fb_err}")
+
                 # 健康度告警
                 alert_threshold = contrib_cfg.get("alerts", {}).get("health_danger_threshold", 35)
                 if overall_health < alert_threshold:
@@ -3754,15 +4788,33 @@ class TradingScheduler:
 
     def _build_param_fitness_fn(self, strategy_name: str, symbol: str,
                                 candles: list) -> Any:
-        """构建真实适应度函数：基于已加载K线的回测评估，返回夏普比率。"""
+        """构建真实适应度函数：基于已加载K线的回测评估，返回夏普比率。
+
+        修复：scalping 参数(RSI/止盈/止损/持仓时长)此前被 _map_params_to_backtest
+        压平成不存在的 ema_fast/ema_slow 键 → 恒 MA(5,20)，导致所有候选参数回测
+        结果相同、fitness 恒等退化为固定值。现按策略分支：scalping 走 RSI 均值回归
+        回测(参数真实驱动)，其余策略走 MA 交叉回测。
+        """
         def fitness(params: Dict[str, float], data=None) -> float:
-            fast, slow = self._map_params_to_backtest(strategy_name, params)
             try:
-                res = self.backtest_engine.run_with_candles(
-                    candles, symbol, strategy_name,
-                    initial_capital=100.0, leverage=6,
-                    fast_period=fast, slow_period=slow,
-                )
+                if strategy_name == "scalping":
+                    res = self.backtest_engine.run_scalping_with_candles(
+                        candles, symbol, strategy_name,
+                        initial_capital=100.0, leverage=6,
+                        rsi_period=int(round(params.get("rsi_period", 4))),
+                        rsi_oversold=float(params.get("rsi_oversold", 30.0)),
+                        rsi_overbought=float(params.get("rsi_overbought", 70.0)),
+                        profit_target_min=float(params.get("profit_target_min", 0.008)),
+                        stop_loss=float(params.get("stop_loss", 0.005)),
+                        max_hold_minutes=int(round(params.get("max_hold_minutes", 10))),
+                    )
+                else:
+                    fast, slow = self._map_params_to_backtest(strategy_name, params)
+                    res = self.backtest_engine.run_with_candles(
+                        candles, symbol, strategy_name,
+                        initial_capital=100.0, leverage=6,
+                        fast_period=fast, slow_period=slow,
+                    )
                 summary = res.summary()
                 if "error" in summary:
                     return 0.0
@@ -3838,51 +4890,21 @@ class TradingScheduler:
                     continue
 
                 fitness_fn = self._build_param_fitness_fn(strategy_name, symbol, candles)
-                self.param_optimizer.set_fitness_fn(fitness_fn)
-                self.param_optimizer.set_param_defs(
-                    self.param_optimizer.define_strategy_params(strategy_name)
-                )
                 close_prices = np.array([float(c["close"]) for c in candles], dtype=np.float64)
-                self.param_optimizer.set_price_data(close_prices)
+                param_defs = self.param_optimizer.define_strategy_params(strategy_name)
 
-                result = await self.param_optimizer.optimize(strategy_name)
-                logger.info(
-                    f"Param optimization [{strategy_name}] finished: phase={result.phase.value}, "
-                    f"best_fitness={result.final_fitness:.4f}, evals={result.total_evaluations}, "
-                    f"errors={len(result.errors)}"
+                # 自动寻优闭环：优化 → 回测 → 上线 → 反馈（协调器 fail-closed 门控上线）
+                report = await self.auto_optimization.run_cycle(
+                    strategy_name,
+                    fitness_fn=fitness_fn,
+                    param_defs=param_defs,
+                    price_data=close_prices,
                 )
-
-                # 企业级防护：失败/有错误/无正收益的结果不得写回生产配置，
-                # 避免无效参数污染运行中策略（历史多次 phase=failed 仍被持久化）。
-                if result.phase != OptimizationPhase.COMPLETE:
-                    logger.warning(
-                        f"Param optimization [{strategy_name}] result rejected: "
-                        f"phase={result.phase.value}, refusing to apply to production config"
-                    )
-                    continue
-                if result.errors:
-                    logger.warning(
-                        f"Param optimization [{strategy_name}] result rejected: "
-                        f"{len(result.errors)} pipeline errors present"
-                    )
-                    continue
-                if result.final_fitness <= 0:
-                    logger.warning(
-                        f"Param optimization [{strategy_name}] result rejected: "
-                        f"non-positive fitness={result.final_fitness:.4f}"
-                    )
-                    continue
-
-                # 三层握手：编排器最优参数 → StrategyOptimizer 应用+持久化(版本回滚)
-                recommendation = self._build_param_opt_recommendation(strategy_name, result)
-                if recommendation:
-                    apply_res = await self.optimizer.apply_optimizations(recommendation)
-                    if apply_res.get("total_applied", 0) > 0:
-                        await self.optimizer.persist_config()
-                        logger.info(
-                            f"Param optimization layered into StrategyOptimizer: "
-                            f"{apply_res['total_applied']} changes persisted for {strategy_name}"
-                        )
+                logger.info(
+                    f"Auto optimization [{strategy_name}] status={report.status} "
+                    f"decision={report.deploy_decision} fitness={report.best_fitness:.4f} "
+                    f"feedback_score={report.feedback_score:.3f} applied={report.deploy_applied}"
+                )
             except Exception as e:
                 logger.error(f"Param optimization failed for {strategy_name}: {e}")
 
@@ -4721,19 +5743,20 @@ class TradingScheduler:
                 if not rl or not rl.is_enabled():
                     continue
 
-                # ── 1. 训练步 ──
-                replay_size = len(rl._replay_buffer) if hasattr(rl._replay_buffer, '__len__') else 0
-                if replay_size >= rl._batch_size:
-                    for _ in range(min(5, max(1, replay_size // rl._batch_size))):
-                        loss = rl.train_step()
-                        if loss is not None:
-                            break  # 完成一批次训练
-                else:
-                    # 无经验数据时进行时间衰减：避免冷启动时 epsilon=1.0 永久不变
-                    now = time.time()
-                    if now - _last_epsilon_decay >= 600:  # 每10分钟衰减一次
-                        rl._epsilon = max(rl._epsilon_min, rl._epsilon * 0.98)
-                        _last_epsilon_decay = now
+                # 实盘在线训练显式 opt-in；默认只维护和观测模型，不让权重随运行漂移。
+                if rl._online_training_enabled and not rl._training_frozen:
+                    replay_size = len(rl._replay_buffer) if hasattr(rl._replay_buffer, '__len__') else 0
+                    if replay_size >= rl._batch_size:
+                        for _ in range(min(5, max(1, replay_size // rl._batch_size))):
+                            loss = rl.train_step()
+                            if loss is not None:
+                                break  # 完成一批次训练
+                    else:
+                        # 无经验数据时进行时间衰减：避免冷启动时 epsilon=1.0 永久不变
+                        now = time.time()
+                        if now - _last_epsilon_decay >= 600:  # 每10分钟衰减一次
+                            rl._epsilon = max(rl._epsilon_min, rl._epsilon * 0.98)
+                            _last_epsilon_decay = now
 
                 # ── 2. 状态日志 ──
                 stats = rl.get_stats()
@@ -4955,6 +5978,13 @@ class TradingScheduler:
         # 取消所有注册的后台任务（防止无限循环阻止关闭）
         await self._cancel_all_tasks()
 
+        if self.position_manager is not None:
+            try:
+                await self.position_manager.stop()
+                logger.info("PositionManager stopped")
+            except Exception as e:
+                logger.error(f"Error stopping PositionManager: {e}")
+
         # P0: 持久化智能决策审计链
         if self.intelligent_decision_engine:
             try:
@@ -5003,6 +6033,14 @@ class TradingScheduler:
                 logger.info("CorrelationRiskControl stopped")
         except Exception as e:
             logger.error(f"Error stopping CorrelationRiskControl: {e}")
+
+        # P0: 停止黑天鹅保护监控
+        try:
+            if hasattr(self, 'black_swan_protection') and self.black_swan_protection:
+                await self.black_swan_protection.stop()
+                logger.info("BlackSwanProtection stopped")
+        except Exception as e:
+            logger.error(f"Error stopping BlackSwanProtection: {e}")
         
         # P0: 停止自适应控制器
         try:
@@ -5048,6 +6086,13 @@ class TradingScheduler:
             logger.info("OrderStateSynchronizer stopped")
             await self.order_lifecycle.stop()
             logger.info("OrderLifecycleManager stopped")
+            # ── 重启挂单丢失修复：优雅关闭订单巡检与持久化存储 ──
+            if getattr(self, "order_patrol", None) is not None:
+                await self.order_patrol.stop()
+                logger.info("OrderPatrolService stopped")
+            if getattr(self, "order_store", None) is not None:
+                self.order_store.close()
+                logger.info("OrderStore closed")
             await self.pipeline_orchestrator.stop()
             logger.info("PipelineOrchestrator stopped")
             if getattr(self, 'metrics_pipeline', None) is not None:

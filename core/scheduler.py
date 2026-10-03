@@ -665,6 +665,11 @@ class TradingScheduler:
         self.risk_gate = get_risk_gate(config, okx_client=self.okx_client)
         logger.info("RiskGate initialized: 5-layer serial risk control")
 
+        # P0: KillSwitch 状态变更告警回调——运营者能感知全局开仓暂停开关被开启/关闭
+        self.risk_gate._kill_switch.register_change_callback(
+            lambda action, reason, by: self._on_kill_switch_change(action, reason, by)
+        )
+
         # 持仓同步失败达到阈值时由 RiskGate 冻结新开仓。
         self.position_manager = PositionManager(
             config,
@@ -3381,6 +3386,27 @@ class TradingScheduler:
         except Exception as e:
             logger.warning(f"[AGI] kill switch check failed (fail-closed): {e}")
             return True
+
+    def _on_kill_switch_change(self, action: str, reason: str, by: str) -> None:
+        """KillSwitch 状态变更告警回调——通过 alert_manager 通知运营者。
+
+        action: "enable" | "disable"
+        """
+        am = getattr(self, "alert_manager", None)
+        if am is None:
+            return
+        try:
+            if action == "enable":
+                severity = "critical"
+                title = "⛔ KillSwitch 已启用 — 所有开仓已暂停"
+                msg = f"全局开仓暂停开关已启用（平仓照常放行）。原因: {reason or '未说明'}，操作者: {by or '未知'}"
+            else:
+                severity = "info"
+                title = "✅ KillSwitch 已解除 — 开仓恢复"
+                msg = f"全局开仓暂停开关已解除。原因: {reason or '未说明'}，操作者: {by or '未知'}"
+            am.send_risk_alert(severity=severity, title=title, message=msg)
+        except Exception as e:
+            logger.warning(f"KillSwitch alert delivery failed: {e}")
 
     async def _reallocate_deployer(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """完全自主：落地 reallocate 动作（把策略权重调整到 target_allocation）。

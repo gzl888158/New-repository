@@ -44,6 +44,10 @@ class KillSwitch:
         self._triggered_at: Optional[datetime] = None
         self._history: list = []
 
+        # P0: 状态变更通知回调（可选注入，不破坏零依赖设计）
+        # 由 scheduler 注入 alert_manager 发送告警，运营者能感知 KillSwitch 被开启/关闭
+        self._on_change_callbacks: list = []
+
         # 启动时从磁盘恢复（fail-closed：磁盘上若为 enabled，则保持 enabled）
         self._load()
 
@@ -76,6 +80,21 @@ class KillSwitch:
             logger.error(f"Failed to load KillSwitch state, defaulting to ENABLED (fail-closed): {e}")
             self._enabled = True
             self._reason = f"状态加载失败，保守禁开仓: {e}"
+
+    def register_change_callback(self, callback) -> None:
+        """注册状态变更回调：KillSwitch enable/disable 时通知（用于发送告警）。
+        回调签名：callback(action: str, reason: str, by: str)
+        """
+        with self._lock:
+            self._on_change_callbacks.append(callback)
+
+    def _notify_change(self, action: str, reason: str, by: str) -> None:
+        """触发所有注册的状态变更回调（异常不影响主流程）。"""
+        for cb in self._on_change_callbacks:
+            try:
+                cb(action, reason, by)
+            except Exception as e:
+                logger.error(f"KillSwitch change callback error: {e}")
 
     def _append_history(self, action: str, reason: str, by: str) -> None:
         """追加一次触发/解除历史（FIFO 截断，防无限膨胀）。"""
@@ -110,9 +129,11 @@ class KillSwitch:
             self._triggered_at = datetime.now()
             self._append_history("enable", reason, by)
             self._save()
+            callbacks = list(self._on_change_callbacks)
         logger.critical(
             f"⛔ Global KillSwitch ENABLED (新开仓已禁止，平仓照常): {reason or '(no reason)'}"
         )
+        self._notify_change_with(callbacks, "enable", reason, by)
 
     def disable(self, reason: str = "", by: str = "") -> None:
         """解除全局开关：恢复新开仓，并持久化。"""
@@ -123,7 +144,18 @@ class KillSwitch:
             self._triggered_at = None
             self._append_history("disable", self._reason, by)
             self._save()
+            callbacks = list(self._on_change_callbacks)
         logger.info(f"✅ Global KillSwitch DISABLED: {self._reason}")
+        self._notify_change_with(callbacks, "disable", self._reason, by)
+
+    @staticmethod
+    def _notify_change_with(callbacks, action, reason, by):
+        """在锁外触发回调，避免回调内部再调用 KillSwitch 方法导致死锁。"""
+        for cb in callbacks:
+            try:
+                cb(action, reason, by)
+            except Exception as e:
+                logger.error(f"KillSwitch change callback error: {e}")
 
     def get_history(self) -> list:
         """返回触发/解除历史（最近 _MAX_HISTORY 条，供 Dashboard 复盘）。"""

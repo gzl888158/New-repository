@@ -736,32 +736,31 @@ class DailyRiskChecker:
                 if self._trading_paused:
                     # P5: 检测是否为平仓信号
                     is_close = self._is_close_signal(signal)
-                    
                     # P5: 连续亏损暂停 vs 硬亏损暂停
                     is_hard_loss_pause = "单日亏损" in self._pause_reason
-                
-                if is_hard_loss_pause:
-                    # 硬亏损限制：绝对阻止一切操作
-                    return RiskCheckResult(
-                        RiskLayer.L4_DAILY, False, RiskAction.PAUSE,
-                        f"交易已暂停: {self._pause_reason}",
-                        {"paused": True, "reason": self._pause_reason}
-                    )
-                
-                if is_close:
-                    # P5: 连续亏损暂停时允许平仓信号穿透，避免仓位锁死
-                    logger.info(
-                        f"L4 paused but allowing close signal: {self._pause_reason}, "
-                        f"signal_type={signal.get('signal_type', 'unknown')}"
-                    )
-                    # 不返回，继续后续检查
-                else:
-                    return RiskCheckResult(
-                        RiskLayer.L4_DAILY, False, RiskAction.PAUSE,
-                        f"交易已暂停: {self._pause_reason}",
-                        {"paused": True, "reason": self._pause_reason}
-                    )
-            
+
+                    if is_hard_loss_pause:
+                        # 硬亏损限制：绝对阻止一切操作
+                        return RiskCheckResult(
+                            RiskLayer.L4_DAILY, False, RiskAction.PAUSE,
+                            f"交易已暂停: {self._pause_reason}",
+                            {"paused": True, "reason": self._pause_reason}
+                        )
+
+                    if is_close:
+                        # P5: 连续亏损暂停时允许平仓信号穿透，避免仓位锁死
+                        logger.info(
+                            f"L4 paused but allowing close signal: {self._pause_reason}, "
+                            f"signal_type={signal.get('signal_type', 'unknown')}"
+                        )
+                        # 不返回，继续后续检查
+                    else:
+                        return RiskCheckResult(
+                            RiskLayer.L4_DAILY, False, RiskAction.PAUSE,
+                            f"交易已暂停: {self._pause_reason}",
+                            {"paused": True, "reason": self._pause_reason}
+                        )
+
             daily_trades = self._daily_trade_count.get(today, 0)
             daily_pnl = self._daily_pnl.get(today, 0)
             daily_start = self._daily_start_equity.get(today, 0)

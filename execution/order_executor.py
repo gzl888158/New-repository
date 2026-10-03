@@ -3121,6 +3121,8 @@ class OrderExecutor:
                         })
                     except Exception as post_ord_err:
                         logger.error(f"Post-order update failed (order already placed): {post_ord_err}")
+                except Exception as post_block_err:
+                    logger.error(f"Post-execution block failed for {symbol}: {post_block_err}")
             else:
                 # place_order 返回 None 的唯一场景：数量低于 lot size（round_quantity_to_lot 返回 <=0）
                 # 该情况不可重试（重试数量不变），直接标记失败避免反复无效重试

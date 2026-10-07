@@ -67,7 +67,10 @@ class FactorEngine:
             min_data_days: 新股过滤阈值 (上市不足N天剔除)
         """
         if ak is None:
-            raise ImportError("AKShare required: pip install akshare")
+            logger.warning(
+                "AKShare not installed. Data fetching disabled. "
+                "Provide data directly to compute_all_factors()."
+            )
 
         self.momentum_window = momentum_window
         self.volatility_window = volatility_window

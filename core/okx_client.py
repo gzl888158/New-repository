@@ -2223,10 +2223,14 @@ class OKXClient:
                         return None
                     if order_type == "take_profit":
                         body["tpTriggerPx"] = str(trigger_price)
-                        body["tpOrdPx"] = str(trigger_price)
+                        # 触发后使用市价单（-1）确保一定成交，避免限价单在价格反弹时挂不上导致止盈失效
+                        # 根因：tpOrdPx=tpTriggerPx（限价）时，触发后价格反弹会导致限价平仓单不成交，
+                        # 最终过期被撤销，出现"止盈被撤销、止损一直挂着"的不对称失效
+                        body["tpOrdPx"] = "-1"
                     else:
                         body["slTriggerPx"] = str(trigger_price)
-                        body["slOrdPx"] = str(trigger_price)
+                        # 止损同样使用市价单，避免触发后限价单不成交（比止盈更危险：止损不成交=裸仓暴露）
+                        body["slOrdPx"] = "-1"
 
             if reduce_only:
                 body["reduceOnly"] = True

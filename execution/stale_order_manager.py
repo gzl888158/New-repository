@@ -141,6 +141,12 @@ class StaleOrderManager:
         self._tier_severe = cfg.get("tier_severe_seconds", self.TIER_THRESHOLDS[StaleLevel.SEVERE])
         self._tier_critical = cfg.get("tier_critical_seconds", self.TIER_THRESHOLDS[StaleLevel.CRITICAL])
 
+        # 网格策略专用时效阈值（网格限价单需要更长等待时间）
+        self._grid_tier_mild = cfg.get("grid_tier_mild_seconds", 10 * 60)  # 默认10分钟
+        self._grid_tier_moderate = cfg.get("grid_tier_moderate_seconds", self._tier_moderate)
+        self._grid_tier_severe = cfg.get("grid_tier_severe_seconds", self._tier_severe)
+        self._grid_tier_critical = cfg.get("grid_tier_critical_seconds", self._tier_critical)
+
         # 价格偏离阈值
         self._deviation_mild = cfg.get("price_deviation_mild", self.PRICE_DEVIATION_MILD)
         self._deviation_moderate = cfg.get("price_deviation_moderate", self.PRICE_DEVIATION_MODERATE)
@@ -184,15 +190,24 @@ class StaleOrderManager:
 
     # ==================== 时效等级判定 ====================
 
-    def _get_stale_level(self, age_seconds: float) -> StaleLevel:
-        """根据挂单年龄判定时效等级"""
-        if age_seconds >= self._tier_critical:
+    def _get_stale_level(self, age_seconds: float, strategy: str = "") -> StaleLevel:
+        """根据挂单年龄和策略类型判定时效等级
+
+        网格策略的限价单需要更长等待时间，MILD 阈值默认 10 分钟（普通订单 5 分钟）。
+        """
+        is_grid = "grid" in strategy.lower() if strategy else False
+        mild = self._grid_tier_mild if is_grid else self._tier_mild
+        moderate = self._grid_tier_moderate if is_grid else self._tier_moderate
+        severe = self._grid_tier_severe if is_grid else self._tier_severe
+        critical = self._grid_tier_critical if is_grid else self._tier_critical
+
+        if age_seconds >= critical:
             return StaleLevel.CRITICAL
-        if age_seconds >= self._tier_severe:
+        if age_seconds >= severe:
             return StaleLevel.SEVERE
-        if age_seconds >= self._tier_moderate:
+        if age_seconds >= moderate:
             return StaleLevel.MODERATE
-        if age_seconds >= self._tier_mild:
+        if age_seconds >= mild:
             return StaleLevel.MILD
         return StaleLevel.NORMAL
 
@@ -637,7 +652,7 @@ class StaleOrderManager:
                         continue
 
                     # 判定时效等级
-                    info.stale_level = self._get_stale_level(info.age_seconds)
+                    info.stale_level = self._get_stale_level(info.age_seconds, info.strategy)
                     if info.stale_level == StaleLevel.NORMAL:
                         continue
 

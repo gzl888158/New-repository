@@ -72,8 +72,8 @@ class FundingRateEnhancer:
 
         if rate is None:
             try:
-                if hasattr(self.okx_client, "get_funding_rate"):
-                    data = self.okx_client.get_funding_rate(symbol)
+                if hasattr(self.okx_client, "get_funding_rate_async"):
+                    data = await self.okx_client.get_funding_rate_async(symbol)
                     if data:
                         rate = self._parse_rate(data)
             except Exception as e:

@@ -2110,7 +2110,7 @@ class OrderExecutor:
         # 网络降级时每次 get_ticker 可能耗时数百 ms，合并为 1 次可节省 1-2s 下单延迟
         prefetched_ticker = None
         try:
-            prefetched_ticker = self.okx_client.get_ticker(symbol)
+            prefetched_ticker = await self.okx_client.get_ticker_async(symbol)
         except Exception as e:
             logger.debug(f"Prefetch ticker failed for {symbol}, will fallback per-call: {e}")
 
@@ -2119,7 +2119,7 @@ class OrderExecutor:
         # 下单前价格新鲜度校验：代理半死/网络降级时 get_ticker 返回过期缓存（ttl 30s），
         # 用陈旧价格开仓会被交易所以「价格偏离盘口」拒绝，治理海量拒单。
         # 仅约束开仓；平仓（reduce_only）放行，保证止损/减仓不被陈旧行情阻塞（fail-open）。
-        if not is_close_signal and not self._check_price_freshness(symbol, ticker=prefetched_ticker):
+        if not is_close_signal and not await self._check_price_freshness(symbol, ticker=prefetched_ticker):
             logger.warning(
                 f"Price stale for {symbol} ({signal_type}), rejecting open order"
             )
@@ -3488,14 +3488,14 @@ class OrderExecutor:
         """获取当前价格。若提供预取 ticker 则直接复用，避免重复 API 调用。"""
         try:
             if ticker is None:
-                ticker = self.okx_client.get_ticker(symbol)
+                ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 return float(ticker.get("last", 0) or 0)
         except Exception as e:
             logger.error(f"Failed to get current price for {symbol}: {e}")
         return 0.0
 
-    def _check_price_freshness(self, symbol: str, ticker: Dict[str, Any] = None) -> bool:
+    async def _check_price_freshness(self, symbol: str, ticker: Dict[str, Any] = None) -> bool:
         """下单前价格新鲜度校验：ticker 交易所时间戳与本地时间偏差超阈值则视为过期。
 
         OKX ticker 返回 ts（毫秒时间戳）。网络健康时 get_ticker 缓存 ttl 2s，
@@ -3506,7 +3506,7 @@ class OrderExecutor:
         max_age = float(self.config.get("execution", {}).get("price_freshness_max_age_sec", 5.0))
         try:
             if ticker is None:
-                ticker = self.okx_client.get_ticker(symbol)
+                ticker = await self.okx_client.get_ticker_async(symbol)
             if not ticker:
                 logger.warning(f"Price freshness check failed for {symbol}: no ticker")
                 return False
@@ -4274,7 +4274,7 @@ class OrderExecutor:
 
         if stop_loss and take_profit and entry_price:
             try:
-                ticker = self.okx_client.get_ticker(symbol)
+                ticker = await self.okx_client.get_ticker_async(symbol)
             except Exception:
                 ticker = None
             last = ticker.get("last") if ticker else None
@@ -4495,7 +4495,7 @@ class OrderExecutor:
 
         # P27: 预放置价格检查 - 获取最新市价验证SL方向
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 current_price = float(ticker.get("last", 0))
                 if current_price > 0:
@@ -4723,7 +4723,7 @@ class OrderExecutor:
         # P0: 获取当前市价，确保TP价格方向正确（long的TP必须>市价，short的TP必须<市价）
         current_price = entry_price
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 current_price = float(ticker.get("last", entry_price))
         except Exception:
@@ -5308,7 +5308,11 @@ class OrderExecutor:
                 await asyncio.sleep(5)
 
     async def _cleanup_stale_orders(self, max_age_seconds: int = 300):
-        """P0-僵尸订单清理：取消停留超过max_age_seconds的pending订单（默认5分钟）"""
+        """P0-僵尸订单清理：取消停留超过max_age_seconds的pending订单（默认5分钟）。
+        P2-grid 优化：grid 策略的限价单在低波动市场需要更长时间成交，使用 10 分钟超时。
+        """
+        # grid 策略专属超时：低波动市场的限价单需要更长等待时间
+        GRID_STRATEGY_TIMEOUT_SEC = 600  # 10 分钟
         try:
             now = datetime.now()
             stale_orders = []
@@ -5319,7 +5323,11 @@ class OrderExecutor:
                     continue
 
                 age = (now - create_time).total_seconds()
-                if age > max_age_seconds:
+                # 按策略选择超时：grid 用 10 分钟，其他策略用传入的 max_age_seconds（默认 5 分钟）
+                strategy = order_info.get("strategy", "")
+                effective_timeout = GRID_STRATEGY_TIMEOUT_SEC if "grid" in strategy.lower() else max_age_seconds
+
+                if age > effective_timeout:
                     status = order_info.get("status", "")
                     # 只清理pending状态的订单（已成交/已取消的不处理）
                     if status == "pending":
@@ -5328,7 +5336,7 @@ class OrderExecutor:
             if not stale_orders:
                 return
 
-            logger.info(f"Found {len(stale_orders)} stale orders (>5min pending)")
+            logger.info(f"Found {len(stale_orders)} stale orders (>timeout pending)")
 
             for order_id, order_info, age in stale_orders:
                 symbol = order_info.get("symbol", "")
@@ -5987,7 +5995,7 @@ class OrderExecutor:
                             if self._trade_journal and symbol_order in self._trade_journal._open_positions:
                                 if self._trade_journal._okx_client:
                                     try:
-                                        ticker = self._trade_journal._okx_client.get_ticker(symbol_order)
+                                        ticker = await self._trade_journal._okx_client.get_ticker_async(symbol_order)
                                         exit_price = float(ticker["last"]) if ticker else filled_price
                                     except Exception:
                                         exit_price = filled_price
@@ -6254,7 +6262,7 @@ class OrderExecutor:
                                             f"initializing stop state with fallback quantity"
                                         )
                                     fallback_qty = float(order_info.get("quantity", quantity) or quantity)
-                                    ct_val = float(self.okx_client.get_instrument_info(symbol_order).get("ctVal", "1") or "1")
+                                    ct_val = float((await self.okx_client.get_instrument_info_async(symbol_order)).get("ctVal", "1") or "1")
                                     pos_quantity = fallback_qty * ct_val
                                 sm.init_position_stop(symbol_order, actual_entry, dir_norm, pos_quantity)
                                 self._position_strategy_map[symbol_order] = strategy_name
@@ -6367,7 +6375,7 @@ class OrderExecutor:
                     return False
 
                 # ─ 第2层：最低名义价值 ─
-                min_notional = self.config.get("trading", {}).get("min_notional_usd", 15.0)
+                min_notional = self.config.get("trading", {}).get("min_notional_usd", 1.0)
                 if position_value < min_notional:
                     logger.debug(
                         f"Signal rejected: {symbol} notional={position_value:.2f} USD < min={min_notional} USD"
@@ -6376,8 +6384,19 @@ class OrderExecutor:
                     return False
 
                 # 成本计算：开仓taker + 平仓taker（保守采用taker费率）
-                taker_fee = self.config.get("trading", {}).get("taker_fee_rate", 0.001)
-                max_slippage = self.config.get("trading", {}).get("max_slippage_pct", 0.001)
+                # P2: 从 TradeCostAnalyzer 获取统一费率，避免与下游成本层参数分歧
+                _cost_params = None
+                if hasattr(self, '_trade_cost_analyzer') and self._trade_cost_analyzer:
+                    try:
+                        _cost_params = self._trade_cost_analyzer.get_cost_params()
+                    except Exception:
+                        _cost_params = None
+                if _cost_params:
+                    taker_fee = _cost_params["taker_fee"]
+                    max_slippage = _cost_params["slippage_pct"]
+                else:
+                    taker_fee = self.config.get("trading", {}).get("taker_fee_rate", 0.001)
+                    max_slippage = self.config.get("trading", {}).get("max_slippage_pct", 0.001)
                 total_fee_cost = position_value * taker_fee * 2  # 开+平 taker 费
                 slippage_cost = position_value * max_slippage   # 滑点成本
                 total_cost = total_fee_cost + slippage_cost

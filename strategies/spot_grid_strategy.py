@@ -236,7 +236,7 @@ class SpotGridStrategy(PersistentStrategy):
             return
 
         try:
-            klines = self.okx_client.get_kline(symbol, "1H", limit=self._ema_slow_period + 5)
+            klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._ema_slow_period + 5)
             if len(klines) < self._ema_slow_period:
                 return
 
@@ -278,7 +278,7 @@ class SpotGridStrategy(PersistentStrategy):
         return float(ema)
 
     async def _update_atr(self, symbol: str):
-        klines = self.okx_client.get_kline(symbol, "1H", limit=self._atr_period + 10)
+        klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._atr_period + 10)
         if len(klines) < self._atr_period + 1:
             return
 
@@ -312,7 +312,7 @@ class SpotGridStrategy(PersistentStrategy):
             return
 
     async def _update_volume_profile(self, symbol: str):
-        klines = self.okx_client.get_kline(symbol, "1H", limit=self._volume_profile_period)
+        klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._volume_profile_period)
         if len(klines) < 20:
             return
 
@@ -403,7 +403,7 @@ class SpotGridStrategy(PersistentStrategy):
         return zones
 
     async def _build_grid(self, symbol: str):
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -527,7 +527,7 @@ class SpotGridStrategy(PersistentStrategy):
         from_ws = True
 
         if not tick:
-            tick = self._get_tick_rest(symbol)
+            tick = await self._get_tick_rest(symbol)
             from_ws = False
             if not tick:
                 return False
@@ -585,14 +585,14 @@ class SpotGridStrategy(PersistentStrategy):
         self._last_tick_price[symbol] = price
         return from_ws
 
-    def _get_tick_rest(self, symbol: str) -> Optional[TickData]:
+    async def _get_tick_rest(self, symbol: str) -> Optional[TickData]:
         now = time.time()
         cache_entry = self._tick_rest_cache.get(symbol)
         if cache_entry and (now - cache_entry[0]) < self._tick_rest_interval:
             return cache_entry[1]
 
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if not ticker:
                 return None
 
@@ -671,17 +671,12 @@ class SpotGridStrategy(PersistentStrategy):
             except Exception as e:
                 logger.debug(f"[spot_grid] get_position_boost failed: {e}")
 
-        min_margin = self.config["trading"].get("min_margin_per_trade", 0.5)
-        if base_position < min_margin:
-            logger.debug(f"Spot Grid skip {symbol}: base_position {base_position:.4f} < min_margin {min_margin}")
-            return
-
         # === 优化：单币种与全策略仓位上限（小账户需要更集中的资金利用）===
         if side == "buy":
             # 单币种最多使用 100% 策略配额，避免小账户因 cap 过低无法交易高价币
             max_symbol_exposure = trading_capital * allocation * 1.0
             current_holdings = self._get_current_holdings(symbol)
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             ref_price = float(ticker["last"]) if ticker else price
             current_holdings_value = current_holdings * ref_price
             if current_holdings_value + base_position > max_symbol_exposure:
@@ -700,7 +695,7 @@ class SpotGridStrategy(PersistentStrategy):
                     # 同币种用上面已查的实时价
                     pos_price = ref_price
                 else:
-                    t = self.okx_client.get_ticker(sym)
+                    t = await self.okx_client.get_ticker_async(sym)
                     pos_price = float(t["last"]) if t else float(pos.get("avg_price", 0))
                 total_exposure += pos_qty * pos_price
             if total_exposure + base_position > trading_capital * allocation * 1.0:
@@ -711,7 +706,7 @@ class SpotGridStrategy(PersistentStrategy):
 
         quantity = base_position / price
 
-        instr_info = self.okx_client.get_instrument_info(symbol) or {}
+        instr_info = await self.okx_client.get_instrument_info_async(symbol) or {}
         min_lot_size = self._safe_float(instr_info.get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             logger.debug(f"Spot Grid {symbol}: quantity {quantity:.6f} < min lot {min_lot_size}, skip")
@@ -729,7 +724,7 @@ class SpotGridStrategy(PersistentStrategy):
                 return
 
         precision = get_price_precision(symbol)
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
 
         quantity = round(quantity, quantity_precision)
         if quantity <= 0:
@@ -792,11 +787,11 @@ class SpotGridStrategy(PersistentStrategy):
         if side == "sell":
             retain_ratio = 0.3
             rebuy_qty = quantity * retain_ratio
-            instr_info = self.okx_client.get_instrument_info(symbol) or {}
+            instr_info = await self.okx_client.get_instrument_info_async(symbol) or {}
             min_lot_size = self._safe_float(instr_info.get("lotSz", "0.001"), 0.001)
             if rebuy_qty >= min_lot_size:
                 precision = get_price_precision(symbol)
-                qty_prec = self._get_quantity_precision(symbol)
+                qty_prec = await self._get_quantity_precision(symbol)
                 rebuy_qty = round(rebuy_qty, qty_prec)
                 if rebuy_qty <= 0:
                     logger.debug(f"Spot Grid {symbol}: skip retain rebuy, rebuy_qty {rebuy_qty} <= 0 after rounding")
@@ -838,9 +833,9 @@ class SpotGridStrategy(PersistentStrategy):
             logger.error(f"Failed to get {base_asset} balance: {e}")
             return 0
 
-    def _get_quantity_precision(self, symbol: str) -> int:
+    async def _get_quantity_precision(self, symbol: str) -> int:
         try:
-            info = self.okx_client.get_instrument_info(symbol)
+            info = await self.okx_client.get_instrument_info_async(symbol)
             lot_size = float(info.get("lotSz", "0.001"))
             return len(str(lot_size).split(".")[1]) if "." in str(lot_size) else 0
         except Exception:
@@ -862,7 +857,7 @@ class SpotGridStrategy(PersistentStrategy):
                 await asyncio.sleep(60)
 
     async def _adjust_grid(self, symbol: str):
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -1009,7 +1004,7 @@ class SpotGridStrategy(PersistentStrategy):
                 self._reconciled_symbols.discard(symbol)
             return
 
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -1059,7 +1054,7 @@ class SpotGridStrategy(PersistentStrategy):
     async def _close_position(self, symbol: str, price: float, quantity: float, reason: str):
         """平仓"""
         precision = get_price_precision(symbol)
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
 
         quantity = round(quantity, quantity_precision)
         if quantity <= 0:

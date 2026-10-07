@@ -1073,7 +1073,7 @@ class ArbitrageStrategy(PersistentStrategy):
             if symbol in self._positions:
                 continue
 
-            funding_data = self.okx_client.get_funding_rate(symbol)
+            funding_data = await self.okx_client.get_funding_rate_async(symbol)
             if not funding_data:
                 continue
 
@@ -1102,7 +1102,7 @@ class ArbitrageStrategy(PersistentStrategy):
                 # 获取成交量数据用于评分
                 volume_data = None
                 try:
-                    ticker = self.okx_client.get_ticker(symbol)
+                    ticker = await self.okx_client.get_ticker_async(symbol)
                     if ticker:
                         volume_data = ticker
                 except Exception:
@@ -1179,7 +1179,7 @@ class ArbitrageStrategy(PersistentStrategy):
         if self._risk_gate:
             base_position *= self._risk_gate.get_leverage_multiplier()
 
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             self._record_filter(symbol, "no_ticker")
             return
@@ -1326,9 +1326,9 @@ class ArbitrageStrategy(PersistentStrategy):
             if symbol in self._positions:
                 continue
 
-            futures_ticker = self.okx_client.get_ticker(symbol)
+            futures_ticker = await self.okx_client.get_ticker_async(symbol)
             spot_symbol = symbol.replace("-SWAP", "") if symbol.endswith("-SWAP") else symbol
-            spot_ticker = self.okx_client.get_ticker(spot_symbol)
+            spot_ticker = await self.okx_client.get_ticker_async(spot_symbol)
 
             if not futures_ticker or not spot_ticker:
                 continue
@@ -1461,7 +1461,7 @@ class ArbitrageStrategy(PersistentStrategy):
             }
         })
 
-        hedge_qty = self._calculate_hedge_quantity(symbol, quantity, futures_price, "basis")
+        hedge_qty = await self._calculate_hedge_quantity(symbol, quantity, futures_price, "basis")
         hedge_ok = await self._place_hedge_position(symbol, direction, futures_price, hedge_qty, arb_id)
         if not hedge_ok:
             logger.error(f"Hedge failed for basis arb {symbol} (arb_id={arb_id}), closing main position")
@@ -1501,12 +1501,12 @@ class ArbitrageStrategy(PersistentStrategy):
                     f"basis: {basis:.4%}, basis_std: {basis_std:.4%}, expected: {basis_pnl:.2f} USDT, "
                     f"score: {opportunity_score:.2f}, arb_id={arb_id}")
 
-    def _calculate_hedge_quantity(self, symbol: str, main_qty: float, futures_price: float, arb_type: str) -> float:
+    async def _calculate_hedge_quantity(self, symbol: str, main_qty: float, futures_price: float, arb_type: str) -> float:
         if arb_type == "basis":
             return main_qty
 
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker and float(ticker.get("last", 0)) > 0:
                 spot_price = float(ticker["last"])
                 hedge_qty = (main_qty * futures_price) / spot_price
@@ -1620,8 +1620,8 @@ class ArbitrageStrategy(PersistentStrategy):
                                      self._risk_gate.is_symbol_frozen(sym_b)):
                 continue
 
-            ticker_a = self.okx_client.get_ticker(sym_a)
-            ticker_b = self.okx_client.get_ticker(sym_b)
+            ticker_a = await self.okx_client.get_ticker_async(sym_a)
+            ticker_b = await self.okx_client.get_ticker_async(sym_b)
 
             if not ticker_a or not ticker_b:
                 continue
@@ -2007,7 +2007,7 @@ class ArbitrageStrategy(PersistentStrategy):
         if state["arbitrage_type"] != "funding":
             return
 
-        funding_data = self.okx_client.get_funding_rate(symbol)
+        funding_data = await self.okx_client.get_funding_rate_async(symbol)
         if not funding_data:
             return
 
@@ -2035,9 +2035,9 @@ class ArbitrageStrategy(PersistentStrategy):
         if state["arbitrage_type"] != "basis":
             return
 
-        futures_ticker = self.okx_client.get_ticker(symbol)
+        futures_ticker = await self.okx_client.get_ticker_async(symbol)
         spot_symbol = symbol.replace("-SWAP", "") if symbol.endswith("-SWAP") else symbol
-        spot_ticker = self.okx_client.get_ticker(spot_symbol)
+        spot_ticker = await self.okx_client.get_ticker_async(spot_symbol)
 
         if not futures_ticker or not spot_ticker:
             return
@@ -2061,7 +2061,7 @@ class ArbitrageStrategy(PersistentStrategy):
         hours_passed = (datetime.now() - state["entry_time"]).total_seconds() / 3600
 
         if state["arbitrage_type"] == "funding":
-            funding_data = self.okx_client.get_funding_rate(symbol)
+            funding_data = await self.okx_client.get_funding_rate_async(symbol)
             if funding_data:
                 current_rate = self._safe_float(funding_data.get("fundingRate"), 0.0)
                 next_funding_ms = funding_data.get("nextFundingTime")
@@ -2082,9 +2082,9 @@ class ArbitrageStrategy(PersistentStrategy):
                 self._total_fee_earned[symbol] = earnings
 
         elif state["arbitrage_type"] == "basis":
-            futures_ticker = self.okx_client.get_ticker(symbol)
+            futures_ticker = await self.okx_client.get_ticker_async(symbol)
             spot_symbol = symbol.replace("-SWAP", "") if symbol.endswith("-SWAP") else symbol
-            spot_ticker = self.okx_client.get_ticker(spot_symbol)
+            spot_ticker = await self.okx_client.get_ticker_async(spot_symbol)
 
             if futures_ticker and spot_ticker:
                 futures_price = self._safe_float(futures_ticker.get("last"), 0.0)
@@ -2098,7 +2098,7 @@ class ArbitrageStrategy(PersistentStrategy):
 
     async def _check_extreme_movement(self, symbol: str):
         state = self._positions[symbol]
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -2116,7 +2116,7 @@ class ArbitrageStrategy(PersistentStrategy):
 
     async def _check_stop_loss_take_profit(self, symbol: str):
         state = self._positions[symbol]
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -2130,7 +2130,7 @@ class ArbitrageStrategy(PersistentStrategy):
         # basis类型的止损使用basis deviation
         if arb_type == "basis":
             spot_symbol = symbol.replace("-SWAP", "") if symbol.endswith("-SWAP") else symbol
-            spot_ticker = self.okx_client.get_ticker(spot_symbol)
+            spot_ticker = await self.okx_client.get_ticker_async(spot_symbol)
             if not spot_ticker:
                 return
             spot_price = float(spot_ticker["last"])
@@ -2193,8 +2193,8 @@ class ArbitrageStrategy(PersistentStrategy):
         state = self._positions[pair_key]
         sym_a, sym_b = pair_key.split(":")
 
-        ticker_a = self.okx_client.get_ticker(sym_a)
-        ticker_b = self.okx_client.get_ticker(sym_b)
+        ticker_a = await self.okx_client.get_ticker_async(sym_a)
+        ticker_b = await self.okx_client.get_ticker_async(sym_b)
 
         if not ticker_a or not ticker_b:
             return
@@ -2247,7 +2247,7 @@ class ArbitrageStrategy(PersistentStrategy):
             await self._close_correlation_position(symbol, reason)
             return
 
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -2370,8 +2370,8 @@ class ArbitrageStrategy(PersistentStrategy):
         state = self._positions[pair_key]
         sym_a, sym_b = pair_key.split(":")
 
-        ticker_a = self.okx_client.get_ticker(sym_a)
-        ticker_b = self.okx_client.get_ticker(sym_b)
+        ticker_a = await self.okx_client.get_ticker_async(sym_a)
+        ticker_b = await self.okx_client.get_ticker_async(sym_b)
 
         if not ticker_a or not ticker_b:
             return

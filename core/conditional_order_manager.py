@@ -83,6 +83,10 @@ class ConditionalOrderManager:
         self._running = False     # 控制后台循环的运行状态
         self._heartbeat_enabled = True  # 心跳检测开关
         self._sync_enabled = True       # 同步循环开关
+        # 同步/心跳间隔从配置读取，支持运行时调参
+        cond_cfg = config.get("conditional_order", {})
+        self._sync_interval_sec = int(cond_cfg.get("sync_interval_sec", 15))
+        self._heartbeat_interval_sec = int(cond_cfg.get("heartbeat_interval_sec", 45))
 
         # 审计日志
         self._audit_log: List[Dict[str, Any]] = []  # 最多 500 条
@@ -170,8 +174,24 @@ class ConditionalOrderManager:
         self._running = True
         asyncio.create_task(self._retry_loop())
         asyncio.create_task(self._sync_loop())
+        asyncio.create_task(self._heartbeat_loop())  # P1: 独立心跳循环，按 _heartbeat_interval_sec 运行
         asyncio.create_task(self._orphan_cleanup_loop())  # P2: 孤儿条件单清理
         logger.info("ConditionalOrderManager started")
+
+    async def _heartbeat_loop(self):
+        """P1: 独立心跳循环，按配置 _heartbeat_interval_sec 周期性补挂丢失的 SL/TP。
+        scheduler._monitoring_loop 也调用 heartbeat_check()，但间隔 300s 太长；
+        本循环使用 cond_cfg.heartbeat_interval_sec（默认 45s），快速发现 SL/TP 丢失。
+        """
+        await asyncio.sleep(self._heartbeat_interval_sec)  # 启动时延迟，等待 sync_loop 先填充本地缓存
+        while self._running:
+            try:
+                restored = await self.heartbeat_check()
+                if restored > 0:
+                    logger.warning(f"Heartbeat loop restored {restored} missing conditional orders")
+            except Exception as e:
+                logger.error(f"Heartbeat loop error: {e}")
+            await asyncio.sleep(self._heartbeat_interval_sec)
 
     async def stop(self):
         """停止条件单管理器：取消后台循环，持久化当前状态"""
@@ -217,7 +237,7 @@ class ConditionalOrderManager:
             if self._sync_enabled:
                 await self._sync_with_exchange()
                 self._sync_operations_count += 1
-            await asyncio.sleep(30)
+            await asyncio.sleep(self._sync_interval_sec)
 
     async def _sync_with_exchange(self):
         """与交易所同步条件单状态"""
@@ -491,20 +511,35 @@ class ConditionalOrderManager:
             logger.error(f"Retry order failed: {e}")
             return False
 
-    def _check_immediate_trigger(self, symbol: str, side: str, trigger_price: float) -> bool:
-        """检查是否会立即触发（避免"-2021 Order would immediately trigger"错误）"""
+    def _check_immediate_trigger(self, symbol: str, side: str, trigger_price: float, order_type: str = "stop_loss") -> bool:
+        """检查是否会立即触发（避免"-2021 Order would immediately trigger"错误）
+
+        order_type: "stop_loss" 或 "take_profit"，两者的触发方向相反：
+        - 止损：long 的 SL 在市价下方，short 的 SL 在市价上方
+        - 止盈：long 的 TP 在市价上方，short 的 TP 在市价下方
+        """
         try:
             ticker = self._okx_client.get_ticker(symbol)
             if not ticker:
                 return False
             current_price = float(ticker["last"])
 
-            if side == "long":
-                if trigger_price >= current_price:
-                    logger.warning(f"Stop loss would immediately trigger for {symbol}: current={current_price:.4f}, sl={trigger_price:.4f}")
+            if order_type == "take_profit":
+                # 止盈触发方向：long TP 在上方，short TP 在下方
+                # long 的 TP 触发价应 > 市价；如果 <= 市价说明已经穿过 → 会立即触发
+                if side == "long" and trigger_price <= current_price:
+                    logger.warning(f"TP would immediately trigger for {symbol}: current={current_price:.4f}, tp={trigger_price:.4f}")
+                    return True
+                if side == "short" and trigger_price >= current_price:
+                    logger.warning(f"TP would immediately trigger for {symbol}: current={current_price:.4f}, tp={trigger_price:.4f}")
                     return True
             else:
-                if trigger_price <= current_price:
+                # 止损触发方向：long SL 在下方，short SL 在上方
+                # long 的 SL 触发价应 < 市价；如果 >= 市价说明已经穿过 → 会立即触发
+                if side == "long" and trigger_price >= current_price:
+                    logger.warning(f"Stop loss would immediately trigger for {symbol}: current={current_price:.4f}, sl={trigger_price:.4f}")
+                    return True
+                if side == "short" and trigger_price <= current_price:
                     logger.warning(f"Stop loss would immediately trigger for {symbol}: current={current_price:.4f}, sl={trigger_price:.4f}")
                     return True
 
@@ -1387,8 +1422,30 @@ class ConditionalOrderManager:
                 if info["symbol"] == symbol and info["type"] == "stop_loss"
             ]
             if not sl_orders:
-                logger.debug(f"No SL order found for {symbol} to update after TP")
-                return None
+                # 本地缓存无 SL：可能被 sync 移除但交易所仍有。向交易所查询兜底
+                exchange_algos = self._okx_client.get_algo_orders()
+                if exchange_algos:
+                    for algo in exchange_algos:
+                        if algo.get("instId") == symbol and algo.get("slTriggerPx"):
+                            algo_id = algo.get("algoId", "")
+                            if algo_id:
+                                # 同步到本地缓存并加入 sl_orders
+                                self._active_orders[algo_id] = {
+                                    "symbol": symbol,
+                                    "side": algo.get("posSide", ""),
+                                    "type": "stop_loss",
+                                    "price": float(algo.get("slTriggerPx", 0) or 0),
+                                    "quantity": 0,
+                                    "leverage": int(float(algo.get("lever", 1) or 1)),
+                                    "is_algo": True,
+                                    "status": algo.get("state", "")
+                                }
+                                sl_orders.append((algo_id, self._active_orders[algo_id]))
+                                logger.info(f"Recovered SL from exchange for {symbol}: algoId={algo_id}")
+                                break
+                if not sl_orders:
+                    logger.debug(f"No SL order found for {symbol} (local + exchange) to update after TP")
+                    return None
 
             # 找到对应的持仓获取入场价
             positions = self._okx_client.get_positions()
@@ -1437,10 +1494,7 @@ class ConditionalOrderManager:
                 logger.warning(f"New SL would immediately trigger for {symbol}, skipping update")
                 return None
 
-            # 取消旧SL单，挂新SL单
-            for old_id, _ in sl_orders:
-                self.cancel_conditional_order(symbol, old_id)
-
+            # fail-closed 顺序：先挂新 SL，成功后再取消旧 SL，避免取消后新挂失败导致裸仓暴露
             new_order_id = await self.place_stop_loss(
                 symbol=symbol,
                 side=side,
@@ -1451,7 +1505,13 @@ class ConditionalOrderManager:
             )
 
             if new_order_id:
-                logger.info(f"SL uplifted after {tp_type} for {symbol}: new_sl={new_sl_price:.4f}")
+                # 新 SL 挂出成功，安全取消旧 SL
+                for old_id, _ in sl_orders:
+                    self.cancel_conditional_order(symbol, old_id)
+                logger.info(f"SL uplifted after {tp_type} for {symbol}: new_sl={new_sl_price:.4f} (old SL cancelled after new SL confirmed)")
+            else:
+                # 新 SL 挂失败，保留旧 SL 不取消（fail-closed）
+                logger.error(f"New SL placement FAILED after {tp_type} for {symbol}, keeping old SL (fail-closed)")
             return new_order_id
 
         except Exception as e:
@@ -1538,8 +1598,8 @@ class ConditionalOrderManager:
                                 )
                                 if contracts_check <= 0:
                                     continue
-                                # 校验止盈价不会立即触发
-                                if self._check_immediate_trigger(inst_id, pos_side, tp_price):
+                                # 校验止盈价不会立即触发（使用 take_profit 方向逻辑）
+                                if self._check_immediate_trigger(inst_id, pos_side, tp_price, order_type="take_profit"):
                                     logger.warning(f"Skip restoring TP for {inst_id}: price {tp_price} would immediately trigger")
                                     continue
                                 result = await self.place_take_profit(

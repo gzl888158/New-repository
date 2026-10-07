@@ -547,7 +547,7 @@ class GridStrategy(PersistentStrategy):
             await asyncio.sleep(300)
 
     async def _update_atr(self, symbol: str):
-        klines = self.okx_client.get_kline(symbol, "1H", limit=self._atr_period + 10)
+        klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._atr_period + 10)
         if len(klines) < self._atr_period + 1:
             return
         
@@ -616,7 +616,7 @@ class GridStrategy(PersistentStrategy):
             return
 
     async def _update_volume_profile(self, symbol: str):
-        klines = self.okx_client.get_kline(symbol, "1H", limit=self._volume_profile_period)
+        klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._volume_profile_period)
         if len(klines) < 20:
             return
         
@@ -731,7 +731,7 @@ class GridStrategy(PersistentStrategy):
         if current_price is not None:
             price = current_price
         else:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if not ticker:
                 return
             price = float(ticker["last"])
@@ -784,7 +784,7 @@ class GridStrategy(PersistentStrategy):
         half_grids = grid_count // 2
         
         # P32: 方向感知网格 - 根据EMA趋势非对称分配buy/sell层
-        trend_direction, trend_strength = self._detect_grid_trend(symbol)
+        trend_direction, trend_strength = await self._detect_grid_trend(symbol)
         if trend_direction == "up" and trend_strength >= 0.15:
             # 上升趋势：buy层更多，sell层更少 (60/40 ~ 70/30)
             # 趋势越强，buy层越多
@@ -947,7 +947,7 @@ class GridStrategy(PersistentStrategy):
         
         return 1.25
 
-    def _detect_grid_trend(self, symbol: str) -> tuple:
+    async def _detect_grid_trend(self, symbol: str) -> tuple:
         """P32: 检测EMA趋势方向，用于非对称网格分配
         
         基于1H K线的EMA(20)斜率判断短期趋势方向。
@@ -961,7 +961,7 @@ class GridStrategy(PersistentStrategy):
             return "sideways", 0.0
 
         try:
-            klines = self.okx_client.get_kline(symbol, "1H", limit=30)
+            klines = await self.okx_client.get_kline_async(symbol, "1H", limit=30)
             if not klines or len(klines) < 20:
                 return "sideways", 0.0
             
@@ -1146,7 +1146,7 @@ class GridStrategy(PersistentStrategy):
                 if await self._confirm_grid_entry(symbol, "buy", price, tick):
                     # 信号质量评分检查
                     try:
-                        quality = self._calculate_grid_signal_quality(symbol, "buy", price, grid)
+                        quality = await self._calculate_grid_signal_quality(symbol, "buy", price, grid)
                         # P0-4: buy方向阈值接入config min_signal_quality（替代硬编码0.50）
                         # P32: 高风险时段叠加质量门槛，优质信号仍可开仓
                         _buy_threshold = self._min_signal_quality + self._high_risk_quality_margin
@@ -1176,7 +1176,7 @@ class GridStrategy(PersistentStrategy):
                 if await self._confirm_grid_entry(symbol, "sell", price, tick):
                     # 信号质量评分检查
                     try:
-                        quality = self._calculate_grid_signal_quality(symbol, "sell", price, grid)
+                        quality = await self._calculate_grid_signal_quality(symbol, "sell", price, grid)
                         # P2: 做空溢价方向感知 — 下跌趋势中做空是顺势，取消 +0.25 做空溢价
                         # （_trend_bias_cache.direction: 1=上涨, -1=下跌, 0=震荡）
                         _short_premium = 0.25
@@ -1284,7 +1284,7 @@ class GridStrategy(PersistentStrategy):
         self._stop_loss_history[key] = []
         return False
 
-    def _get_minute_rebound_metrics(self, symbol: str) -> Optional[Dict[str, float]]:
+    async def _get_minute_rebound_metrics(self, symbol: str) -> Optional[Dict[str, float]]:
         """P36: 计算分钟级反转指标（带30秒缓存）。
 
         用最近 1m K 线度量短期急拉(rise)/急杀(drop)，区分方向：
@@ -1299,7 +1299,7 @@ class GridStrategy(PersistentStrategy):
                 return cached.get("metrics")
 
             window = max(3, int(self._minute_rebound_window))
-            klines = self.okx_client.get_kline(symbol, "1m", limit=window + 2)
+            klines = await self.okx_client.get_kline_async(symbol, "1m", limit=window + 2)
             metrics: Optional[Dict[str, float]] = None
             if len(klines) >= 3:
                 highs, lows, closes = [], [], []
@@ -1326,7 +1326,7 @@ class GridStrategy(PersistentStrategy):
             logger.debug(f"P36: minute rebound metrics error for {symbol}: {e}")
             return None
 
-    def _check_minute_rebound(self, symbol: str, side: str, price: float) -> bool:
+    async def _check_minute_rebound(self, symbol: str, side: str, price: float) -> bool:
         """P36: 分钟级反转过滤器。返回 True 表示存在危险反转，应拦截开仓。
 
         - 做空(sell)：短期急拉（反弹）幅度超阈值 → 禁开空（对称于既有做多逆势惩罚）。
@@ -1335,7 +1335,7 @@ class GridStrategy(PersistentStrategy):
         """
         if self._minute_rebound_threshold <= 0:
             return False
-        metrics = self._get_minute_rebound_metrics(symbol)
+        metrics = await self._get_minute_rebound_metrics(symbol)
         if not metrics:
             return False
         threshold = self._minute_rebound_threshold
@@ -1393,7 +1393,7 @@ class GridStrategy(PersistentStrategy):
 
         # P36: 分钟级反转过滤 — 短期急拉(做空)/急杀(做多)超阈值拦截，
         # 补齐 EMA20-EMA50 滞后指标捕捉不到的分钟级反弹（grid 做空反复被反弹止损的根因）。
-        if self._check_minute_rebound(symbol, side, price):
+        if await self._check_minute_rebound(symbol, side, price):
             return False
 
         # 成交量确认 - 降低阈值，更容易触发
@@ -1427,7 +1427,7 @@ class GridStrategy(PersistentStrategy):
           趋势市（ADX ≥ 20）才做 +DI / -DI 方向对齐（顺势）+ 价格位置过滤（避免追高/追低）
         """
         try:
-            klines = self.okx_client.get_kline(symbol, "15m", limit=50)
+            klines = await self.okx_client.get_kline_async(symbol, "15m", limit=50)
             if len(klines) < 20:
                 return True  # 数据不足时放行，避免阻塞
 
@@ -1598,7 +1598,7 @@ class GridStrategy(PersistentStrategy):
         # P28: 最终价格验证 - 在下单前重新验证网格价格与当前市价的距离
         # 防止网格重建冷却期间、or validation pass但实际价格已偏离的情况下放置无效订单
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 current_price = float(ticker.get("last", 0))
                 if current_price > 0 and price > 0:
@@ -1682,12 +1682,7 @@ class GridStrategy(PersistentStrategy):
             except Exception as e:
                 logger.debug(f"Grid adaptive multiplier error: {e}")
 
-        min_margin = self.config["trading"].get("min_margin_per_trade", 0.5)
-        if base_position < min_margin:
-            logger.debug(f"Grid skip {symbol}: base_position {base_position:.4f} < min_margin {min_margin}")
-            return
-
-        instrument_info = self.okx_client.get_instrument_info(symbol)
+        instrument_info = await self.okx_client.get_instrument_info_async(symbol)
         if not instrument_info:
             logger.debug(f"Grid {symbol}: instrument info unavailable, skip")
             return
@@ -1702,22 +1697,13 @@ class GridStrategy(PersistentStrategy):
 
         strategy_cap = trading_capital * allocation
         if base_position < margin_needed_for_min_lot:
-            if total_capital < 1500:
-                adjusted = min(margin_needed_for_min_lot, strategy_cap * 0.5)
-                if adjusted >= margin_needed_for_min_lot:
-                    logger.info(f"Grid {symbol}: small-cap adjusted margin {base_position:.2f} -> {adjusted:.2f} (strategy_cap={strategy_cap:.2f})")
-                    base_position = adjusted
-                else:
-                    logger.debug(f"Grid {symbol}: margin {base_position:.2f} < min lot margin {margin_needed_for_min_lot:.2f}, skip (strategy_cap too small)")
-                    return
+            adjusted = min(margin_needed_for_min_lot, strategy_cap)
+            if adjusted >= margin_needed_for_min_lot:
+                logger.info(f"Grid {symbol}: adjusted margin {base_position:.2f} -> {adjusted:.2f} for min lot (strategy_cap={strategy_cap:.2f})")
+                base_position = adjusted
             else:
-                adjusted = min(margin_needed_for_min_lot, strategy_cap * 0.3)
-                if adjusted >= margin_needed_for_min_lot:
-                    logger.info(f"Grid {symbol}: adjusted margin {base_position:.2f} -> {adjusted:.2f} for min lot")
-                    base_position = adjusted
-                else:
-                    logger.debug(f"Grid {symbol}: margin {base_position:.2f} < min lot margin {margin_needed_for_min_lot:.2f}, skip")
-                    return
+                logger.debug(f"Grid {symbol}: margin {base_position:.2f} < min lot margin {margin_needed_for_min_lot:.2f}, skip (strategy_cap {strategy_cap:.2f} too small)")
+                return
 
         # P33: 单币种累计仓位上限 - 防止多层网格叠加突破单币种风控阈值
         # （阈值与 risk/global_risk.py 的 0.25 保持一致，从源头封顶，不增加风险）
@@ -1758,7 +1744,7 @@ class GridStrategy(PersistentStrategy):
         else:
             cap_factor = 0.80
         max_nominal = total_capital * self.config["risk"].get("max_symbol_position_ratio", 1.0) * cap_factor
-        min_notional = self.config["trading"].get("min_notional_usd", 3.0)
+        min_notional = self.config["trading"].get("min_notional_usd", 1.0)
         if nominal_value > max_nominal:
             capped_qty = round((max_nominal * 0.9) / (price * min_lot_size)) * min_lot_size
             capped_nominal = capped_qty * price
@@ -1790,7 +1776,7 @@ class GridStrategy(PersistentStrategy):
         # P0-2: 资金费率检查 - 距结算 <5min 或 费率吃掉 >50% 预期利润时跳过开仓
         # 注：okx_client.get_funding_rate 为同步 REST 接口，try/except 包裹保证失败时默认放行
         try:
-            funding_data = self.okx_client.get_funding_rate(symbol)
+            funding_data = await self.okx_client.get_funding_rate_async(symbol)
             if funding_data:
                 rate_str = funding_data.get("fundingRate")
                 next_funding_str = funding_data.get("nextFundingTime")
@@ -1920,8 +1906,22 @@ class GridStrategy(PersistentStrategy):
         
         # 使用配置的多级止盈比例（tp1_pct, tp2_pct），回退到基于网格间距的计算
         # 配置值为百分比（如0.8=0.8%），需除以100转为小数
-        tp1_pct = (self._tp1_pct / 100.0) if self._tp1_pct > 0 else grid_spacing
-        tp2_pct = (self._tp2_pct / 100.0) if self._tp2_pct > 0 else grid_spacing * 2.5
+        raw_tp1 = (self._tp1_pct / 100.0) if self._tp1_pct > 0 else grid_spacing
+        raw_tp2 = (self._tp2_pct / 100.0) if self._tp2_pct > 0 else grid_spacing * 2.5
+
+        # 波动率自适应止盈上限：低波动市中固定 TP（如 4%）可能超出市场日内振幅，
+        # 导致 TradeCostAnalyzer 以「震荡空间不足」拦截全部开单。
+        # 将 TP 上限锚定到 ATR 衍生的 grid_spacing，确保止盈在可达范围内。
+        tp1_vol_cap = grid_spacing * 1.5
+        tp2_vol_cap = grid_spacing * 3.0
+        tp1_pct = min(raw_tp1, tp1_vol_cap) if tp1_vol_cap > 0 else raw_tp1
+        tp2_pct = min(raw_tp2, tp2_vol_cap) if tp2_vol_cap > 0 else raw_tp2
+
+        if tp1_pct != raw_tp1:
+            logger.debug(
+                f"[grid] {symbol} TP1 capped by volatility: {raw_tp1:.4%} -> {tp1_pct:.4%} "
+                f"(grid_spacing={grid_spacing:.4%})"
+            )
         
         if layer == 0:
             take_profit_levels = [
@@ -1986,7 +1986,7 @@ class GridStrategy(PersistentStrategy):
     async def _switch_to_trend_mode(self, symbol: str):
         self._trend_mode[symbol] = True
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
@@ -2023,7 +2023,7 @@ class GridStrategy(PersistentStrategy):
             logger.error(f"TP/SL validation failed for {symbol}: {validation['errors']}")
             return
         
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = current_price * min_lot_size / leverage
         
         effective_capital = self._get_effective_capital()
@@ -2100,7 +2100,7 @@ class GridStrategy(PersistentStrategy):
         if entry_price <= 0:
             return
 
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         current_price = float(ticker["last"])
@@ -2123,13 +2123,13 @@ class GridStrategy(PersistentStrategy):
         await self._exit_trend_mode(symbol)
 
     async def _check_trend_exit(self, symbol: str):
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
         current_price = float(ticker["last"])
         
-        klines = self.okx_client.get_kline(symbol, "1H", limit=12)
+        klines = await self.okx_client.get_kline_async(symbol, "1H", limit=12)
         if len(klines) < 6:
             return
         
@@ -2323,7 +2323,7 @@ class GridStrategy(PersistentStrategy):
             await self._build_grid(symbol)
             return
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
@@ -2434,7 +2434,7 @@ class GridStrategy(PersistentStrategy):
             await self._build_grid(symbol)
             return
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
@@ -2856,7 +2856,7 @@ class GridStrategy(PersistentStrategy):
         if not pending:
             return
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
@@ -2892,7 +2892,7 @@ class GridStrategy(PersistentStrategy):
         if not sl_order or sl_order["status"] != "active":
             return
 
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -2913,7 +2913,7 @@ class GridStrategy(PersistentStrategy):
                 if pnl_pct >= self._breakeven_trigger_pct:
                     breakeven_sl = entry_price * (1 + self._breakeven_stop_pct)
                     if breakeven_sl > sl_price:
-                        self._update_stop_loss_order(symbol, breakeven_sl)
+                        await self._update_stop_loss_order(symbol, breakeven_sl)
                         sl_price = breakeven_sl
                         trailing_state["trailing_activated"] = True
             elif direction == "short":
@@ -2921,7 +2921,7 @@ class GridStrategy(PersistentStrategy):
                 if pnl_pct >= self._breakeven_trigger_pct:
                     breakeven_sl = entry_price * (1 - self._breakeven_stop_pct)
                     if breakeven_sl < sl_price:
-                        self._update_stop_loss_order(symbol, breakeven_sl)
+                        await self._update_stop_loss_order(symbol, breakeven_sl)
                         sl_price = breakeven_sl
                         trailing_state["trailing_activated"] = True
 
@@ -2934,7 +2934,7 @@ class GridStrategy(PersistentStrategy):
                 if trailing_state.get("trailing_activated"):
                     trail_sl = trailing_state["highest_price"] * (1 - self._trailing_stop_pct)
                     if trail_sl > sl_price:
-                        self._update_stop_loss_order(symbol, trail_sl)
+                        await self._update_stop_loss_order(symbol, trail_sl)
                         sl_price = trail_sl
                         trailing_state["trailing_sl"] = trail_sl
             elif direction == "short":
@@ -2944,7 +2944,7 @@ class GridStrategy(PersistentStrategy):
                 if trailing_state.get("trailing_activated"):
                     trail_sl = trailing_state["lowest_price"] * (1 + self._trailing_stop_pct)
                     if trail_sl < sl_price:
-                        self._update_stop_loss_order(symbol, trail_sl)
+                        await self._update_stop_loss_order(symbol, trail_sl)
                         sl_price = trail_sl
                         trailing_state["trailing_sl"] = trail_sl
 
@@ -2968,7 +2968,7 @@ class GridStrategy(PersistentStrategy):
                             f"Time partial exit for {symbol}: held {hold_hours:.1f}h >= "
                             f"{self._time_exit_after_hours}h, tightening stop to breakeven"
                         )
-                        self._update_stop_loss_order(symbol, tight_target)
+                        await self._update_stop_loss_order(symbol, tight_target)
                         sl_price = tight_target
 
         # === 4. 波动率止盈（波动率飙升时部分退出） ===
@@ -2987,12 +2987,12 @@ class GridStrategy(PersistentStrategy):
                     if direction == "long":
                         vol_sl = last_price * (1 - self._vol_stop_partial_pct * current_vol)
                         if vol_sl > sl_price:
-                            self._update_stop_loss_order(symbol, vol_sl)
+                            await self._update_stop_loss_order(symbol, vol_sl)
                             sl_price = vol_sl
                     elif direction == "short":
                         vol_sl = last_price * (1 + self._vol_stop_partial_pct * current_vol)
                         if vol_sl < sl_price:
-                            self._update_stop_loss_order(symbol, vol_sl)
+                            await self._update_stop_loss_order(symbol, vol_sl)
                             sl_price = vol_sl
 
         # === 5. 止损触发判断 ===
@@ -3192,7 +3192,7 @@ class GridStrategy(PersistentStrategy):
             self._stop_loss_orders[symbol]["status"] = "cancelled"
             logger.info(f"Stop loss order cancelled: {symbol}")
 
-    def _update_stop_loss_order(self, symbol: str, new_price: float):
+    async def _update_stop_loss_order(self, symbol: str, new_price: float):
         if symbol not in self._stop_loss_orders:
             return
         
@@ -3200,7 +3200,7 @@ class GridStrategy(PersistentStrategy):
         if sl_order["status"] != "active":
             return
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             logger.warning(f"Cannot update SL: no ticker for {symbol}")
             return
@@ -3250,7 +3250,7 @@ class GridStrategy(PersistentStrategy):
                     grid_utilization = filled / len(grids)
                 
                 atr = self._atr_cache.get(symbol, 0)
-                ticker = self.okx_client.get_ticker(symbol)
+                ticker = await self.okx_client.get_ticker_async(symbol)
                 current_price = float(ticker["last"]) if ticker else 0
                 
                 volatility = atr / current_price if current_price > 0 and atr > 0 else 0
@@ -3326,7 +3326,7 @@ class GridStrategy(PersistentStrategy):
         if not grids:
             return
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
@@ -4038,7 +4038,7 @@ class GridStrategy(PersistentStrategy):
 
     # ===================== 信号质量增强 =====================
 
-    def _calculate_grid_signal_quality(self, symbol: str, side: str, price: float, grid: Dict[str, Any]) -> float:
+    async def _calculate_grid_signal_quality(self, symbol: str, side: str, price: float, grid: Dict[str, Any]) -> float:
         """计算网格信号质量评分 0-1
         
         基于以下维度：
@@ -4060,7 +4060,7 @@ class GridStrategy(PersistentStrategy):
                     if avg_vol > 0:
                         # 获取当前tick的24h成交量
                         try:
-                            ticker = self.okx_client.get_ticker(symbol)
+                            ticker = await self.okx_client.get_ticker_async(symbol)
                             if ticker:
                                 vol_24h = float(ticker.get("vol24h", 0))
                                 if vol_24h > avg_vol * 0.5:
@@ -4096,7 +4096,7 @@ class GridStrategy(PersistentStrategy):
 
             # 3. 价差检查 (0-0.25)
             try:
-                ticker = self.okx_client.get_ticker(symbol)
+                ticker = await self.okx_client.get_ticker_async(symbol)
                 if ticker:
                     bid = float(ticker.get("bidPx", 0))
                     ask = float(ticker.get("askPx", 0))
@@ -4314,7 +4314,7 @@ class GridStrategy(PersistentStrategy):
             sl_order = self._stop_loss_orders.get(symbol)
             if sl_order and sl_order.get("status") == "active":
                 try:
-                    ticker = self.okx_client.get_ticker(symbol)
+                    ticker = await self.okx_client.get_ticker_async(symbol)
                     if ticker:
                         current_price = float(ticker["last"])
                         sl_price = sl_order.get("price", 0)

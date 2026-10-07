@@ -256,6 +256,14 @@ class TradeCostAnalyzer:
             "fee_cache_ttl": self.fee_cache_ttl,
         }
 
+    def get_cost_params(self, inst_type: str = "SWAP") -> Dict[str, float]:
+        """返回统一成本参数，供 handle_signal 等上游层复用，消除参数分歧。"""
+        taker, _, _, _ = self.get_effective_fee_rates(inst_type=inst_type)
+        return {
+            "taker_fee": max(taker, 0.0),
+            "slippage_pct": self.default_slippage,
+        }
+
     def calculate_full_cost(
         self,
         symbol: str,

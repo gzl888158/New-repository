@@ -248,7 +248,7 @@ class TrendStrategyBase(StrategyBase):
         except Exception:
             pass
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 return self._safe_float(ticker.get("last"), 0.0)
         except Exception as e:
@@ -421,9 +421,39 @@ class TrendStrategyBase(StrategyBase):
             "bar": self._bar,
         }
 
+    async def _sync_positions_with_exchange(self):
+        """同步交易所实际持仓，清理被外部（如减仓/爆仓）平掉的幽灵仓位。
+
+        若缺少此步，_position_state 中残留的 open 状态会让 max_positions_reached
+        永远成立，策略无法开新仓。
+        """
+        if not self._position_state:
+            return
+        try:
+            positions = await self.okx_client.get_positions_async()
+            if positions is None:
+                return
+            exchange_symbols = set()
+            for p in positions:
+                sym = p.get("instId", "")
+                qty = abs(float(p.get("pos", 0) or 0))
+                if sym and qty > 0:
+                    exchange_symbols.add(sym)
+            stale = []
+            for sym in list(self._position_state.keys()):
+                if self._position_state[sym].get("status") == "open" and sym not in exchange_symbols:
+                    stale.append(sym)
+                    del self._position_state[sym]
+                    self._last_signal_time.pop(sym, None)
+            if stale:
+                logger.info(f"[{self._strategy_name}] removed {len(stale)} stale positions: {stale}")
+        except Exception as e:
+            logger.debug(f"[{self._strategy_name}] _sync_positions_with_exchange error: {e}")
+
     async def _monitor_loop(self):
         while self._running:
             try:
+                await self._sync_positions_with_exchange()
                 await self._check_signals()
                 await self._manage_positions()
             except asyncio.CancelledError:

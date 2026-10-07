@@ -100,6 +100,9 @@ class FakeTicker:
     def get_ticker(self, symbol):
         return {"last": "101"}
 
+    async def get_ticker_async(self, symbol):
+        return {"last": "101"}
+
 
 class TestGridReversalTakeProfit:
     def _grid(self, slm, pos_side="buy", entry_price=100.0):

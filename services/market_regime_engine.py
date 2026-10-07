@@ -4,6 +4,7 @@
 遵循经验回顾中的核心教训：建立统一的状态融合与可解释计算链。
 """
 import asyncio
+import time
 import numpy as np
 from datetime import datetime, timedelta
 from enum import Enum
@@ -111,6 +112,12 @@ class MarketRegimeEngine:
         self._orderbook_cache: Dict[str, Dict] = {}
         self._data_collection_ok: Dict[str, bool] = {}
         self._data_stale: bool = False
+        # 数据过期宽限期：单次数据采集失败（如网络抖动）不立即标记过期，
+        # 仅当连续超过宽限期仍无成功采集才判定 stale，避免临时网络问题阻断全部信号。
+        self._last_successful_collection_time: float = 0.0
+        self._stale_grace_seconds: float = float(
+            config.get("market_regime", {}).get("stale_grace_seconds", 120.0)
+        )
 
         # 企业级趋势行情判断参数（可从 config market_regime 覆盖）
         self._trend_adx_period = config.get("market_regime", {}).get("trend_adx_period", 14)
@@ -205,7 +212,18 @@ class MarketRegimeEngine:
         await self._collect_factor_data()
 
         if self.okx_client:
-            self._data_stale = not self._data_collection_ok.get(self._base_symbol, False)
+            base_ok = self._data_collection_ok.get(self._base_symbol, False)
+            now = time.time()
+            if base_ok:
+                self._last_successful_collection_time = now
+                self._data_stale = False
+            else:
+                # 宽限期内仍使用上次成功采集的行情，不标记 stale
+                elapsed = now - self._last_successful_collection_time
+                if self._last_successful_collection_time > 0 and elapsed <= self._stale_grace_seconds:
+                    self._data_stale = False
+                else:
+                    self._data_stale = True
             if self._data_stale:
                 logger.warning(f"[REGIME] {self._base_symbol} market data incomplete; keeping previous regime")
                 return
@@ -254,7 +272,7 @@ class MarketRegimeEngine:
 
         factor_scores = base_result["scores"]
         regime = MarketRegime(base_result["regime"])
-        subtype = RegimeSubtype(base_result["subtype"])
+        subtype = MarketSubtype(base_result["subtype"])
         strength = base_result["strength"]
         confidence = base_result["confidence"]
 
@@ -441,22 +459,22 @@ class MarketRegimeEngine:
             async def _get_ticker():
                 if hasattr(self.okx_client, 'get_ticker_async'):
                     return await self.okx_client.get_ticker_async(symbol)
-                return self.okx_client.get_ticker(symbol)
+                return await self.okx_client.get_ticker_async(symbol)
             
             async def _get_funding():
                 if hasattr(self.okx_client, 'get_funding_rate_async'):
                     return await self.okx_client.get_funding_rate_async(symbol)
-                return self.okx_client.get_funding_rate(symbol)
+                return await self.okx_client.get_funding_rate_async(symbol)
             
             async def _get_kline_1h():
                 if hasattr(self.okx_client, 'get_kline_async'):
                     return await self.okx_client.get_kline_async(symbol, "1H", limit=60)
-                return self.okx_client.get_kline(symbol, "1H", limit=60)
+                return await self.okx_client.get_kline_async(symbol, "1H", limit=60)
             
             async def _get_kline_4h():
                 if hasattr(self.okx_client, 'get_kline_async'):
                     return await self.okx_client.get_kline_async(symbol, "4H", limit=60)
-                return self.okx_client.get_kline(symbol, "4H", limit=60)
+                return await self.okx_client.get_kline_async(symbol, "4H", limit=60)
             
             ticker, funding_info, klines_1h, klines_4h = await asyncio.wait_for(
                 asyncio.gather(

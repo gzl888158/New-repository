@@ -434,12 +434,12 @@ class ScalpingStrategy(PersistentStrategy):
             self._is_active = False
             # 取消时不关闭仓位，由外部控制
 
-    def _get_ticker_cached(self, symbol: str):
+    async def _get_ticker_cached(self, symbol: str):
         now = datetime.now()
         if symbol in self._ticker_cache and (now - self._ticker_cache_time[symbol]).total_seconds() < 2:
             return self._ticker_cache[symbol]
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if ticker:
             self._ticker_cache[symbol] = ticker
             self._ticker_cache_time[symbol] = now
@@ -1301,7 +1301,7 @@ class ScalpingStrategy(PersistentStrategy):
         stoch_1m = momentum.get("stoch_1m", 50)
         atr_1m = momentum.get("atr_1m", 0)
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1383,7 +1383,7 @@ class ScalpingStrategy(PersistentStrategy):
         stoch_1m = momentum.get("stoch_1m", 50)
         atr_1m = momentum.get("atr_1m", 0)
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1464,7 +1464,7 @@ class ScalpingStrategy(PersistentStrategy):
         vwap_1m = momentum.get("vwap_1m", 0)
         volume_delta = momentum.get("volume_delta", 0)
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1541,7 +1541,7 @@ class ScalpingStrategy(PersistentStrategy):
         vwap_1m = momentum.get("vwap_1m", 0)
         volume_delta = momentum.get("volume_delta", 0)
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1646,7 +1646,7 @@ class ScalpingStrategy(PersistentStrategy):
         volume_spike = momentum.get("volume_spike", False)
         price_action_patterns = momentum.get("price_action_patterns", [])
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1771,7 +1771,7 @@ class ScalpingStrategy(PersistentStrategy):
         volume_spike = momentum.get("volume_spike", False)
         price_action_patterns = momentum.get("price_action_patterns", [])
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1885,7 +1885,7 @@ class ScalpingStrategy(PersistentStrategy):
         price_above_vwap = momentum.get("price_above_vwap", False)
         stoch_1m = momentum.get("stoch_1m", 50)
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -1927,7 +1927,7 @@ class ScalpingStrategy(PersistentStrategy):
         price_above_vwap = momentum.get("price_above_vwap", False)
         stoch_1m = momentum.get("stoch_1m", 50)
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -2084,7 +2084,7 @@ class ScalpingStrategy(PersistentStrategy):
         """
         try:
             import numpy as np
-            klines = self.okx_client.get_kline(symbol, "15m", limit=50)
+            klines = await self.okx_client.get_kline_async(symbol, "15m", limit=50)
             if len(klines) < 20:
                 return True  # 数据不足时放行
 
@@ -2577,7 +2577,7 @@ class ScalpingStrategy(PersistentStrategy):
 
         # P0-4: 临近 funding 结算暂停开仓（避免结算瞬间价格剧烈波动）
         try:
-            funding_data = self.okx_client.get_funding_rate(symbol)
+            funding_data = await self.okx_client.get_funding_rate_async(symbol)
             if funding_data:
                 next_funding_ms = funding_data.get("nextFundingTime")
                 funding_rate = float(funding_data.get("fundingRate", 0))
@@ -2705,7 +2705,7 @@ class ScalpingStrategy(PersistentStrategy):
 
         quantity = base_position * leverage / price
         
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = price * min_lot_size / leverage
         
         if base_position < margin_needed_for_min_lot:
@@ -3048,7 +3048,7 @@ class ScalpingStrategy(PersistentStrategy):
                     state["_verify_fail_count"] = 0  # 验证通过，重置计数
                 state["_last_verify_ts"] = now_ts
             
-            ticker = self._get_ticker_cached(symbol)
+            ticker = await self._get_ticker_cached(symbol)
             if not ticker:
                 continue
             
@@ -3486,7 +3486,7 @@ class ScalpingStrategy(PersistentStrategy):
             self.cleanup_position(symbol, "scalping")
             return
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         
@@ -3571,7 +3571,7 @@ class ScalpingStrategy(PersistentStrategy):
             self.cleanup_position(symbol, "scalping")
             return
         
-        ticker = self._get_ticker_cached(symbol)
+        ticker = await self._get_ticker_cached(symbol)
         if not ticker:
             return
         

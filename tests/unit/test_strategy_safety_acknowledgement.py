@@ -24,7 +24,8 @@ async def test_spot_martingale_preserves_position_when_close_signal_is_rejected(
         "total": 2.0,
     }
     strategy.okx_client.get_instrument_info.return_value = {"lotSz": "0.001"}
-    strategy._get_quantity_precision = MagicMock(return_value=3)
+    strategy.okx_client.get_instrument_info_async = AsyncMock(return_value={"lotSz": "0.001"})
+    strategy._get_quantity_precision = AsyncMock(return_value=3)
     strategy._safe_float = MagicMock(return_value=0.001)
     strategy._place_martingale_order = AsyncMock(return_value=False)
 
@@ -51,7 +52,8 @@ async def test_spot_martingale_keeps_position_tracked_until_balance_confirms_clo
         "total": 2.0,
     }
     strategy.okx_client.get_instrument_info.return_value = {"lotSz": "0.001"}
-    strategy._get_quantity_precision = MagicMock(return_value=3)
+    strategy.okx_client.get_instrument_info_async = AsyncMock(return_value={"lotSz": "0.001"})
+    strategy._get_quantity_precision = AsyncMock(return_value=3)
     strategy._safe_float = MagicMock(return_value=0.001)
     strategy._place_martingale_order = AsyncMock(return_value=True)
 
@@ -77,7 +79,8 @@ async def test_spot_martingale_partial_close_waits_for_balance_reconciliation():
         "total": 2.0,
     }
     strategy.okx_client.get_instrument_info.return_value = {"lotSz": "0.001"}
-    strategy._get_quantity_precision = MagicMock(return_value=3)
+    strategy.okx_client.get_instrument_info_async = AsyncMock(return_value={"lotSz": "0.001"})
+    strategy._get_quantity_precision = AsyncMock(return_value=3)
     strategy._safe_float = MagicMock(return_value=0.001)
     strategy._place_martingale_order = AsyncMock(return_value=True)
 
@@ -115,7 +118,7 @@ async def test_spot_martingale_sell_signal_is_marked_as_close():
     strategy._validate_direction = MagicMock(return_value=True)
     strategy._validate_price = MagicMock(return_value=True)
     strategy._validate_quantity = MagicMock(return_value=True)
-    strategy._get_quantity_precision = MagicMock(return_value=3)
+    strategy._get_quantity_precision = AsyncMock(return_value=3)
     strategy._signal_callback = AsyncMock(return_value=True)
     strategy._record_metric = MagicMock()
 

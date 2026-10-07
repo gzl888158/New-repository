@@ -77,10 +77,10 @@ def _klines(n=50, high=100.0, low=90.0, close=95.0):
 
 
 def _target_with_adx(adx, plus_di, minus_di):
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
     g = _make_target()
     g.okx_client = MagicMock()
-    g.okx_client.get_kline = MagicMock(return_value=_klines())
+    g.okx_client.get_kline_async = AsyncMock(return_value=_klines())
     g._calculate_adx = MagicMock(return_value=(adx, plus_di, minus_di))
     return g
 

@@ -234,7 +234,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
     async def _update_rsi(self, symbol: str):
         try:
-            klines = self.okx_client.get_kline(symbol, "1H", limit=20)
+            klines = await self.okx_client.get_kline_async(symbol, "1H", limit=20)
             if len(klines) < 15:
                 return False
             closes = np.array([float(k[4]) for k in klines], dtype=float)
@@ -290,7 +290,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
     async def _update_atr(self, symbol: str):
         """更新ATR波动率"""
         try:
-            klines = self.okx_client.get_kline(symbol, "1H", limit=self._atr_period + 1)
+            klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._atr_period + 1)
             if len(klines) < self._atr_period + 1:
                 return False
 
@@ -328,7 +328,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
     async def _update_ema(self, symbol: str):
         """更新EMA判断市场状态"""
         try:
-            klines = self.okx_client.get_kline(symbol, "1D", limit=self._ema_slow_period + 5)
+            klines = await self.okx_client.get_kline_async(symbol, "1D", limit=self._ema_slow_period + 5)
             if len(klines) < self._ema_slow_period:
                 return
 
@@ -469,7 +469,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
             if holdings is None:
                 logger.warning(f"Spot Martingale {symbol}: holdings unavailable, skip reconciliation")
                 continue
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             try:
                 current_price = float(ticker.get("last", 0) or 0) if ticker else 0.0
             except (TypeError, ValueError):
@@ -563,7 +563,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
         from_ws = True
 
         if not tick:
-            tick = self._get_tick_rest(symbol)
+            tick = await self._get_tick_rest(symbol)
             from_ws = False
             if not tick:
                 return
@@ -582,14 +582,14 @@ class SpotMartingaleStrategy(PersistentStrategy):
         else:
             await self._check_new_entry(symbol, price, tick)
 
-    def _get_tick_rest(self, symbol: str) -> Optional[TickData]:
+    async def _get_tick_rest(self, symbol: str) -> Optional[TickData]:
         now = time.time()
         cache_entry = self._tick_rest_cache.get(symbol)
         if cache_entry and (now - cache_entry[0]) < self._tick_rest_interval:
             return cache_entry[1]
 
         try:
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if not ticker:
                 return None
 
@@ -741,7 +741,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
     async def _confirm_entry(self, symbol: str, tick: TickData) -> bool:
         if tick.volume and tick.volume > 0:
-            klines = self.okx_client.get_kline(symbol, "1H", limit=24)
+            klines = await self.okx_client.get_kline_async(symbol, "1H", limit=24)
             if len(klines) >= 12:
                 recent_vols = [float(kline[5]) for kline in klines[-12:]]
                 avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
@@ -793,12 +793,12 @@ class SpotMartingaleStrategy(PersistentStrategy):
 
         quantity = base_usdt / price
 
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             logger.debug(f"Spot Martingale {symbol}: quantity {quantity:.6f} < min lot {min_lot_size}")
             return None
 
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
         quantity = round(quantity, quantity_precision)
         if quantity <= 0:
             logger.debug(f"Spot Martingale {symbol}: quantity {quantity} <= 0 after rounding, skip entry")
@@ -955,12 +955,12 @@ class SpotMartingaleStrategy(PersistentStrategy):
             return
 
         new_quantity = layer_usdt / price
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if new_quantity < min_lot_size:
             logger.debug(f"Spot Martingale {symbol}: new quantity {new_quantity:.6f} < min lot {min_lot_size}")
             return
 
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
         new_quantity = round(new_quantity, quantity_precision)
         if new_quantity <= 0:
             logger.debug(f"Spot Martingale {symbol}: layer new_quantity {new_quantity} <= 0 after rounding, skip")
@@ -1004,11 +1004,11 @@ class SpotMartingaleStrategy(PersistentStrategy):
         except (TypeError, ValueError):
             logger.warning(f"Spot Martingale {symbol}: invalid available balance, skip partial close")
             return
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             return
 
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
         quantity = round(quantity, quantity_precision)
         if quantity <= 0:
             logger.debug(f"Spot Martingale {symbol}: partial close quantity {quantity} <= 0 after rounding, skip")
@@ -1045,12 +1045,12 @@ class SpotMartingaleStrategy(PersistentStrategy):
             logger.warning(f"Spot Martingale {symbol}: holdings are frozen or unavailable for closing")
             return
 
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "0.001"), 0.001)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "0.001"), 0.001)
         if quantity < min_lot_size:
             logger.debug(f"Spot Martingale {symbol}: quantity {quantity:.6f} < min lot {min_lot_size}")
             return
 
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
         quantity = round(quantity, quantity_precision)
         if quantity <= 0:
             logger.debug(f"Spot Martingale {symbol}: close quantity {quantity} <= 0 after rounding, skip order")
@@ -1085,7 +1085,7 @@ class SpotMartingaleStrategy(PersistentStrategy):
             return False
 
         precision = get_price_precision(symbol)
-        quantity_precision = self._get_quantity_precision(symbol)
+        quantity_precision = await self._get_quantity_precision(symbol)
 
         quantity = round(quantity, quantity_precision)
         price = round(price, precision)
@@ -1161,9 +1161,9 @@ class SpotMartingaleStrategy(PersistentStrategy):
             logger.error(f"Failed to get {base_asset} balance: {e}")
             return None
 
-    def _get_quantity_precision(self, symbol: str) -> int:
+    async def _get_quantity_precision(self, symbol: str) -> int:
         try:
-            info = self.okx_client.get_instrument_info(symbol) or {}
+            info = await self.okx_client.get_instrument_info_async(symbol) or {}
             lot_size = float(info.get("lotSz", "0.001"))
             return len(str(lot_size).split(".")[1]) if "." in str(lot_size) else 0
         except Exception:

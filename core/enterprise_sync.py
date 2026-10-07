@@ -370,6 +370,10 @@ class SyncHealthMonitor:
                     ws_ts[ch.value.replace("_ws", "")] = s.last_success_time
 
             for key in set(rest_ts.keys()) & set(ws_ts.keys()):
+                # 防御性：任一通道从未成功同步（last_success_time=0.0）时跳过 drift 计算，
+                # 否则会得到 ~56 年的假告警（启动期或 WS 断线时常见）
+                if rest_ts[key] == 0.0 or ws_ts[key] == 0.0:
+                    continue
                 drift = abs(rest_ts[key] - ws_ts[key])
                 if drift > self._max_channel_drift_sec:
                     alerts.append(f"Channel drift: {key} REST/WS gap={drift:.1f}s")

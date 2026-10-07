@@ -1675,7 +1675,7 @@ class TrendStrategy(PersistentStrategy):
         # P33: 企业级凯利仓位调整（在静态自适应之上叠加数据驱动的凯利）
         base_position = self._calculate_kelly_position(base_position, symbol)
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         
@@ -1720,7 +1720,7 @@ class TrendStrategy(PersistentStrategy):
             logger.warning(f"Trend {symbol}: invalid quantity={quantity}, skipping")
             return
         
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = price * min_lot_size / leverage
         
         if base_position < margin_needed_for_min_lot:
@@ -2099,7 +2099,7 @@ class TrendStrategy(PersistentStrategy):
             if state["status"] != "open":
                 continue
             
-            ticker = self.okx_client.get_ticker(symbol)
+            ticker = await self.okx_client.get_ticker_async(symbol)
             if not ticker:
                 continue
             
@@ -2172,7 +2172,7 @@ class TrendStrategy(PersistentStrategy):
         state = self._position_state[symbol]
         direction = state["direction"]
 
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
 
@@ -2199,7 +2199,7 @@ class TrendStrategy(PersistentStrategy):
 
         base_position *= price_factor
 
-        min_lot_size = self._safe_float((self.okx_client.get_instrument_info(symbol) or {}).get("lotSz", "1"), 1.0)
+        min_lot_size = self._safe_float((await self.okx_client.get_instrument_info_async(symbol) or {}).get("lotSz", "1"), 1.0)
         margin_needed_for_min_lot = price * min_lot_size / leverage
 
         if base_position < margin_needed_for_min_lot:
@@ -2774,7 +2774,7 @@ class TrendStrategy(PersistentStrategy):
         tier_settings = self.config["currencies"][f"{tier}_settings"]
         leverage = tier_settings["leverage_max"]
         
-        ticker = self.okx_client.get_ticker(symbol)
+        ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
             return
         

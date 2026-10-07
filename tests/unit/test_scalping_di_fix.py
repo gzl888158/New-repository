@@ -25,6 +25,9 @@ class _FakeOkx:
     def get_kline(self, symbol, timeframe, limit=50):
         return self._klines
 
+    async def get_kline_async(self, symbol, timeframe, limit=50):
+        return self._klines
+
 
 def _make_target(klines):
     """绕过 ScalpingStrategy 重型 __init__，仅装配 okx_client 与 DX 历史缓存。"""

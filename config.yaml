@@ -437,7 +437,7 @@ strategies:
     - min_signal_quality
     - stop_loss_pct
     max_grid_spacing: 0.04
-    min_grid_spacing: 0.03
+    min_grid_spacing: 0.012
     volatility_adaptive_spacing: true
     long_only: false
     dynamic_grid_count: true
@@ -453,14 +453,14 @@ strategies:
     min_drop: 0.008
     min_rise: 0.008
     price_deviation: 0.003
-    max_hold_minutes: 47
+    max_hold_minutes: 60
     profit_target_min: 0.004
     profit_target_max: 0.03
     stop_loss: 0.002
     momentum_periods: 5
     reversal_threshold: 0.002
     rsi_period: 14
-    rsi_oversold: 20.0
+    rsi_oversold: 30.0
     rsi_overbought: 75.0
     stoch_period: 10
     volume_delta_threshold: 0.2
@@ -685,7 +685,7 @@ strategies:
     min_signal_quality: 0.35
     leverage: 5
     max_concurrent_positions: 2
-    capital_allocation: 0.1
+    capital_allocation: 0.2
     max_stop_loss_pct: 0.02
     take_profit_pct: 0.04
     loop_interval_seconds: 60
@@ -702,7 +702,7 @@ strategies:
     min_signal_quality: 0.35
     leverage: 5
     max_concurrent_positions: 2
-    capital_allocation: 0.1
+    capital_allocation: 0.2
     max_stop_loss_pct: 0.02
     take_profit_pct: 0.04
     loop_interval_seconds: 30
@@ -772,7 +772,7 @@ strategies:
     risk_lock_quality_boost: 0.15
     leverage: 5
     max_concurrent_positions: 2
-    capital_allocation: 0.05
+    capital_allocation: 0.1
     max_stop_loss_pct: 0.02
     take_profit_pct: 0.02
     loop_interval_seconds: 60
@@ -1237,6 +1237,7 @@ trading:
   funding_rate_min_hold: 0.0008
   grid_allocation: 0.0
   hourly_max_loss: 0.025
+  weekly_max_loss: 0.06
   idle_cash_allocation: true
   maker_fee_rate: 0.0002
   max_concurrent_positions: 10
@@ -1264,7 +1265,7 @@ trading:
   taker_fee_rate: 0.0005
   target_return: 1.5
   target_utilization: 0.85
-  total_capital: 219.153176
+  total_capital: 220.641845
   high_value_equity_threshold: 2000.0
   trading_capital_ratio: 0.95
   trailing_profit_lock: 0.04
@@ -1665,9 +1666,9 @@ conditional_order:
   enabled: true
   retry_interval_sec: 5
   max_retries: 3
-  sync_interval_sec: 30
+  sync_interval_sec: 15
   heartbeat_enabled: true
-  heartbeat_interval_sec: 60
+  heartbeat_interval_sec: 45
   immediate_trigger_protection: true
   stop_loss:
     margin_call_offset: 0.3

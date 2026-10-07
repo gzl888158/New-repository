@@ -14,7 +14,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    warnings.warn("scipy not installed — statistical tests will use numpy fallback")
 
 from loguru import logger
 
@@ -308,6 +314,29 @@ class DataSnoopingDetector:
     def __init__(self):
         pass
 
+    @staticmethod
+    def _norm_ppf(q: float) -> float:
+        """Percent point function (inverse CDF) for normal distribution."""
+        if SCIPY_AVAILABLE:
+            return stats.norm.ppf(q)
+        # Numpy fallback using rational approximation
+        if q <= 0 or q >= 1:
+            return float('inf') if q >= 1 else float('-inf')
+        if q < 0.5:
+            return -DataSnoopingDetector._norm_ppf(1 - q)
+        t = np.sqrt(-2 * np.log(1 - q))
+        c0, c1, c2 = 2.515517, 0.802853, 0.010328
+        d1, d2, d3 = 1.432788, 0.189269, 0.001308
+        return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
+
+    @staticmethod
+    def _norm_cdf(x: float) -> float:
+        """Cumulative distribution function for normal distribution."""
+        if SCIPY_AVAILABLE:
+            return stats.norm.cdf(x)
+        # Numpy fallback using error function approximation
+        return 0.5 * (1 + np.math.erf(x / np.sqrt(2)))
+
     def deflated_sharpe_ratio(
         self,
         sharpe: float,
@@ -332,7 +361,7 @@ class DataSnoopingDetector:
         logger.info(f"[DataSnooping] Computing DSR with n_trials={n_trials}")
 
         # 期望最大夏普比率 (假设n_trials次独立试验)
-        expected_max_sharpe = stats.norm.ppf(1 - 1 / n_trials)
+        expected_max_sharpe = self._norm_ppf(1 - 1 / n_trials)
 
         # 调整后的夏普比率
         dsr = sharpe / expected_max_sharpe if expected_max_sharpe > 0 else 0.0
@@ -365,7 +394,7 @@ class DataSnoopingDetector:
         # 实际实现应更复杂
 
         # 假设真实夏普为0，计算观测到sharpe的概率
-        p_value = 1 - stats.norm.cdf(sharpe * np.sqrt(n_years * 252))
+        p_value = 1 - self._norm_cdf(sharpe * np.sqrt(n_years * 252))
 
         # 调整多重检验
         adjusted_p = min(p_value * n_trials, 1.0)

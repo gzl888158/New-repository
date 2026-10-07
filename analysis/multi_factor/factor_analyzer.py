@@ -9,11 +9,17 @@
 """
 
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    warnings.warn("scipy not installed — IC analysis will use numpy fallback (slower)")
 
 from loguru import logger
 
@@ -34,6 +40,25 @@ class FactorAnalyzer:
             ic_method: IC计算方法 ("spearman" 或 "pearson")
         """
         self.ic_method = ic_method
+
+    @staticmethod
+    def _spearmanr(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        """Spearman rank correlation with numpy fallback."""
+        if SCIPY_AVAILABLE:
+            return stats.spearmanr(x, y)
+        # Numpy fallback: rank-based Pearson correlation
+        rx = pd.Series(x).rank().values
+        ry = pd.Series(y).rank().values
+        corr = np.corrcoef(rx, ry)[0, 1]
+        return corr, 0.0  # p-value not computed in fallback
+
+    @staticmethod
+    def _pearsonr(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        """Pearson correlation with numpy fallback."""
+        if SCIPY_AVAILABLE:
+            return stats.pearsonr(x, y)
+        corr = np.corrcoef(x, y)[0, 1]
+        return corr, 0.0  # p-value not computed in fallback
 
     def compute_ic_report(
         self,
@@ -68,9 +93,9 @@ class FactorAnalyzer:
 
             # 计算IC
             if self.ic_method == "spearman":
-                ic, p_value = stats.spearmanr(factor_vals, ret_vals)
+                ic, p_value = self._spearmanr(factor_vals, ret_vals)
             else:
-                ic, p_value = stats.pearsonr(factor_vals, ret_vals)
+                ic, p_value = self._pearsonr(factor_vals, ret_vals)
 
             results.append({
                 "factor": factor_name,
@@ -127,9 +152,9 @@ class FactorAnalyzer:
                     continue
 
                 if self.ic_method == "spearman":
-                    ic, _ = stats.spearmanr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
+                    ic, _ = self._spearmanr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
                 else:
-                    ic, _ = stats.pearsonr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
+                    ic, _ = self._pearsonr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
 
                 ic_values[factor_name] = ic
 
@@ -291,9 +316,9 @@ class FactorAnalyzer:
                     continue
 
                 if self.ic_method == "spearman":
-                    ic, _ = stats.spearmanr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
+                    ic, _ = self._spearmanr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
                 else:
-                    ic, _ = stats.pearsonr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
+                    ic, _ = self._pearsonr(factor_vals.loc[common_idx], ret_vals.loc[common_idx])
 
                 ic_values[factor_name] = ic
 

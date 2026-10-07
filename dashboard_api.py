@@ -3903,6 +3903,88 @@ def get_tp_sl_protection():
     return jsonify({"success": True, "data": view})
 
 
+@app.route('/api/tp_sl_pipeline_health', methods=['GET'])
+def get_tp_sl_pipeline_health():
+    """P2-4: TP/SL 链路健康看板 — 统一视图：条件单管理器指标 + 下单延迟 + 心跳恢复 + 熔断器状态"""
+    try:
+        cm = _get_scheduler_attr("conditional_order_manager")
+        if cm is None:
+            return jsonify({
+                "success": False,
+                "error": "ConditionalOrderManager not available (scheduler not running or not in same process)"
+            }), 503
+        
+        # 获取增强统计（包含 P2-2 的所有指标）
+        if hasattr(cm, "get_enhanced_stats"):
+            stats = cm.get_enhanced_stats()
+            
+            # 构建健康评分（0-100）
+            health_score = 100
+            health_issues = []
+            
+            # 检查下单延迟
+            placement_latency = stats.get("placement_latency", {})
+            avg_latency = placement_latency.get("avg_seconds")
+            if avg_latency is not None:
+                if avg_latency > 2.0:
+                    health_score -= 30
+                    health_issues.append(f"High placement latency: {avg_latency:.2f}s")
+                elif avg_latency > 1.0:
+                    health_score -= 15
+                    health_issues.append(f"Elevated placement latency: {avg_latency:.2f}s")
+            
+            # 检查熔断器状态
+            circuit_breaker = stats.get("circuit_breaker", {})
+            open_symbols = circuit_breaker.get("open_symbols", [])
+            if open_symbols:
+                health_score -= 20 * len(open_symbols)
+                health_issues.append(f"Circuit breaker open for: {', '.join(open_symbols)}")
+            
+            # 检查心跳恢复延迟
+            heartbeat_metrics = stats.get("heartbeat_metrics", {})
+            restore_max = heartbeat_metrics.get("restore_max_seconds")
+            if restore_max is not None and restore_max > 10.0:
+                health_score -= 15
+                health_issues.append(f"Slow heartbeat restoration: {restore_max:.2f}s max")
+            
+            # 检查成功率
+            success_rate = stats.get("success_rate", 100)
+            if success_rate < 90:
+                health_score -= 20
+                health_issues.append(f"Low placement success rate: {success_rate:.1f}%")
+            elif success_rate < 95:
+                health_score -= 10
+                health_issues.append(f"Below-target success rate: {success_rate:.1f}%")
+            
+            # 确定健康状态
+            if health_score >= 80:
+                health_status = "healthy"
+            elif health_score >= 60:
+                health_status = "degraded"
+            else:
+                health_status = "critical"
+            
+            return jsonify({
+                "success": True,
+                "data": {
+                    "health_score": max(0, health_score),
+                    "health_status": health_status,
+                    "health_issues": health_issues,
+                    "pipeline_metrics": stats,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "ConditionalOrderManager does not support get_enhanced_stats"
+            }), 501
+    
+    except Exception as e:
+        logger.error(f"Failed to get tp_sl_pipeline_health: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route('/api/tp_sl_config', methods=['GET', 'POST'])
 def tp_sl_config():
     """获取或更新止盈止损配置（按策略）"""

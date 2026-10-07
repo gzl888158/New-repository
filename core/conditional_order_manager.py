@@ -90,19 +90,35 @@ class ConditionalOrderManager:
         self._sync_interval_sec = int(cond_cfg.get("sync_interval_sec", 15))
         # P1-2: 心跳间隔从 45s 缩短到 15s，减少条件单丢失的检测延迟
         self._heartbeat_interval_sec = int(cond_cfg.get("heartbeat_interval_sec", 15))
+        
+        # P2-3: 批量保存优化 — 脏标记 + 延迟写入，减少高频 I/O
+        self._save_dirty = False
+        self._save_debounce_sec = 2.0  # 2秒内多次修改只写一次
+        self._last_save_time = 0.0
 
         # 审计日志
         self._audit_log: List[Dict[str, Any]] = []  # 最多 500 条
         self._audit_log_max = 500
 
         # 错误分类计数
+        # P2-5: 增强错误分类 — 更细粒度的子类别
         self._error_counts: Dict[str, int] = {
             "network": 0,
+            "network_timeout": 0,
+            "network_connection": 0,
             "auth": 0,
+            "auth_signature": 0,
+            "auth_api_key": 0,
             "rate_limit": 0,
             "order_rejected": 0,
+            "order_rejected_price": 0,  # 价格立即触发、超出范围
+            "order_rejected_quantity": 0,  # 数量不合法
+            "order_rejected_duplicate": 0,  # 重复订单
+            "order_rejected_overflow": 0,  # 订单超限 (51261)
             "unknown": 0,
         }
+        # OKX 特定错误码追踪
+        self._okx_error_codes: Dict[str, int] = {}
 
         # 增强指标
         self._uptime_start = time.time()
@@ -120,6 +136,8 @@ class ConditionalOrderManager:
         self._heartbeat_restore_latencies_max = 20
         self._last_heartbeat_at: Optional[float] = None
         self._last_heartbeat_duration: Optional[float] = None
+        # P2-8: 降级事件计数
+        self._adaptive_fallback_count = 0  # 自适应引擎降级到静态计算的次数
 
         # 企业级强化：下单失败熔断器（连续失败达阈值暂停下单，冷却后自动恢复）
         # P1-4: 改为按品种维度熔断，避免单品种故障拖累全局交易
@@ -128,6 +146,12 @@ class ConditionalOrderManager:
         self._consecutive_failures: Dict[str, int] = {}   # 连续下单失败计数（key: symbol）
         self._circuit_threshold = 10        # 连续失败 N 次触发熔断
         self._circuit_cooldown = 300        # 熔断冷却时间（秒）
+        
+        # P2-7: 条件单限流器 — 防止交易所 API 滥用
+        # 滑动窗口限流：每 symbol 每 N 秒最多 M 次下单
+        self._rate_limit_window_sec = int(cond_cfg.get("rate_limit_window_sec", 60))  # 默认 60 秒窗口
+        self._rate_limit_max_per_window = int(cond_cfg.get("rate_limit_max_per_window", 10))  # 每窗口最多 10 次
+        self._placement_timestamps: Dict[str, List[float]] = {}  # symbol -> [timestamp, ...]
 
         self._load_active_orders()
 
@@ -145,12 +169,59 @@ class ConditionalOrderManager:
         """P1-5: 注入自适应止盈止损引擎，用于心跳恢复时使用当前自适应TP水平"""
         self._adaptive_tp_sl_engine = engine
 
-    def _save_active_orders(self):
+    def _check_rate_limit(self, symbol: str) -> bool:
+        """P2-7: 检查是否超过限流阈值（滑动窗口）
+        
+        返回：
+        - True: 允许下单
+        - False: 超过限流，应拒绝
+        """
+        now = time.time()
+        window_start = now - self._rate_limit_window_sec
+        
+        # 初始化或获取该 symbol 的时间戳列表
+        if symbol not in self._placement_timestamps:
+            self._placement_timestamps[symbol] = []
+        
+        # 清理窗口外的旧时间戳
+        self._placement_timestamps[symbol] = [
+            ts for ts in self._placement_timestamps[symbol]
+            if ts > window_start
+        ]
+        
+        # 检查是否超过限制
+        if len(self._placement_timestamps[symbol]) >= self._rate_limit_max_per_window:
+            return False
+        
+        return True
+    
+    def _record_placement_for_rate_limit(self, symbol: str):
+        """P2-7: 记录一次下单（用于限流统计）"""
+        now = time.time()
+        if symbol not in self._placement_timestamps:
+            self._placement_timestamps[symbol] = []
+        self._placement_timestamps[symbol].append(now)
+
+    def _save_active_orders(self, force: bool = False):
         """原子写入条件单状态到文件（使用线程锁防止并发写竞态）
         
         包含版本号、时间戳，并同时保存 pending 和 failed 订单状态。
+        P2-3: 支持防抖，force=True 时强制立即写入
         """
         try:
+            now = time.time()
+            
+            # 防抖逻辑：非强制写入时，如果距离上次写入不足 _save_debounce_sec，仅标记脏
+            if not force and not self._save_dirty:
+                # 首次标记脏，记录当前时间
+                self._save_dirty = True
+                if now - self._last_save_time < self._save_debounce_sec:
+                    return  # 防抖：稍后再写
+            
+            # 重置脏标记和上次写入时间
+            self._save_dirty = False
+            self._last_save_time = now
+            
             with self._save_lock:
                 dir_path = os.path.dirname(self._orders_file)
                 if dir_path:
@@ -162,6 +233,10 @@ class ConditionalOrderManager:
                 os.replace(tmp_file, self._orders_file)
         except Exception as e:
             logger.error(f"Failed to save active orders: {e}")
+    
+    def _flush_active_orders(self):
+        """P2-3: 强制立即写入（用于关键时机如关闭前、重要状态变更后）"""
+        self._save_active_orders(force=True)
 
     def _load_active_orders(self):
         try:
@@ -192,6 +267,7 @@ class ConditionalOrderManager:
         asyncio.create_task(self._sync_loop())
         asyncio.create_task(self._heartbeat_loop())  # P1: 独立心跳循环，按 _heartbeat_interval_sec 运行
         asyncio.create_task(self._orphan_cleanup_loop())  # P2: 孤儿条件单清理
+        asyncio.create_task(self._save_flush_loop())  # P2-3: 定期刷新脏状态到磁盘
         logger.info("ConditionalOrderManager started")
 
     async def _heartbeat_loop(self):
@@ -213,7 +289,7 @@ class ConditionalOrderManager:
         """停止条件单管理器：取消后台循环，持久化当前状态"""
         logger.info("Stopping ConditionalOrderManager...")
         self._running = False
-        self._save_active_orders()
+        self._flush_active_orders()  # P2-3: 强制刷新所有脏状态
         logger.info("ConditionalOrderManager stopped")
 
     async def _retry_loop(self):
@@ -580,6 +656,10 @@ class ConditionalOrderManager:
             if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing SL for {symbol}")
                 return None
+            # P2-7: 限流检查
+            if not self._check_rate_limit(symbol):
+                logger.warning(f"Rate limit exceeded for {symbol}, skip placing SL")
+                return None
             if self._has_active_order(symbol, side, "stop_loss"):
                 logger.info(f"Skip placing SL for {symbol}: active stop_loss already exists")
                 return None
@@ -632,6 +712,7 @@ class ConditionalOrderManager:
                     self._save_active_orders()
                     self._placed_count += 1
                     self._record_placement_success(symbol)
+                    self._record_placement_for_rate_limit(symbol)  # P2-7: 记录下单用于限流
                     self._add_audit_entry("place_stop_loss", symbol, order_id,
                                           {"price": trigger_price, "quantity": quantity, "side": side})
                     logger.info(f"Stop loss placed for {symbol}: {trigger_price:.4f} (algoId={order_id})")
@@ -689,6 +770,7 @@ class ConditionalOrderManager:
                 # 网络/限流类进重试队列，参数错误直接记 failed_orders
                 self._failed_placement_count += 1
                 self._record_placement_failure(symbol)
+                self._categorize_error(Exception(result.get("sMsg", "unknown")), s_code=s_code)  # P2-5: 传递错误码
                 self._queue_failed_order("pending_sl", symbol, side, "stop_loss",
                                          trigger_price, quantity, leverage, clordid, result)
 
@@ -713,6 +795,10 @@ class ConditionalOrderManager:
             # 企业级强化：熔断器 + 防重（分段止盈按价位去重，仅拦截完全相同的重复单）
             if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing TP for {symbol}")
+                return None
+            # P2-7: 限流检查
+            if not self._check_rate_limit(symbol):
+                logger.warning(f"Rate limit exceeded for {symbol}, skip placing TP")
                 return None
             if self._has_active_order(symbol, side, "take_profit", trigger_price):
                 logger.info(f"Skip placing TP for {symbol}: active take_profit at {trigger_price} already exists")
@@ -759,6 +845,7 @@ class ConditionalOrderManager:
                     self._save_active_orders()
                     self._placed_count += 1
                     self._record_placement_success(symbol)
+                    self._record_placement_for_rate_limit(symbol)  # P2-7: 记录下单用于限流
                     self._add_audit_entry("place_take_profit", symbol, order_id,
                                           {"price": trigger_price, "quantity": quantity, "side": side})
                     logger.info(f"Take profit placed for {symbol}: {trigger_price:.4f} (algoId={order_id})")
@@ -814,6 +901,7 @@ class ConditionalOrderManager:
                 # 网络/限流类进重试队列，参数错误直接记 failed_orders
                 self._failed_placement_count += 1
                 self._record_placement_failure(symbol)
+                self._categorize_error(Exception(result.get("sMsg", "unknown")), s_code=s_code)  # P2-5: 传递错误码
                 self._queue_failed_order("pending_tp", symbol, side, "take_profit",
                                          trigger_price, quantity, leverage, clordid, result)
 
@@ -1703,6 +1791,7 @@ class ConditionalOrderManager:
                                     logger.debug(f"P1-5: Using adaptive TP for {inst_id}: {tp_price:.4f}")
                                 except Exception as e:
                                     logger.warning(f"P1-5: Failed to get adaptive TP for {inst_id}, falling back: {e}")
+                                    self._adaptive_fallback_count += 1  # P2-8: 记录降级事件
                                     tp_prices = None
                             
                             # 降级：使用静态TP计算
@@ -1753,6 +1842,19 @@ class ConditionalOrderManager:
             # P2-2: 即使失败也记录耗时
             self._last_heartbeat_duration = time.time() - heartbeat_start
             return 0
+
+    async def _save_flush_loop(self):
+        """P2-3: 定期刷新脏状态到磁盘（每 5 秒检查一次）"""
+        while self._running:
+            try:
+                await asyncio.sleep(5.0)
+                if self._save_dirty:
+                    self._flush_active_orders()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Save flush loop error: {e}")
+                await asyncio.sleep(1.0)
 
     # ==================== P2: 孤儿条件单清理 ====================
 
@@ -1932,36 +2034,68 @@ class ConditionalOrderManager:
 
     # ==================== 错误分类 ====================
 
-    def _categorize_error(self, error: Exception) -> str:
+    def _categorize_error(self, error: Exception, s_code: str = None) -> str:
         """
-        将错误分类为：network, auth, rate_limit, order_rejected, unknown
+        P2-5: 增强错误分类 — 更细粒度的子类别
+        
+        参数：
+        - error: 异常对象
+        - s_code: OKX API 返回的 sCode（如果有）
+        
+        返回主类别（如 "network", "order_rejected"）
         """
         error_str = str(error).lower()
         error_type = type(error).__name__.lower()
+        
+        # P2-5: 追踪 OKX 特定错误码
+        if s_code:
+            self._okx_error_codes[s_code] = self._okx_error_codes.get(s_code, 0) + 1
 
-        # 网络错误
-        if any(kw in error_str for kw in ["timeout", "connection", "network", "dns", "reset", "refused",
+        # 网络错误 — 细分超时和连接错误
+        if any(kw in error_str for kw in ["timeout", "timed out"]):
+            category = "network"
+            self._error_counts["network_timeout"] = self._error_counts.get("network_timeout", 0) + 1
+        elif any(kw in error_str for kw in ["connection", "network", "dns", "reset", "refused",
                                             "broken pipe", "eof", "httperror", "socket"]):
             category = "network"
+            self._error_counts["network_connection"] = self._error_counts.get("network_connection", 0) + 1
         elif "connection" in error_type:
             category = "network"
-        # 认证错误
-        elif any(kw in error_str for kw in ["auth", "unauthorized", "signature", "api key", "apikey",
-                                              "invalid sign", "login", "credential", "forbidden"]):
+            self._error_counts["network_connection"] = self._error_counts.get("network_connection", 0) + 1
+        # 认证错误 — 细分签名和 API Key
+        elif any(kw in error_str for kw in ["signature", "invalid sign", "sign error"]):
             category = "auth"
+            self._error_counts["auth_signature"] = self._error_counts.get("auth_signature", 0) + 1
+        elif any(kw in error_str for kw in ["auth", "unauthorized", "api key", "apikey",
+                                              "login", "credential", "forbidden"]):
+            category = "auth"
+            self._error_counts["auth_api_key"] = self._error_counts.get("auth_api_key", 0) + 1
         # 频率限制
         elif any(kw in error_str for kw in ["rate limit", "too many requests", "throttle", "429",
                                               "exceed", "frequency", "request limit"]):
             category = "rate_limit"
-        # 订单被拒
-        elif any(kw in error_str for kw in ["order would", "immediately trigger", "insufficient",
-                                              "balance", "margin", "position", "order rejected",
-                                              "-2021", "-2022", "invalid order", "not allowed",
-                                              "cancel", "filled", "already"]):
+        # 订单被拒 — 细分子类别
+        elif any(kw in error_str for kw in ["order would", "immediately trigger", "invalid price",
+                                              "51277"]):  # 价格立即触发
+            category = "order_rejected"
+            self._error_counts["order_rejected_price"] = self._error_counts.get("order_rejected_price", 0) + 1
+        elif any(kw in error_str for kw in ["51261", "overflow", "order limit", "too many orders"]):  # 订单超限
+            category = "order_rejected"
+            self._error_counts["order_rejected_overflow"] = self._error_counts.get("order_rejected_overflow", 0) + 1
+        elif any(kw in error_str for kw in ["51068", "duplicate"]):  # 重复订单
+            category = "order_rejected"
+            self._error_counts["order_rejected_duplicate"] = self._error_counts.get("order_rejected_duplicate", 0) + 1
+        elif any(kw in error_str for kw in ["insufficient", "balance", "margin", "position",
+                                              "quantity", "lot size", "min size"]):  # 数量/余额问题
+            category = "order_rejected"
+            self._error_counts["order_rejected_quantity"] = self._error_counts.get("order_rejected_quantity", 0) + 1
+        elif any(kw in error_str for kw in ["order rejected", "-2021", "-2022", "invalid order",
+                                              "not allowed", "cancel", "filled", "already"]):
             category = "order_rejected"
         else:
             category = "unknown"
 
+        # 主类别计数
         self._error_counts[category] = self._error_counts.get(category, 0) + 1
         return category
 
@@ -2297,8 +2431,22 @@ class ConditionalOrderManager:
             # 运行时长
             "uptime_seconds": round(uptime_seconds, 1),
             "uptime_human": self._format_uptime(uptime_seconds),
-            # 错误分类
+            # 错误分类（P2-5: 增强细粒度分类）
             "error_counts": dict(self._error_counts),
+            # P2-5: OKX 特定错误码追踪
+            "okx_error_codes": dict(self._okx_error_codes),
+            # P2-7: 限流器状态
+            "rate_limiter": {
+                "window_seconds": self._rate_limit_window_sec,
+                "max_per_window": self._rate_limit_max_per_window,
+                "per_symbol": {
+                    symbol: {
+                        "count_in_window": len([ts for ts in timestamps if ts > time.time() - self._rate_limit_window_sec]),
+                        "timestamps": timestamps[-5:],  # 最近 5 次
+                    }
+                    for symbol, timestamps in self._placement_timestamps.items()
+                },
+            },
             # P1-4: 企业级强化：按品种熔断器状态
             "circuit_breaker": {
                 "open_symbols": [sym for sym, is_open in self._circuit_open.items() if is_open],
@@ -2321,6 +2469,26 @@ class ConditionalOrderManager:
                 "max_retries": self._max_retries,
                 "heartbeat_enabled": self._heartbeat_enabled,
                 "sync_enabled": self._sync_enabled,
+            },
+            # P2-2: TP/SL pipeline metrics
+            "placement_latency": {
+                "count": len(self._placement_latencies),
+                "avg_seconds": round(sum(self._placement_latencies) / len(self._placement_latencies), 3) if self._placement_latencies else None,
+                "min_seconds": round(min(self._placement_latencies), 3) if self._placement_latencies else None,
+                "max_seconds": round(max(self._placement_latencies), 3) if self._placement_latencies else None,
+                "p95_seconds": round(sorted(self._placement_latencies)[int(len(self._placement_latencies) * 0.95)], 3) if len(self._placement_latencies) >= 2 else None,
+            },
+            "heartbeat_metrics": {
+                "last_at": self._last_heartbeat_at,
+                "last_duration_seconds": round(self._last_heartbeat_duration, 3) if self._last_heartbeat_duration else None,
+                "restore_count": len(self._heartbeat_restore_latencies),
+                "restore_avg_seconds": round(sum(self._heartbeat_restore_latencies) / len(self._heartbeat_restore_latencies), 3) if self._heartbeat_restore_latencies else None,
+                "restore_max_seconds": round(max(self._heartbeat_restore_latencies), 3) if self._heartbeat_restore_latencies else None,
+            },
+            # P2-8: 降级事件统计
+            "degradation": {
+                "adaptive_fallback_count": self._adaptive_fallback_count,
+                "adaptive_engine_available": hasattr(self, "_adaptive_tp_sl_engine") and self._adaptive_tp_sl_engine is not None,
             },
         }
 

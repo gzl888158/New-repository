@@ -71,6 +71,8 @@ class OrderExecutor:
         self._order_queue = None
         # 后台任务引用：start() 创建、stop() 负责 cancel+await，防泄漏与重复创建
         self._tasks: List[asyncio.Task] = []
+        # P0-2: 追踪 TP/SL 后台任务，防止任务引用丢失导致异常静默
+        self._tp_sl_background_tasks: Set[asyncio.Task] = set()
 
         # 强化止损管理器：按策略名分别管理
         self._stop_managers: Dict[str, EnhancedStopLoss] = {
@@ -124,6 +126,11 @@ class OrderExecutor:
 
         # 五层风控拦截器（由scheduler注入，用于L4单日开仓次数/连续亏损跟踪）
         self._risk_gate = None
+
+        # P0-2: 资金池锁定（由scheduler注入，挂单锁定/成交转用/撤单解锁）
+        self._capital_manager = None
+        # 跟踪每个订单的锁定金额 {exchange_order_id: {"amount": float, "symbol": str}}
+        self._order_locked_amounts: Dict[str, Dict[str, Any]] = {}
 
         # P2: 独立风控裁决器（由scheduler注入，下单前最终裁决 + traceID 全链路串联）
         self._risk_adjudicator = None
@@ -475,6 +482,10 @@ class OrderExecutor:
     def set_risk_gate(self, risk_gate):
         """注入五层风控拦截器（用于L4单日开仓次数/连续亏损跟踪）"""
         self._risk_gate = risk_gate
+
+    def set_capital_manager(self, capital_manager):
+        """注入资金管理器（挂单锁定/成交转用/撤单解锁）"""
+        self._capital_manager = capital_manager
 
     def set_risk_adjudicator(self, adjudicator):
         """P2: 注入独立风控裁决器（下单前最终裁决 + traceID 全链路串联）。"""
@@ -963,6 +974,54 @@ class OrderExecutor:
         self._positions_cache_time = now
         return positions
 
+    def _unlock_order_locked_funds(self, exchange_order_id: str, symbol: str = ""):
+        """P0-2: 撤单/过期时解锁锁定资金"""
+        if self._capital_manager is None:
+            return
+        entry = self._order_locked_amounts.pop(exchange_order_id, None)
+        if entry is None:
+            return
+        locked_amt = entry.get("amount", 0.0)
+        sym = symbol or entry.get("symbol", "")
+        if locked_amt > 0 and sym:
+            try:
+                self._capital_manager.unlock_funds(sym, locked_amt)
+            except Exception as _unlock_err:
+                logger.debug(f"unlock_funds error for {exchange_order_id}: {_unlock_err}")
+
+    async def reconcile_locked_capital(self) -> Dict[str, float]:
+        """P0-2: 对账锁定资金 — 比较内部跟踪 vs 交易所实际挂单保证金。
+
+        清理不再活跃的订单锁定记录，并用交易所实际挂单保证金修正内部偏差。
+        """
+        if self._capital_manager is None or not self._order_locked_amounts:
+            return {}
+
+        # 清理已不在活跃订单中的锁定记录（防止泄漏）
+        stale_ids = [
+            oid for oid in self._order_locked_amounts
+            if oid not in self._active_orders
+        ]
+        for oid in stale_ids:
+            self._unlock_order_locked_funds(oid)
+
+        # 查询交易所实际挂单保证金
+        actual_by_pool = {"base": 0.0}
+        try:
+            open_orders = await asyncio.to_thread(self.okx_client.get_open_orders)
+            if isinstance(open_orders, list):
+                for order in open_orders:
+                    sz = float(order.get("sz", 0) or 0)
+                    px = float(order.get("px", 0) or 0)
+                    lev = max(1.0, float(order.get("lever", 1) or 1))
+                    if sz > 0 and px > 0:
+                        actual_by_pool["base"] += sz * px / lev
+        except Exception as e:
+            logger.debug(f"reconcile_locked_capital: exchange query failed: {e}")
+            return {}
+
+        return self._capital_manager.reconcile_locked_capital(actual_by_pool)
+
     def _invalidate_positions_cache(self):
         """P0-9: 持仓变更后清除缓存，确保下次查询获取最新数据。"""
         self._positions_cache = None
@@ -1364,6 +1423,8 @@ class OrderExecutor:
                     "clordid": clordid,
                     "trace_id": trace_id,
                 })
+                # P0-2: 撤单解锁資金
+                self._unlock_order_locked_funds(exchange_order_id, symbol)
                 logger.info(
                     f"Remaining order cancelled: {symbol} ordId={exchange_order_id}"
                 )
@@ -1584,6 +1645,8 @@ class OrderExecutor:
                         "reason": "batch_cancel_by_strategy",
                         "trace_id": order_info.get("trace_id", ""),
                     })
+                    # P0-2: 撤单解锁資金
+                    self._unlock_order_locked_funds(ord_id, symbol)
                 else:
                     logger.warning(f"Batch cancel failed: {ord_id} ({strategy_name}/{symbol})")
             except Exception as e:
@@ -1687,6 +1750,8 @@ class OrderExecutor:
                         "reason": "emergency_cancel_all",
                         "trace_id": order_info.get("trace_id", ""),
                     })
+                    # P0-2: 撤单解锁資金
+                    self._unlock_order_locked_funds(ord_id, symbol)
             except Exception as e:
                 logger.error(f"Emergency cancel error for {ord_id}: {e}")
         
@@ -3040,6 +3105,18 @@ class OrderExecutor:
                         margin_used = quantity * price / leverage
                         self._account_manager.notify_order_placed(strategy_name, margin_used)
 
+                    # P0-2: 挂单锁定资金（防止可用资金高估导致超额下单）
+                    if self._capital_manager is not None and margin_used > 0:
+                        try:
+                            locked = self._capital_manager.lock_funds(symbol, margin_used)
+                            if locked:
+                                self._order_locked_amounts[exchange_order_id] = {
+                                    "amount": margin_used,
+                                    "symbol": symbol,
+                                }
+                        except Exception as _lock_err:
+                            logger.debug(f"lock_funds error for {exchange_order_id}: {_lock_err}")
+
                     # 通过路径：记录交易到五层风控（L4单日开仓次数跟踪）
                     if self._risk_gate is not None:
                         try:
@@ -3404,9 +3481,12 @@ class OrderExecutor:
         """
         # P0-1: TP/SL 立即异步发出，不等待结果
         if not is_close_signal:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._place_conditional_orders_async(order_data, exchange_order_id, symbol)
             )
+            # P0-2: 存储任务引用并添加完成回调，防止异常静默丢失
+            self._tp_sl_background_tasks.add(task)
+            task.add_done_callback(self._on_tp_sl_task_done)
 
         # 开仓记录落盘（同步，受 5s 超时保护）
         if not is_close_signal:
@@ -3474,11 +3554,14 @@ class OrderExecutor:
                     f"Conditional orders partially failed for {symbol} "
                     f"(SL={failed_sl}, TP={failed_tp}), starting background retry"
                 )
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._retry_conditional_orders_background(
                         order_data, exchange_order_id, symbol, failed_sl, failed_tp
                     )
                 )
+                # P0-2: 存储重试任务引用并添加完成回调
+                self._tp_sl_background_tasks.add(task)
+                task.add_done_callback(self._on_tp_sl_task_done)
         except Exception as e:
             logger.error(f"Unexpected error in _place_conditional_orders_async for {symbol}: {e}", exc_info=True)
             if self._alert_manager:
@@ -3492,6 +3575,15 @@ class OrderExecutor:
                     )
                 except Exception:
                     pass
+
+    def _on_tp_sl_task_done(self, task: asyncio.Task):
+        """P0-2: TP/SL 后台任务完成回调 — 记录异常并从追踪集合中移除"""
+        self._tp_sl_background_tasks.discard(task)
+        if task.cancelled():
+            logger.debug("TP/SL background task cancelled")
+        elif task.exception():
+            exc = task.exception()
+            logger.error(f"TP/SL background task failed with exception: {exc}", exc_info=task)
 
     async def _retry_conditional_orders_background(
         self,
@@ -5428,6 +5520,8 @@ class OrderExecutor:
                 if state_recon_counter >= 300:
                     state_recon_counter = 0
                     await self._reconcile_component_states()
+                    # P0-2: 锁定资金对账（内部跟踪 vs 交易所实际挂单保证金）
+                    await self.reconcile_locked_capital()
 
                 # 方案A：低频全量对账补回执（fill 回执丢失根因修复，节流避免 REST 限频）
                 now = time.time()
@@ -5506,6 +5600,7 @@ class OrderExecutor:
                     elif exchange_state == "canceled":
                         # 订单已取消，清理本地状态
                         logger.info(f"Stale order {order_id} already canceled on exchange, cleaning up")
+                        self._unlock_order_locked_funds(exchange_order_id, symbol)
                         self._active_orders.pop(order_id, None)
                     elif exchange_state in ("live", "partially_filled"):
                         # 订单仍在交易所活跃，主动取消
@@ -5517,6 +5612,7 @@ class OrderExecutor:
                             )
                             if cancel_result and not cancel_result.get("_failed", False):
                                 logger.info(f"Stale order {order_id} canceled successfully")
+                                self._unlock_order_locked_funds(exchange_order_id, symbol)
                                 self._active_orders.pop(order_id, None)
                             else:
                                 logger.warning(f"Failed to cancel stale order {order_id}: {cancel_result}")
@@ -5782,6 +5878,8 @@ class OrderExecutor:
                                     "reason": timeout_reason,
                                     "trace_id": order_info.get("trace_id", ""),
                                 })
+                                # P0-2: 撤单解锁資金
+                                self._unlock_order_locked_funds(exchange_order_id, order_info.get("symbol", ""))
                                 await self._lifecycle_manager.update_status(order_info.get("order_id"), OrderStatus.CANCELLED)
                                 orders_to_remove.append(exchange_order_id)
                                 continue
@@ -5875,6 +5973,17 @@ class OrderExecutor:
 
                         if self._account_manager:
                             self._account_manager.notify_order_filled(strategy_name, margin_used)
+
+                        # P0-2: 成交后锁定资金转为已用
+                        if self._capital_manager is not None:
+                            entry = self._order_locked_amounts.pop(exchange_order_id, None)
+                            if entry is not None:
+                                locked_amt = entry.get("amount", 0.0)
+                                if locked_amt > 0:
+                                    try:
+                                        self._capital_manager.convert_locked_to_used(symbol, locked_amt)
+                                    except Exception as _conv_err:
+                                        logger.debug(f"convert_locked_to_used error for {exchange_order_id}: {_conv_err}")
 
                         # 记录成交质量（滑点统计）
                         if self._fill_quality_tracker:

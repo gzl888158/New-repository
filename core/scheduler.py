@@ -518,6 +518,7 @@ class TradingScheduler:
                 mini_backtester=get_mini_backtester(config),
                 stress_test_engine=self._build_stress_test_engine(config),
                 account_manager=getattr(self, "account_manager", None),
+                conditional_order_manager=self.conditional_order_manager,
             )
 
             # P0: 使用 StrategyLoader 动态加载所有策略（替代硬编码）
@@ -658,6 +659,8 @@ class TradingScheduler:
         self.capital_manager.initialize(all_symbols, trading_capital)
         # 连接 AdaptiveController 实现风险预算协作
         self.capital_manager.set_adaptive_controller(self.adaptive_controller)
+        # P0-2: 注入资金管理器到订单执行器（挂单锁定/成交转用/撤单解锁）
+        self.order_executor.set_capital_manager(self.capital_manager)
         logger.info(f"CapitalManager initialized: {len(all_symbols)} symbols, "
                     f"capital={trading_capital:.2f} USDT")
 
@@ -1199,6 +1202,8 @@ class TradingScheduler:
         self.adaptive_tp_sl_engine = AdaptiveTpSlEngine(config, regime_engine=self.market_regime_engine)
         self.adaptive_controller.set_adaptive_tp_sl_engine(self.adaptive_tp_sl_engine)
         self.order_executor.set_adaptive_tp_sl_engine(self.adaptive_tp_sl_engine)
+        # P1-5: 注入自适应TP/SL引擎到条件单管理器，用于心跳恢复时使用当前自适应TP水平
+        self.conditional_order_manager.set_adaptive_tp_sl_engine(self.adaptive_tp_sl_engine)
         logger.info("AdaptiveTpSlEngine initialized and injected into AdaptiveController + OrderExecutor")
 
         # P0: 统一自适应仓位引擎（融合 Kelly + 权益模式 + 信号 + 波动率 + 策略资金占比 + tier + 杠杆）

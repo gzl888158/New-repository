@@ -27,6 +27,10 @@ from loguru import logger
 from core.capital_attrition_analyzer import (
     CapitalAttritionAnalyzer, AttritionType, AttritionBudget
 )
+from core.capital_attribution_analyzer import CapitalAttributionAnalyzer
+from core.capital_scenario_simulator import CapitalScenarioSimulator
+from core.capital_parameter_optimizer import CapitalParameterOptimizer
+from core.multi_timeframe_capital_planner import MultiTimeframeCapitalPlanner
 
 
 # ============================================================================
@@ -114,9 +118,31 @@ class CapitalPoolController:
         )
         
         self._initialize_pools()
-        
+
         self._rebalance_callback: Optional[Callable] = None
-        
+
+        # P1-2: 风险隔离金使用追踪与防护
+        self._risk_isolation_usage: List[Dict[str, Any]] = []  # [{amount, reason, timestamp, repaid}]
+        self._risk_isolation_cooldown_until: float = 0.0  # 使用后冷却截止时间
+        self._risk_isolation_max_usage_pct = pool_config.get(
+            "risk_isolation_max_usage_pct", 0.5
+        )  # 单次最多使用池总额的50%
+        self._risk_isolation_cooldown_seconds = pool_config.get(
+            "risk_isolation_cooldown_seconds", 86400
+        )  # 使用后24小时冷却
+        self._risk_isolation_max_concurrent = pool_config.get(
+            "risk_isolation_max_concurrent", 2
+        )  # 最多同时2笔未偿还
+
+        # P2-7: 池级 ROI 追踪与动态比例调整
+        self._pool_pnl_history: Dict[CapitalPoolType, Deque[float]] = {
+            pt: deque(maxlen=30) for pt in [CapitalPoolType.BASE, CapitalPoolType.ADD_POSITION_RESERVE]
+        }
+        self._dynamic_pool_ratios: Optional[Dict[CapitalPoolType, float]] = None  # None=使用默认比例
+        self._dynamic_rebalance_enabled = pool_config.get("dynamic_rebalance_enabled", True)
+        self._min_risk_isolation_ratio = pool_config.get("min_risk_isolation_ratio", 0.15)
+        self._max_ratio_shift_per_day = pool_config.get("max_ratio_shift_per_day", 0.05)  # 每日最多调整5%
+
         logger.info(f"CapitalPoolController initialized: base={self._base_ratio:.0%}, "
                     f"add_reserve={self._add_reserve_ratio:.0%}, "
                     f"risk_isolation={self._risk_isolation_ratio:.0%}")
@@ -176,34 +202,81 @@ class CapitalPoolController:
         else:
             return self._risk_isolation_ratio
 
-    def allocate(self, symbol: str, amount: float, 
-                 pool_type: CapitalPoolType = CapitalPoolType.BASE) -> bool:
+    def allocate(self, symbol: str, amount: float,
+                 pool_type: CapitalPoolType = CapitalPoolType.BASE,
+                 position_profitable: bool = True) -> bool:
         """
         从指定资金池分配资金
-        
+
+        Args:
+            symbol: 币种
+            amount: 分配金额
+            pool_type: 资金池类型
+            position_profitable: P1-7: 持仓是否盈利（加仓池要求持仓盈利才可使用）
+
         Returns:
             是否分配成功
         """
         with self._lock:
-            pool = self._pools.get(pool_type)
-            if not pool:
-                return False
-            
-            if amount <= 0:
-                logger.warning(f"Invalid allocate amount {amount} for {symbol}, rejected")
-                return False
+            # P2-4: 尝试从指定池分配，不足时自动降级到下一个池
+            pools_to_try = self._get_pool_fallback_order(pool_type)
 
-            if pool.available < amount:
-                logger.warning(f"Insufficient funds in {pool_type.value} pool: "
-                             f"need {amount:.4f}, available {pool.available:.4f}")
-                return False
-            
-            pool.used_amount += amount
-            pool.last_updated = datetime.now()
-            
-            self._symbol_pool_usage[symbol][pool_type] += amount
-            
-            return True
+            for target_pool_type in pools_to_try:
+                if self._try_allocate_from_pool(symbol, amount, target_pool_type, position_profitable):
+                    return True
+
+            logger.warning(
+                f"Allocation failed for {symbol}: amount={amount:.4f}, "
+                f"all pools exhausted (tried: {[p.value for p in pools_to_try]})"
+            )
+            return False
+
+    def _get_pool_fallback_order(self, preferred_pool: CapitalPoolType) -> List[CapitalPoolType]:
+        """P2-4: 返回资金池降级顺序"""
+        if preferred_pool == CapitalPoolType.BASE:
+            return [CapitalPoolType.BASE, CapitalPoolType.ADD_POSITION_RESERVE]
+        elif preferred_pool == CapitalPoolType.ADD_POSITION_RESERVE:
+            return [CapitalPoolType.ADD_POSITION_RESERVE, CapitalPoolType.BASE]
+        else:
+            # RISK_ISOLATION 不参与自动降级
+            return [preferred_pool]
+
+    def _try_allocate_from_pool(self, symbol: str, amount: float,
+                                pool_type: CapitalPoolType,
+                                position_profitable: bool) -> bool:
+        """P2-4: 尝试从指定池分配（内部方法，需在锁内调用）"""
+        pool = self._pools.get(pool_type)
+        if not pool:
+            return False
+
+        if amount <= 0:
+            return False
+
+        # P1-7: 加仓池使用限制
+        if pool_type == CapitalPoolType.ADD_POSITION_RESERVE and not position_profitable:
+            return False
+
+        if pool.available < amount:
+            return False
+
+        # P1-4: 单币种集中度硬限制
+        current_usage = self._symbol_pool_usage[symbol][pool_type]
+        new_usage = current_usage + amount
+        max_concentration = pool.total_amount * 0.30
+        if new_usage > max_concentration:
+            return False
+
+        pool.used_amount += amount
+        pool.last_updated = datetime.now()
+        self._symbol_pool_usage[symbol][pool_type] += amount
+
+        if pool_type != CapitalPoolType.BASE:
+            logger.info(
+                f"Allocation from fallback pool: {symbol} amount={amount:.4f} "
+                f"from {pool_type.value} (primary pool exhausted)"
+            )
+
+        return True
 
     def release(self, symbol: str, amount: float,
                 pool_type: CapitalPoolType = CapitalPoolType.BASE) -> None:
@@ -296,10 +369,24 @@ class CapitalPoolController:
             return sum(p.used_amount for p in self._pools.values())
 
     def record_daily_pnl(self, pnl: float) -> None:
-        """记录当日盈亏"""
+        """记录当日盈亏
+
+        P2-7: 同时按各池利用率占比拆分 PnL，记录池级贡献。
+        """
         today = date.today().isoformat()
         with self._lock:
             self._daily_pnl[today] = self._daily_pnl.get(today, 0) + pnl
+
+            # P2-7: 按池利用率占比拆分 PnL 到各池
+            base_pool = self._pools[CapitalPoolType.BASE]
+            addon_pool = self._pools[CapitalPoolType.ADD_POSITION_RESERVE]
+            total_used = base_pool.used_amount + addon_pool.used_amount
+
+            if total_used > 0:
+                base_share = base_pool.used_amount / total_used
+                addon_share = addon_pool.used_amount / total_used
+                self.record_pool_pnl(CapitalPoolType.BASE, pnl * base_share)
+                self.record_pool_pnl(CapitalPoolType.ADD_POSITION_RESERVE, pnl * addon_share)
 
     def get_daily_pnl(self, day: str = None) -> float:
         """获取当日盈亏"""
@@ -310,45 +397,262 @@ class CapitalPoolController:
     def trigger_risk_isolation(self, amount: float, reason: str) -> bool:
         """
         触发风险隔离金（极端情况）
-        
-        从风险隔离金中提取资金救市
+
+        从风险隔离金中提取资金救急。受以下防护约束：
+        - 冷却期：上次使用后需等待 cooldown_seconds
+        - 单笔上限：单次最多使用池总额的 max_usage_pct
+        - 并发上限：未偿还笔数不超过 max_concurrent
+        - 总额上限：累计未偿还不得超过池总额
+        """
+        now = time.time()
+        with self._lock:
+            pool = self._pools[CapitalPoolType.RISK_ISOLATION]
+
+            # 冷却期检查
+            if now < self._risk_isolation_cooldown_until:
+                remaining = self._risk_isolation_cooldown_until - now
+                logger.error(
+                    f"Risk isolation in cooldown: {remaining:.0f}s remaining, "
+                    f"request rejected (amount={amount:.4f}, reason={reason})"
+                )
+                return False
+
+            # 并发上限
+            outstanding = [u for u in self._risk_isolation_usage if not u.get("repaid")]
+            if len(outstanding) >= self._risk_isolation_max_concurrent:
+                logger.error(
+                    f"Risk isolation concurrent limit reached: "
+                    f"{len(outstanding)}/{self._risk_isolation_max_concurrent} outstanding"
+                )
+                return False
+
+            # 单笔上限
+            max_single = pool.total_amount * self._risk_isolation_max_usage_pct
+            if amount > max_single:
+                logger.error(
+                    f"Risk isolation amount exceeds single-use limit: "
+                    f"{amount:.4f} > {max_single:.4f} ({self._risk_isolation_max_usage_pct:.0%} of pool)"
+                )
+                return False
+
+            # 累计未偿还上限
+            total_outstanding = sum(u["amount"] for u in outstanding)
+            if total_outstanding + amount > pool.total_amount:
+                logger.error(
+                    f"Risk isolation insufficient: outstanding={total_outstanding:.4f}, "
+                    f"requested={amount:.4f}, pool_total={pool.total_amount:.4f}"
+                )
+                return False
+
+            if pool.available < amount:
+                logger.error(
+                    f"Risk isolation fund insufficient: need {amount}, "
+                    f"available {pool.available}"
+                )
+                return False
+
+            pool.used_amount += amount
+            pool.last_updated = datetime.now()
+
+            self._risk_isolation_usage.append({
+                "amount": amount,
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+                "repaid": False,
+            })
+            self._risk_isolation_cooldown_until = now + self._risk_isolation_cooldown_seconds
+
+            logger.warning(
+                f"Risk isolation fund triggered: {amount:.4f} USDT, reason: {reason}. "
+                f"Outstanding: {len(outstanding) + 1}/{self._risk_isolation_max_concurrent}, "
+                f"cooldown: {self._risk_isolation_cooldown_seconds}s"
+            )
+            return True
+
+    def repay_risk_isolation(self, amount: float = None) -> float:
+        """偿还风险隔离金（从盈利中回补）。
+
+        Args:
+            amount: 偿还金额，None 则偿还所有未偿还余额
+
+        Returns:
+            实际偿还金额
         """
         with self._lock:
             pool = self._pools[CapitalPoolType.RISK_ISOLATION]
-            if pool.available < amount:
-                logger.error(f"Risk isolation fund insufficient: need {amount}, "
-                            f"available {pool.available}")
-                return False
-            
-            pool.used_amount += amount
+            outstanding = [u for u in self._risk_isolation_usage if not u.get("repaid")]
+            if not outstanding:
+                return 0.0
+
+            total_outstanding = sum(u["amount"] for u in outstanding)
+            repay_amount = amount if amount is not None else total_outstanding
+            repay_amount = min(repay_amount, total_outstanding)
+
+            if repay_amount <= 0:
+                return 0.0
+
+            pool.used_amount = max(0.0, pool.used_amount - repay_amount)
             pool.last_updated = datetime.now()
-            
-            logger.warning(f"Risk isolation fund triggered: {amount:.4f} USDT, reason: {reason}")
-            return True
+
+            remaining = repay_amount
+            for usage in outstanding:
+                if remaining <= 0:
+                    break
+                repay_this = min(remaining, usage["amount"])
+                usage["amount"] -= repay_this
+                remaining -= repay_this
+                if usage["amount"] <= 0.001:
+                    usage["repaid"] = True
+
+            logger.info(
+                f"Risk isolation repaid: {repay_amount:.4f} USDT, "
+                f"remaining outstanding: {total_outstanding - repay_amount:.4f}"
+            )
+            return repay_amount
+
+    def record_pool_pnl(self, pool_type: CapitalPoolType, period_pnl: float) -> None:
+        """P2-7: 记录池级盈亏（用于计算池级 ROI 与动态比例）
+
+        Args:
+            pool_type: 资金池类型（仅 BASE / ADD_POSITION_RESERVE 参与动态调整）
+            period_pnl: 本期盈亏
+        """
+        with self._lock:
+            if pool_type in self._pool_pnl_history:
+                self._pool_pnl_history[pool_type].append(period_pnl)
+
+    def _compute_dynamic_pool_ratios(self) -> Dict[CapitalPoolType, float]:
+        """P2-7: 基于各池近30期 ROI 贡献动态调整池比例。
+
+        逻辑：
+        1. 计算 BASE / ADD_RESERVE 各自近30期累计 PnL
+        2. ROI 更高的池获得更大比例（向高效池倾斜）
+        3. 每日调整幅度不超过 max_ratio_shift_per_day（防剧烈震荡）
+        4. RISK_ISOLATION 始终保持 >= min_risk_isolation_ratio
+        5. 最终比例归一化，总和 = 1.0
+        """
+        if not self._dynamic_rebalance_enabled:
+            return {
+                CapitalPoolType.BASE: self._base_ratio,
+                CapitalPoolType.ADD_POSITION_RESERVE: self._add_reserve_ratio,
+                CapitalPoolType.RISK_ISOLATION: self._risk_isolation_ratio,
+            }
+
+        base_pnl = sum(self._pool_pnl_history.get(CapitalPoolType.BASE, []))
+        addon_pnl = sum(self._pool_pnl_history.get(CapitalPoolType.ADD_POSITION_RESERVE, []))
+
+        # 基础比例从默认值出发
+        base_ratio = self._base_ratio
+        addon_ratio = self._add_reserve_ratio
+        risk_ratio = self._risk_isolation_ratio
+
+        # 如果两个池都有数据，按 ROI 差异调整
+        if self._pool_pnl_history.get(CapitalPoolType.BASE) and self._pool_pnl_history.get(CapitalPoolType.ADD_POSITION_RESERVE):
+            base_pool = self._pools[CapitalPoolType.BASE]
+            addon_pool = self._pools[CapitalPoolType.ADD_POSITION_RESERVE]
+
+            base_roi = base_pnl / base_pool.total_amount if base_pool.total_amount > 0 else 0
+            addon_roi = addon_pnl / addon_pool.total_amount if addon_pool.total_amount > 0 else 0
+
+            roi_gap = addon_roi - base_roi  # 正值=addon 更高效
+
+            # 将 ROI 差异映射到比例调整（sigmoid-like，限制幅度）
+            import math
+            shift = self._max_ratio_shift_per_day * math.tanh(roi_gap * 10)
+
+            # addon 更高效 → 从 base 转移比例到 addon；反之亦然
+            base_ratio = max(0.30, min(0.75, self._base_ratio - shift))
+            addon_ratio = max(0.10, min(0.40, self._add_reserve_ratio + shift))
+
+            # 确保 risk_isolation 不低于最低要求
+            remaining = 1.0 - base_ratio - addon_ratio
+            if remaining < self._min_risk_isolation_ratio:
+                deficit = self._min_risk_isolation_ratio - remaining
+                risk_ratio = self._min_risk_isolation_ratio
+                # 从两个池按比例扣除 deficit
+                total_active = base_ratio + addon_ratio
+                if total_active > 0:
+                    base_ratio -= deficit * (base_ratio / total_active)
+                    addon_ratio -= deficit * (addon_ratio / total_active)
+            else:
+                risk_ratio = remaining
+
+        return {
+            CapitalPoolType.BASE: round(base_ratio, 4),
+            CapitalPoolType.ADD_POSITION_RESERVE: round(addon_ratio, 4),
+            CapitalPoolType.RISK_ISOLATION: round(risk_ratio, 4),
+        }
 
     def rebalance_pools(self) -> None:
         """重新平衡资金池（每日结算时调用）。
 
-        仅调整各池 total_amount 至目标比例，并清空挂单锁定金额（locked）。
+        P2-7: 使用动态池比例（基于各池 ROI 贡献），向高效池倾斜。
+        仅调整各池 total_amount 至目标比例。
         used_amount 表示仍在持仓中的保证金，不可清零，否则会错误释放仍在仓保证金。
+        locked_amount 由 reconcile_locked_capital() 每5分钟对账修正，此处不重置。
         """
         with self._lock:
             current_total = self._total_capital
-            
-            for pool_type, ratio in [
-                (CapitalPoolType.BASE, self._base_ratio),
-                (CapitalPoolType.ADD_POSITION_RESERVE, self._add_reserve_ratio),
-                (CapitalPoolType.RISK_ISOLATION, self._risk_isolation_ratio),
-            ]:
+
+            # P2-7: 计算动态池比例
+            ratios = self._compute_dynamic_pool_ratios()
+            self._dynamic_pool_ratios = ratios
+
+            for pool_type, ratio in ratios.items():
                 pool = self._pools[pool_type]
                 target_amount = current_total * ratio
                 pool.total_amount = target_amount
                 # 保留在仓保证金（used_amount），仅约束其不超过池总额
                 pool.used_amount = min(pool.used_amount, target_amount)
-                pool.locked_amount = 0.0  # 每日结算清空挂单锁定
+                # P1-1: locked_amount 不在此处清零，由 reconcile_locked_capital() 对账
+                # 确保 available = total - used - locked 始终反映真实状态
+                pool.total_amount = max(pool.total_amount, pool.used_amount + pool.locked_amount)
                 pool.last_updated = datetime.now()
-            
-            logger.info("Capital pools rebalanced (used_amount preserved, locked reset)")
+
+            logger.info(
+                f"Capital pools rebalanced (dynamic ratios: "
+                f"base={ratios[CapitalPoolType.BASE]:.0%}, "
+                f"addon={ratios[CapitalPoolType.ADD_POSITION_RESERVE]:.0%}, "
+                f"risk={ratios[CapitalPoolType.RISK_ISOLATION]:.0%})"
+            )
+
+    def reconcile_locked_capital(self, actual_locked_by_pool: Dict[str, float]) -> Dict[str, float]:
+        """对账锁定资金：比较内部跟踪 vs 交易所实际挂单保证金。
+
+        Args:
+            actual_locked_by_pool: {pool_type_value: actual_locked_amount} 从交易所挂单计算
+
+        Returns:
+            差异报告 {pool_type_value: discrepancy}，正值表示内部多锁（需释放），
+            负值表示内部少锁（需补锁），0 表示一致。
+        """
+        discrepancies = {}
+        with self._lock:
+            for pool_type_val, actual_locked in actual_locked_by_pool.items():
+                pool_type = None
+                for pt in self._pools:
+                    if pt.value == pool_type_val:
+                        pool_type = pt
+                        break
+                if pool_type is None:
+                    continue
+
+                pool = self._pools[pool_type]
+                internal_locked = pool.locked_amount
+                diff = internal_locked - actual_locked
+
+                if abs(diff) > 0.01:
+                    logger.warning(
+                        f"Locked capital discrepancy for {pool_type_val}: "
+                        f"internal={internal_locked:.4f}, exchange={actual_locked:.4f}, "
+                        f"diff={diff:.4f} — reconciling to exchange value"
+                    )
+                    pool.locked_amount = max(0.0, actual_locked)
+                    pool.last_updated = datetime.now()
+
+                discrepancies[pool_type_val] = round(diff, 4)
+
+        return discrepancies
 
     def to_dict(self) -> Dict[str, Any]:
         with self._lock:
@@ -508,39 +812,55 @@ class SymbolWeightAllocator:
             
             return new_weights
 
-    def rebalance(self) -> Dict[str, float]:
+    def rebalance(self, current_positions: Dict[str, float] = None) -> Dict[str, float]:
         """
         执行权重再平衡
-        
-        单次变更不超过 max_weight_change
+
+        单次变更不超过 max_weight_change。
+        P1-5: 如果币种有持仓，降权时减缓变更速度，避免强制平仓压力。
+
+        Args:
+            current_positions: {symbol: position_size} 当前持仓大小（可选）
         """
         with self._lock:
             new_weights = self.calculate_optimal_weights()
-            
+
             old_weights = self._symbol_weights.copy()
-            
+
             adjusted = {}
             for symbol in self._symbols:
                 old_w = old_weights.get(symbol, 0)
                 new_w = new_weights.get(symbol, 0)
-                
+
                 # 限制单次变更幅度
                 change = new_w - old_w
                 max_change = self._max_weight_change
+
+                # P1-5: 持仓币种降权时减缓变更（避免强制平仓）
+                if current_positions and change < 0:
+                    position_size = abs(current_positions.get(symbol, 0))
+                    if position_size > 0:
+                        # 有持仓时，降权速度减半
+                        max_change *= 0.5
+                        logger.debug(
+                            f"Symbol {symbol} has position {position_size:.4f}, "
+                            f"weight reduction dampened: max_change={max_change:.4f}"
+                        )
+
                 if abs(change) > max_change:
                     new_w = old_w + (max_change if change > 0 else -max_change)
-                
+
                 adjusted[symbol] = new_w
-            
+
             # 归一化
             total = sum(adjusted.values())
             if total > 0:
                 adjusted = {s: w / total for s, w in adjusted.items()}
-            
+
             self._symbol_weights = adjusted
             self._last_rebalance = datetime.now()
             self._adjustment_count += 1
-            
+
             # 记录显著变更
             for symbol in self._symbols:
                 old_w = old_weights.get(symbol, 0)
@@ -548,7 +868,7 @@ class SymbolWeightAllocator:
                 if abs(new_w - old_w) > 0.01:
                     logger.info(f"Symbol weight adjusted: {symbol} "
                                f"{old_w:.4f} -> {new_w:.4f}")
-            
+
             return adjusted
 
     def get_weight(self, symbol: str) -> float:
@@ -581,9 +901,35 @@ class SymbolWeightAllocator:
             return 0.0
 
     def should_rebalance(self) -> bool:
-        """是否需要再平衡"""
+        """是否需要再平衡（P2-2: 自适应频率，高波动时更频繁）"""
         elapsed = (datetime.now() - self._last_rebalance).total_seconds()
-        return elapsed >= self._rebalance_interval
+
+        # P2-2: 根据平均波动率调整再平衡间隔
+        avg_volatility = self._compute_avg_volatility()
+        adaptive_interval = self._rebalance_interval
+
+        if avg_volatility > 0.05:  # 高波动：缩短间隔到50%
+            adaptive_interval *= 0.5
+        elif avg_volatility > 0.03:  # 中波动：缩短到75%
+            adaptive_interval *= 0.75
+        elif avg_volatility < 0.01:  # 低波动：延长到150%
+            adaptive_interval *= 1.5
+
+        return elapsed >= adaptive_interval
+
+    def _compute_avg_volatility(self) -> float:
+        """P2-2: 计算所有币种的平均波动率"""
+        with self._lock:
+            if not self._symbol_metrics:
+                return 0.02  # 默认中等波动
+            volatilities = [
+                m.get("volatility", 0.02)
+                for m in self._symbol_metrics.values()
+                if m.get("volatility") is not None
+            ]
+            if not volatilities:
+                return 0.02
+            return sum(volatilities) / len(volatilities)
 
     def to_dict(self) -> Dict[str, Any]:
         with self._lock:
@@ -660,14 +1006,19 @@ class LeverageTierManager:
         
         # 当前持仓杠杆
         self._current_leverages: Dict[str, float] = {}
-        
+
         # 杠杆调整历史
         self._adjustment_history: List[Dict[str, Any]] = []
-        
+
+        # P1-8: 组合级杠杆敞口追踪
+        self._portfolio_leverage_exposure: float = 0.0  # 加权平均杠杆 * 仓位占比
+        self._max_portfolio_leverage = lev_config.get("max_portfolio_leverage", 10.0)  # 组合最大杠杆
+
         self._lock = threading.RLock()
-        
+
         logger.info(f"LeverageTierManager initialized: light={self._light_min}-{self._light_max}x, "
-                    f"main={self._main_min}-{self._main_max}x, max={self._absolute_max}x")
+                    f"main={self._main_min}-{self._main_max}x, max={self._absolute_max}x, "
+                    f"portfolio_max={self._max_portfolio_leverage}x")
 
     def assign_leverage(self, symbol: str, position_type: str = "initial",
                         volatility: float = 0.02, signal_strength: float = 0.5,
@@ -748,7 +1099,34 @@ class LeverageTierManager:
             
             # 计算该杠杆下最大可承受亏损（到强平距离的50%）
             max_losing_pct = 1.0 / (final_leverage * 2)  # 保守估计
-            
+
+            # P1-8: 组合级杠杆敞口检查
+            # 计算当前组合加权杠杆（简化：所有持仓杠杆的平均值）
+            if self._current_leverages:
+                avg_leverage = sum(self._current_leverages.values()) / len(self._current_leverages)
+                # 新持仓加入后的预估组合杠杆
+                projected_count = len(self._current_leverages) + 1
+                projected_avg = (sum(self._current_leverages.values()) + final_leverage) / projected_count
+                if projected_avg > self._max_portfolio_leverage:
+                    # 降低杠杆以符合组合限制
+                    allowed_new_lev = max(
+                        self._light_min,
+                        self._max_portfolio_leverage * projected_count - sum(self._current_leverages.values())
+                    )
+                    if allowed_new_lev < final_leverage:
+                        logger.warning(
+                            f"Portfolio leverage limit: current_avg={avg_leverage:.1f}x, "
+                            f"requested={final_leverage:.1f}x, max_portfolio={self._max_portfolio_leverage}x. "
+                            f"Reducing to {allowed_new_lev:.1f}x"
+                        )
+                        final_leverage = allowed_new_lev
+                        # 重新计算等级
+                        if final_leverage <= self._light_max:
+                            tier = LeverageTier.LIGHT
+                        else:
+                            tier = LeverageTier.MAIN
+                        max_losing_pct = 1.0 / (final_leverage * 2)
+
             assignment = LeverageAssignment(
                 symbol=symbol,
                 tier=tier,
@@ -758,7 +1136,7 @@ class LeverageTierManager:
                 reason=f"{position_type} position, vol={volatility:.4f}, "
                        f"signal={signal_strength:.2f}, drawdown={account_drawdown:.4f}"
             )
-            
+
             self._current_leverages[symbol] = final_leverage
             self._adjustment_history.append({
                 "symbol": symbol,
@@ -767,7 +1145,7 @@ class LeverageTierManager:
                 "position_type": position_type,
                 "timestamp": datetime.now().isoformat()
             })
-            
+
             return assignment
 
     def check_leverage(self, symbol: str, requested_leverage: float) -> Tuple[bool, float, str]:
@@ -1047,9 +1425,14 @@ class HedgeScheduler:
         self._active_hedges: Dict[str, HedgePosition] = {}
         self._hedge_history: List[Dict[str, Any]] = []
         self._lock = threading.RLock()
-        
+
         self._hedge_created_count = 0
         self._hedge_closed_count = 0
+
+        # P1-9: 对冲执行验证追踪
+        self._hedge_execution_status: Dict[str, str] = {}  # {hedge_id: "pending"|"confirmed"|"failed"}
+        self._hedge_failed_count = 0
+        self._hedge_last_failure_time: Optional[datetime] = None
         
         logger.info("HedgeScheduler initialized for multi-position hedging")
 
@@ -1126,10 +1509,10 @@ class HedgeScheduler:
             return suggestion
 
     def create_hedge(self, suggestion: Dict[str, Any]) -> Optional[HedgePosition]:
-        """创建对冲仓位"""
+        """创建对冲仓位（P1-9: 初始状态为 pending，需确认执行）"""
         with self._lock:
             hedge_id = f"hedge_{suggestion['symbol']}_{int(time.time())}"
-            
+
             hedge = HedgePosition(
                 hedge_id=hedge_id,
                 hedge_type=HedgeType(suggestion.get("hedge_type", "same_symbol_diff_direction")),
@@ -1145,15 +1528,62 @@ class HedgeScheduler:
                 hedge_entry=suggestion["current_price"],
                 hedge_ratio=suggestion["hedge_ratio"]
             )
-            
+
             self._active_hedges[hedge_id] = hedge
             self._hedge_created_count += 1
-            
-            logger.info(f"Hedge created: {hedge_id}, "
+            # P1-9: 标记为待确认
+            self._hedge_execution_status[hedge_id] = "pending"
+
+            logger.info(f"Hedge created (pending confirmation): {hedge_id}, "
                        f"{suggestion['symbol']} {suggestion['hedge_side']} "
                        f"size={suggestion['hedge_size']:.6f}, ratio={suggestion['hedge_ratio']:.2f}")
-            
+
             return hedge
+
+    def confirm_hedge_execution(self, hedge_id: str, exchange_order_id: str = "") -> bool:
+        """P1-9: 确认对冲已在交易所成功执行"""
+        with self._lock:
+            if hedge_id not in self._hedge_execution_status:
+                return False
+            self._hedge_execution_status[hedge_id] = "confirmed"
+            logger.info(f"Hedge execution confirmed: {hedge_id} (exchange_order={exchange_order_id})")
+            return True
+
+    def mark_hedge_execution_failed(self, hedge_id: str, reason: str = "") -> bool:
+        """P1-9: 标记对冲执行失败"""
+        with self._lock:
+            if hedge_id not in self._hedge_execution_status:
+                return False
+            self._hedge_execution_status[hedge_id] = "failed"
+            self._hedge_failed_count += 1
+            self._hedge_last_failure_time = datetime.now()
+
+            # 清理失败的对冲记录
+            if hedge_id in self._active_hedges:
+                hedge = self._active_hedges[hedge_id]
+                hedge.status = "failed"
+                del self._active_hedges[hedge_id]
+
+            logger.warning(
+                f"Hedge execution FAILED: {hedge_id}, reason={reason}. "
+                f"Total failures: {self._hedge_failed_count}"
+            )
+
+            # 连续失败告警
+            if self._hedge_failed_count >= 3:
+                logger.error(
+                    f"[HedgeAlert] {self._hedge_failed_count} consecutive hedge execution failures! "
+                    f"Last failure: {self._hedge_last_failure_time.isoformat()}. "
+                    f"Hedge system may be broken — manual inspection required."
+                )
+
+            return True
+
+    def get_pending_hedges(self) -> List[str]:
+        """P1-9: 获取待确认执行的对冲列表"""
+        with self._lock:
+            return [hid for hid, status in self._hedge_execution_status.items()
+                    if status == "pending"]
 
     def close_hedge(self, hedge_id: str, reason: str = "manual") -> bool:
         """关闭对冲仓位"""
@@ -1251,14 +1681,30 @@ class CapitalManager:
         # 初始化资金磨损分析器（第六模块）
         self.attrition_analyzer = CapitalAttritionAnalyzer(config)
         self._init_attrition_budgets()
-        
+
+        # P3-1: 资金分配绩效归因分析器（第七模块）
+        self.attribution_analyzer = CapitalAttributionAnalyzer(config)
+
+        # P3-2: What-if 场景模拟器（第八模块）
+        self.scenario_simulator = CapitalScenarioSimulator(config)
+
+        # P3-3: 分配参数自动优化器（第九模块）
+        self.parameter_optimizer = CapitalParameterOptimizer(config)
+
+        # P3-4: 多时间框架资金规划器（第十模块）
+        self.timeframe_planner = MultiTimeframeCapitalPlanner(config)
+
         self._running = False
         self._rebalance_task: Optional[asyncio.Task] = None
         self._lock = threading.RLock()
-        
+
         # 风险预算缓存（从 AdaptiveController 同步）
         self._risk_budget_allocation: Dict[str, float] = {}
         self._last_risk_budget_sync: datetime = datetime.min
+
+        # P1-6: 资金效率追踪（策略级 ROI）
+        self._strategy_capital_roi: Dict[str, Dict[str, float]] = {}  # {strategy: {allocated, pnl, roi}}
+        self._strategy_capital_history: Dict[str, Deque[Dict[str, Any]]] = {}  # 历史快照
         
         logger.info("CapitalManager initialized with 6 modules (incl. attrition analyzer)")
 
@@ -1266,9 +1712,12 @@ class CapitalManager:
         """初始化资金管理器"""
         if total_capital:
             self.capital_pool.update_total_capital(total_capital)
-        
+
         self.symbol_allocator.initialize(symbols)
-        
+
+        # P2-1: 加载资金效率追踪数据
+        self._load_capital_efficiency_state()
+
         logger.info(f"CapitalManager initialized: {len(symbols)} symbols, "
                     f"capital={self.capital_pool._total_capital:.2f} USDT")
 
@@ -1345,6 +1794,307 @@ class CapitalManager:
             symbol, volatility, momentum, liquidity, pnl, win_rate
         )
 
+    def record_strategy_capital_efficiency(self, strategy_name: str,
+                                           allocated_capital: float,
+                                           period_pnl: float,
+                                           fees: float = 0.0,
+                                           funding_costs: float = 0.0) -> Dict[str, float]:
+        """P1-6: 记录策略资金效率（ROI = Net PnL / allocated_capital）
+
+        P2-6: 扣除手续费和资金成本，真实反映资本效率
+
+        Args:
+            strategy_name: 策略名称
+            allocated_capital: 本期分配资本
+            period_pnl: 本期毛盈亏（未扣费用）
+            fees: 本期手续费（maker/taker fee）
+            funding_costs: 本期资金成本（永续合约 funding rate）
+
+        Returns:
+            {roi, cumulative_roi, efficiency_tier, net_pnl, total_costs}
+        """
+        with self._lock:
+            if strategy_name not in self._strategy_capital_roi:
+                self._strategy_capital_roi[strategy_name] = {
+                    "allocated": 0.0,
+                    "gross_pnl": 0.0,
+                    "net_pnl": 0.0,
+                    "fees": 0.0,
+                    "funding": 0.0,
+                    "roi": 0.0,
+                }
+                self._strategy_capital_history[strategy_name] = deque(maxlen=100)
+
+            roi_data = self._strategy_capital_roi[strategy_name]
+            roi_data["allocated"] += allocated_capital
+            roi_data["gross_pnl"] += period_pnl
+            roi_data["fees"] += fees
+            roi_data["funding"] += funding_costs
+
+            # 净盈亏 = 毛盈亏 - 手续费 - 资金成本
+            net_pnl = period_pnl - fees - funding_costs
+            roi_data["net_pnl"] += net_pnl
+
+            if roi_data["allocated"] > 0:
+                roi_data["roi"] = roi_data["net_pnl"] / roi_data["allocated"]
+            else:
+                roi_data["roi"] = 0.0
+
+            # 记录历史快照
+            self._strategy_capital_history[strategy_name].append({
+                "timestamp": datetime.now().isoformat(),
+                "allocated": allocated_capital,
+                "gross_pnl": period_pnl,
+                "net_pnl": net_pnl,
+                "fees": fees,
+                "funding": funding_costs,
+                "roi": roi_data["roi"],
+            })
+
+            # 效率分级
+            roi = roi_data["roi"]
+            if roi > 0.10:
+                tier = "excellent"
+            elif roi > 0.03:
+                tier = "good"
+            elif roi > -0.03:
+                tier = "neutral"
+            elif roi > -0.10:
+                tier = "poor"
+            else:
+                tier = "critical"
+
+            return {
+                "roi": round(roi_data["roi"], 4),
+                "cumulative_net_pnl": round(roi_data["net_pnl"], 4),
+                "cumulative_gross_pnl": round(roi_data["gross_pnl"], 4),
+                "cumulative_fees": round(roi_data["fees"], 4),
+                "cumulative_funding": round(roi_data["funding"], 4),
+                "total_costs": round(roi_data["fees"] + roi_data["funding"], 4),
+                "cumulative_allocated": round(roi_data["allocated"], 4),
+                "efficiency_tier": tier,
+            }
+
+    def get_capital_efficiency_report(self) -> Dict[str, Any]:
+        """P1-6: 获取资金效率报告（按策略）"""
+        with self._lock:
+            report = {}
+            for strategy_name, roi_data in self._strategy_capital_roi.items():
+                history = list(self._strategy_capital_history.get(strategy_name, []))
+                recent_roi = history[-1]["roi"] if history else 0.0
+                roi = roi_data.get("roi", 0.0)
+
+                if roi > 0.10:
+                    tier = "excellent"
+                elif roi > 0.03:
+                    tier = "good"
+                elif roi > -0.03:
+                    tier = "neutral"
+                elif roi > -0.10:
+                    tier = "poor"
+                else:
+                    tier = "critical"
+
+                report[strategy_name] = {
+                    "roi": round(roi, 4),
+                    "recent_roi": round(recent_roi, 4),
+                    "cumulative_net_pnl": round(roi_data.get("net_pnl", 0.0), 4),
+                    "cumulative_gross_pnl": round(roi_data.get("gross_pnl", 0.0), 4),
+                    "cumulative_fees": round(roi_data.get("fees", 0.0), 4),
+                    "cumulative_funding": round(roi_data.get("funding", 0.0), 4),
+                    "total_costs": round(roi_data.get("fees", 0.0) + roi_data.get("funding", 0.0), 4),
+                    "cumulative_allocated": round(roi_data.get("allocated", 0.0), 4),
+                    "efficiency_tier": tier,
+                    "data_points": len(history),
+                }
+
+            return report
+
+    def record_attribution_period(self, period_key: str,
+                                  strategy_weights: Dict[str, float],
+                                  strategy_returns: Dict[str, float],
+                                  strategy_allocated: Dict[str, float],
+                                  strategy_pnl: Dict[str, float]) -> None:
+        """P3-1: 记录单期归因数据。
+
+        应在每日/每周结算时调用，记录各策略的权重、收益率、分配资金、盈亏。
+        """
+        self.attribution_analyzer.record_period(
+            period_key=period_key,
+            strategy_weights=strategy_weights,
+            strategy_returns=strategy_returns,
+            strategy_allocated=strategy_allocated,
+            strategy_pnl=strategy_pnl,
+        )
+
+    def get_attribution_report(self, period_start: datetime = None,
+                                period_end: datetime = None) -> Dict[str, Any]:
+        """P3-1: 获取 Brinson 式绩效归因报告。
+
+        Returns:
+            {
+                portfolio_return, benchmark_return, excess_return,
+                allocation_effect, selection_effect, interaction_effect,
+                strategy_attribution: {strategy: {weight, return, allocation_effect, ...}},
+                total_pnl, total_allocated
+            }
+        """
+        result = self.attribution_analyzer.compute_attribution(
+            period_start=period_start,
+            period_end=period_end,
+            benchmark_mode="equal_weight",
+        )
+        return {
+            "period_start": result.period_start.isoformat() if result.period_start != datetime.min else None,
+            "period_end": result.period_end.isoformat(),
+            "portfolio_return": result.portfolio_return,
+            "benchmark_return": result.benchmark_return,
+            "excess_return": result.excess_return,
+            "allocation_effect": result.allocation_effect,
+            "selection_effect": result.selection_effect,
+            "interaction_effect": result.interaction_effect,
+            "strategy_attribution": result.strategy_attribution,
+            "total_pnl": result.total_pnl,
+            "total_allocated": result.total_allocated,
+        }
+
+    def get_top_contributors(self, limit: int = 3) -> List[Tuple[str, float]]:
+        """P3-1: 获取贡献最大的策略"""
+        return self.attribution_analyzer.get_top_contributors(limit)
+
+    def run_scenario_simulation(self, current_allocation: Dict[str, float],
+                                historical_returns: Dict[str, List[float]],
+                                n_simulations: int = None,
+                                horizon_days: int = None) -> Dict[str, Any]:
+        """P3-2: 蒙特卡洛场景模拟。
+
+        Returns:
+            {var_95, var_99, cvar_95, cvar_99, max_drawdown_p50, max_drawdown_p95,
+             expected_return, sharpe_ratio, n_simulations, horizon_days}
+        """
+        return self.scenario_simulator.run_monte_carlo(
+            current_allocation=current_allocation,
+            historical_returns=historical_returns,
+            n_simulations=n_simulations,
+            horizon_days=horizon_days,
+        )
+
+    def run_stress_test(self, current_allocation: Dict[str, float],
+                        stress_scenarios: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+        """P3-2: 压力测试。
+
+        Args:
+            stress_scenarios: {scenario_name: {strategy: return}}
+                例如：{"market_crash": {"grid": -0.10, "trend": -0.20}}
+        """
+        return self.scenario_simulator.stress_test(
+            current_allocation=current_allocation,
+            stress_scenarios=stress_scenarios,
+        )
+
+    def optimize_parameters(self, historical_returns: Dict[str, List[float]],
+                            current_params: Dict[str, Any],
+                            constraints: Dict[str, float] = None,
+                            optimization_target: str = "sharpe") -> Dict[str, Any]:
+        """P3-3: 自动优化分配参数。
+
+        Returns:
+            {suggested_params, expected_sharpe, expected_return,
+             expected_max_drawdown, confidence, reasoning}
+        """
+        return self.parameter_optimizer.optimize(
+            historical_returns=historical_returns,
+            current_params=current_params,
+            constraints=constraints,
+            optimization_target=optimization_target,
+        )
+
+    def update_capital_plan(self, available_liquidity: float = None,
+                            reserved_for_orders: float = None,
+                            target_utilization: float = None,
+                            current_positions: Dict[str, float] = None,
+                            weekly_target: float = None,
+                            current_equity: float = None) -> Dict[str, Any]:
+        """P3-4: 更新多时间框架资金规划并返回计划。
+
+        按需更新各层级（传 None 则跳过该层级），然后返回完整计划。
+        """
+        if available_liquidity is not None:
+            self.timeframe_planner.update_short_term(
+                available_liquidity=available_liquidity,
+                reserved_for_orders=reserved_for_orders or 0.0,
+            )
+        if target_utilization is not None:
+            self.timeframe_planner.update_mid_term(
+                target_utilization=target_utilization,
+                current_positions=current_positions or {},
+            )
+        if weekly_target is not None and current_equity is not None:
+            self.timeframe_planner.update_long_term(
+                weekly_target=weekly_target,
+                current_equity=current_equity,
+            )
+        plan = self.timeframe_planner.get_plan()
+        plan["constraints"] = self.timeframe_planner.check_constraints()
+        return plan
+
+    def check_and_trigger_capital_reallocation(self) -> Dict[str, Any]:
+        """P1-10: 检查策略ROI差异，触发资金从低效策略向高效策略再分配。
+
+        当高效策略ROI与低效策略ROI差距超过阈值时，建议减少低效策略资金、增加高效策略资金。
+
+        Returns:
+            {reallocation_needed: bool, actions: [{from_strategy, to_strategy, amount}]}
+        """
+        with self._lock:
+            if len(self._strategy_capital_roi) < 2:
+                return {"reallocation_needed": False, "actions": []}
+
+            # 计算各策略ROI
+            roi_by_strategy = {}
+            for strategy_name, roi_data in self._strategy_capital_roi.items():
+                roi_by_strategy[strategy_name] = roi_data.get("roi", 0.0)
+
+            # 排序：高效 vs 低效
+            sorted_strategies = sorted(roi_by_strategy.items(), key=lambda x: x[1], reverse=True)
+            best_strategy, best_roi = sorted_strategies[0]
+            worst_strategy, worst_roi = sorted_strategies[-1]
+
+            roi_gap = best_roi - worst_roi
+            reallocation_threshold = 0.10  # ROI差距超过10%触发再分配
+
+            if roi_gap < reallocation_threshold:
+                return {"reallocation_needed": False, "actions": []}
+
+            # 建议从最低效策略转移10%资金到最高效策略
+            actions = []
+            worst_allocated = self._strategy_capital_roi[worst_strategy].get("allocated", 0.0)
+            if worst_allocated > 0:
+                transfer_amount = worst_allocated * 0.10  # 转移10%
+                actions.append({
+                    "from_strategy": worst_strategy,
+                    "to_strategy": best_strategy,
+                    "amount": round(transfer_amount, 4),
+                    "reason": f"ROI gap: {best_strategy}={best_roi:.2%} vs {worst_strategy}={worst_roi:.2%} "
+                              f"(gap={roi_gap:.2%} > threshold={reallocation_threshold:.2%})",
+                })
+
+                logger.warning(
+                    f"[CapitalReallocation] ROI gap detected: "
+                    f"{best_strategy} ROI={best_roi:.2%} vs {worst_strategy} ROI={worst_roi:.2%}. "
+                    f"Suggest transferring {transfer_amount:.4f} USDT from {worst_strategy} to {best_strategy}."
+                )
+
+            return {
+                "reallocation_needed": True,
+                "roi_gap": round(roi_gap, 4),
+                "best_strategy": best_strategy,
+                "best_roi": round(best_roi, 4),
+                "worst_strategy": worst_strategy,
+                "worst_roi": round(worst_roi, 4),
+                "actions": actions,
+            }
+
     async def start_periodic_tasks(self) -> None:
         """启动定期任务"""
         self._running = True
@@ -1357,21 +2107,72 @@ class CapitalManager:
         if self._rebalance_task:
             self._rebalance_task.cancel()
             self._rebalance_task = None
+        # P2-1: 停止时保存资金效率数据
+        self._save_capital_efficiency_state()
         logger.info("CapitalManager periodic tasks stopped")
+
+    def _save_capital_efficiency_state(self) -> None:
+        """P2-1: 持久化资金效率追踪数据"""
+        try:
+            state = {
+                "strategy_capital_roi": self._strategy_capital_roi,
+                "strategy_capital_history": {
+                    k: list(v) for k, v in self._strategy_capital_history.items()
+                },
+                "saved_at": datetime.now().isoformat(),
+            }
+            state_path = os.path.join("data", "capital_efficiency_state.json")
+            os.makedirs("data", exist_ok=True)
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2, default=str)
+            logger.debug(f"Capital efficiency state saved to {state_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save capital efficiency state: {e}")
+
+    def _load_capital_efficiency_state(self) -> None:
+        """P2-1: 加载资金效率追踪数据"""
+        try:
+            state_path = os.path.join("data", "capital_efficiency_state.json")
+            if not os.path.exists(state_path):
+                return
+            with open(state_path, "r") as f:
+                state = json.load(f)
+            self._strategy_capital_roi = state.get("strategy_capital_roi", {})
+            history = state.get("strategy_capital_history", {})
+            for k, v in history.items():
+                self._strategy_capital_history[k] = deque(v, maxlen=100)
+            logger.info(
+                f"Capital efficiency state loaded from {state_path} "
+                f"(saved at {state.get('saved_at', 'unknown')})"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load capital efficiency state: {e}")
 
     async def _rebalance_loop(self) -> None:
         """定期再平衡循环（含风险预算同步）"""
+        utilization_check_counter = 0
+        intraday_loss_check_counter = 0
+        last_equity_for_loss_check = 0.0
         while self._running:
             try:
                 await asyncio.sleep(self.symbol_allocator._rebalance_interval)
-                
-                # 权重再平衡
+
+                # 权重再平衡（P1-5: 传入持仓信息以减缓有持仓币种的降权速度）
                 if self.symbol_allocator.should_rebalance():
-                    self.symbol_allocator.rebalance()
-                
+                    current_positions = {}
+                    try:
+                        for symbol in self.symbol_allocator._symbols:
+                            usage = self.capital_pool.get_symbol_usage(symbol)
+                            total_usage = sum(usage.values())
+                            if total_usage > 0:
+                                current_positions[symbol] = total_usage
+                    except Exception as e:
+                        logger.debug(f"Failed to get positions for rebalance: {e}")
+                    self.symbol_allocator.rebalance(current_positions)
+
                 # 风险预算同步（从 AdaptiveController 拉取最新预算分配）
                 self._sync_risk_budget_allocations()
-                
+
                 # 资金池再平衡（每日）—— P0: 改用日期比较替代分钟窗口，避免错过
                 if not hasattr(self.symbol_allocator, '_last_pool_rebalance_date'):
                     self.symbol_allocator._last_pool_rebalance_date = None
@@ -1379,12 +2180,111 @@ class CapitalManager:
                 if self.symbol_allocator._last_pool_rebalance_date != today_str:
                     self.capital_pool.rebalance_pools()
                     self.symbol_allocator._last_pool_rebalance_date = today_str
-                
+
+                # P1-3: 利用率异常监控（每30分钟检查一次）
+                utilization_check_counter += 1
+                if utilization_check_counter >= 6:  # 6 * 5min = 30min
+                    utilization_check_counter = 0
+                    self._check_utilization_anomaly()
+
+                # P1-10: 资金效率再分配检查（每小时一次）
+                if utilization_check_counter % 12 == 0:  # 12 * 5min = 60min
+                    self.check_and_trigger_capital_reallocation()
+
+                # P1-11: 日内大额亏损监控（每10分钟检查一次）
+                intraday_loss_check_counter += 1
+                if intraday_loss_check_counter >= 2:  # 2 * 5min = 10min
+                    intraday_loss_check_counter = 0
+                    current_equity = self.capital_pool._total_capital
+                    if last_equity_for_loss_check > 0:
+                        self._check_intraday_large_loss(current_equity, last_equity_for_loss_check)
+                    last_equity_for_loss_check = current_equity
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in capital rebalance loop: {e}")
                 await asyncio.sleep(60)
+
+    def _check_intraday_large_loss(self, current_equity: float, previous_equity: float) -> None:
+        """P1-11: 检查日内大额亏损，超阈值时触发告警和资本保全措施。
+
+        阈值配置：
+        - warning_threshold: 2% 亏损告警
+        - critical_threshold: 3% 亏损严重告警 + 建议减仓
+        - emergency_threshold: 5% 亏损紧急告警 + 建议暂停交易
+        """
+        if previous_equity <= 0:
+            return
+
+        loss_pct = (previous_equity - current_equity) / previous_equity
+
+        cfg = self.config.get("intraday_loss_monitor", {})
+        warning_threshold = cfg.get("warning_threshold", 0.02)
+        critical_threshold = cfg.get("critical_threshold", 0.03)
+        emergency_threshold = cfg.get("emergency_threshold", 0.05)
+
+        if loss_pct >= emergency_threshold:
+            logger.error(
+                f"[IntraDayLoss] EMERGENCY: Equity dropped {loss_pct:.2%} "
+                f"({previous_equity:.2f} -> {current_equity:.2f}). "
+                f"RECOMMENDATION: Pause all trading immediately. "
+                f"Review positions and consider reducing exposure."
+            )
+        elif loss_pct >= critical_threshold:
+            logger.error(
+                f"[IntraDayLoss] CRITICAL: Equity dropped {loss_pct:.2%} "
+                f"({previous_equity:.2f} -> {current_equity:.2f}). "
+                f"RECOMMENDATION: Reduce position sizes by 30-50%. "
+                f"Review stop-loss levels and risk exposure."
+            )
+        elif loss_pct >= warning_threshold:
+            logger.warning(
+                f"[IntraDayLoss] WARNING: Equity dropped {loss_pct:.2%} "
+                f"({previous_equity:.2f} -> {current_equity:.2f}). "
+                f"Monitor closely. If trend continues, consider reducing exposure."
+            )
+
+    def _check_utilization_anomaly(self) -> None:
+        """P1-3: 检查资金利用率异常并告警"""
+        try:
+            total_capital = self.capital_pool._total_capital
+            if total_capital <= 0:
+                return
+
+            total_used = self.capital_pool.get_total_used()
+            total_locked = sum(p.locked_amount for p in self.capital_pool._pools.values())
+            utilization = (total_used + total_locked) / total_capital
+
+            # 利用率过低（<20%）：资金闲置
+            if utilization < 0.20:
+                logger.warning(
+                    f"[CapitalUtilization] LOW utilization alert: {utilization:.1%} "
+                    f"(used={total_used:.2f}, locked={total_locked:.2f}, total={total_capital:.2f}). "
+                    f"Capital is idle — consider increasing position sizes or activating more strategies."
+                )
+
+            # 利用率过高（>90%）：过度部署
+            elif utilization > 0.90:
+                logger.warning(
+                    f"[CapitalUtilization] HIGH utilization alert: {utilization:.1%} "
+                    f"(used={total_used:.2f}, locked={total_locked:.2f}, total={total_capital:.2f}). "
+                    f"Capital is over-deployed — risk of margin call or missed opportunities."
+                )
+
+            # 风险隔离金被使用
+            risk_pool = self.capital_pool._pools.get(CapitalPoolType.RISK_ISOLATION)
+            if risk_pool and risk_pool.used_amount > 0:
+                outstanding = [u for u in self.capital_pool._risk_isolation_usage if not u.get("repaid")]
+                total_outstanding = sum(u["amount"] for u in outstanding)
+                if total_outstanding > 0:
+                    logger.warning(
+                        f"[CapitalUtilization] Risk isolation pool has {total_outstanding:.2f} USDT "
+                        f"outstanding ({len(outstanding)} unpaid). Repayment recommended."
+                    )
+
+        except Exception as e:
+            logger.debug(f"Utilization check error: {e}")
 
     def _sync_risk_budget_allocations(self):
         """从 AdaptiveController 同步风险预算分配到资金池"""

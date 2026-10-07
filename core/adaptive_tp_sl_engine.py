@@ -19,6 +19,8 @@
 与 StopLossManager / ConditionalOrderManager 复用同一底层价格函数（utils.helpers）。
 """
 
+import json
+import os
 from typing import Dict, Any, Optional, List, Tuple
 
 from loguru import logger
@@ -83,6 +85,28 @@ class AdaptiveTpSlEngine:
         self._smoothing_alpha = _clamp(_f(cfg.get("smoothing_alpha"), 0.5), 0.0, 1.0)
         self._protection_hysteresis_margin = _f(cfg.get("protection_hysteresis_margin"), 0.002)
 
+        # ── 波动率因子参数 ──
+        self._vol_tp_sensitivity = _f(cfg.get("vol_tp_sensitivity"), 0.8)
+
+        # ── 市场状态因子参数（regime-based multipliers）──
+        regime_cfg = cfg.get("regime_factors", {})
+        self._regime_trend_tp_boost = _f(regime_cfg.get("trend_tp_boost"), 0.2)
+        self._regime_range_sl_tighten = _f(regime_cfg.get("range_sl_tighten"), 0.1)
+        self._regime_range_tp_tighten = _f(regime_cfg.get("range_tp_tighten"), 0.2)
+        self._regime_extreme_sl_widen = _f(regime_cfg.get("extreme_sl_widen"), 0.3)
+        self._regime_extreme_tp_widen = _f(regime_cfg.get("extreme_tp_widen"), 0.1)
+        self._regime_funding_tp_tighten = _f(regime_cfg.get("funding_tp_tighten"), 0.2)
+        self._regime_liquidity_sl_widen = _f(regime_cfg.get("liquidity_sl_widen"), 0.2)
+
+        # ── 策略表现因子参数（profit_factor-based multipliers）──
+        perf_cfg = cfg.get("performance_factors", {})
+        self._perf_high_pf_tp_mult = _f(perf_cfg.get("high_pf_tp_mult"), 1.1)
+        self._perf_mid_pf_tp_mult = _f(perf_cfg.get("mid_pf_tp_mult"), 1.0)
+        self._perf_low_pf_tp_mult = _f(perf_cfg.get("low_pf_tp_mult"), 1.2)
+        self._perf_very_low_pf_tp_mult = _f(perf_cfg.get("very_low_pf_tp_mult"), 1.3)
+        self._perf_high_pf_threshold = _f(perf_cfg.get("high_pf_threshold"), 1.5)
+        self._perf_mid_pf_threshold = _f(perf_cfg.get("mid_pf_threshold"), 1.0)
+
         # ── 价格格式化 ──
         self._slippage_pct = _f(cfg.get("slippage_pct"), 0.001)
         self._precision = int(cfg.get("precision", 4))
@@ -105,6 +129,12 @@ class AdaptiveTpSlEngine:
         self._protection_state: Dict[str, str] = {}
         # 平滑状态（key: f"{symbol}:{direction}" → {"sl_pct", "tp_pct"}）
         self._smoothed: Dict[str, Dict[str, float]] = {}
+        
+        # P0-3: 状态持久化路径
+        self._state_file = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "data", "adaptive_tp_sl_state.json"
+        )
+        self._load_state()
 
     # ─────────────────────────────────────────────────────────────
     # 公开 API
@@ -259,6 +289,7 @@ class AdaptiveTpSlEngine:
         key = f"{symbol}:{direction}"
         self._protection_state.pop(key, None)
         self._smoothed.pop(key, None)
+        self._save_state()
 
     # ─────────────────────────────────────────────────────────────
     # 基础距离
@@ -281,7 +312,7 @@ class AdaptiveTpSlEngine:
         """波动率得分映射到 ATR 比率，波动越大 SL/TP 越宽（SL 更敏感）。"""
         vol_ratio = _clamp(1.0 + _clamp(vol_score, -1.0, 1.0), 0.5, 2.0)
         sl_mult = vol_ratio
-        tp_mult = 1.0 + (vol_ratio - 1.0) * 0.8
+        tp_mult = 1.0 + (vol_ratio - 1.0) * self._vol_tp_sensitivity
         meta = {"vol_score": round(_clamp(vol_score, -1.0, 1.0), 4), "vol_ratio": round(vol_ratio, 4),
                 "sl_mult": round(sl_mult, 4), "tp_mult": round(tp_mult, 4)}
         return sl_mult, tp_mult, meta
@@ -298,22 +329,22 @@ class AdaptiveTpSlEngine:
 
         if regime_name in ("trend_bullish", "trend_bearish"):
             sl_mult = 1.0
-            tp_mult = 1.0 + 0.2 * s          # 趋势：让利润奔跑
+            tp_mult = 1.0 + self._regime_trend_tp_boost * s          # 趋势：让利润奔跑
             reason = f"trend regime (strength={strength:.2f}) widens TP"
         elif regime_name == "range_bound":
-            sl_mult = 1.0 - 0.1 * s
-            tp_mult = 1.0 - 0.2 * s          # 震荡：均值回归，收紧止盈
+            sl_mult = 1.0 - self._regime_range_sl_tighten * s
+            tp_mult = 1.0 - self._regime_range_tp_tighten * s          # 震荡：均值回归，收紧止盈
             reason = f"range regime (strength={strength:.2f}) tightens TP"
         elif regime_name == "extreme_volatility":
-            sl_mult = 1.0 + 0.3 * s
-            tp_mult = 1.0 + 0.1 * s          # 极端波动：放宽止损防洗盘
+            sl_mult = 1.0 + self._regime_extreme_sl_widen * s
+            tp_mult = 1.0 + self._regime_extreme_tp_widen * s          # 极端波动：放宽止损防洗盘
             reason = f"extreme volatility (strength={strength:.2f}) widens SL"
         elif regime_name == "funding_crush":
             sl_mult = 1.0
-            tp_mult = 1.0 - 0.2 * s          # 高费率：缩短持仓，收紧止盈
+            tp_mult = 1.0 - self._regime_funding_tp_tighten * s          # 高费率：缩短持仓，收紧止盈
             reason = f"funding crush (strength={strength:.2f}) tightens TP"
         elif regime_name == "liquidity_crisis":
-            sl_mult = 1.0 + 0.2 * s          # 流动性差：放宽止损缓冲滑点
+            sl_mult = 1.0 + self._regime_liquidity_sl_widen * s          # 流动性差：放宽止损缓冲滑点
             tp_mult = 1.0
             reason = f"liquidity crisis (strength={strength:.2f}) widens SL"
         else:
@@ -334,14 +365,14 @@ class AdaptiveTpSlEngine:
         # 胜率：0% → sl_mult 0.8（收紧），100% → sl_mult 1.1（略放宽）
         sl_mult = 0.8 + 0.3 * win_rate
         # 盈亏比：pf=1.0 中性；pf 越低越需要放大止盈
-        if profit_factor >= 1.5:
-            tp_mult = 1.1
-        elif profit_factor >= 1.0:
-            tp_mult = 1.0
+        if profit_factor >= self._perf_high_pf_threshold:
+            tp_mult = self._perf_high_pf_tp_mult
+        elif profit_factor >= self._perf_mid_pf_threshold:
+            tp_mult = self._perf_mid_pf_tp_mult
         elif profit_factor >= 0.7:
-            tp_mult = 1.2
+            tp_mult = self._perf_low_pf_tp_mult
         else:
-            tp_mult = 1.3
+            tp_mult = self._perf_very_low_pf_tp_mult
 
         meta = {"win_rate": round(win_rate, 4), "profit_factor": round(profit_factor, 4),
                 "sl_mult": round(sl_mult, 4), "tp_mult": round(tp_mult, 4),
@@ -397,6 +428,7 @@ class AdaptiveTpSlEngine:
             sl_mult = 0.7
 
         self._protection_state[key] = new_mode
+        self._save_state()
 
         meta = {
             "profit_pct": round(profit_pct, 6),
@@ -419,12 +451,14 @@ class AdaptiveTpSlEngine:
         prev = self._smoothed.get(key)
         if prev is None:
             self._smoothed[key] = {"sl_pct": sl_pct, "tp_pct": tp_pct}
+            self._save_state()
             return sl_pct, tp_pct, False
 
         alpha = self._smoothing_alpha
         new_sl = alpha * sl_pct + (1.0 - alpha) * prev["sl_pct"]
         new_tp = alpha * tp_pct + (1.0 - alpha) * prev["tp_pct"]
         self._smoothed[key] = {"sl_pct": new_sl, "tp_pct": new_tp}
+        self._save_state()
         return new_sl, new_tp, True
 
     # ─────────────────────────────────────────────────────────────
@@ -500,3 +534,36 @@ class AdaptiveTpSlEngine:
         if profit_pct < -0.05:
             return "close"
         return "hold"
+
+    # ─────────────────────────────────────────────────────────────
+    # P0-3: 状态持久化（跨重启保留 EMA 平滑 + 保护态）
+    # ─────────────────────────────────────────────────────────────
+
+    def _load_state(self):
+        """从 JSON 文件加载平滑/保护态（启动时调用）"""
+        try:
+            if not os.path.exists(self._state_file):
+                return
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._protection_state = data.get("protection_state", {})
+            self._smoothed = data.get("smoothed", {})
+            logger.info(f"AdaptiveTpSlEngine state loaded: {len(self._protection_state)} protection, {len(self._smoothed)} smoothed")
+        except Exception as e:
+            logger.error(f"Failed to load AdaptiveTpSlEngine state: {e}")
+
+    def _save_state(self):
+        """将平滑/保护态持久化到 JSON 文件（状态变更后调用，P1-3: 原子写入防崩溃损坏）"""
+        try:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            data = {
+                "protection_state": self._protection_state,
+                "smoothed": self._smoothed,
+            }
+            # P1-3: 原子写入 — 先写临时文件，再原子替换，防止写入中途崩溃导致文件损坏
+            tmp_file = self._state_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, self._state_file)
+        except Exception as e:
+            logger.error(f"Failed to save AdaptiveTpSlEngine state: {e}")

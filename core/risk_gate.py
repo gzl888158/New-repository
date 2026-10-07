@@ -195,8 +195,15 @@ class PreTradeRiskChecker:
             )
 
         order_value = order_qty * order_price
-        leverage = safe_float(signal.get("leverage"), 1.0)
-        margin_required = safe_div(order_value, leverage, order_value) if leverage > 0 else order_value
+        raw_leverage = signal.get("leverage")
+        leverage = safe_float(raw_leverage, None)
+        if leverage is None or leverage <= 0:
+            return RiskCheckResult(
+                RiskLayer.L1_PRE_TRADE, False, RiskAction.REJECT,
+                f"杠杆值非法: leverage={raw_leverage!r}",
+                {"leverage": raw_leverage}
+            )
+        margin_required = safe_div(order_value, leverage, order_value)
         
         if margin_required > available_margin:
             return RiskCheckResult(

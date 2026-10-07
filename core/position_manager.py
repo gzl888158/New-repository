@@ -1041,8 +1041,11 @@ class PositionManager:
                 "timestamp": datetime.now().isoformat(),
             }
 
-            with open(self._persist_file, "w", encoding="utf-8") as f:
+            # P1-3: 原子写入 — 先写临时文件，再原子替换，防止写入中途崩溃导致持仓状态损坏
+            tmp_file = self._persist_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_file, self._persist_file)
 
             logger.debug(f"Position state saved: {len(self._positions)} positions")
 

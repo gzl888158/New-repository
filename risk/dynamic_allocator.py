@@ -346,6 +346,11 @@ class DynamicAllocator:
         # 本轮处于「缩量试探」的策略集合（由 _evaluate_strategy_priorities 填充，供瀑布缩量使用）
         self._probing_strategies: set = set()
 
+        # ── 试探→正常渐变恢复（避免权重跳变） ──
+        self._ramp_up_steps = max(1, int(_safe_float(freeze_cfg.get("ramp_up_steps"), 5)))
+        # {strategy: {exited_probing_at, current_step, target_weight}}
+        self._ramp_up_state: Dict[str, Dict[str, Any]] = {}
+
         # ── 外部依赖（延迟注入） ──
         self._portfolio_optimizer = None
         self._performance_provider: Optional[Callable] = None
@@ -608,8 +613,15 @@ class DynamicAllocator:
 
             # 不满足冻结条件（或试探期已恢复）：清除冻结状态，走正常评估
             if name in self._freeze_state:
+                was_probing = bool(self._freeze_state.get(name, {}).get("probing"))
                 logger.info(f"[FreezePolicy] {name} 已恢复（不再满足冻结条件），解除冻结")
                 self._freeze_state.pop(name, None)
+                if was_probing:
+                    # 标记曾处于试探期，供瀑布分配启动渐变恢复
+                    self._ramp_up_state[name] = {
+                        "current_step": 0,
+                        "started_at": datetime.now().isoformat(),
+                    }
 
             # 交易数不足 → 最低优先级但不冻结
             # 正收益高盈亏比策略放宽门槛（已证明正期望，避免样本略不足即降为 LOW）
@@ -909,6 +921,21 @@ class DynamicAllocator:
                 # 冻结策略缩量试探：权重再打折，控制试探风险
                 if name in self._probing_strategies:
                     target_w = self._min_single_weight * self._probe_weight_ratio
+                    # 清除可能残留的 ramp-up 状态（重新进入试探）
+                    self._ramp_up_state.pop(name, None)
+
+            # 试探→正常渐变恢复：退出试探后不直接跳到满权重，逐步递增
+            if name not in self._probing_strategies and name in self._ramp_up_state:
+                rs = self._ramp_up_state[name]
+                step = rs["current_step"]
+                if step < self._ramp_up_steps:
+                    probe_w = self._min_single_weight * self._probe_weight_ratio
+                    full_w = target_w
+                    progress = (step + 1) / self._ramp_up_steps
+                    target_w = probe_w + (full_w - probe_w) * progress
+                    rs["current_step"] = step + 1
+                else:
+                    self._ramp_up_state.pop(name, None)
 
             # 市场状态微调
             target_w = self._regime_weight_adj(target_w, regime, priority)

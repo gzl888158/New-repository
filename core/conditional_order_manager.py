@@ -75,6 +75,8 @@ class ConditionalOrderManager:
         # algo 触发成交落库：由 scheduler 注入，未注入时降级为跳过落库（不阻塞同步）
         self._fill_quality_tracker = None
         self._trade_journal = None
+        # P1-5: 自适应止盈止损引擎，由 scheduler 注入，未注入时降级为使用静态TP计算
+        self._adaptive_tp_sl_engine = None
 
         self._retry_interval = 5  # 重试间隔（秒）
         self._max_retries = 3     # 最大重试次数
@@ -86,7 +88,8 @@ class ConditionalOrderManager:
         # 同步/心跳间隔从配置读取，支持运行时调参
         cond_cfg = config.get("conditional_order", {})
         self._sync_interval_sec = int(cond_cfg.get("sync_interval_sec", 15))
-        self._heartbeat_interval_sec = int(cond_cfg.get("heartbeat_interval_sec", 45))
+        # P1-2: 心跳间隔从 45s 缩短到 15s，减少条件单丢失的检测延迟
+        self._heartbeat_interval_sec = int(cond_cfg.get("heartbeat_interval_sec", 15))
 
         # 审计日志
         self._audit_log: List[Dict[str, Any]] = []  # 最多 500 条
@@ -110,10 +113,19 @@ class ConditionalOrderManager:
         self._heartbeat_restored_count = 0
         self._sync_operations_count = 0
 
+        # P2-2: TP/SL pipeline metrics
+        self._placement_latencies: List[float] = []  # 最近 N 次下单耗时（秒）
+        self._placement_latencies_max = 50  # 保留最近 50 次
+        self._heartbeat_restore_latencies: List[float] = []  # 最近 N 次心跳恢复耗时
+        self._heartbeat_restore_latencies_max = 20
+        self._last_heartbeat_at: Optional[float] = None
+        self._last_heartbeat_duration: Optional[float] = None
+
         # 企业级强化：下单失败熔断器（连续失败达阈值暂停下单，冷却后自动恢复）
-        self._circuit_open = False          # 熔断器是否打开（打开时拒绝新挂单）
-        self._circuit_opened_at = 0.0       # 熔断打开时间戳
-        self._consecutive_failures = 0      # 连续下单失败计数
+        # P1-4: 改为按品种维度熔断，避免单品种故障拖累全局交易
+        self._circuit_open: Dict[str, bool] = {}          # 熔断器是否打开（key: symbol）
+        self._circuit_opened_at: Dict[str, float] = {}    # 熔断打开时间戳（key: symbol）
+        self._consecutive_failures: Dict[str, int] = {}   # 连续下单失败计数（key: symbol）
         self._circuit_threshold = 10        # 连续失败 N 次触发熔断
         self._circuit_cooldown = 300        # 熔断冷却时间（秒）
 
@@ -128,6 +140,10 @@ class ConditionalOrderManager:
     def set_trade_journal(self, trade_journal):
         """注入交易日志，用于 algo 触发成交落库 trade_records/trades 对齐。"""
         self._trade_journal = trade_journal
+
+    def set_adaptive_tp_sl_engine(self, engine):
+        """P1-5: 注入自适应止盈止损引擎，用于心跳恢复时使用当前自适应TP水平"""
+        self._adaptive_tp_sl_engine = engine
 
     def _save_active_orders(self):
         """原子写入条件单状态到文件（使用线程锁防止并发写竞态）
@@ -561,7 +577,7 @@ class ConditionalOrderManager:
             clordid = self._gen_algo_cl_ord_id(symbol, side, "stop_loss", trigger_price)
 
             # 企业级强化：熔断器（连续失败暂停下单）与防重（同一持仓方向仅一张止损）
-            if not self._circuit_breaker_allows():
+            if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing SL for {symbol}")
                 return None
             if self._has_active_order(symbol, side, "stop_loss"):
@@ -581,6 +597,8 @@ class ConditionalOrderManager:
                     logger.warning(f"Skip placing SL for existing position {symbol}: would immediately trigger")
                     return None
 
+            # P2-2: 记录下单耗时
+            placement_start = time.time()
             result = self._okx_client.place_order(
                 symbol=symbol,
                 side=close_side,
@@ -593,6 +611,10 @@ class ConditionalOrderManager:
                 conditional_type="stop_loss",
                 clOrdId=clordid
             )
+            placement_latency = time.time() - placement_start
+            self._placement_latencies.append(placement_latency)
+            if len(self._placement_latencies) > self._placement_latencies_max:
+                self._placement_latencies.pop(0)
 
             if result and not result.get("_failed"):
                 order_id = result.get("algoId", "") or result.get("ordId", "")
@@ -609,14 +631,16 @@ class ConditionalOrderManager:
                     }
                     self._save_active_orders()
                     self._placed_count += 1
-                    self._record_placement_success()
+                    self._record_placement_success(symbol)
                     self._add_audit_entry("place_stop_loss", symbol, order_id,
                                           {"price": trigger_price, "quantity": quantity, "side": side})
                     logger.info(f"Stop loss placed for {symbol}: {trigger_price:.4f} (algoId={order_id})")
+                    # P1-6: 异步验证条件单是否真的在交易所激活
+                    asyncio.create_task(self._validate_placement_async(symbol, order_id, "stop_loss"))
                     return order_id
                 # 成功但无 order_id（API 返回格式变化），保守按失败处理
                 self._failed_placement_count += 1
-                self._record_placement_failure()
+                self._record_placement_failure(symbol)
                 logger.warning(f"Stop loss placed but no algoId returned: {result}")
             else:
                 # 失败：先检查特殊错误码
@@ -656,7 +680,7 @@ class ConditionalOrderManager:
                                 }
                                 self._save_active_orders()
                                 self._placed_count += 1
-                                self._record_placement_success()
+                                self._record_placement_success(symbol)
                                 self._add_audit_entry("place_stop_loss", symbol, order_id,
                                                       {"price": trigger_price, "quantity": quantity, "side": side})
                                 logger.info(f"Stop loss placed after 51261 cleanup for {symbol}: {trigger_price:.4f}")
@@ -664,7 +688,7 @@ class ConditionalOrderManager:
                 
                 # 网络/限流类进重试队列，参数错误直接记 failed_orders
                 self._failed_placement_count += 1
-                self._record_placement_failure()
+                self._record_placement_failure(symbol)
                 self._queue_failed_order("pending_sl", symbol, side, "stop_loss",
                                          trigger_price, quantity, leverage, clordid, result)
 
@@ -672,7 +696,7 @@ class ConditionalOrderManager:
         except Exception as e:
             self._categorize_error(e)
             self._failed_placement_count += 1
-            self._record_placement_failure()
+            self._record_placement_failure(symbol)
             logger.error(f"Failed to place stop loss: {e}")
             self._queue_failed_order("pending_sl", symbol, side, "stop_loss",
                                      trigger_price, quantity, leverage, clordid,
@@ -687,7 +711,7 @@ class ConditionalOrderManager:
             clordid = self._gen_algo_cl_ord_id(symbol, side, "take_profit", trigger_price)
 
             # 企业级强化：熔断器 + 防重（分段止盈按价位去重，仅拦截完全相同的重复单）
-            if not self._circuit_breaker_allows():
+            if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing TP for {symbol}")
                 return None
             if self._has_active_order(symbol, side, "take_profit", trigger_price):
@@ -701,6 +725,8 @@ class ConditionalOrderManager:
                 logger.warning(f"Skip placing TP for {symbol}: invalid price {trigger_price} vs market")
                 return None
 
+            # P2-2: 记录下单耗时
+            placement_start = time.time()
             result = self._okx_client.place_order(
                 symbol=symbol,
                 side=close_side,
@@ -713,6 +739,10 @@ class ConditionalOrderManager:
                 conditional_type="take_profit",
                 clOrdId=clordid
             )
+            placement_latency = time.time() - placement_start
+            self._placement_latencies.append(placement_latency)
+            if len(self._placement_latencies) > self._placement_latencies_max:
+                self._placement_latencies.pop(0)
 
             if result and not result.get("_failed"):
                 order_id = result.get("algoId", "") or result.get("ordId", "")
@@ -728,14 +758,16 @@ class ConditionalOrderManager:
                     }
                     self._save_active_orders()
                     self._placed_count += 1
-                    self._record_placement_success()
+                    self._record_placement_success(symbol)
                     self._add_audit_entry("place_take_profit", symbol, order_id,
                                           {"price": trigger_price, "quantity": quantity, "side": side})
                     logger.info(f"Take profit placed for {symbol}: {trigger_price:.4f} (algoId={order_id})")
+                    # P1-6: 异步验证条件单是否真的在交易所激活
+                    asyncio.create_task(self._validate_placement_async(symbol, order_id, "take_profit"))
                     return order_id
                 # 成功但无 order_id（API 返回格式变化），保守按失败处理
                 self._failed_placement_count += 1
-                self._record_placement_failure()
+                self._record_placement_failure(symbol)
                 logger.warning(f"Take profit placed but no algoId returned: {result}")
             else:
                 # 失败：先检查特殊错误码
@@ -773,7 +805,7 @@ class ConditionalOrderManager:
                                 }
                                 self._save_active_orders()
                                 self._placed_count += 1
-                                self._record_placement_success()
+                                self._record_placement_success(symbol)
                                 self._add_audit_entry("place_take_profit", symbol, order_id,
                                                       {"price": trigger_price, "quantity": quantity, "side": side})
                                 logger.info(f"Take profit placed after 51261 cleanup for {symbol}: {trigger_price:.4f}")
@@ -781,7 +813,7 @@ class ConditionalOrderManager:
                 
                 # 网络/限流类进重试队列，参数错误直接记 failed_orders
                 self._failed_placement_count += 1
-                self._record_placement_failure()
+                self._record_placement_failure(symbol)
                 self._queue_failed_order("pending_tp", symbol, side, "take_profit",
                                          trigger_price, quantity, leverage, clordid, result)
 
@@ -789,7 +821,7 @@ class ConditionalOrderManager:
         except Exception as e:
             self._categorize_error(e)
             self._failed_placement_count += 1
-            self._record_placement_failure()
+            self._record_placement_failure(symbol)
             logger.error(f"Failed to place take profit: {e}")
             self._queue_failed_order("pending_tp", symbol, side, "take_profit",
                                      trigger_price, quantity, leverage, clordid,
@@ -928,6 +960,31 @@ class ConditionalOrderManager:
                 return False
         except Exception as e:
             logger.error(f"Failed to cancel conditional order: {e}")
+            return False
+
+    def has_active_conditional_orders(self, symbol: str, order_type: str = None) -> bool:
+        """P0-4: 检查指定品种是否有活跃的条件单（用于防止双重触发）
+        
+        Args:
+            symbol: 品种名称
+            order_type: 可选，过滤条件单类型（"stop_loss" / "take_profit" / None 表示任意）
+        
+        Returns:
+            bool: 是否有活跃的条件单
+        """
+        try:
+            for order_id, order_info in self._active_orders.items():
+                if order_info["symbol"] != symbol:
+                    continue
+                if order_type:
+                    # 检查条件单的 type 字段
+                    if order_info.get("type") == order_type:
+                        return True
+                else:
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking active conditional orders for {symbol}: {e}")
             return False
 
     def cancel_all_conditional_orders(self, symbol: str = None):
@@ -1304,35 +1361,65 @@ class ConditionalOrderManager:
             self._failed_orders[failed_id] = entry
             logger.warning(f"{order_type} placement rejected (non-retryable): {symbol} sCode={s_code} sMsg={s_msg}")
 
-    def _circuit_breaker_allows(self) -> bool:
-        """熔断器检查：打开且未过冷却期则拒绝下单。"""
-        if not self._circuit_open:
+    def _circuit_breaker_allows(self, symbol: str) -> bool:
+        """P1-4: 按品种熔断器检查：打开且未过冷却期则拒绝该品种下单。"""
+        if not self._circuit_open.get(symbol, False):
             return True
-        if time.time() - self._circuit_opened_at >= self._circuit_cooldown:
+        if time.time() - self._circuit_opened_at.get(symbol, 0) >= self._circuit_cooldown:
             # 冷却期结束，自动恢复
-            self._circuit_open = False
-            self._consecutive_failures = 0
-            logger.info("Conditional order circuit breaker recovered (cooldown elapsed)")
+            self._circuit_open[symbol] = False
+            self._consecutive_failures[symbol] = 0
+            logger.info(f"Conditional order circuit breaker recovered for {symbol} (cooldown elapsed)")
             return True
         return False
 
-    def _record_placement_failure(self):
-        """记录一次下单失败，达到阈值则打开熔断器。"""
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self._circuit_threshold and not self._circuit_open:
-            self._circuit_open = True
-            self._circuit_opened_at = time.time()
+    def _record_placement_failure(self, symbol: str):
+        """P1-4: 记录一次品种级下单失败，达到阈值则打开该品种熔断器。"""
+        self._consecutive_failures[symbol] = self._consecutive_failures.get(symbol, 0) + 1
+        failures = self._consecutive_failures[symbol]
+        if failures >= self._circuit_threshold and not self._circuit_open.get(symbol, False):
+            self._circuit_open[symbol] = True
+            self._circuit_opened_at[symbol] = time.time()
             logger.error(
-                f"Conditional order circuit breaker OPEN after {self._consecutive_failures} "
+                f"Conditional order circuit breaker OPEN for {symbol} after {failures} "
                 f"consecutive failures (cooldown {self._circuit_cooldown}s)"
             )
 
-    def _record_placement_success(self):
-        """下单成功时重置连续失败计数并关闭熔断器。"""
-        self._consecutive_failures = 0
-        if self._circuit_open:
-            self._circuit_open = False
-            logger.info("Conditional order circuit breaker closed after successful placement")
+    def _record_placement_success(self, symbol: str):
+        """P1-4: 品种级下单成功时重置该品种连续失败计数并关闭熔断器。"""
+        self._consecutive_failures[symbol] = 0
+        if self._circuit_open.get(symbol, False):
+            self._circuit_open[symbol] = False
+            logger.info(f"Conditional order circuit breaker closed for {symbol} after successful placement")
+
+    async def _validate_placement_async(self, symbol: str, order_id: str, order_type: str):
+        """P1-6: 异步验证条件单是否真的在交易所激活（不阻塞主流程）"""
+        try:
+            # 延迟1秒检查，给交易所时间处理
+            await asyncio.sleep(1.0)
+            
+            # 查询交易所algo订单
+            exchange_orders = self._okx_client.get_algo_orders()
+            if not exchange_orders:
+                logger.warning(f"P1-6: Cannot validate {order_type} {order_id} for {symbol} — no exchange orders returned")
+                return
+            
+            # 检查我们的订单是否在活跃列表中
+            found = False
+            for order in exchange_orders:
+                if order.get("algoId") == order_id:
+                    state = order.get("state", "")
+                    if state == "live":
+                        found = True
+                        logger.debug(f"P1-6: Validated {order_type} {order_id} for {symbol} is active on exchange")
+                    else:
+                        logger.warning(f"P1-6: {order_type} {order_id} for {symbol} has unexpected state: {state}")
+                    break
+            
+            if not found:
+                logger.warning(f"P1-6: {order_type} {order_id} for {symbol} not found in exchange active orders — may have been rejected")
+        except Exception as e:
+            logger.error(f"P1-6: Failed to validate {order_type} {order_id} for {symbol}: {e}")
 
     async def place_move_stop(self, symbol: str, side: str, quantity: float,
                               trigger_price: float, callback_rate: float,
@@ -1348,7 +1435,7 @@ class ConditionalOrderManager:
             close_side = "sell" if side == "long" else "buy"
 
             # 企业级强化：熔断器 + 防重（同一持仓方向仅一张移动止损）
-            if not self._circuit_breaker_allows():
+            if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing move_stop for {symbol}")
                 return None
             if self._has_active_order(symbol, side, "move_stop"):
@@ -1384,7 +1471,7 @@ class ConditionalOrderManager:
                     }
                     self._save_active_orders()
                     self._placed_count += 1
-                    self._record_placement_success()
+                    self._record_placement_success(symbol)
                     self._add_audit_entry("place_move_stop", symbol, order_id,
                                           {"trigger_price": trigger_price, "callback_rate": callback_rate,
                                            "quantity": quantity, "side": side})
@@ -1392,18 +1479,18 @@ class ConditionalOrderManager:
                     return order_id
                 # 成功但无 order_id（API 返回格式变化），保守按失败处理
                 self._failed_placement_count += 1
-                self._record_placement_failure()
+                self._record_placement_failure(symbol)
                 logger.warning(f"Move stop placed but no algoId returned: {result}")
             else:
                 self._failed_placement_count += 1
-                self._record_placement_failure()
+                self._record_placement_failure(symbol)
                 logger.warning(f"Move stop placement failed: {symbol} "
                                f"sCode={(result or {}).get('sCode')} sMsg={(result or {}).get('sMsg')}")
             return None
         except Exception as e:
             self._categorize_error(e)
             self._failed_placement_count += 1
-            self._record_placement_failure()
+            self._record_placement_failure(symbol)
             logger.error(f"Failed to place move stop: {e}")
             return None
 
@@ -1526,6 +1613,11 @@ class ConditionalOrderManager:
         """
         if not self._heartbeat_enabled:
             return 0
+        
+        # P2-2: 记录心跳检测开始时间
+        heartbeat_start = time.time()
+        self._last_heartbeat_at = heartbeat_start
+        
         try:
             positions = self._okx_client.get_positions()
             # None = 查询失败：跳过本轮心跳，避免在 API 不可用时误判无持仓
@@ -1589,7 +1681,34 @@ class ConditionalOrderManager:
                     if not has_tp:
                         avg_px = float(pos_data.get("avgPx", 0))
                         if avg_px > 0:
-                            tp_prices = self._calculate_tp_prices(pos_side, avg_px)
+                            # P1-5: 优先使用自适应TP水平，降级到静态计算
+                            tp_prices = None
+                            if hasattr(self, "_adaptive_tp_sl_engine") and self._adaptive_tp_sl_engine:
+                                try:
+                                    # 从自适应引擎获取当前TP水平
+                                    # 注意：这里需要知道direction和当前市场状态，从pos_data推断
+                                    direction = pos_side
+                                    current_price = float(pos_data.get("last", avg_px))
+                                    
+                                    # 调用自适应引擎计算TP（需要传入必要的状态）
+                                    # 这里简化处理：使用基础TP百分比
+                                    base_tp_pct = getattr(self._adaptive_tp_sl_engine, "_base_tp_pct", 0.06)
+                                    if direction == "long":
+                                        tp_price = avg_px * (1 + base_tp_pct)
+                                    else:
+                                        tp_price = avg_px * (1 - base_tp_pct)
+                                    
+                                    # 单级TP，100%仓位
+                                    tp_prices = [(tp_price, 1.0)]
+                                    logger.debug(f"P1-5: Using adaptive TP for {inst_id}: {tp_price:.4f}")
+                                except Exception as e:
+                                    logger.warning(f"P1-5: Failed to get adaptive TP for {inst_id}, falling back: {e}")
+                                    tp_prices = None
+                            
+                            # 降级：使用静态TP计算
+                            if tp_prices is None:
+                                tp_prices = self._calculate_tp_prices(pos_side, avg_px)
+                            
                             for tp_price, tp_ratio in tp_prices:
                                 stage_qty = pos_qty * tp_ratio
                                 # 转合约张数取整判断最小手数
@@ -1618,10 +1737,21 @@ class ConditionalOrderManager:
             if restored_count > 0:
                 logger.info(f"Heartbeat check: restored {restored_count} missing conditional orders (SL/TP)")
             self._heartbeat_restored_count += restored_count
+            
+            # P2-2: 记录心跳恢复耗时（仅当有恢复操作时）
+            heartbeat_duration = time.time() - heartbeat_start
+            self._last_heartbeat_duration = heartbeat_duration
+            if restored_count > 0:
+                self._heartbeat_restore_latencies.append(heartbeat_duration)
+                if len(self._heartbeat_restore_latencies) > self._heartbeat_restore_latencies_max:
+                    self._heartbeat_restore_latencies.pop(0)
+            
             return restored_count
 
         except Exception as e:
             logger.error(f"Heartbeat check failed: {e}")
+            # P2-2: 即使失败也记录耗时
+            self._last_heartbeat_duration = time.time() - heartbeat_start
             return 0
 
     # ==================== P2: 孤儿条件单清理 ====================
@@ -2169,11 +2299,17 @@ class ConditionalOrderManager:
             "uptime_human": self._format_uptime(uptime_seconds),
             # 错误分类
             "error_counts": dict(self._error_counts),
-            # 企业级强化：熔断器状态
+            # P1-4: 企业级强化：按品种熔断器状态
             "circuit_breaker": {
-                "open": self._circuit_open,
-                "opened_at": self._circuit_opened_at,
-                "consecutive_failures": self._consecutive_failures,
+                "open_symbols": [sym for sym, is_open in self._circuit_open.items() if is_open],
+                "per_symbol": {
+                    sym: {
+                        "open": self._circuit_open.get(sym, False),
+                        "opened_at": self._circuit_opened_at.get(sym, 0),
+                        "consecutive_failures": self._consecutive_failures.get(sym, 0),
+                    }
+                    for sym in set(list(self._circuit_open.keys()) + list(self._consecutive_failures.keys()))
+                },
                 "threshold": self._circuit_threshold,
                 "cooldown_seconds": self._circuit_cooldown,
             },

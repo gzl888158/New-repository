@@ -216,6 +216,10 @@ class TrendStrategy(PersistentStrategy):
         """注入StrategyCoordinator实例"""
         self._coordinator = coordinator
 
+    def set_conditional_order_manager(self, manager):
+        """注入ConditionalOrderManager实例，用于平仓时立即撤销条件单"""
+        self._conditional_order_manager = manager
+
     async def update_config(self, updates: Dict[str, Any]):
         """运行时热更新策略配置（不重启策略）
 
@@ -2122,7 +2126,17 @@ class TrendStrategy(PersistentStrategy):
             await self._check_addition(symbol, current_price)
             await self._check_multiple_take_profit(symbol, current_price)
             await self._check_take_profit(symbol, current_price)
-            await self._check_stop_loss(symbol, current_price)
+            
+            # P0-4: 双重触发协调 — 如果交易所侧已有活跃的条件止损单，跳过策略级止损检查
+            # 防止策略级轮询和交易所条件单同时触发导致双重平仓
+            if hasattr(self, "_conditional_order_manager") and self._conditional_order_manager:
+                if self._conditional_order_manager.has_active_conditional_orders(symbol, "stop_loss"):
+                    logger.debug(f"P0-4: Skipping strategy SL check for {symbol} — exchange conditional SL active")
+                else:
+                    await self._check_stop_loss(symbol, current_price)
+            else:
+                await self._check_stop_loss(symbol, current_price)
+            
             await self._check_trailing_stop(symbol, current_price)
             await self._check_trend_reversal(symbol, current_price)
             await self._check_time_exit(symbol, current_price)
@@ -2845,6 +2859,13 @@ class TrendStrategy(PersistentStrategy):
                         f"Trend close skipped: {symbol} held {hold_seconds:.0f}s < min_hold {self._min_hold_minutes}min"
                     )
                     return
+        # P0-1: 平仓前立即撤销该品种的所有条件单（TP/SL），防止平仓后120s内条件单仍挂在网上
+        if hasattr(self, "_conditional_order_manager") and self._conditional_order_manager:
+            try:
+                self._conditional_order_manager.cancel_all_conditional_orders(symbol)
+                logger.debug(f"P0-1: Canceled conditional orders for {symbol} before close")
+            except Exception as e:
+                logger.error(f"P0-1: Failed to cancel conditional orders for {symbol}: {e}")
         await self._close_partial(symbol, state["current_quantity"])
         # P0: 保留 "reversed" 状态，不覆盖为 "closed"，以便 get_stats 区分正常平仓和反转平仓
         if state.get("status") != "reversed":

@@ -288,6 +288,7 @@ class StrategyManager:
         self._intelligent_agent = services.get("intelligent_agent", self._intelligent_agent)
         self._mini_backtester = services.get("mini_backtester", self._mini_backtester)
         self._stress_test_engine = services.get("stress_test_engine", self._stress_test_engine)
+        self._conditional_order_manager = services.get("conditional_order_manager", getattr(self, "_conditional_order_manager", None))
         self._account_manager = services.get("account_manager", self._account_manager)
         logger.debug(f"StrategyManager: services injected (coordinator={self._coordinator is not None}, "
                      f"adaptive={self._adaptive_controller is not None}, "
@@ -570,6 +571,7 @@ class StrategyManager:
             "stop_loss_manager": self._stop_loss_manager,
             "coordinator": self._coordinator,
             "market_regime_engine": self._market_regime_engine,
+            "conditional_order_manager": getattr(self, "_conditional_order_manager", None),
         }
         all_deps.update(dependencies)
 
@@ -605,6 +607,7 @@ class StrategyManager:
             "adaptive_controller": self._adaptive_controller,
             "stop_loss_manager": self._stop_loss_manager,
             "coordinator": self._coordinator,
+            "conditional_order_manager": getattr(self, "_conditional_order_manager", None),
         }
         all_deps.update(dependencies)
 
@@ -661,6 +664,8 @@ class StrategyManager:
             instance.set_stop_loss_manager(self._stop_loss_manager)
         if self._coordinator and hasattr(instance, "set_coordinator"):
             instance.set_coordinator(self._coordinator)
+        if hasattr(self, "_conditional_order_manager") and self._conditional_order_manager and hasattr(instance, "set_conditional_order_manager"):
+            instance.set_conditional_order_manager(self._conditional_order_manager)
 
     def get_instance(self, name: str) -> Optional[Any]:
         """获取策略实例"""

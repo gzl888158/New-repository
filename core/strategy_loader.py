@@ -852,6 +852,7 @@ class StrategyFactory:
         "set_stop_loss_manager": "stop_loss_manager",
         "set_coordinator": "coordinator",
         "set_regime_engine": "market_regime_engine",
+        "set_conditional_order_manager": "conditional_order_manager",
     }
 
     def __init__(self, config: Dict[str, Any] = None):

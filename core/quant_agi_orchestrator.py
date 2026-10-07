@@ -32,7 +32,6 @@ from loguru import logger
 
 from decision.rl_agent import StateEncoding
 from risk.dynamic_allocator import MarketRegime
-from decision.rl_agent import StateEncoding
 from utils.helpers import safe_div, safe_finite, safe_float, safe_int
 
 # regime_engine 输出值 → DynamicAllocator 的 MarketRegime（仅编排映射，不重算）
@@ -334,6 +333,15 @@ class QuantAGIOrchestrator:
         self._simulation_fail_closed_streak = 0
         self._simulation_kill_switch_enabled = False
         self._simulation_kill_switch_reason = ""
+
+        # ── 循环失败熔断（cycle circuit breaker）──
+        # run_cycle 连续失败超过阈值时自停，防止静默持续异常
+        self._cycle_failure_streak = 0
+        self._cycle_failure_threshold = max(
+            3, safe_int(agi_cfg.get("cycle_failure_threshold"), 10)
+        )
+        self._cycle_halted = False
+        self._cycle_halt_reason = ""
 
         # ── 账户级收益检测自动平仓（profit_take）──
         # AGI 综合账户整体浮盈，达到阈值后生成 profit_take_close 动作，
@@ -2329,6 +2337,25 @@ class QuantAGIOrchestrator:
                     self._last_execution_result = copy.deepcopy(
                         self._execution_memory[-1].get("result")
                     )
+            sks = ls.get("simulation_kill_switch")
+            if isinstance(sks, dict) and sks.get("enabled"):
+                self._simulation_kill_switch_enabled = True
+                self._simulation_kill_switch_reason = str(sks.get("reason", "persisted_from_previous_session"))
+                self._simulation_fail_closed_streak = safe_int(sks.get("fail_closed_streak"), 0)
+                logger.warning(
+                    f"[AGI-Simulation] simulated Kill Switch restored from persistence: "
+                    f"reason={self._simulation_kill_switch_reason}, streak={self._simulation_fail_closed_streak}"
+                )
+            ccb = ls.get("cycle_circuit_breaker")
+            if isinstance(ccb, dict):
+                self._cycle_failure_streak = safe_int(ccb.get("failure_streak"), 0)
+                if ccb.get("halted"):
+                    self._cycle_halted = True
+                    self._cycle_halt_reason = str(ccb.get("halt_reason", "consecutive_cycle_failures"))
+                    logger.warning(
+                        f"[AGI] cycle circuit breaker restored: halted=True, "
+                        f"reason={self._cycle_halt_reason}, streak={self._cycle_failure_streak}"
+                    )
             logger.info("[AGI] learning state restored")
         except Exception as e:
             logger.debug(f"[AGI] load learning state failed: {e}")
@@ -2477,6 +2504,16 @@ class QuantAGIOrchestrator:
             "execution_memory": [
                 copy.deepcopy(item) for item in self._execution_memory
             ],
+            "simulation_kill_switch": {
+                "enabled": self._simulation_kill_switch_enabled,
+                "reason": self._simulation_kill_switch_reason,
+                "fail_closed_streak": int(self._simulation_fail_closed_streak),
+            },
+            "cycle_circuit_breaker": {
+                "failure_streak": int(self._cycle_failure_streak),
+                "halted": self._cycle_halted,
+                "halt_reason": self._cycle_halt_reason,
+            },
         }
 
     def _load_paused_strategies(self) -> None:
@@ -2624,6 +2661,30 @@ class QuantAGIOrchestrator:
 
         self._cycle_count += 1
 
+        # 循环熔断检查：连续失败超过阈值后拒绝执行
+        if self._cycle_halted:
+            report_halted: Dict[str, Any] = {
+                "decision_id": f"agi-halted-{self._cycle_count}",
+                "timestamp": datetime.now().isoformat(),
+                "cycle": self._cycle_count,
+                "status": "halted",
+                "cooldown": False,
+                "halt_reason": self._cycle_halt_reason,
+                "failure_streak": self._cycle_failure_streak,
+                "perception": {},
+                "diagnosis": {"alerts": []},
+                "decision": {"allocation_plan": None, "reallocation_suggestions": [],
+                             "market_regime": "unknown", "strategy_names": [], "strategy_metrics": {}},
+                "actions": [],
+                "projection": {},
+                "attribution": {},
+                "errors": [{"stage": "circuit_breaker", "type": "CycleHalted",
+                            "message": self._cycle_halt_reason}],
+                "reflection": {"health_score": 0.0, "health_grade": "HALTED",
+                               "alerts_count": 0, "cycle_summary": self._cycle_halt_reason},
+            }
+            return report_halted
+
         decision_id = f"agi-dec-{self._cycle_count}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         report: Dict[str, Any] = {
             "decision_id": decision_id,
@@ -2745,6 +2806,18 @@ class QuantAGIOrchestrator:
             report["actions"] = []
             report["timescale"] = self._last_timescale
             self._apply_simulation_safety(report)
+            # 循环失败熔断：decide 阶段 fail_closed 也算一次失败（仅内存计数，不持久化）
+            if report.get("errors"):
+                self._cycle_failure_streak += 1
+                if self._cycle_failure_streak >= self._cycle_failure_threshold:
+                    self._cycle_halted = True
+                    self._cycle_halt_reason = (
+                        f"consecutive_cycle_failures:{self._cycle_failure_streak}"
+                    )
+                    logger.error(
+                        f"[AGI] cycle circuit breaker tripped (decide fail_closed): "
+                        f"{self._cycle_failure_streak} consecutive failures"
+                    )
             report = self._sanitize(report)
             return report
 
@@ -2821,6 +2894,25 @@ class QuantAGIOrchestrator:
             report["decision_memory"] = [dict(m) for m in self._decision_memory]
         # 已暂停策略集合（sorted list 保证 JSON 可序列化，跨重启续用）
         report["paused_strategies"] = sorted(self._paused_strategies)
+
+        # 循环失败熔断：连续 fail_closed 且有 errors 时累计，超过阈值则自停
+        has_errors = bool(report.get("errors"))
+        is_fail_closed = report.get("status") == "fail_closed"
+        if has_errors and is_fail_closed:
+            self._cycle_failure_streak += 1
+            if self._cycle_failure_streak >= self._cycle_failure_threshold:
+                self._cycle_halted = True
+                self._cycle_halt_reason = (
+                    f"consecutive_cycle_failures:{self._cycle_failure_streak}"
+                )
+                logger.error(
+                    f"[AGI] cycle circuit breaker tripped: "
+                    f"{self._cycle_failure_streak} consecutive failures, "
+                    f"threshold={self._cycle_failure_threshold}"
+                )
+        else:
+            self._cycle_failure_streak = 0
+
         self._persist_state(report)
         self._append_decision_lineage(report)
         self._last_report = copy.deepcopy(report)
@@ -10797,6 +10889,13 @@ class QuantAGIOrchestrator:
         self._simulation_kill_switch_enabled = False
         self._simulation_kill_switch_reason = ""
         self._simulation_fail_closed_streak = 0
+
+    def reset_cycle_circuit_breaker(self) -> None:
+        """Reset the cycle failure circuit breaker after operator intervention."""
+        self._cycle_halted = False
+        self._cycle_halt_reason = ""
+        self._cycle_failure_streak = 0
+        logger.info("[AGI] cycle circuit breaker manually reset")
 
     def get_decision_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         """返回最近决策溯源历史（深拷贝，最新在前），供 Dashboard 回溯决策依据链。"""

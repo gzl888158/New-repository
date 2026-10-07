@@ -681,7 +681,12 @@ class TradingScheduler:
         self.risk_gate.set_position_manager(self.position_manager)
         # P0-手动平仓清理链：注册持仓移除回调，触发 OrderExecutor 清理止损/策略/状态
         self.position_manager.on_position_removal(self.order_executor.handle_position_removal)
-        logger.info("PositionManager initialized and connected to RiskGate + OrderExecutor removal callback")
+        # P1: position_ws 通道集成——WS 持仓数据直接驱动 PositionManager 增量更新
+        # 消除 REST 轮询间隔内的状态盲区，降低对账误报告警
+        self.okx_client.position_callback = self.position_manager.update_position_from_ws
+        # P1: 注入 PositionManager 到 OrderStateSynchronizer，用于对账时检查 WS 同步健康度
+        self.order_state_synchronizer.set_position_manager(self.position_manager)
+        logger.info("PositionManager initialized and connected to RiskGate + OrderExecutor removal callback + position_ws")
 
         # P1: 注入SQLite存储，持久化风控拦截事件到 risk_events 表（修复审计缺口）
         self.risk_gate.set_sqlite_storage(self.sqlite_storage)
@@ -5351,6 +5356,44 @@ class TradingScheduler:
                         elapsed = (now - last_signal.replace(tzinfo=None)).total_seconds()
                         if elapsed > heartbeat_timeout:
                             logger.warning(f"Strategy '{name}' heartbeat timeout: {elapsed:.0f}s since last signal")
+
+                # P0: 自动重试启动卡在 PREPARED 的策略（启动时被门禁拦截后无自动恢复，
+                # 当持仓/权益等条件改善时需重新尝试通过门禁）。
+                try:
+                    prepared = [
+                        name for name in self.strategy_manager.get_enabled_strategy_names()
+                        if self.strategy_manager.get_lifecycle_state(name) == StrategyLifecycle.PREPARED
+                    ]
+                    if prepared:
+                        logger.info(f"StrategyManager: retrying start for {len(prepared)} prepared strategies: {prepared}")
+                        for name in prepared:
+                            ok = await self.strategy_manager.start_strategy(name)
+                            if ok:
+                                logger.info(f"Strategy '{name}' auto-retry start succeeded -> RUNNING")
+                            else:
+                                logger.debug(f"Strategy '{name}' auto-retry start still blocked (will retry later)")
+                except Exception as e:
+                    logger.error(f"Strategy prepared-retry error: {e}")
+
+                # P1: 自动恢复被 AGI 暂停（PAUSED）的策略。
+                # 暂停 → 无交易 → 休眠(dormant) → AGI 再暂停 形成死锁；
+                # 这里给策略一次恢复交易的机会，首笔成交后 lifecycle_last_trade_age_hours 归零，
+                # 休眠状态自动解除。resume 同样经过 prelaunch_gate 兜底，安全。
+                try:
+                    paused = [
+                        name for name in self.strategy_manager.get_enabled_strategy_names()
+                        if self.strategy_manager.get_lifecycle_state(name) == StrategyLifecycle.PAUSED
+                    ]
+                    if paused:
+                        logger.info(f"StrategyManager: auto-resuming {len(paused)} paused strategies: {paused}")
+                        for name in paused:
+                            ok = await self.strategy_manager.resume_strategy(name)
+                            if ok:
+                                logger.info(f"Strategy '{name}' auto-resume succeeded -> RUNNING")
+                            else:
+                                logger.debug(f"Strategy '{name}' auto-resume blocked (will retry later)")
+                except Exception as e:
+                    logger.error(f"Strategy paused-resume error: {e}")
 
                 # 持久化状态
                 self.strategy_manager.persist_state()

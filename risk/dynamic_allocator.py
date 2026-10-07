@@ -326,6 +326,9 @@ class DynamicAllocator:
         self._probe_max_attempts = max(0, int(_safe_float(freeze_cfg.get("probe_max_attempts"), 3)))
         self._consecutive_loss_freeze = max(1, int(_safe_float(freeze_cfg.get("consecutive_loss_freeze"), 5)))
         self._max_drawdown_freeze = max(0.0, _safe_float(freeze_cfg.get("max_drawdown_freeze"), 0.15))
+        # P1: 永久冻结自动恢复——经过足够长的冷却期后，允许策略重新进入试探周期
+        # 避免策略因短期市场不适被永久冻结，需人工介入解冻
+        self._auto_recovery_seconds = max(0.0, _safe_float(freeze_cfg.get("auto_recovery_hours"), 24.0) * 3600.0)
         # 正收益高盈亏比策略（低胜率高盈亏比，回撤天然大）的回撤冻结阈值放宽
         self._positive_return_drawdown_freeze = max(
             self._max_drawdown_freeze,
@@ -726,6 +729,20 @@ class DynamicAllocator:
         probe_elapsed = now - _safe_float(state.get("probe_started_at"), now)
         if self._freeze_observe_seconds > 0 and probe_elapsed >= self._freeze_observe_seconds:
             if int(state.get("probe_attempts", 0)) >= self._probe_max_attempts:
+                # P1: 永久冻结自动恢复——冷却期足够长后，重置状态允许重新试探
+                # 避免策略因短期市场不适被永久冻结，需人工介入解冻
+                if self._auto_recovery_seconds > 0:
+                    total_frozen_duration = now - _safe_float(state.get("frozen_at"), now)
+                    if total_frozen_duration >= self._auto_recovery_seconds:
+                        logger.info(
+                            f"[FreezePolicy] {name} 永久冻结已超过 "
+                            f"{total_frozen_duration / 3600:.1f}h（阈值 {self._auto_recovery_seconds / 3600:.1f}h），"
+                            f"自动恢复，重新进入试探周期"
+                        )
+                        # 重置冻结状态，允许策略重新进入观察期→试探循环
+                        self._freeze_state.pop(name, None)
+                        # 递归调用重新进入首次冻结逻辑
+                        return self._resolve_frozen_strategy(name, m, reason)
                 logger.warning(
                     f"[FreezePolicy] {name} 试探 {self._probe_max_attempts} 次仍未恢复，"
                     f"永久冻结（需人工确认）"

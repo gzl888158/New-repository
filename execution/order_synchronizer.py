@@ -103,6 +103,7 @@ class OrderStateSynchronizer:
         self.config = config
         self.okx_client = okx_client
         self.alert_manager = alert_manager
+        self._position_manager = None  # 用于检查 WS 同步健康度
         
         sync_config = config.get("execution", {}).get("order_synchronizer") or {}
         if not isinstance(sync_config, dict):
@@ -112,6 +113,7 @@ class OrderStateSynchronizer:
         self._reconcile_interval = sync_config.get("reconcile_interval", 30)       # 对账间隔30秒
         self._max_order_age = sync_config.get("max_order_age_days", 7) * 86400     # 订单历史保留7天
         self._auto_repair = sync_config.get("auto_repair", True)                   # 对账差异自动修复（以交易所为准）
+        self._sync_grace_period = sync_config.get("sync_grace_period", 5.0)        # WS 同步宽限期（秒）
         
         # 本地订单缓存 {order_id: OrderInfo}
         self._orders: Dict[str, OrderInfo] = {}
@@ -168,6 +170,10 @@ class OrderStateSynchronizer:
         logger.info(f"OrderStateSynchronizer initialized: "
                    f"full_sync_interval={self._full_sync_interval}s, "
                    f"reconcile_interval={self._reconcile_interval}s")
+
+    def set_position_manager(self, position_manager):
+        """注入 PositionManager 用于检查 WS 同步健康度"""
+        self._position_manager = position_manager
 
     async def start(self):
         """启动同步器"""
@@ -417,18 +423,36 @@ class OrderStateSynchronizer:
                                   f"orders={len(result.order_mismatches)}, "
                                   f"positions={len(result.position_mismatches)}")
                     
-                    # 发送告警
+                    # 发送告警（但检查 WS 同步健康度，避免误报）
                     if self.alert_manager:
-                        await self.alert_manager.send_alert(
-                            "reconciliation_mismatch",
-                            f"对账发现差异: 订单{len(result.order_mismatches)}个, "
-                            f"持仓{len(result.position_mismatches)}个",
-                            severity="WARNING",
-                            metadata={
-                                "order_mismatches": len(result.order_mismatches),
-                                "position_mismatches": len(result.position_mismatches),
-                            }
-                        )
+                        # 如果持仓有差异但 position_ws 通道最近成功同步，可能是 REST 轮询时序差异，降级为 DEBUG
+                        should_alert = True
+                        if result.position_mismatches and self._position_manager and self._sync_engine:
+                            try:
+                                ws_health = self._sync_engine.get_channel_health("position_ws")
+                                if ws_health and ws_health.is_healthy:
+                                    # WS 通道健康，差异可能是时序问题，检查是否在宽限期内
+                                    time_since_sync = time.time() - (ws_health.last_success_time or 0)
+                                    if time_since_sync < self._sync_grace_period:
+                                        should_alert = False
+                                        logger.debug(
+                                            f"Reconciliation position mismatch suppressed: "
+                                            f"position_ws healthy (last sync {time_since_sync:.1f}s ago)"
+                                        )
+                            except Exception as e:
+                                logger.debug(f"Failed to check position_ws health: {e}")
+                        
+                        if should_alert:
+                            await self.alert_manager.send_alert(
+                                "reconciliation_mismatch",
+                                f"对账发现差异: 订单{len(result.order_mismatches)}个, "
+                                f"持仓{len(result.position_mismatches)}个",
+                                severity="WARNING",
+                                metadata={
+                                    "order_mismatches": len(result.order_mismatches),
+                                    "position_mismatches": len(result.position_mismatches),
+                                }
+                            )
                 
             except asyncio.CancelledError:
                 break

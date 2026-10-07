@@ -182,6 +182,10 @@ class PositionManager:
         self._margin_ratio_warning = rl_cfg.get("margin_ratio_warning", 0.5)
         self._margin_ratio_critical = rl_cfg.get("margin_ratio_critical", 0.3)
         self._position_loss_limit = rl_cfg.get("position_loss_limit", 0.1)
+        # 峰值权益衰减：当回撤持续超过阈值达指定时长后，重置峰值到当前权益，
+        # 避免历史高位永久卡死回撤计算导致持续 emergency 减仓死循环。
+        self._peak_decay_drawdown_threshold = rl_cfg.get("peak_decay_drawdown_threshold", 0.50)
+        self._peak_decay_after_hours = rl_cfg.get("peak_decay_after_hours", 24.0)
 
         # 动态调整配置
         da_cfg = pm_cfg.get("dynamic_adjust", {})
@@ -206,6 +210,7 @@ class PositionManager:
         # ── 账户风险 ──
         self._account_risk = AccountRiskSnapshot()
         self._peak_equity: float = 0.0
+        self._drawdown_high_since: float = 0.0  # 回撤首次超过衰减阈值的时间戳
         self._risk_events: List[RiskEvent] = []
         self._max_risk_events = 200
 
@@ -578,6 +583,7 @@ class PositionManager:
             return
 
         changed = False
+        failed_count = 0
         for data in ws_data:
             try:
                 symbol = data.get("instId", "")
@@ -628,14 +634,18 @@ class PositionManager:
                 self._positions[key] = snapshot
 
             except Exception as e:
+                failed_count += 1
                 logger.debug(f"WS position update error: {e}")
 
         if changed:
             self._notify_position_change()
 
-        # ── 企业级同步：记录 WS 通道同步事件 ──
-        self._record_sync_event("position_ws", success=True,
-                                entities=list(self._positions.keys()))
+        # ── 企业级同步：记录 WS 通道同步事件（区分成功/失败） ──
+        if failed_count > 0:
+            self._record_sync_event("position_ws", success=False, error=f"{failed_count} position updates failed")
+        else:
+            self._record_sync_event("position_ws", success=True,
+                                    entities=list(self._positions.keys()))
 
     # ═══════════════════════════════════════════════════════════════
     # 风险检查
@@ -723,6 +733,26 @@ class PositionManager:
             if self._peak_equity > 0:
                 drawdown = (self._peak_equity - total_eq) / self._peak_equity
                 self._account_risk.drawdown_pct = drawdown
+
+                # 峰值权益衰减：回撤持续超阈值达指定时长后重置峰值，
+                # 承认资金已进入新基准，避免永久 emergency 死循环。
+                now_ts = time.time()
+                if drawdown >= self._peak_decay_drawdown_threshold:
+                    if self._drawdown_high_since <= 0:
+                        self._drawdown_high_since = now_ts
+                    elif (now_ts - self._drawdown_high_since) >= self._peak_decay_after_hours * 3600:
+                        old_peak = self._peak_equity
+                        self._peak_equity = total_eq
+                        self._drawdown_high_since = 0.0
+                        self._account_risk.drawdown_pct = 0.0
+                        drawdown = 0.0
+                        logger.warning(
+                            f"Peak equity decayed: {old_peak:.2f} -> {total_eq:.2f} "
+                            f"(drawdown sustained >{self._peak_decay_drawdown_threshold:.0%} "
+                            f"for >{self._peak_decay_after_hours:.0f}h)"
+                        )
+                else:
+                    self._drawdown_high_since = 0.0
 
                 if drawdown >= self._drawdown_trigger:
                     self._account_risk.risk_level = RiskLevel.HIGH
@@ -984,6 +1014,7 @@ class PositionManager:
                     "position_count": self._account_risk.position_count,
                 },
                 "peak_equity": self._peak_equity,
+                "drawdown_high_since": self._drawdown_high_since,
                 "timestamp": datetime.now().isoformat(),
             }
 
@@ -1020,6 +1051,7 @@ class PositionManager:
             account_data = state.get("account_risk", {})
 
             self._peak_equity = state.get("peak_equity", 0.0)
+            self._drawdown_high_since = state.get("drawdown_high_since", 0.0)
 
             for key, data in positions_data.items():
                 try:

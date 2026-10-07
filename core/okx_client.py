@@ -3052,9 +3052,7 @@ class OKXClient:
                         self._ws_private_last_data = time.time()
                     if channel == "positions" and self.position_callback:
                         for pos in data.get("data", []):
-                            position = self._parse_position(pos)
-                            if position:
-                                asyncio.create_task(self._dispatch_position_callback(position))
+                            asyncio.create_task(self._dispatch_position_callback(pos))
                     elif channel == "orders" and self.order_callback:
                         for order in data.get("data", []):
                             asyncio.create_task(self._dispatch_order_callback(order))

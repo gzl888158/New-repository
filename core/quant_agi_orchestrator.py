@@ -10724,7 +10724,7 @@ class QuantAGIOrchestrator:
     # ─────────────────────────────────────────────────────────────
 
     def _persist_state(self, report: Dict[str, Any]) -> None:
-        """持久化闭环状态到 data/agi_orchestrator_state.json（fail-closed：失败仅记日志）。"""
+        """持久化闭环状态到 data/agi_orchestrator_state.json（atomic write，fail-closed）。"""
         try:
             state_dir = os.path.dirname(self.state_path)
             if state_dir:
@@ -10732,8 +10732,11 @@ class QuantAGIOrchestrator:
             state = dict(report)
             # 学习型状态（跨重启续用）：进攻归因/观察期冷却/利润峰值/健康度时序/突变冷却
             state["learning_state"] = self._serialize_learning_state()
-            with open(self.state_path, "w", encoding="utf-8") as f:
+            # Atomic write: write to temp file, then atomically replace
+            temp_path = f"{self.state_path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+            os.replace(temp_path, self.state_path)
             logger.debug(f"[AGI-Reflect] state persisted to {self.state_path}")
         except Exception as e:
             logger.error(f"[AGI-Reflect] state persist failed (fail-closed): {e}")

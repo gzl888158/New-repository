@@ -21,6 +21,7 @@ class GlobalRiskControl:
         self._max_drawdown = config["trading"]["max_drawdown"]
         self._daily_max_loss = config["trading"]["daily_max_loss"]
         self._hourly_max_loss = config["trading"]["hourly_max_loss"]
+        self._weekly_max_loss = config["trading"].get("weekly_max_loss", 0.06)
         
         self._margin_call_threshold = config["risk"]["margin_call_threshold"]
         self._margin_warning_threshold = config["risk"]["margin_warning_threshold"]
@@ -36,11 +37,14 @@ class GlobalRiskControl:
         self._current_equity = 0.0  # 当前权益（每次检查时更新，供导出使用）
         self._daily_start_equity = None
         self._hourly_start_equity = None
+        self._weekly_start_equity = None
         self._last_daily_reset_date = None
         self._last_hourly_reset = None
+        self._last_weekly_reset_isoweek = None
         
         self._daily_pnl = 0.0
         self._hourly_pnl = 0.0
+        self._weekly_pnl = 0.0
         
         self._consecutive_losses = 0
         self._last_loss_time = None
@@ -112,6 +116,7 @@ class GlobalRiskControl:
             self._initial_equity = account.total_equity
             self._daily_start_equity = account.total_equity
             self._hourly_start_equity = account.total_equity
+            self._weekly_start_equity = account.total_equity
 
             # 从数据库加载历史峰值权益
             self._peak_equity = account.total_equity
@@ -196,6 +201,7 @@ class GlobalRiskControl:
                 self._consecutive_losses = 0
                 self._daily_pnl = 0
                 self._hourly_pnl = 0
+                self._weekly_pnl = 0
                 self._tier_triggered = {1: False, 2: False, 3: False}
                 logger.info("Manual reset: pause cleared via risk_control.json")
                 try:
@@ -301,6 +307,7 @@ class GlobalRiskControl:
                 "max_drawdown": self._max_drawdown,
                 "daily_max_loss": self._daily_max_loss,
                 "hourly_max_loss": self._hourly_max_loss,
+                "weekly_max_loss": self._weekly_max_loss,
                 "is_paused": self._is_paused,
                 "pause_reason": self._pause_reason,
                 "pause_time": self._pause_time.isoformat() if self._pause_time else None,
@@ -314,6 +321,7 @@ class GlobalRiskControl:
                 "consecutive_losses": self._consecutive_losses,
                 "daily_pnl": self._daily_pnl,
                 "hourly_pnl": self._hourly_pnl,
+                "weekly_pnl": self._weekly_pnl,
                 "current_drawdown": (self._effective_peak - self._current_equity) / self._effective_peak if self._effective_peak > 0 else 0,
                 "last_update": datetime.now().isoformat(),
                 "process_running": True,
@@ -365,9 +373,15 @@ class GlobalRiskControl:
         if self._last_hourly_reset != current_hour:
             self._hourly_start_equity = equity
             self._last_hourly_reset = current_hour
+
+        current_isoweek = current_time.isocalendar()[:2]  # (year, week)
+        if self._last_weekly_reset_isoweek != current_isoweek:
+            self._weekly_start_equity = equity
+            self._last_weekly_reset_isoweek = current_isoweek
         
         self._daily_pnl = equity - self._daily_start_equity
         self._hourly_pnl = equity - self._hourly_start_equity
+        self._weekly_pnl = equity - self._weekly_start_equity
 
         # 保存当前权益，供导出使用
         self._current_equity = equity
@@ -435,6 +449,7 @@ class GlobalRiskControl:
         
         daily_loss_ratio = (self._daily_pnl / self._daily_start_equity) if self._daily_start_equity else 0.0
         hourly_loss_ratio = (self._hourly_pnl / self._hourly_start_equity) if self._hourly_start_equity else 0.0
+        weekly_loss_ratio = (self._weekly_pnl / self._weekly_start_equity) if self._weekly_start_equity else 0.0
         checks = [
             ("max_drawdown", drawdown >= self._max_drawdown, 
              f"Max drawdown {drawdown:.2%} exceeded threshold {self._max_drawdown:.2%} (peak={self._peak_equity:.2f}, current={equity:.2f})", self._handle_max_drawdown),
@@ -442,6 +457,8 @@ class GlobalRiskControl:
              f"Daily loss {self._daily_pnl:.2f} exceeded threshold {self._daily_max_loss:.2%}", self._handle_daily_loss),
             ("hourly_loss", hourly_loss_ratio <= -self._hourly_max_loss,
              f"Hourly loss {self._hourly_pnl:.2f} exceeded threshold {self._hourly_max_loss:.2%}", self._handle_hourly_loss),
+            ("weekly_loss", weekly_loss_ratio <= -self._weekly_max_loss,
+             f"Weekly loss {self._weekly_pnl:.2f} exceeded threshold {self._weekly_max_loss:.2%}", self._handle_weekly_loss),
         ]
         
         for check_name, condition, message, handler in checks:
@@ -621,12 +638,14 @@ class GlobalRiskControl:
     async def _handle_daily_loss(self):
         if self._alert_manager:
             asyncio.create_task(self._alert_manager.send_alert(
-                "DAILY_LOSS_LIMIT", "Daily max loss exceeded, stopping new positions",
+                "DAILY_LOSS_LIMIT", "Daily max loss exceeded, closing positions and stopping",
                 severity="CRITICAL", symbol="ALL"
             ))
-        logger.critical("Daily max loss exceeded, stopping new positions")
+        logger.critical("Daily max loss exceeded, closing all positions and stopping")
+        await self._reduce_all_positions(1.0, "daily_loss_circuit_breaker")
         self._is_paused = True
         self._pause_reason = "Daily max loss exceeded"
+        self._pause_time = datetime.now()
 
     async def _handle_hourly_loss(self):
         if self._alert_manager:
@@ -637,6 +656,17 @@ class GlobalRiskControl:
         logger.error("Hourly max loss exceeded, pausing aggressive strategies")
         self._is_paused = True
         self._pause_reason = "Hourly max loss exceeded"
+
+    async def _handle_weekly_loss(self):
+        if self._alert_manager:
+            asyncio.create_task(self._alert_manager.send_alert(
+                "WEEKLY_LOSS_LIMIT", "Weekly max loss exceeded, stopping trading for 24h",
+                severity="CRITICAL", symbol="ALL"
+            ))
+        logger.critical("Weekly max loss exceeded, stopping trading for 24h")
+        self._is_paused = True
+        self._pause_reason = "Weekly max loss exceeded"
+        self._pause_time = datetime.now()
 
     async def _handle_consecutive_losses(self):
         if self._alert_manager:
@@ -876,7 +906,8 @@ class GlobalRiskControl:
             if (self._is_paused and self._pause_reason
                     and "EXTREME" not in self._pause_reason
                     and not str(self._pause_reason).startswith("[干预·")):
-                pause_duration = (datetime.now() - getattr(self, '_pause_time', datetime.now())).total_seconds()
+                pause_time = self._pause_time or datetime.now()
+                pause_duration = (datetime.now() - pause_time).total_seconds()
                 # minor: 60秒恢复，major: 300秒恢复
                 is_major = "major" in (self._pause_reason or "")
                 recover_threshold = 300 if is_major else 60
@@ -939,6 +970,7 @@ class GlobalRiskControl:
         self._is_paused = False
         self._pause_reason = None
         self._consecutive_losses = 0
+        self._weekly_pnl = 0.0
 
 
 class CircuitBreakers:

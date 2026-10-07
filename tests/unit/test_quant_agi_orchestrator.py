@@ -7272,7 +7272,13 @@ def _pnl_momentum_trend_orch(**overrides):
     }}}
     for k, v in overrides.items():
         cfg["agi_orchestrator"]["pnl_momentum_trend_guard"][k] = v
-    return QuantAGIOrchestrator(config=cfg)
+    import tempfile, os
+    cfg["agi_orchestrator"]["state_path"] = os.path.join(
+        tempfile.gettempdir(), "test_pnl_momentum_trend_state.json"
+    )
+    orch = QuantAGIOrchestrator(config=cfg)
+    orch._strategy_pnl_momentum_history.clear()
+    return orch
 
 
 def _pnl_momentum_trend_perception(momentum, total_trades=20):

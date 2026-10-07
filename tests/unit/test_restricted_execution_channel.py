@@ -60,7 +60,9 @@ def _channel(tmp_path, event_store=None, alert_manager=None, max_pending=200,
              idle_cash_deployer=None, autonomous=False, reallocate_deployer=None,
              kill_switch_check=None, close_position_deployer=None,
              param_adjust_deployer=None, strategy_pause_deployer=None,
-             strategy_resume_deployer=None):
+             strategy_resume_deployer=None, always_require_confirmation=None):
+    if always_require_confirmation is None and autonomous:
+        always_require_confirmation = []
     return RestrictedExecutionChannel(
         event_store=event_store,
         alert_manager=alert_manager,
@@ -74,6 +76,7 @@ def _channel(tmp_path, event_store=None, alert_manager=None, max_pending=200,
         param_adjust_deployer=param_adjust_deployer,
         strategy_pause_deployer=strategy_pause_deployer,
         strategy_resume_deployer=strategy_resume_deployer,
+        always_require_confirmation=always_require_confirmation,
     )
 
 

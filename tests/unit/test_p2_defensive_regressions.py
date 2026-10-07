@@ -49,8 +49,8 @@ class TestRebalancePoolsPreservesUsedAmount:
         assert base.total_amount == pytest.approx(60.0)
         # 在仓保证金必须保留
         assert base.used_amount == pytest.approx(30.0)
-        # 挂单锁定清空
-        assert base.locked_amount == 0.0
+        # P1-1: locked_amount 由 reconcile_locked_capital() 对账修正，rebalance 不清零
+        assert base.locked_amount == pytest.approx(5.0)
 
     def test_used_amount_clamped_to_target(self):
         ctrl = CapitalPoolController({"trading": {"total_capital": 100.0}})
@@ -73,7 +73,8 @@ class TestRebalancePoolsPreservesUsedAmount:
 
         assert add.total_amount == pytest.approx(25.0)  # 100 * 0.25
         assert add.used_amount == pytest.approx(10.0)
-        assert add.locked_amount == 0.0
+        # P1-1: locked_amount 由 reconcile_locked_capital() 对账修正，rebalance 不清零
+        assert add.locked_amount == pytest.approx(3.0)
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -335,6 +335,15 @@ class HealthChecker:
             # 非关键依赖失败：降级但允许运行
             if unhealthy_deps:
                 logger.info(f"Readiness degraded: {len(unhealthy_deps)} non-critical dependencies unhealthy")
+                return HealthProbeResult(
+                    name="readiness",
+                    status=HealthStatus.DEGRADED,
+                    probe_type=ProbeType.READINESS,
+                    latency_ms=(time.time() - t0) * 1000,
+                    message=f"Readiness degraded: {len(unhealthy_deps)} non-critical dependencies unhealthy",
+                    details={"non_critical_unhealthy": [d.name for d in unhealthy_deps if d.name not in self._dependency_critical]},
+                    suggestions=suggestions,
+                )
 
             # 运行自定义就绪探针
             if self._readiness_probes:

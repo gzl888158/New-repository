@@ -445,7 +445,7 @@ class TestStopLossIntegration:
         })
         mgr.set_regime_arbiter(arb)
         # 调 _fetch_reversal_inputs
-        hmm, ohlcv = asyncio.get_event_loop().run_until_complete(
+        hmm, ohlcv = asyncio.run(
             mgr._fetch_reversal_inputs("ETH-USDT-SWAP", None, ["dummy"])
         )
         assert hmm is not None
@@ -461,7 +461,7 @@ class TestStopLossIntegration:
         det.get_regime = MagicMock(return_value={"symbol": "ETH", "regime": "reversal"})
         mgr.set_market_regime_detector(det)
         # _regime_arbiter 未注入 → None
-        hmm, ohlcv = asyncio.get_event_loop().run_until_complete(
+        hmm, ohlcv = asyncio.run(
             mgr._fetch_reversal_inputs("ETH-USDT-SWAP", None, ["dummy"])
         )
         assert hmm is not None
@@ -480,7 +480,7 @@ class TestOrchestratorPerceive:
         })
         orch = QuantAGIOrchestrator(config={}, regime_arbiter=arb)
         # 调 _perceive（async 方法）
-        perception = asyncio.get_event_loop().run_until_complete(orch._perceive())
+        perception = asyncio.run(orch._perceive())
         assert perception["market_regime"]["regime"] == "reversal"
         arb.arbitrate.assert_called_once()
 
@@ -492,7 +492,7 @@ class TestOrchestratorPerceive:
         # MagicMock 会自动创建 arbitrate 属性，需显式置 None 强制走 get_regime
         eng.arbitrate = None
         orch = QuantAGIOrchestrator(config={}, regime_engine=eng, regime_arbiter=None)
-        perception = asyncio.get_event_loop().run_until_complete(orch._perceive())
+        perception = asyncio.run(orch._perceive())
         assert perception["market_regime"]["regime"] == "trend_bullish"
         eng.get_regime.assert_called_once()
 

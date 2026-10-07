@@ -4,6 +4,8 @@
 覆盖：_diagnose 连续 window 周期资金费率上升告警、_funding_cost_trend_actions
 收敛持仓动作、上升/平坦/下降轨迹、total_pnl<=0 与 funding<=0 不触发、去重与禁用。
 """
+import os
+import tempfile
 import pytest
 
 from core.quant_agi_orchestrator import QuantAGIOrchestrator, snapshot_to_dict
@@ -18,11 +20,14 @@ def _config(**overrides):
         "reduce_target": 0.1,
     }
     guard.update(overrides)
-    return {"agi_orchestrator": {"funding_cost_trend_guard": guard}}
+    state_path = os.path.join(tempfile.gettempdir(), "test_funding_cost_trend_state.json")
+    return {"agi_orchestrator": {"funding_cost_trend_guard": guard, "state_path": state_path}}
 
 
 def _orch(**overrides):
-    return QuantAGIOrchestrator(config=_config(**overrides))
+    orch = QuantAGIOrchestrator(config=_config(**overrides))
+    orch._strategy_funding_cost_history.clear()
+    return orch
 
 
 def _perception(strategies, equity=1000.0):

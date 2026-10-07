@@ -163,17 +163,17 @@ class TestReadiness:
         assert result.status == HealthStatus.HEALTHY
 
     def test_readiness_unhealthy(self, checker_with_startup, unhealthy_dep_check):
-        """有依赖不健康，就绪探针返回 UNHEALTHY"""
+        """非关键依赖不健康，就绪探针返回 DEGRADED"""
         checker_with_startup.register_dependency("test", unhealthy_dep_check)
         result = checker_with_startup.run_readiness()
-        assert result.status == HealthStatus.UNHEALTHY
+        assert result.status == HealthStatus.DEGRADED
         assert len(result.suggestions) > 0
 
     def test_readiness_with_exception(self, checker_with_startup, raising_dep_check):
-        """依赖检查抛出异常，返回 UNHEALTHY"""
+        """非关键依赖检查抛出异常，返回 DEGRADED"""
         checker_with_startup.register_dependency("test", raising_dep_check)
         result = checker_with_startup.run_readiness()
-        assert result.status == HealthStatus.UNHEALTHY
+        assert result.status == HealthStatus.DEGRADED
 
     def test_readiness_custom_probes(self, checker_with_startup):
         checker_with_startup.mark_startup_complete()

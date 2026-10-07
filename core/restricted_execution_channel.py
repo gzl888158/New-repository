@@ -91,7 +91,7 @@ class RestrictedExecutionChannel:
         self._action_history_ready = True
         self._load_action_history()
         # P3: 强制人工确认的动作类型（即使 autonomous=True 也需排队等待确认）
-        self._always_require_confirmation = set(always_require_confirmation or ["reallocate"])
+        self._always_require_confirmation = set(always_require_confirmation if always_require_confirmation is not None else ["reallocate"])
         self._stats: Dict[str, int] = {
             "routed": 0, "queued": 0, "notified": 0, "rejected": 0,
             "confirmed": 0, "rejected_manual": 0, "deployed": 0, "skipped": 0,

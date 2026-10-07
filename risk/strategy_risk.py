@@ -211,8 +211,8 @@ class StrategyRiskControl:
         
         # position_limit 是保证金占交易资金的比例上限（与策略仓位计算 base_position = trading_capital * position_limit 对齐）
         # 策略生成 quantity = base_position * leverage / price，因此 margin = quantity * price / leverage
-        leverage = self._finite(signal_data.get("leverage"), 1.0)
-        if leverage <= 0:
+        leverage = self._finite(signal_data.get("leverage"))
+        if leverage is None or leverage <= 0:
             leverage = 1.0
         margin = quantity * price / leverage
         

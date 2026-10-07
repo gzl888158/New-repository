@@ -17,6 +17,8 @@
 """
 
 import pytest
+import os
+import tempfile
 
 from core.adaptive_tp_sl_engine import AdaptiveTpSlEngine
 from execution.order_executor import OrderExecutor
@@ -31,7 +33,11 @@ def _make_engine(**overrides) -> AdaptiveTpSlEngine:
     cfg = {"adaptive_tp_sl": {}}
     for key, value in overrides.items():
         cfg["adaptive_tp_sl"][key] = value
-    return AdaptiveTpSlEngine(cfg)
+    engine = AdaptiveTpSlEngine(cfg)
+    engine._state_file = os.path.join(tempfile.gettempdir(), "test_adaptive_tp_sl_state.json")
+    engine._protection_state.clear()
+    engine._smoothed.clear()
+    return engine
 
 
 def _default_ctx(symbol="BTC-USDT-SWAP", entry=100.0, direction="long", **overrides):

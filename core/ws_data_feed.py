@@ -470,12 +470,12 @@ class WebSocketManager:
             symbols = self._public_subscriptions.get(depth_key, set())
             if symbols:
                 depth = 5 if depth_key == "books5" else 50
-                    channel = "books5" if depth_key == "books5" else "books"
-                    for symbol in symbols:
-                        subscribe_args.append({
-                            "channel": channel,
-                            "instId": symbol,
-                        })
+                channel = "books5" if depth_key == "books5" else "books"
+                for symbol in symbols:
+                    subscribe_args.append({
+                        "channel": channel,
+                        "instId": symbol,
+                    })
 
             # Trades
             trades = self._public_subscriptions.get("trades", set())

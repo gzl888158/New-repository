@@ -735,6 +735,7 @@ class GlobalRiskControl:
     async def _reduce_all_positions(self, ratio: float, reason: str = "tier_drawdown"):
         """阶梯式风控：按比例减仓所有持仓，避免一次性砸盘
         ratio: 减仓比例 (0.20=减20%, 0.40=减40%, 0.60=减60%)
+        P1-5: 并行优化 — asyncio.gather 替代串行 + sleep，REST 限流器自动序列化
         """
         try:
             positions = self.okx_client.get_positions()
@@ -742,7 +743,8 @@ class GlobalRiskControl:
                 logger.info(f"No positions to reduce for {reason}")
                 return
 
-            reduced_count = 0
+            # 收集需要减仓的持仓
+            reduce_tasks = []
             for pos_data in positions:
                 position = self.okx_client._parse_position(pos_data)
                 if not position or float(position.quantity) <= 0:
@@ -751,11 +753,24 @@ class GlobalRiskControl:
                 pos_qty = abs(float(position.quantity))
                 reduce_qty = pos_qty * ratio
                 if pos_qty > 0 and reduce_qty > 0:
+                    reduce_tasks.append((position, reduce_qty))
+
+            if not reduce_tasks:
+                logger.info(f"No positions need reduction for {reason}")
+                return
+
+            # P1-5: 并行执行减仓（REST 限流器自动序列化，避免 API 限频）
+            async def reduce_one(position, reduce_qty):
+                try:
                     await self._reduce_position(position, ratio)
-                    reduced_count += 1
                     logger.info(f"{reason}: reduced {position.symbol} by {ratio*100:.0f}% (qty={reduce_qty:.4f})")
-                    # 减仓间隔0.2秒，避免API限频
-                    await asyncio.sleep(0.2)
+                    return True
+                except Exception as e:
+                    logger.error(f"{reason}: failed to reduce {position.symbol}: {e}")
+                    return False
+
+            results = await asyncio.gather(*[reduce_one(pos, qty) for pos, qty in reduce_tasks])
+            reduced_count = sum(1 for r in results if r)
 
             logger.warning(f"{reason} completed: reduced {reduced_count} positions by {ratio*100:.0f}%")
         except Exception as e:
@@ -965,6 +980,13 @@ class GlobalRiskControl:
             return False
         
         return True
+
+    def pause_trading(self, reason: str):
+        """Public API for external modules (e.g. BlackSwan) to pause trading."""
+        if not self._is_paused:
+            self._is_paused = True
+            self._pause_reason = reason
+            logger.warning(f"Trading paused via pause_trading(): {reason}")
 
     def reset(self):
         self._is_paused = False

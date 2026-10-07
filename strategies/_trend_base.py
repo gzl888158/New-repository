@@ -78,6 +78,11 @@ class TrendStrategyBase(StrategyBase):
         self._save_task: Optional[asyncio.Task] = None
 
         self.init_state_persistence(key, redis_cache)
+
+        self._capital_cache_value = 0.0
+        self._capital_cache_ts = 0.0
+        self._capital_cache_ttl = 30.0
+
         logger.info(f"[{key}] 初始化完成，标的={self._symbols}, bar={self._bar}, enabled={self._enabled}")
 
     # ------------------------------------------------------------------
@@ -145,6 +150,10 @@ class TrendStrategyBase(StrategyBase):
     # 资金 / 仓位
     # ------------------------------------------------------------------
     def _get_effective_capital(self) -> float:
+        import time
+        now = time.time()
+        if self._capital_cache_value > 0 and (now - self._capital_cache_ts) < self._capital_cache_ttl:
+            return self._capital_cache_value
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -152,13 +161,16 @@ class TrendStrategyBase(StrategyBase):
                     if detail.get("ccy") == "USDT":
                         eq = self._safe_float(detail.get("eq"), 0.0)
                         if eq > 0:
+                            self._capital_cache_value = eq
+                            self._capital_cache_ts = now
                             return eq
                 total_eq = self._safe_float(account_info.get("totalEq"), 0.0)
                 if total_eq > 0:
+                    self._capital_cache_value = total_eq
+                    self._capital_cache_ts = now
                     return total_eq
         except Exception as e:
             logger.debug(f"[{self._strategy_name}] get_account_info failed: {type(e).__name__}: {e}")
-        # fail-closed: 账户权益查询失败时返回 0，避免用静态 total_capital 兜底导致仓位失真
         logger.warning(f"[{self._strategy_name}] 账户权益查询失败，返回 0（fail-closed）")
         return 0.0
 

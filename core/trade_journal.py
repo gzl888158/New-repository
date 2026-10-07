@@ -965,43 +965,47 @@ class TradeJournal:
         logger.info(f"Position marked closed in journal: {symbol} (reason={reason})")
 
     async def _save_trade(self, trade: TradeRecord):
-        conn = self.sqlite_storage.get_connection()
+        # P1-5: 将阻塞式 SQLite 操作移至线程池，避免阻塞事件循环
+        def _do_save():
+            conn = self.sqlite_storage.get_connection()
+            try:
+                conn.execute(text('''
+                    INSERT OR REPLACE INTO trades 
+                    (trade_id, symbol, strategy_name, direction, entry_price, exit_price, quantity, leverage,
+                     entry_time, exit_time, fees, pnl, pnl_usdt, win, entry_signal_type, exit_reason,
+                     slippage_cost, funding_cost, spread_cost, trace_id, confidence, created_at)
+                    VALUES (:trade_id, :symbol, :strategy_name, :direction, :entry_price, :exit_price, :quantity, :leverage,
+                     :entry_time, :exit_time, :fees, :pnl, :pnl_usdt, :win, :entry_signal_type, :exit_reason,
+                     :slippage_cost, :funding_cost, :spread_cost, :trace_id, :confidence, :created_at)
+                '''), {
+                    "trade_id": trade.trade_id,
+                    "symbol": trade.symbol,
+                    "strategy_name": trade.strategy_name,
+                    "direction": trade.direction,
+                    "entry_price": trade.entry_price,
+                    "exit_price": trade.exit_price,
+                    "quantity": trade.quantity,
+                    "leverage": trade.leverage,
+                    "entry_time": trade.entry_time.isoformat(),
+                    "exit_time": trade.exit_time.isoformat(),
+                    "fees": trade.fees,
+                    "pnl": trade.pnl_pct,
+                    "pnl_usdt": trade.pnl_usdt,
+                    "win": int(trade.win),
+                    "entry_signal_type": trade.entry_signal_type,
+                    "exit_reason": trade.exit_reason,
+                    "slippage_cost": trade.slippage_cost,
+                    "funding_cost": trade.funding_cost,
+                    "spread_cost": trade.spread_cost,
+                    "trace_id": trade.trace_id,
+                    "confidence": trade.confidence,
+                    "created_at": datetime.now().isoformat()
+                })
+                conn.commit()
+            finally:
+                conn.close()
         
-        conn.execute(text('''
-            INSERT OR REPLACE INTO trades 
-            (trade_id, symbol, strategy_name, direction, entry_price, exit_price, quantity, leverage,
-             entry_time, exit_time, fees, pnl, pnl_usdt, win, entry_signal_type, exit_reason,
-             slippage_cost, funding_cost, spread_cost, trace_id, confidence, created_at)
-            VALUES (:trade_id, :symbol, :strategy_name, :direction, :entry_price, :exit_price, :quantity, :leverage,
-             :entry_time, :exit_time, :fees, :pnl, :pnl_usdt, :win, :entry_signal_type, :exit_reason,
-             :slippage_cost, :funding_cost, :spread_cost, :trace_id, :confidence, :created_at)
-        '''), {
-            "trade_id": trade.trade_id,
-            "symbol": trade.symbol,
-            "strategy_name": trade.strategy_name,
-            "direction": trade.direction,
-            "entry_price": trade.entry_price,
-            "exit_price": trade.exit_price,
-            "quantity": trade.quantity,
-            "leverage": trade.leverage,
-            "entry_time": trade.entry_time.isoformat(),
-            "exit_time": trade.exit_time.isoformat(),
-            "fees": trade.fees,
-            "pnl": trade.pnl_pct,
-            "pnl_usdt": trade.pnl_usdt,
-            "win": int(trade.win),
-            "entry_signal_type": trade.entry_signal_type,
-            "exit_reason": trade.exit_reason,
-            "slippage_cost": trade.slippage_cost,
-            "funding_cost": trade.funding_cost,
-            "spread_cost": trade.spread_cost,
-            "trace_id": trade.trace_id,
-            "confidence": trade.confidence,
-            "created_at": datetime.now().isoformat()
-        })
-        
-        conn.commit()
-        conn.close()
+        await asyncio.to_thread(_do_save)
 
         # P0-2 记账事件化：平仓落账发布 TRADE_RECORDED（带 traceID 贯穿）
         self._publish_event(EventType.TRADE_RECORDED, {

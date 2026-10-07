@@ -2359,7 +2359,8 @@ class DashboardEngine:
                     for fut in as_completed(futs):
                         s = futs[fut]
                         try:
-                            funding_cache[s] = fut.result()
+                            # P1-5: 添加超时保护，防止单个请求挂起阻塞整个仪表板
+                            funding_cache[s] = fut.result(timeout=5.0)
                         except Exception:
                             funding_cache[s] = None
 
@@ -2463,7 +2464,8 @@ class DashboardEngine:
                     for fut in as_completed(futures):
                         s = futures[fut]
                         try:
-                            orderbooks[s] = fut.result() or {}
+                            # P1-5: 添加超时保护，防止单个请求挂起阻塞整个仪表板
+                            orderbooks[s] = fut.result(timeout=5.0) or {}
                         except Exception:
                             orderbooks[s] = {}
 

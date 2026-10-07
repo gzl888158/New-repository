@@ -638,18 +638,20 @@ class SignalProcessor:
                 return
             
             reconnect_count = 0
+            _MAX_RECONNECT_ATTEMPTS = 50
             while True:
                 try:
-                    message = pubsub.get_message(timeout=1)
+                    # P0-3: 使用 to_thread 避免阻塞事件循环
+                    message = await asyncio.to_thread(pubsub.get_message, timeout=1)
                     if message and message["type"] == "message":
                         signal_data = None
                         try:
                             data = message["data"]
                             if isinstance(data, bytes):
                                 data = data.decode()
-                            
+
                             signal_data = __import__('json').loads(data)
-                            
+
                             if signal_data.get("type") == "signal":
                                 await self._process_signal(signal_data["data"])
                         except Exception as e:
@@ -674,8 +676,23 @@ class SignalProcessor:
                 except (ConnectionError, OSError) as e:
                     # P0: Redis断线时自动重连，避免信号监听静默失效
                     reconnect_count += 1
+                    if reconnect_count > _MAX_RECONNECT_ATTEMPTS:
+                        logger.critical(
+                            f"Redis signal listener exhausted {_MAX_RECONNECT_ATTEMPTS} reconnect attempts, "
+                            f"exiting listener. Manual restart required."
+                        )
+                        if self._alert_manager:
+                            try:
+                                await self._alert_manager.send_alert(
+                                    "redis_listener_dead",
+                                    f"Redis signal listener gave up after {_MAX_RECONNECT_ATTEMPTS} attempts",
+                                    severity="CRITICAL",
+                                )
+                            except Exception:
+                                pass
+                        return
                     backoff = min(30, 2 ** min(reconnect_count, 6))
-                    logger.warning(f"Redis connection lost in signal listener, reconnecting in {backoff}s (attempt {reconnect_count})")
+                    logger.warning(f"Redis connection lost in signal listener, reconnecting in {backoff}s (attempt {reconnect_count}/{_MAX_RECONNECT_ATTEMPTS})")
                     await asyncio.sleep(backoff)
                     # P0: 关闭旧的pubsub连接，避免Redis服务端残留订阅耗尽连接数
                     if pubsub is not None:
@@ -975,10 +992,17 @@ class SignalProcessor:
         if self._risk_adjudicator is not None or self._risk_gate is not None:
             try:
                 # P2: 独立风控裁决器优先（traceID 贯穿回写 signal + 裁决事件溯源），未注入回退 RiskGate
+                # P0-A: 风控校验为同步方法，使用 to_thread 避免阻塞事件循环
+                # P0-B: 传递 is_close 使平仓信号跳过 L1 保证金/仓位上限检查（平仓释放保证金），
+                #       与 order_executor 第二次调用保持一致，避免平仓被误拦
                 if self._risk_adjudicator is not None:
-                    risk_result = self._risk_adjudicator.adjudicate(signal_dict)
+                    risk_result = await asyncio.to_thread(
+                        self._risk_adjudicator.adjudicate, signal_dict, None, is_close_sig
+                    )
                 else:
-                    risk_result = self._risk_gate.validate(signal_dict)
+                    risk_result = await asyncio.to_thread(
+                        self._risk_gate.validate, signal_dict, None, is_close_sig
+                    )
                 if not risk_result.passed:
                     # 拦截路径：丢弃信号 + 记录拦截原因 + 推送风险告警 + 不下单
                     await self._handle_risk_block(signal_dict, risk_result)
@@ -1259,6 +1283,19 @@ class SignalProcessor:
 
             except Exception as e:
                 logger.error(f"IntelligentDecisionEngine processing error for {symbol}: {e}")
+                # P0-3: dead letter + alert，不再静默丢弃信号
+                self._push_dead_letter(signal_dict, f"IntelligentDecisionEngine exception: {e}")
+                if self._alert_manager:
+                    try:
+                        await self._alert_manager.send_alert(
+                            alert_type="signal_processing_error",
+                            message=f"{symbol} IntelligentDecisionEngine 异常，信号已入 dead letter: {e}",
+                            severity="WARNING",
+                            symbol=symbol,
+                            metadata={"signal_id": signal_id, "strategy": strategy_name},
+                        )
+                    except Exception:
+                        pass
                 # 引擎异常时不下发信号，保证安全
                 return
 

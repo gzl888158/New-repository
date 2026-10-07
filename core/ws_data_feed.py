@@ -1,4 +1,7 @@
 """
+[DEPRECATED] 此模块已被 market_data/websocket_feed.py 替代，仅供向后兼容。
+生产代码请使用 market_data.OKXWebSocketFeed。
+
 生产级 WebSocket 实时数据推送管理器
 ========================================
 核心定位：统一管理OKX WebSocket连接，提供生产级实时数据流
@@ -453,20 +456,20 @@ class WebSocketManager:
 
         subscribe_args = []
 
-        with self._subscription_lock:
-            # Tickers
-            tickers = self._public_subscriptions.get("tickers", set())
-            for symbol in tickers:
-                subscribe_args.append({
-                    "channel": "tickers",
-                    "instId": symbol,
-                })
+        # P1-1: 异步上下文移除 threading.Lock 避免阻塞事件循环（仅读取快照，GIL 保证安全）
+        # Tickers
+        tickers = self._public_subscriptions.get("tickers", set())
+        for symbol in tickers:
+            subscribe_args.append({
+                "channel": "tickers",
+                "instId": symbol,
+            })
 
-            # Orderbooks
-            for depth_key in ["books5", "books"]:
-                symbols = self._public_subscriptions.get(depth_key, set())
-                if symbols:
-                    depth = 5 if depth_key == "books5" else 50
+        # Orderbooks
+        for depth_key in ["books5", "books"]:
+            symbols = self._public_subscriptions.get(depth_key, set())
+            if symbols:
+                depth = 5 if depth_key == "books5" else 50
                     channel = "books5" if depth_key == "books5" else "books"
                     for symbol in symbols:
                         subscribe_args.append({
@@ -743,9 +746,9 @@ class WebSocketManager:
             return
 
         subscribe_args = []
-        with self._subscription_lock:
-            for channel in self._private_subscriptions:
-                subscribe_args.append({"channel": channel, "instType": "ANY"})
+        # P1-1: 异步上下文移除 threading.Lock 避免阻塞事件循环（仅读取快照，GIL 保证安全）
+        for channel in self._private_subscriptions:
+            subscribe_args.append({"channel": channel, "instType": "ANY"})
 
         if subscribe_args:
             request = {"op": "subscribe", "args": subscribe_args}
@@ -823,72 +826,67 @@ class WebSocketManager:
                 # 处理Tick数据
                 ticks = self._tick_buffer.pop_batch(100)
                 if ticks:
-                    with self._callback_lock:
-                        callbacks = list(self._tick_callbacks)
+                    # P1-1: 异步上下文移除 threading.Lock 避免阻塞事件循环（仅读取快照，GIL 保证安全）
+                    callbacks = list(self._tick_callbacks)
                     for tick in ticks:
                         for cb in callbacks:
                             try:
                                 cb(tick)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.warning(f"Tick callback {cb.__name__} failed: {e}")
 
                 # 处理订单簿数据
                 books = self._book_buffer.pop_batch(50)
                 if books:
-                    with self._callback_lock:
-                        callbacks = list(self._book_callbacks)
+                    callbacks = list(self._book_callbacks)
                     for book in books:
                         for cb in callbacks:
                             try:
                                 cb(book)
-                            except Exception:
-                                    pass
+                            except Exception as e:
+                                logger.warning(f"OrderBook callback {cb.__name__} failed: {e}")
 
                 # 处理成交数据
                 trades = self._trade_buffer.pop_batch(50)
                 if trades:
-                    with self._callback_lock:
-                        callbacks = list(self._trade_callbacks)
+                    callbacks = list(self._trade_callbacks)
                     for trade in trades:
                         for cb in callbacks:
                             try:
                                 cb(trade)
-                            except Exception:
-                                    pass
+                            except Exception as e:
+                                logger.warning(f"Trade callback {cb.__name__} failed: {e}")
 
                 # 处理持仓数据
                 positions = self._position_buffer.pop_all()
                 if positions:
-                    with self._callback_lock:
-                        callbacks = list(self._position_callbacks)
+                    callbacks = list(self._position_callbacks)
                     for cb in callbacks:
                         try:
                             cb(positions)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"Position callback {cb.__name__} failed: {e}")
 
                 # 处理订单数据
                 orders = self._order_buffer.pop_batch(50)
                 if orders:
-                    with self._callback_lock:
-                        callbacks = list(self._order_callbacks)
+                    callbacks = list(self._order_callbacks)
                     for order in orders:
                         for cb in callbacks:
                             try:
                                 cb(order)
-                            except Exception:
-                                    pass
+                            except Exception as e:
+                                logger.warning(f"Order callback {cb.__name__} failed: {e}")
 
                 # 处理账户数据
                 accounts = self._account_buffer.pop_all()
                 if accounts:
-                    with self._callback_lock:
-                        callbacks = list(self._account_callbacks)
+                    callbacks = list(self._account_callbacks)
                     for cb in callbacks:
                         try:
                             cb(accounts)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"Account callback {cb.__name__} failed: {e}")
 
                 await asyncio.sleep(0.01)  # 10ms处理间隔，避免CPU空转
 

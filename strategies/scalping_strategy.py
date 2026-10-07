@@ -206,6 +206,10 @@ class ScalpingStrategy(PersistentStrategy):
         self.sqlite_storage = None        # 数据库存储（由scheduler注入，用于孤儿持仓恢复与对账）
         self._orphan_recovery_last_ts = 0.0  # 孤儿持仓恢复节流时间戳
 
+        self._capital_cache_value = 0.0
+        self._capital_cache_ts = 0.0
+        self._capital_cache_ttl = 30.0
+
     def set_adaptive_controller(self, controller):
         """注入AdaptiveController实例，用于获取动态资金分配"""
         self._adaptive_controller = controller
@@ -350,7 +354,11 @@ class ScalpingStrategy(PersistentStrategy):
         return self.config["trading"].get("scalping_allocation", 0.20)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital"""
+        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital。30s TTL 缓存避免每次调用都 REST。"""
+        import time
+        now = time.time()
+        if self._capital_cache_value > 0 and (now - self._capital_cache_ts) < self._capital_cache_ttl:
+            return self._capital_cache_value
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -359,13 +367,21 @@ class ScalpingStrategy(PersistentStrategy):
                     if detail.get("ccy") == "USDT":
                         eq = float(detail.get("eq", 0))
                         if eq > 0:
+                            self._capital_cache_value = eq
+                            self._capital_cache_ts = now
                             return eq
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
+                    self._capital_cache_value = total_eq
+                    self._capital_cache_ts = now
                     return total_eq
         except Exception as e:
             logger.warning(f"[scalping] get_account_info failed, fallback to config total_capital: {e}")
-        return self.config["trading"].get("total_capital", 100.0)
+        fallback = self.config["trading"].get("total_capital", 100.0)
+        if self._capital_cache_value <= 0:
+            self._capital_cache_value = fallback
+            self._capital_cache_ts = now
+        return fallback
 
     def apply_param_update(self, params: Dict[str, Any]):
         """热更新策略参数（由StrategyOptimizer调用，无需重启）
@@ -654,16 +670,18 @@ class ScalpingStrategy(PersistentStrategy):
             logger.info("Scalping _monitor_loop cancelled")
 
     async def _update_klines(self):
-        for symbol in self._scalping_symbols:
+        async def _fetch_symbol(symbol):
             if symbol not in self._last_klines:
                 self._last_klines[symbol] = {}
-            
-            for timeframe in ["1m", "5m", "15m"]:
-                klines = await self.okx_client.get_kline_async(symbol, timeframe, limit=120)
-                if len(klines) >= 2:
-                    self._last_klines[symbol][timeframe] = klines
-        
-        # 标记指标需要重新计算
+            tasks = [self.okx_client.get_kline_async(symbol, tf, limit=120) for tf in ("1m", "5m", "15m")]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for tf, res in zip(("1m", "5m", "15m"), results):
+                if isinstance(res, Exception):
+                    continue
+                if res and len(res) >= 2:
+                    self._last_klines[symbol][tf] = res
+
+        await asyncio.gather(*[_fetch_symbol(sym) for sym in self._scalping_symbols])
         self._indicators_dirty = True
 
     async def _calculate_indicators(self):
@@ -1197,51 +1215,44 @@ class ScalpingStrategy(PersistentStrategy):
             self._record_filter("global", "signal_density")
             return
         
-        for symbol in self._scalping_symbols:
+        async def _scan_symbol(symbol):
             if symbol in self._positions and self._positions[symbol]["status"] == "open":
-                continue
-            
+                return
             if symbol in self._signal_cooldown:
                 cooldown_remaining = (datetime.now() - self._signal_cooldown[symbol]).total_seconds()
                 if cooldown_remaining < 60:
-                    continue
-
-            # 波动率尖峰锁仓检查：锁仓期内不新开仓
+                    return
             lockout_until = self._volatility_lockout_until.get(symbol)
             if lockout_until and datetime.now() < lockout_until:
-                continue
-            
+                return
             momentum = self._momentum_cache.get(symbol)
             if not momentum:
-                continue
-            
+                return
+
             await self._update_breakout_levels(symbol)
-            
             market_state = self._market_state.get(symbol, {"state": "range", "volatility": "normal"})
-            
             active_signal_types = self._get_active_signal_types(market_state)
-            
+
             if "breakout" in active_signal_types and self._aggressive_mode:
                 await self._check_aggressive_long_signal(symbol, momentum)
                 await self._check_aggressive_short_signal(symbol, momentum)
-            
             if "momentum" in active_signal_types:
                 if self._check_position_correlation(symbol, "long"):
                     await self._check_long_signal(symbol, momentum)
                 if self._check_position_correlation(symbol, "short"):
                     await self._check_short_signal(symbol, momentum)
-            
             if "mean_reversion" in active_signal_types:
                 if self._check_position_correlation(symbol, "long"):
                     await self._check_mean_reversion_long(symbol, momentum)
                 if self._check_position_correlation(symbol, "short"):
                     await self._check_mean_reversion_short(symbol, momentum)
-            
             if "range" in active_signal_types:
                 if self._check_position_correlation(symbol, "long"):
                     await self._check_range_long(symbol, momentum)
                 if self._check_position_correlation(symbol, "short"):
                     await self._check_range_short(symbol, momentum)
+
+        await asyncio.gather(*[_scan_symbol(sym) for sym in self._scalping_symbols])
 
     def _get_active_signal_types(self, market_state: Dict[str, Any]) -> List[str]:
         if not self._auto_select_signal_type:

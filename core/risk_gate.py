@@ -321,8 +321,14 @@ class InTradeRiskChecker:
 
         # 1. API请求频率限流
         with self._lock:
-            recent_calls = [t for t in self._api_call_times if now - t < 1.0]
-            current_rps = len(recent_calls)
+            # P1-3: 优化 O(n) 扫描 — 时间戳单调递增，从后向前扫描并在遇到过期条目时提前终止
+            recent_count = 0
+            for t in reversed(self._api_call_times):
+                if now - t < 1.0:
+                    recent_count += 1
+                else:
+                    break  # 更早的条目必然也过期
+            current_rps = recent_count
         
         if current_rps >= self._max_api_rps:
             return RiskCheckResult(
@@ -1150,12 +1156,19 @@ class EmergencyCircuitBreaker:
                 if len(history) < 3:
                     continue
 
-                # 按时间窗口筛选：只取 _flash_crash_window 秒内的有效价格
-                window_prices = [p for p in history if now_ts - p["time"] <= self._flash_crash_window]
+                # P1-3: 优化 O(n) 扫描 — 时间戳单调递增，从后向前收集窗口内价格并提前终止
+                window_prices = []
+                for p in reversed(history):
+                    if now_ts - p["time"] <= self._flash_crash_window:
+                        window_prices.append(p["price"])
+                    else:
+                        break  # 更早的条目必然也过期
+                window_prices.reverse()  # 恢复时间顺序
+                
                 if len(window_prices) < 3:
                     continue
 
-                prices = [p["price"] for p in window_prices]
+                prices = window_prices
                 recent_max = max(prices)
                 recent_min = min(prices)
                 current = prices[-1]
@@ -1347,6 +1360,10 @@ class RiskGate:
         # P1: 风控事件持久化存储（修复 risk_events 表长期 0 行的审计缺口）
         self._sqlite_storage = None
 
+        # P0: 复用线程池，避免每次 check 创建/销毁 ThreadPoolExecutor（5-20ms 开销）
+        import concurrent.futures
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="riskgate")
+
         logger.info("RiskGate initialized: 5-layer serial risk control")
 
     def set_sqlite_storage(self, storage):
@@ -1364,6 +1381,13 @@ class RiskGate:
     def set_position_manager(self, position_manager) -> None:
         """注入仓位管理器，以便同步持续失败时冻结新开仓。"""
         self._position_manager = position_manager
+
+    def shutdown(self):
+        """关闭复用线程池，在系统停机时调用。"""
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
 
     def _record_interception(self, layer: str, action: RiskAction, reason: str, symbol: str = ""):
         """记录风控拦截到统计，并持久化到 risk_events 表"""
@@ -1553,18 +1577,26 @@ class RiskGate:
         # L1 事前风控 —— 平仓/减仓信号跳过（平仓释放保证金，不占用）
         # L2 事中风控 —— 平仓信号也需检查（API频率/延迟/滑点对平仓同样适用）
         # L3 持仓实时风控（不拦截开仓，但产生预警）
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {}
-            if not is_close:
-                futures["L1"] = executor.submit(self._l1.check, signal)
-            futures["L2"] = executor.submit(self._l2.check, signal, market_data)
-            futures["L3"] = executor.submit(self._l3.check, signal)
+        futures = {}
+        if not is_close:
+            futures["L1"] = self._executor.submit(self._l1.check, signal)
+        futures["L2"] = self._executor.submit(self._l2.check, signal, market_data)
+        futures["L3"] = self._executor.submit(self._l3.check, signal)
 
-            # 收集结果并按优先级处理（L1 > L2 > L3）
-            l1_result = futures["L1"].result() if "L1" in futures else None
-            l2_result = futures["L2"].result()
-            l3_results = futures["L3"].result()
+        # P1-2: 添加超时保护，防止线程池任务挂起导致无限阻塞
+        timeout_seconds = 5.0
+        try:
+            l1_result = futures["L1"].result(timeout=timeout_seconds) if "L1" in futures else None
+            l2_result = futures["L2"].result(timeout=timeout_seconds)
+            l3_results = futures["L3"].result(timeout=timeout_seconds)
+        except TimeoutError as e:
+            logger.error(f"L1/L2/L3 parallel check timeout after {timeout_seconds}s: {e}")
+            # 超时视为风控失败，保守拦截
+            return RiskGateResult(
+                passed=False, action="reject",
+                blocked_layer=None, results=results,
+                summary=f"风控并行校验超时({timeout_seconds}s)"
+            )
 
         # L1 结果处理
         if l1_result is not None:

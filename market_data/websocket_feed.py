@@ -253,13 +253,27 @@ class OKXWebSocketFeed:
         except Exception as e:
             logger.error(f"Unsubscribe failed: {e}")
 
-    def _feed_type_to_table(self, feed_type: str) -> str:
-        """订阅类型转 OKX table 名"""
+    def _feed_type_to_table(self, feed_type: str, bar: str = "1m") -> str:
+        """订阅类型转 OKX table 名
+        
+        Args:
+            feed_type: 订阅类型
+            bar: K线周期（仅对 KLINE 类型有效），如 "1m", "5m", "15m", "1H", "4H", "1D"
+        """
+        if feed_type == FeedType.KLINE.value:
+            # OKX K线频道命名：candle1m, candle5m, candle15m, candle1H, candle4H, candle1D 等
+            bar_map = {
+                "1m": "candle1m", "5m": "candle5m", "15m": "candle15m", "30m": "candle30m",
+                "1H": "candle1H", "2H": "candle2H", "4H": "candle4H", "6H": "candle6H",
+                "8H": "candle8H", "12H": "candle12H", "1D": "candle1D", "1W": "candle1W",
+                "1M": "candle1M", "1h": "candle1H", "4h": "candle4H", "1d": "candle1D",
+            }
+            return bar_map.get(bar, "candle1m")
+        
         mapping = {
             FeedType.TICKER.value: "tickers",
             FeedType.ORDERBOOK.value: "books",
             FeedType.TRADES.value: "trades",
-            FeedType.KLINE.value: "candle1m",
             FeedType.FUNDING.value: "funding-rate",
         }
         return mapping.get(feed_type, "tickers")
@@ -471,11 +485,14 @@ class OKXWebSocketFeed:
 
     def _table_to_feed_type(self, table: str) -> str:
         """OKX table 名转订阅类型"""
+        # K线频道统一映射到 KLINE 类型
+        if table.startswith("candle"):
+            return FeedType.KLINE.value
+        
         mapping = {
             "tickers": FeedType.TICKER.value,
             "books": FeedType.ORDERBOOK.value,
             "trades": FeedType.TRADES.value,
-            "candle1m": FeedType.KLINE.value,
             "funding-rate": FeedType.FUNDING.value,
         }
         return mapping.get(table, "unknown")

@@ -33,6 +33,9 @@ class MomentumRotationStrategy(TrendStrategyBase):
         self._min_long_return = self._safe_float(self._cfg.get("min_long_return", 0.0), 0.0)
         self._enable_short = bool(self._cfg.get("enable_short", False))
         self._rotation_count = 1
+        # P1-119: 缓存单周期内的returns计算结果，避免_check_signals和_manage_positions重复计算
+        self._returns_cache: Dict[str, float] = {}
+        self._returns_cache_cycle: int = 0
 
     # ------------------------------------------------------------------
     # 资金分配：动量轮动按目标持仓数均分单笔资金
@@ -44,6 +47,10 @@ class MomentumRotationStrategy(TrendStrategyBase):
         return base
 
     async def _compute_returns(self) -> Dict[str, float]:
+        # P1-119: 使用缓存避免同一周期内重复计算（_check_signals和_manage_positions各调用一次）
+        if self._returns_cache and self._returns_cache_cycle == self._cycle_count:
+            return self._returns_cache
+        
         returns: Dict[str, float] = {}
         for symbol in self._symbols:
             klines = await self._fetch_klines(symbol, limit=self._lookback + 2)
@@ -51,7 +58,31 @@ class MomentumRotationStrategy(TrendStrategyBase):
                 continue
             _, _, _, closes, _ = self._klines_to_arrays(klines)
             returns[symbol] = rolling_return(closes, self._lookback)
+        
+        # 缓存结果
+        self._returns_cache = returns
+        self._returns_cache_cycle = self._cycle_count
         return returns
+    
+    async def _monitor_loop(self):
+        """重写主循环，在每周期开始时清空returns缓存。"""
+        while self._running:
+            try:
+                # 新周期开始，清空缓存
+                self._returns_cache = {}
+                self._returns_cache_cycle = getattr(self, '_cycle_count', 0) + 1
+                if not hasattr(self, '_cycle_count'):
+                    self._cycle_count = 0
+                self._cycle_count += 1
+                
+                await self._sync_positions_with_exchange()
+                await self._check_signals()
+                await self._manage_positions()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[{self._strategy_name}] 主循环异常: {e}")
+            await asyncio.sleep(self._loop_interval)
 
     async def _check_signals(self):
         returns = await self._compute_returns()

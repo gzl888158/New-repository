@@ -2741,7 +2741,10 @@ def _read_kill_switch_state() -> dict:
             state["enabled_by"] = data.get("enabled_by", "") or ""
             state["triggered_at"] = data.get("triggered_at")
     except Exception as e:
-        logger.warning(f"Failed to read kill switch state: {e}")
+        # fail-closed: 读取失败时保守视为已启用，与 core/kill_switch.py 保持一致
+        logger.warning(f"Failed to read kill switch state, defaulting to ENABLED (fail-closed): {e}")
+        state["enabled"] = True
+        state["reason"] = f"状态读取失败，保守禁开仓: {e}"
     return state
 
 

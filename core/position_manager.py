@@ -883,7 +883,7 @@ class PositionManager:
                 self._last_rebalance_time = now
 
     async def _trigger_drawdown_reduce(self, drawdown: float):
-        """回撤触发减仓"""
+        """回撤触发减仓 — 实际通过 API 平掉亏损最大的持仓"""
         if self._emergency_reduce:
             return
 
@@ -895,7 +895,7 @@ class PositionManager:
             f"({self._drawdown_reduce_pct:.0%})"
         )
 
-        # 按亏损程度排序持仓
+        # 按亏损程度排序持仓（亏损最大的在前）
         sorted_positions = sorted(
             self._positions.items(),
             key=lambda x: x[1].unrealized_pnl,
@@ -903,20 +903,43 @@ class PositionManager:
 
         # 减仓亏损最大的持仓
         reduce_count = max(1, int(len(self._positions) * self._drawdown_reduce_pct))
+        closed = 0
         for key, pos in sorted_positions[:reduce_count]:
-            logger.info(
-                f"Drawdown reduce: closing {pos.symbol} {pos.side.value} "
-                f"(loss={pos.unrealized_pnl:.4f})"
-            )
+            close_side = "sell" if pos.side == PositionSide.LONG else "buy"
+            reduce_qty = abs(pos.quantity) * self._drawdown_reduce_pct
+            if reduce_qty <= 0 or not self._okx_client:
+                continue
+            try:
+                self._okx_client.place_order(
+                    symbol=pos.symbol,
+                    side=close_side,
+                    order_type="market",
+                    quantity=reduce_qty,
+                    leverage=pos.leverage,
+                    reduce_only=True,
+                )
+                closed += 1
+                logger.warning(
+                    f"Drawdown reduce: closed {pos.symbol} {close_side} "
+                    f"qty={reduce_qty:.4f} (loss={pos.unrealized_pnl:.4f})"
+                )
+            except Exception as e:
+                logger.error(f"Drawdown reduce order failed for {pos.symbol}: {e}")
+
             event = RiskEvent(
                 event_type="drawdown_reduce",
                 severity=RiskLevel.HIGH,
                 symbol=pos.symbol,
                 strategy_name=pos.strategy_name,
-                message=f"Drawdown reduce: closed {pos.symbol} {pos.side.value}",
+                message=f"Drawdown reduce: closed {pos.symbol} {close_side} qty={reduce_qty:.4f}",
                 action_taken="close_position",
             )
             self._notify_risk_event(event)
+
+        if closed > 0:
+            logger.warning(f"Drawdown reduce completed: {closed}/{reduce_count} positions reduced")
+        else:
+            logger.error("Drawdown reduce FAILED: no positions were closed")
 
         self._emergency_reduce = False
 

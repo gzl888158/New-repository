@@ -292,9 +292,8 @@ class BlackSwanProtection:
             f"  原因: {event.event_type}"
         )
 
-        if self.global_risk and hasattr(self.global_risk, '_is_paused'):
-            self.global_risk._is_paused = True
-            self.global_risk._pause_reason = f"熔断: {event.description}"
+        if self.global_risk and hasattr(self.global_risk, 'pause_trading'):
+            self.global_risk.pause_trading(f"熔断: {event.description}")
 
         for callback in self._callbacks.get("circuit_breaker_triggered", []):
             try:
@@ -330,14 +329,17 @@ class BlackSwanProtection:
             return False
 
     async def _direct_close_all(self) -> bool:
-        """直接通过OKX API全平所有持仓（order_executor不可用时的回退方案）"""
+        """直接通过OKX API全平所有持仓（order_executor不可用时的回退方案）
+        P1-5: 批量下单优化 — 一次 API 调用平所有仓位，减少延迟
+        """
         try:
             positions = self.okx_client.get_positions()
             if not positions:
                 logger.info("无需平仓：无持仓")
                 return True
 
-            closed_count = 0
+            # P1-5: 构建批量平仓订单体
+            order_bodies = []
             for pos_data in positions:
                 try:
                     symbol = pos_data.get("instId", "")
@@ -346,21 +348,52 @@ class BlackSwanProtection:
                     if pos_qty == 0 or not symbol:
                         continue
 
-                    # 平仓方向与 posSide：多头卖、空头买；net 模式按数量正负判断，
-                    # 避免 net 模式多头被误下 buy、空头被误下 sell 的反向单。
+                    # 平仓方向与 posSide：多头卖、空头买；net 模式按数量正负判断
                     side, close_pos_side = _close_side_and_pos_side(pos_side, pos_qty)
-                    self.okx_client.place_order(
-                        symbol=symbol,
-                        side=side,
-                        order_type="market",
-                        quantity=abs(pos_qty),
-                        reduce_only=True,
-                        pos_side=close_pos_side,
-                    )
-                    closed_count += 1
-                    logger.warning(f"[EMERGENCY] 直接API平仓: {symbol} {close_pos_side} qty={abs(pos_qty)}")
+
+                    # 构建订单体（与 place_order 内部逻辑一致）
+                    is_spot = "-SWAP" not in symbol
+                    qty = abs(pos_qty)
+                    if not is_spot:
+                        qty = self.okx_client.coin_to_contracts(symbol, qty)
+                        qty = self.okx_client.round_quantity_to_lot(symbol, qty, round_up=True)
+                    if qty <= 0:
+                        continue
+
+                    body = {
+                        "instId": symbol,
+                        "side": side,
+                        "ordType": "market",
+                        "sz": str(qty),
+                        "reduceOnly": True,
+                    }
+                    if is_spot:
+                        body["tdMode"] = "cash"
+                    else:
+                        body["tdMode"] = "isolated"
+                        body["posSide"] = close_pos_side
+
+                    order_bodies.append((symbol, close_pos_side, qty, body))
                 except Exception as e:
-                    logger.error(f"[EMERGENCY] 直接API平仓失败 {symbol}: {e}")
+                    logger.error(f"[EMERGENCY] 构建平仓订单失败 {symbol}: {e}")
+
+            # 批量发送（最多 20 单/批）
+            if order_bodies:
+                batch_bodies = [item[3] for item in order_bodies]
+                try:
+                    batch_results = self.okx_client.place_batch_orders(batch_bodies)
+                    closed_count = sum(1 for r in batch_results if not r.get("_failed", False))
+                    for idx, (symbol, close_pos_side, qty, _) in enumerate(order_bodies):
+                        if idx < len(batch_results) and not batch_results[idx].get("_failed", False):
+                            logger.warning(f"[EMERGENCY] 直接API平仓: {symbol} {close_pos_side} qty={qty}")
+                        else:
+                            msg = batch_results[idx].get("sMsg", "") if idx < len(batch_results) else "No result"
+                            logger.error(f"[EMERGENCY] 直接API平仓失败 {symbol}: {msg}")
+                except Exception as e:
+                    logger.error(f"[EMERGENCY] 批量平仓失败: {e}")
+                    closed_count = 0
+            else:
+                closed_count = 0
 
             logger.warning(f"[EMERGENCY] 直接API全平完成: {closed_count}个仓位")
             return True

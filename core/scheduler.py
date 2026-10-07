@@ -2715,7 +2715,7 @@ class TradingScheduler:
 
             if account is None:
                 # 兜底：直接查询OKX
-                account_info = self.okx_client.get_account_info()
+                account_info = await self.okx_client.get_account_info_async()
                 if account_info:
                     account = self.okx_client._parse_account_info(account_info)
 
@@ -2766,7 +2766,7 @@ class TradingScheduler:
     async def _sync_risk_gate_positions(self) -> None:
         """同步持仓状态到五层风控拦截器（L3持仓实时风控 + L1单币种仓位上限）"""
         try:
-            positions = self.okx_client.get_positions()
+            positions = await self.okx_client.get_positions_async()
             if not positions:
                 positions = []
 
@@ -6054,6 +6054,14 @@ class TradingScheduler:
             except Exception as e:
                 logger.error(f"Error stopping PositionManager: {e}")
 
+        # P0: 关闭 RiskGate 复用线程池
+        if self.risk_gate is not None:
+            try:
+                self.risk_gate.shutdown()
+                logger.info("RiskGate executor shutdown")
+            except Exception as e:
+                logger.error(f"Error shutting down RiskGate: {e}")
+
         # P0: 持久化智能决策审计链
         if self.intelligent_decision_engine:
             try:
@@ -6207,23 +6215,45 @@ class TradingScheduler:
             logger.info("Pending orders canceled")
         except Exception as e:
             logger.error(f"Error canceling orders: {e}")
-        
+
         try:
             logger.info("Step 2: Closing all positions...")
             positions = self.okx_client.get_positions()
-            closed_count = 0
+            # P1-5: 批量平仓优化 — 一次 API 调用平所有仓位
+            order_bodies = []
             for pos_data in positions:
                 position = self.okx_client._parse_position(pos_data)
                 if position and float(position.quantity) > 0:
                     side = "sell" if position.side == "long" else "buy"
-                    self.okx_client.place_order(
-                        symbol=position.symbol,
-                        side=side,
-                        order_type="market",
-                        quantity=self.okx_client.contracts_to_coins(position.symbol, abs(float(position.quantity))),
-                        leverage=position.leverage
-                    )
-                    closed_count += 1
+                    qty = self.okx_client.contracts_to_coins(position.symbol, abs(float(position.quantity)))
+
+                    # 构建订单体
+                    is_spot = "-SWAP" not in position.symbol
+                    contracts_qty = abs(float(position.quantity))
+                    if not is_spot:
+                        contracts_qty = self.okx_client.round_quantity_to_lot(position.symbol, contracts_qty, round_up=True)
+                    if contracts_qty <= 0:
+                        continue
+
+                    body = {
+                        "instId": position.symbol,
+                        "side": side,
+                        "ordType": "market",
+                        "sz": str(contracts_qty),
+                    }
+                    if is_spot:
+                        body["tdMode"] = "cash"
+                    else:
+                        body["tdMode"] = "isolated"
+                        body["lever"] = str(int(position.leverage))
+                        body["posSide"] = position.side
+                    order_bodies.append((position.symbol, body))
+
+            if order_bodies:
+                batch_results = self.okx_client.place_batch_orders([b[1] for b in order_bodies])
+                closed_count = sum(1 for r in batch_results if not r.get("_failed", False))
+            else:
+                closed_count = 0
             logger.info(f"Closed {closed_count} positions")
         except Exception as e:
             logger.error(f"Error closing positions: {e}")

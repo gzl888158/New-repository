@@ -85,14 +85,14 @@ class AccountManager:
     
     async def _update_account_status(self):
         try:
-            account_info = self.okx_client.get_account_info()
+            account_info = await self.okx_client.get_account_info_async()
             account = None
             
             if account_info:
                 account = self.okx_client._parse_account_info(account_info)
                 self._spot_holdings = self._extract_spot_holdings(account_info)
             
-            positions = self.okx_client.get_positions()
+            positions = await self.okx_client.get_positions_async()
             if not positions:
                 positions = []
             
@@ -221,7 +221,7 @@ class AccountManager:
     
     async def _update_pending_orders(self):
         try:
-            orders = self.okx_client.get_orders()
+            orders = await asyncio.to_thread(self.okx_client.get_orders)
             if not orders:
                 self._pending_orders = {}
                 self._pending_orders_margin = 0.0
@@ -314,7 +314,7 @@ class AccountManager:
             await self._reduce_exposure()
     
     async def _reduce_exposure(self):
-        positions = self.okx_client.get_positions()
+        positions = await self.okx_client.get_positions_async()
         if not positions:
             return
         
@@ -340,7 +340,8 @@ class AccountManager:
             reduce_quantity = abs(float(position.quantity)) * 0.3
             
             try:
-                self.okx_client.place_order(
+                await asyncio.to_thread(
+                    self.okx_client.place_order,
                     symbol=position.symbol,
                     side=side,
                     order_type="market",
@@ -503,7 +504,7 @@ class AccountManager:
         logger.info("Account rebalancing completed")
     
     async def _reduce_strategy_margin(self, strategy_name: str, amount: float):
-        positions = self.okx_client.get_positions()
+        positions = await self.okx_client.get_positions_async()
         strategy_positions = []
         
         for pos_data in positions:
@@ -525,7 +526,8 @@ class AccountManager:
             side = "sell" if position.side == "long" else "buy"
             
             try:
-                self.okx_client.place_order(
+                await asyncio.to_thread(
+                    self.okx_client.place_order,
                     symbol=position.symbol,
                     side=side,
                     order_type="market",

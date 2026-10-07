@@ -232,6 +232,10 @@ class GridStrategy(PersistentStrategy):
         # P0-4: 启用状态持久化（redis_cache 当前同步接口，StatePersistence 内部会自动降级到 JSON 文件）
         self.init_state_persistence("grid", redis_cache)
 
+        self._capital_cache_value = 0.0
+        self._capital_cache_ts = 0.0
+        self._capital_cache_ttl = 30.0
+
     def set_adaptive_controller(self, controller):
         """注入AdaptiveController实例，用于获取动态资金分配"""
         self._adaptive_controller = controller
@@ -342,7 +346,11 @@ class GridStrategy(PersistentStrategy):
         return self.config["trading"].get("grid_allocation", 0.30)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金；账户权益无法确认时返回 0，禁止按静态配置扩大仓位。"""
+        """获取有效资金；账户权益无法确认时返回 0，禁止按静态配置扩大仓位。30s TTL 缓存。"""
+        import time
+        now = time.time()
+        if self._capital_cache_value > 0 and (now - self._capital_cache_ts) < self._capital_cache_ttl:
+            return self._capital_cache_value
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -351,9 +359,13 @@ class GridStrategy(PersistentStrategy):
                     if detail.get("ccy") == "USDT":
                         eq = float(detail.get("eq", 0))
                         if eq > 0:
+                            self._capital_cache_value = eq
+                            self._capital_cache_ts = now
                             return eq
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
+                    self._capital_cache_value = total_eq
+                    self._capital_cache_ts = now
                     return total_eq
         except Exception as e:
             logger.warning(f"[grid] get_account_info failed, refusing new exposure: {e}")
@@ -1033,11 +1045,17 @@ class GridStrategy(PersistentStrategy):
         
         while True:
             ws_used = False
-            for symbol in self._all_symbols:
-                if self._trend_mode.get(symbol, False):
-                    continue
-                if await self._process_tick(symbol):
-                    ws_used = True
+
+            async def _tick_one(sym):
+                if self._trend_mode.get(sym, False):
+                    return False
+                return await self._process_tick(sym)
+
+            results = await asyncio.gather(
+                *[_tick_one(sym) for sym in self._all_symbols],
+                return_exceptions=True,
+            )
+            ws_used = any(r is True for r in results)
             
             # 定期更新活跃时间戳，避免心跳超时误报
             now = time.time()

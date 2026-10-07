@@ -1414,6 +1414,7 @@ class OKXClient:
         """异步获取K线数据（失败时自动降级为同步请求）
         
         P4-3: 添加K线缓存，网络降级时优先使用缓存避免重复请求
+        P0-118: 增强缓存 — 根据K线周期动态调整TTL，减少高频REST调用
         """
         try:
             bar_map = {
@@ -1425,9 +1426,31 @@ class OKXClient:
             bar = bar_map.get(interval, interval)
             cache_key = f"{symbol}:{bar}:{limit}"
             
-            # P4-3: 网络降级时优先使用缓存
+            # P0-118: 根据K线周期动态调整缓存TTL
+            # 短周期（1m-15m）：30秒 — 数据变化快，缓存窗口短
+            # 中周期（30m-2H）：60秒 — 平衡新鲜度与API负载
+            # 长周期（4H+）：120秒 — 数据变化慢，可长时间缓存
+            bar_minutes = {
+                "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                "1H": 60, "2H": 120, "4H": 240, "6H": 360,
+                "8H": 480, "12H": 720, "1D": 1440, "1W": 10080, "1M": 43200
+            }
+            minutes = bar_minutes.get(bar, 60)
+            if minutes <= 15:
+                cache_ttl = 30
+            elif minutes <= 120:
+                cache_ttl = 60
+            else:
+                cache_ttl = 120
+            
+            # P0-118: 优先检查缓存（即使网络正常也使用缓存，减少API调用）
+            cached = self._kline_cache.get(cache_key)
+            if cached and (time.time() - cached["ts"]) < cache_ttl:
+                logger.debug(f"P0-118: Using cached kline for {symbol} {bar} (age={time.time()-cached['ts']:.0f}s, ttl={cache_ttl}s)")
+                return cached["data"]
+            
+            # P4-3: 网络降级时优先使用缓存（更长TTL）
             if not self._network_healthy:
-                cached = self._kline_cache.get(cache_key)
                 if cached and (time.time() - cached["ts"]) < 300:  # 5分钟缓存
                     logger.debug(f"P4-3: Using cached kline for {symbol} (network degraded, age={time.time()-cached['ts']:.0f}s)")
                     return cached["data"]
@@ -1445,7 +1468,6 @@ class OKXClient:
                 return data["data"]
             # 异步失败，检查缓存
             if data is None:
-                cached = self._kline_cache.get(cache_key)
                 if cached and (time.time() - cached["ts"]) < 120:  # 2分钟缓存
                     logger.debug(f"P4-3: Using cached kline for {symbol} after async failure (age={time.time()-cached['ts']:.0f}s)")
                     return cached["data"]
@@ -1460,7 +1482,6 @@ class OKXClient:
                     return data["data"]
             # P5-1: 429限流 / 403代理屏蔽 - 跳过同步回退，直接使用缓存
             elif data.get("code") in ("429", "403"):
-                cached = self._kline_cache.get(cache_key)
                 if cached:
                     age = time.time() - cached["ts"]
                     # 403（代理被屏蔽）恢复较慢，用更长缓存窗口（10分钟）
@@ -2051,6 +2072,41 @@ class OKXClient:
         except Exception as e:
             logger.error(f"Error placing order: {e}")
             return {"sCode": "exception", "sMsg": str(e), "_failed": True}
+
+    def place_batch_orders(self, order_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """批量下单 — /api/v5/trade/batch-orders，最多 20 单/批。
+
+        每个 order 必须是已预处理好的请求体（instId/side/ordType/sz/tdMode/posSide 等），
+        与 place_order 内部构建的 body 格式一致。
+        返回与 order_list 等长的结果列表，每项包含 ordId/sCode/sMsg 或 _failed 标记。
+        """
+        if not order_list:
+            return []
+        if len(order_list) > 20:
+            logger.warning(f"place_batch_orders: {len(order_list)} orders exceeds max 20, truncating")
+            order_list = order_list[:20]
+
+        try:
+            path = "/api/v5/trade/batch-orders"
+            body_str = json.dumps({"orderList": order_list})
+            logger.debug(f"place_batch_orders request: {len(order_list)} orders")
+            data = self._make_request("POST", path, body_str)
+            if data is None:
+                return [{"_failed": True, "sCode": "0", "sMsg": "Network error"}] * len(order_list)
+
+            if data["code"] == "0":
+                results = data.get("data", [])
+                # OKX 返回的 data 顺序与请求 orderList 一致
+                return results if len(results) == len(order_list) else results + [
+                    {"_failed": True, "sCode": "missing", "sMsg": "Result not returned"}
+                ] * (len(order_list) - len(results))
+
+            # 整批失败
+            logger.error(f"Batch order failed: code={data.get('code')} msg={data.get('msg')}")
+            return [{"_failed": True, "sCode": data.get("code", ""), "sMsg": data.get("msg", "")}] * len(order_list)
+        except Exception as e:
+            logger.error(f"Error in place_batch_orders: {e}")
+            return [{"sCode": "exception", "sMsg": str(e), "_failed": True}] * len(order_list)
 
     def close_position(self, symbol: str, pos_side: str = "net") -> Dict[str, Any]:
         """平仓单个持仓（市价 reduce_only）

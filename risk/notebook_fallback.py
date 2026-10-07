@@ -161,6 +161,9 @@ class NotebookFallbackControl:
         except Exception as e:
             logger.error(f"Failed to fetch positions during emergency shutdown: {e}")
             positions = None
+
+        # P1-5: 批量平仓优化 — 一次 API 调用平所有仓位
+        order_bodies = []
         for pos_data in positions or []:
             try:
                 position = self.okx_client._parse_position(pos_data)
@@ -173,18 +176,40 @@ class NotebookFallbackControl:
                 continue
             side = _position_close_side(position)
             pos_side = _position_pos_side(position)
+
+            # 构建订单体
+            is_spot = "-SWAP" not in position.symbol
+            contracts_qty = qty
+            if not is_spot:
+                contracts_qty = self.okx_client.coin_to_contracts(position.symbol, qty)
+                contracts_qty = self.okx_client.round_quantity_to_lot(position.symbol, contracts_qty, round_up=True)
+            if contracts_qty <= 0:
+                continue
+
+            body = {
+                "instId": position.symbol,
+                "side": side,
+                "ordType": "market",
+                "sz": str(contracts_qty),
+                "reduceOnly": True,
+            }
+            if is_spot:
+                body["tdMode"] = "cash"
+            else:
+                body["tdMode"] = "isolated"
+                body["lever"] = str(int(_finite(position.leverage, 1.0)))
+                body["posSide"] = pos_side
+            order_bodies.append((position.symbol, body))
+
+        if order_bodies:
             try:
-                self.okx_client.place_order(
-                    symbol=position.symbol,
-                    side=side,
-                    order_type="market",
-                    quantity=qty,
-                    leverage=position.leverage,
-                    reduce_only=True,
-                    pos_side=pos_side,
-                )
+                batch_results = self.okx_client.place_batch_orders([b[1] for b in order_bodies])
+                for idx, (symbol, _) in enumerate(order_bodies):
+                    if idx >= len(batch_results) or batch_results[idx].get("_failed", False):
+                        msg = batch_results[idx].get("sMsg", "") if idx < len(batch_results) else "No result"
+                        logger.error(f"Emergency close failed for {symbol}: {msg}")
             except Exception as e:
-                logger.error(f"Emergency close failed for {position.symbol}: {e}")
+                logger.error(f"Batch emergency close failed: {e}")
 
         logger.critical("All positions closed. System shutting down.")
         self._sleep_prevention_active = False
@@ -195,6 +220,9 @@ class NotebookFallbackControl:
         except Exception as e:
             logger.error(f"Failed to fetch positions for aggressive close: {e}")
             positions = None
+
+        # P1-5: 批量平仓优化 — 只平高杠杆（>=8x）仓位
+        order_bodies = []
         for pos_data in positions or []:
             try:
                 position = self.okx_client._parse_position(pos_data)
@@ -209,18 +237,40 @@ class NotebookFallbackControl:
             if leverage >= 8:
                 side = _position_close_side(position)
                 pos_side = _position_pos_side(position)
-                try:
-                    self.okx_client.place_order(
-                        symbol=position.symbol,
-                        side=side,
-                        order_type="market",
-                        quantity=qty,
-                        leverage=position.leverage,
-                        reduce_only=True,
-                        pos_side=pos_side,
-                    )
-                except Exception as e:
-                    logger.error(f"Aggressive close failed for {position.symbol}: {e}")
+
+                # 构建订单体
+                is_spot = "-SWAP" not in position.symbol
+                contracts_qty = qty
+                if not is_spot:
+                    contracts_qty = self.okx_client.coin_to_contracts(position.symbol, qty)
+                    contracts_qty = self.okx_client.round_quantity_to_lot(position.symbol, contracts_qty, round_up=True)
+                if contracts_qty <= 0:
+                    continue
+
+                body = {
+                    "instId": position.symbol,
+                    "side": side,
+                    "ordType": "market",
+                    "sz": str(contracts_qty),
+                    "reduceOnly": True,
+                }
+                if is_spot:
+                    body["tdMode"] = "cash"
+                else:
+                    body["tdMode"] = "isolated"
+                    body["lever"] = str(int(leverage))
+                    body["posSide"] = pos_side
+                order_bodies.append((position.symbol, body))
+
+        if order_bodies:
+            try:
+                batch_results = self.okx_client.place_batch_orders([b[1] for b in order_bodies])
+                for idx, (symbol, _) in enumerate(order_bodies):
+                    if idx >= len(batch_results) or batch_results[idx].get("_failed", False):
+                        msg = batch_results[idx].get("sMsg", "") if idx < len(batch_results) else "No result"
+                        logger.error(f"Aggressive close failed for {symbol}: {msg}")
+            except Exception as e:
+                logger.error(f"Batch aggressive close failed: {e}")
 
     async def _pause_high_frequency_strategies(self):
         pass

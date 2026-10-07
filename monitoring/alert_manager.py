@@ -1,6 +1,7 @@
 """告警管理器：负责告警的生成、去重、分级与通知分发。"""
 import asyncio
 import os
+import time
 import requests
 import json
 from collections import deque
@@ -37,6 +38,12 @@ class AlertManager:
         self._retry_max = notif.get("alert_retry_max", 2)
         self._retry_delay = notif.get("alert_retry_delay_seconds", 1.0)
         self._fallback_dir = notif.get("alert_fallback_dir", "data/alerts_failed")
+        self._provider_circuit: Dict[str, Dict[str, Any]] = {
+            p: {"failures": 0, "open": False, "opened_at": 0.0}
+            for p in ("webhook", "telegram", "email", "dingtalk", "feishu")
+        }
+        self._circuit_threshold = notif.get("circuit_breaker_threshold", 5)
+        self._circuit_cooldown = notif.get("circuit_breaker_cooldown", 60.0)
     
     async def send_alert(self, alert_type: str, message: str, severity: str = "INFO", 
                          symbol: str = "", metadata: Dict[str, Any] = None):
@@ -122,8 +129,39 @@ class AlertManager:
         timestamps.append(now)
         return False
     
+    def _circuit_allows(self, provider: str) -> bool:
+        cb = self._provider_circuit.get(provider)
+        if cb is None:
+            return True
+        if not cb["open"]:
+            return True
+        if time.monotonic() - cb["opened_at"] > self._circuit_cooldown:
+            return True
+        return False
+
+    def _circuit_record(self, provider: str, success: bool) -> None:
+        cb = self._provider_circuit.get(provider)
+        if cb is None:
+            return
+        if success:
+            cb["failures"] = 0
+            cb["open"] = False
+        else:
+            cb["failures"] += 1
+            if cb["failures"] >= self._circuit_threshold and not cb["open"]:
+                cb["open"] = True
+                cb["opened_at"] = time.monotonic()
+                logger.warning(
+                    f"{provider} circuit breaker OPEN after {cb['failures']} failures "
+                    f"(cooldown {self._circuit_cooldown}s)"
+                )
+
     async def _send_with_retry(self, channel: str, alert_data: Dict[str, Any]) -> bool:
         """带重试的告警投递；返回 True 表示成功。"""
+        if not self._circuit_allows(channel):
+            logger.debug(f"{channel} circuit breaker open, skipping")
+            return False
+
         for attempt in range(1 + self._retry_max):
             ok = False
             if channel == "webhook":
@@ -133,9 +171,11 @@ class AlertManager:
             else:
                 return False
             if ok:
+                self._circuit_record(channel, True)
                 return True
             if attempt < self._retry_max:
                 await asyncio.sleep(self._retry_delay * (attempt + 1))
+        self._circuit_record(channel, False)
         logger.warning(f"Alert delivery exhausted retries: channel={channel} type={alert_data.get('alert_type')}")
         return False
 

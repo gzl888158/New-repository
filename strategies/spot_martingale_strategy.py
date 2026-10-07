@@ -97,6 +97,10 @@ class SpotMartingaleStrategy(PersistentStrategy):
         # === P0-6: 状态持久化 ===
         self.init_state_persistence("spot_martingale", redis_cache)
 
+        self._capital_cache_value = 0.0
+        self._capital_cache_ts = 0.0
+        self._capital_cache_ttl = 30.0
+
     def set_adaptive_controller(self, controller):
         self._adaptive_controller = controller
 
@@ -146,7 +150,11 @@ class SpotMartingaleStrategy(PersistentStrategy):
         return self.config["trading"].get("spot_martingale_allocation", 0.15)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金：仅使用实际账户权益；查询失败时 fail-closed 返回 0 拒绝开仓"""
+        """获取有效资金：仅使用实际账户权益；查询失败时 fail-closed 返回 0 拒绝开仓。30s TTL 缓存。"""
+        import time
+        now = time.time()
+        if self._capital_cache_value > 0 and (now - self._capital_cache_ts) < self._capital_cache_ttl:
+            return self._capital_cache_value
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -155,9 +163,13 @@ class SpotMartingaleStrategy(PersistentStrategy):
                     if detail.get("ccy") == "USDT":
                         eq = float(detail.get("eq", 0))
                         if eq > 0:
+                            self._capital_cache_value = eq
+                            self._capital_cache_ts = now
                             return eq
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
+                    self._capital_cache_value = total_eq
+                    self._capital_cache_ts = now
                     return total_eq
         except Exception as e:
             logger.error(f"Spot Martingale _get_effective_capital failed: {e}")
@@ -549,8 +561,10 @@ class SpotMartingaleStrategy(PersistentStrategy):
     async def _monitor_ticks(self):
         while True:
             try:
-                for symbol in self._all_symbols:
-                    await self._process_tick(symbol)
+                results = await asyncio.gather(
+                    *[self._process_tick(sym) for sym in self._all_symbols],
+                    return_exceptions=True,
+                )
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 raise

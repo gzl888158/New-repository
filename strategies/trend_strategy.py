@@ -200,6 +200,10 @@ class TrendStrategy(PersistentStrategy):
         # P0-4: 启用状态持久化（redis_cache 当前同步接口，StatePersistence 内部会自动降级到 JSON 文件）
         self.init_state_persistence("trend", redis_cache)
 
+        self._capital_cache_value = 0.0
+        self._capital_cache_ts = 0.0
+        self._capital_cache_ttl = 30.0
+
     def set_adaptive_controller(self, controller):
         """注入AdaptiveController实例，用于获取动态资金分配"""
         self._adaptive_controller = controller
@@ -275,7 +279,11 @@ class TrendStrategy(PersistentStrategy):
         return self.config["trading"].get("trend_allocation", 0.35)
 
     def _get_effective_capital(self) -> float:
-        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital"""
+        """获取有效资金：优先使用实际账户权益，回退到配置中的total_capital。30s TTL 缓存。"""
+        import time
+        now = time.time()
+        if self._capital_cache_value > 0 and (now - self._capital_cache_ts) < self._capital_cache_ttl:
+            return self._capital_cache_value
         try:
             account_info = self.okx_client.get_account_info()
             if account_info:
@@ -284,13 +292,21 @@ class TrendStrategy(PersistentStrategy):
                     if detail.get("ccy") == "USDT":
                         eq = float(detail.get("eq", 0))
                         if eq > 0:
+                            self._capital_cache_value = eq
+                            self._capital_cache_ts = now
                             return eq
                 total_eq = float(account_info.get("totalEq", 0))
                 if total_eq > 0:
+                    self._capital_cache_value = total_eq
+                    self._capital_cache_ts = now
                     return total_eq
         except Exception as e:
             logger.warning(f"[trend] get_account_info failed, fallback to config total_capital: {e}")
-        return self.config["trading"].get("total_capital", 100.0)
+        fallback = self.config["trading"].get("total_capital", 100.0)
+        if self._capital_cache_value <= 0:
+            self._capital_cache_value = fallback
+            self._capital_cache_ts = now
+        return fallback
 
     def _get_small_cap_multiplier(self, total_capital: float) -> float:
         """小资金适配乘数：资金越少，乘数越大，确保单笔保证金足够"""
@@ -546,10 +562,9 @@ class TrendStrategy(PersistentStrategy):
                 await asyncio.sleep(60)
 
     async def _update_indicators(self):
-        for symbol in self._all_symbols:
+        async def _fetch_symbol(symbol):
             if symbol not in self._indicator_cache:
                 self._indicator_cache[symbol] = {}
-            
             for period in self._confirmation_periods:
                 try:
                     klines = await self.okx_client.get_kline_async(symbol, period, limit=120)
@@ -558,22 +573,23 @@ class TrendStrategy(PersistentStrategy):
                 except Exception as e:
                     logger.debug(f"Trend _update_indicators failed for {symbol} {period}: {e}")
 
+        await asyncio.gather(*[_fetch_symbol(sym) for sym in self._all_symbols])
+
     async def _update_market_state(self):
-        for symbol in self._all_symbols:
+        async def _fetch_state(symbol):
             try:
                 klines = await self.okx_client.get_kline_async(symbol, "1H", limit=self._market_state_lookback + 10)
-                
                 if len(klines) >= self._market_state_lookback:
                     klines = sorted(klines, key=lambda k: int(k[0]))
                     prices = [float(k[4]) for k in klines[-self._market_state_lookback:]]
                     volumes = [float(k[5]) for k in klines[-self._market_state_lookback:]]
-                    
                     atr = self._indicator_cache.get(symbol, {}).get("1H", {}).get("atr", 0)
-                    
                     market_state = detect_market_state(prices, volumes, atr, self._market_state_lookback)
                     self._market_state[symbol] = market_state
             except Exception as e:
                 logger.debug(f"Trend _update_market_state failed for {symbol}: {e}")
+
+        await asyncio.gather(*[_fetch_state(sym) for sym in self._all_symbols])
 
     def _calculate_all_indicators(self, klines, symbol: str = ""):
         data = self._kline_to_df(klines)
@@ -926,46 +942,36 @@ class TrendStrategy(PersistentStrategy):
                 )
             return
         
-        for symbol in self._all_symbols:
+        async def _check_one(symbol):
             now = datetime.now()
             last_signal = self._last_signal_time.get(symbol)
-            
+
             if last_signal and (now - last_signal).total_seconds() / 3600 < 1:
-                continue
-            
-            # 如果该symbol已有持仓，跳过新开仓信号
+                return
+
             pos_state = self._position_state.get(symbol)
             if pos_state and pos_state.get("status") == "open":
-                continue
-            
-            # 波动率锁仓检查：锁仓期内不新开仓
+                return
+
             lockout = self._volatility_lockout_until.get(symbol)
             if lockout and datetime.now() < lockout:
-                continue
-            
+                return
+
             trend_direction, confidence = await self._detect_trend(symbol)
             self._signal_starvation_stats["scanned"] += 1
             if trend_direction:
                 self._signal_starvation_stats["detected"] += 1
-                # === 企业级趋势子策略确认（均线/唐奇安/MACD零轴/动量） ===
                 try:
                     sub = await self._evaluate_trend_sub_strategies(symbol)
                     if sub.get("available"):
                         macd_axis = sub.get("macd_axis")
-                        # MACD 零轴软调整：方向一致加分、方向矛盾减分（不再硬否决）
-                        # 底部反转初期价格已转多但 1H MACD 仍趴在零轴下方，硬否决会
-                        # 挡住所有多头信号；改为降置信度，让信号交由后续综合门槛裁决。
                         if trend_direction == "long" and macd_axis == "bear":
-                            logger.debug(f"Trend {symbol}: MACD 零轴下方，多头信号降置信度")
                             confidence = max(0.0, confidence - 0.05)
                         elif trend_direction == "short" and macd_axis == "bull":
-                            logger.debug(f"Trend {symbol}: MACD 零轴上方，空头信号降置信度")
                             confidence = max(0.0, confidence - 0.05)
                         elif (trend_direction == "long" and macd_axis == "bull") or \
                                 (trend_direction == "short" and macd_axis == "bear"):
                             confidence = min(0.95, confidence + 0.03)
-
-                        # 均线/唐奇安方向一致 → 加分；震荡市且不一致 → 减分
                         ma_sig = sub.get("ma", {}).get("signal")
                         don_sig = sub.get("donchian", {}).get("signal")
                         agreement = sum(1 for s in (ma_sig, don_sig) if s == trend_direction)
@@ -973,8 +979,6 @@ class TrendStrategy(PersistentStrategy):
                             confidence = min(0.95, confidence + 0.05 * agreement)
                         if sub.get("ma", {}).get("range_market") and ma_sig != trend_direction:
                             confidence = max(0.0, confidence - 0.05)
-
-                        # 动量（强者恒强）：同向动量加分，反向动量减分
                         mom = sub.get("momentum", {}).get("composite", 0.0)
                         if (trend_direction == "long" and mom > 0) or (trend_direction == "short" and mom < 0):
                             confidence = min(0.95, confidence + 0.03)
@@ -985,13 +989,9 @@ class TrendStrategy(PersistentStrategy):
 
                 self._signal_starvation_stats["macd_pass"] += 1
 
-                # === 增强趋势确认（软加权门控：不再逐项硬否决，改为综合评分） ===
                 try:
-                    # 多时间框架确认：至少 2/3 周期 (1h, 4h, 24h) 方向一致
                     mtf_passed = await self._check_multi_timeframe_direction(symbol, trend_direction)
-                    # 成交量确认：当前量 > 20周期均量
                     vol_passed = await self._check_volume_confirmation(symbol, trend_direction)
-                    # ADX 确认：ADX(14) > 20
                     adx_passed = await self._check_adx_confirmation(symbol)
 
                     if mtf_passed:
@@ -1001,18 +1001,12 @@ class TrendStrategy(PersistentStrategy):
                     if adx_passed:
                         self._signal_starvation_stats["adx_pass"] += 1
 
-                    # 至少 min_confirmation_count 项确认通过（默认 1），避免完全无确认的纯结构信号
                     confirmation_count = sum(1 for p in (mtf_passed, vol_passed, adx_passed) if p)
                     if confirmation_count < self._min_confirmation_count:
                         self._increment_metric("trend_gate_rejected_total", 1.0,
                                                {"gate": "min_confirmation", "symbol": symbol})
-                        logger.debug(
-                            f"Trend {symbol}: confirmations {confirmation_count}/3 < "
-                            f"min {self._min_confirmation_count}, signal rejected"
-                        )
-                        continue
+                        return
 
-                    # 综合置信度计算（融合检测器置信度与多因子软评分）
                     trend_confidence = await self._calculate_trend_confidence(
                         symbol, trend_direction, confidence,
                         mtf_passed=mtf_passed,
@@ -1022,11 +1016,7 @@ class TrendStrategy(PersistentStrategy):
                     if trend_confidence < self._confidence_threshold:
                         self._increment_metric("trend_gate_rejected_total", 1.0,
                                                {"gate": "confidence", "symbol": symbol})
-                        logger.debug(
-                            f"Trend {symbol}: confidence {trend_confidence:.2f} < "
-                            f"{self._confidence_threshold:.2f}, signal rejected"
-                        )
-                        continue
+                        return
 
                     confidence = trend_confidence
                 except Exception as e:
@@ -1034,6 +1024,8 @@ class TrendStrategy(PersistentStrategy):
 
                 self._signal_starvation_stats["generated"] += 1
                 await self._generate_trend_signal(symbol, trend_direction, confidence)
+
+        await asyncio.gather(*[_check_one(sym) for sym in self._all_symbols])
 
         # 信号饥饿诊断：周期性汇总开单漏斗各层通过情况
         self._log_starvation_summary()

@@ -2,9 +2,11 @@
 通知渠道管理器
 支持多种通知渠道：邮件、钉钉、飞书等
 """
+import asyncio
 import json
 import smtplib
 import ssl
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -16,18 +18,48 @@ from loguru import logger
 
 
 class NotificationChannel(ABC):
-    """通知渠道抽象基类"""
-    
+    """通知渠道抽象基类（内置熔断器）"""
+
+    CIRCUIT_FAILURE_THRESHOLD = 5
+    CIRCUIT_COOLDOWN_SECONDS = 60.0
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.enabled = config.get("enabled", True)
         self.name = self.__class__.__name__
-    
+        self._consecutive_failures = 0
+        self._circuit_open = False
+        self._circuit_opened_at = 0.0
+
+    def _circuit_allows_send(self) -> bool:
+        if not self._circuit_open:
+            return True
+        if time.monotonic() - self._circuit_opened_at > self.CIRCUIT_COOLDOWN_SECONDS:
+            logger.info(f"{self.name} circuit breaker half-open, allowing trial send")
+            return True
+        return False
+
+    def _record_success(self) -> None:
+        if self._consecutive_failures > 0:
+            logger.info(f"{self.name} circuit breaker closed (was {self._consecutive_failures} failures)")
+        self._consecutive_failures = 0
+        self._circuit_open = False
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.CIRCUIT_FAILURE_THRESHOLD:
+            self._circuit_open = True
+            self._circuit_opened_at = time.monotonic()
+            logger.warning(
+                f"{self.name} circuit breaker OPEN after {self._consecutive_failures} "
+                f"consecutive failures (cooldown {self.CIRCUIT_COOLDOWN_SECONDS}s)"
+            )
+
     @abstractmethod
     async def send(self, message: str, subject: str, severity: str = "INFO", **kwargs) -> bool:
         """发送通知"""
         pass
-    
+
     def format_message(self, message: str, subject: str, severity: str) -> str:
         """格式化消息"""
         return f"[{severity}] {subject}\n\n{message}"
@@ -63,10 +95,14 @@ class EmailChannel(NotificationChannel):
             
             context = ssl.create_default_context()
             
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls(context=context)
-                server.login(self.username, self.password)
-                server.sendmail(self.username, self.recipients, msg.as_string())
+            # P1-5: 将阻塞式 SMTP 操作移至线程池
+            def _send_email():
+                with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                    server.starttls(context=context)
+                    server.login(self.username, self.password)
+                    server.sendmail(self.username, self.recipients, msg.as_string())
+            
+            await asyncio.to_thread(_send_email)
             
             logger.info(f"Email sent to {self.recipients}")
             return True
@@ -112,7 +148,10 @@ class DingTalkChannel(NotificationChannel):
                 }
             }
             
-            response = requests.post(self.webhook_url, headers=headers, json=body, timeout=10)
+            # P1-5: 将阻塞式 requests.post 移至线程池
+            response = await asyncio.to_thread(
+                requests.post, self.webhook_url, headers=headers, json=body, timeout=10
+            )
             response.raise_for_status()
             
             result = response.json()
@@ -152,7 +191,10 @@ class FeishuChannel(NotificationChannel):
                 }
             }
             
-            response = requests.post(self.webhook_url, headers=headers, json=body, timeout=10)
+            # P1-5: 将阻塞式 requests.post 移至线程池
+            response = await asyncio.to_thread(
+                requests.post, self.webhook_url, headers=headers, json=body, timeout=10
+            )
             response.raise_for_status()
             
             result = response.json()
@@ -227,15 +269,24 @@ class NotificationManager:
         """列出所有渠道"""
         return list(self._channels.keys())
     
-    async def send_to_channel(self, channel_name: str, message: str, subject: str, 
+    async def send_to_channel(self, channel_name: str, message: str, subject: str,
                               severity: str = "INFO", **kwargs) -> bool:
-        """发送到指定渠道"""
+        """发送到指定渠道（带熔断保护）"""
         channel = self.get_channel(channel_name)
         if not channel:
             logger.warning(f"Channel {channel_name} not found")
             return False
-        
-        return await channel.send(message, subject, severity, **kwargs)
+
+        if not channel._circuit_allows_send():
+            logger.debug(f"{channel_name} circuit breaker open, dropping message")
+            return False
+
+        result = await channel.send(message, subject, severity, **kwargs)
+        if result:
+            channel._record_success()
+        else:
+            channel._record_failure()
+        return result
     
     async def broadcast(self, message: str, subject: str, severity: str = "INFO", 
                        channels: Optional[List[str]] = None, **kwargs) -> Dict[str, bool]:

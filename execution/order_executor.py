@@ -177,6 +177,11 @@ class OrderExecutor:
             config.get("execution", {}).get("persist_active_orders", False)
         )
         self._fill_receipt_recovered = 0   # 观测指标：全量对账补发的回执数
+
+        # P0-9: 持仓查询短期缓存 — 同一执行路径内多次调用复用结果，避免重复 REST API
+        self._positions_cache: Optional[List[Dict[str, Any]]] = None
+        self._positions_cache_time: float = 0.0
+        self._positions_cache_ttl: float = config.get("execution", {}).get("positions_cache_ttl", 2.0)  # 默认2秒
         self._last_fill_reconcile_ts = 0.0  # 全量对账低频节流时间戳
         self._fill_reconcile_interval = float(
             config.get("execution", {}).get("fill_reconcile_interval_sec", 30.0)
@@ -924,7 +929,18 @@ class OrderExecutor:
         return None  # 不可重试
 
     def _get_positions_checked(self) -> Optional[List[Dict[str, Any]]]:
-        """查询交易所持仓；None 表示失败，空列表仅表示确认空仓。"""
+        """查询交易所持仓；None 表示失败，空列表仅表示确认空仓。
+
+        P0-9: 2秒内重复调用直接返回缓存，避免同一执行路径多次 REST API。
+        """
+        cache = getattr(self, "_positions_cache", None)
+        cache_time = getattr(self, "_positions_cache_time", 0.0)
+        cache_ttl = getattr(self, "_positions_cache_ttl", 2.0)
+
+        now = time.perf_counter()
+        if cache is not None and (now - cache_time) < cache_ttl:
+            return cache
+
         checked_query = getattr(self.okx_client, "get_positions_checked", None)
         positions = (
             checked_query()
@@ -932,13 +948,25 @@ class OrderExecutor:
             else self.okx_client.get_positions()
         )
         if positions is None:
+            self._positions_cache = None
+            self._positions_cache_time = now
             return None
         if not isinstance(positions, list) or any(
             not isinstance(position, dict) for position in positions
         ):
             logger.error("Invalid exchange positions response; refusing position-dependent action")
+            self._positions_cache = None
+            self._positions_cache_time = now
             return None
+
+        self._positions_cache = positions
+        self._positions_cache_time = now
         return positions
+
+    def _invalidate_positions_cache(self):
+        """P0-9: 持仓变更后清除缓存，确保下次查询获取最新数据。"""
+        self._positions_cache = None
+        self._positions_cache_time = 0.0
 
     async def _confirm_lifecycle_timeout(self, order: Dict[str, Any]) -> bool:
         """只有交易所确认订单已撤销后，生命周期管理器才可终结超时订单。"""
@@ -1896,13 +1924,18 @@ class OrderExecutor:
         # 幂等启动：避免重复调用创建多套后台任务
         if self._tasks:
             return
+        # P2-1: 多消费者并行执行 — 提升高并发场景吞吐量
+        # 配置项 execution_workers 控制并行度，默认 2
+        num_workers = max(1, int(self.config.get("execution", {}).get("execution_workers", 2)))
         self._tasks = [
-            asyncio.create_task(self._execution_loop(), name="exec_loop"),
+            *(asyncio.create_task(self._execution_loop(worker_id=i), name=f"exec_loop_{i}")
+              for i in range(num_workers)),
             asyncio.create_task(self._reconciliation_loop(), name="recon_loop"),
             asyncio.create_task(self._order_tracking_loop(), name="track_loop"),
             asyncio.create_task(self._dynamic_stop_loss_loop(), name="sl_loop"),
         ]
         await self._lifecycle_manager.start()
+        logger.info(f"OrderExecutor started with {num_workers} execution workers")
 
     async def stop(self):
         """取消并等待所有后台任务退出，防止任务泄漏与重复创建。"""
@@ -1951,15 +1984,17 @@ class OrderExecutor:
             logger.error(f"Failed to queue order: {e}")
             return False
     
-    async def _execution_loop(self):
+    async def _execution_loop(self, worker_id: int = 0):
+        """执行主循环 — P2-1: 支持多 worker 并行消费"""
         while True:
             try:
                 if self._order_queue is None:
                     await asyncio.sleep(0.5)
                     continue
-                
+
                 order_data = await self._order_queue.get_next_order()
                 if order_data:
+                    logger.debug(f"[worker_{worker_id}] Processing order for {order_data.get('symbol')}")
                     await self._execute_order(order_data)
                     await asyncio.sleep(0.05)  # 处理完订单后短暂休息
                 else:
@@ -1967,7 +2002,7 @@ class OrderExecutor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Loop error in _execution_loop: {e}")
+                logger.error(f"Loop error in _execution_loop[worker_{worker_id}]: {e}")
                 if self._alert_manager:
                     try:
                         await self._alert_manager.send_alert(
@@ -1975,7 +2010,7 @@ class OrderExecutor:
                             message=f"执行主循环异常（订单处理可能中断）: {e}",
                             severity="CRITICAL",
                             symbol="SYSTEM",
-                            metadata={"loop": "_execution_loop", "error": str(e)},
+                            metadata={"loop": f"_execution_loop[{worker_id}]", "error": str(e)},
                         )
                     except Exception:
                         pass
@@ -2060,7 +2095,8 @@ class OrderExecutor:
                 logger.debug(f"Converted direction 'close' -> '{direction}' via explicit pos_side")
             else:
                 # 从现有持仓推导方向
-                positions = self.okx_client.get_positions()
+                # P0-C: 使用异步持仓查询避免阻塞事件循环
+                positions = await self.okx_client.get_positions_async()
                 existing_pos = next((p for p in positions if p.get("instId", "") == symbol 
                                     and abs(float(p.get("pos", 0) or 0)) > 0), None)
                 if existing_pos:
@@ -2279,102 +2315,118 @@ class OrderExecutor:
         order_data["order_type"] = order_type
         order_data["price"] = price
 
-        # 开仓前保证金预检，避免直接发51008错误单（平仓信号不需要保证金）
-        if not is_close_signal and not self._check_margin_sufficient(symbol, quantity, price, leverage):
-            logger.warning(f"Insufficient margin for {symbol} open order, skipping (pre-check)")
-            self._record_symbol_fail(symbol, "margin_pre_check_failed", strategy_name)
-            if order_id:
-                await self._order_queue.update_order_status(order_id, "failed")
-            return
-
-        # P2: 开仓前动态波动过滤 - 替代固定时段禁交易
-        # 当24h振幅超过阈值时禁止开仓，避免高波动磨损
-        if not is_close_signal and self._no_trade_volatility_threshold > 0:
-            try:
-                # 复用预取 ticker（不再重复调用 get_ticker_async）
-                vol_ticker = prefetched_ticker
-                if vol_ticker is None:
-                    vol_ticker = await self.okx_client.get_ticker_async(symbol)
-                if vol_ticker:
-                    high_24h = float(vol_ticker.get("high24h", 0) or 0)
-                    low_24h = float(vol_ticker.get("low24h", 0) or 0)
-                    if low_24h > 0:
-                        volatility = (high_24h - low_24h) / low_24h
-                        if volatility > self._no_trade_volatility_threshold:
-                            logger.info(
-                                f"Order blocked: {symbol} 24h volatility {volatility:.1%} "
-                                f"> threshold {self._no_trade_volatility_threshold:.0%}, "
-                                f"skipping {strategy_name} {signal_type}"
-                            )
-                            if order_id:
-                                await self._order_queue.update_order_status(order_id, "failed")
-                            return
-            except Exception as e:
-                logger.debug(f"Volatility check failed for {symbol}, allowing trade: {e}")
-
-        # 开仓前重复持仓检查：同 symbol + 同方向只允许 1 笔 open 持仓
-        # 避免策略连续同向信号导致保证金累积浪费（历史数据显示 ARB short 6 笔重复，浪费 5.5 USDT）
-        # 网格策略豁免：网格策略的多层双向开仓是其设计核心，不应拦截
-        # P0-竞态修复：优先使用交易所持仓状态（而非 SQLite），避免本地记录滞后导致重复开仓
-        if not is_close_signal and "grid" not in strategy_name.lower():
-            # 查询交易所实际持仓（权威数据源）
-            exchange_positions = self._get_positions_checked()
-            if exchange_positions is None:
-                # 交易所查询失败时降级到 SQLite（保守策略：允许开仓但记录警告）
-                logger.warning(
-                    f"Exchange position query failed for {symbol}, falling back to SQLite for duplicate check"
-                )
-                existing_open = self.sqlite_storage.get_all_open_records(symbol)
-                duplicate = False
-                opposite_conflict = False
-                for rec in existing_open:
-                    rec_side = str(rec.get("side", "")).lower()
-                    rec_dir = DirectionUnifier.normalize(rec_side) if rec_side in ("long", "short", "buy", "sell") else ""
-                    if rec_dir and rec_dir == pos_side:
-                        duplicate = True
-                        break
-                    if rec_dir and rec_dir != pos_side and rec_dir in ("long", "short"):
-                        opposite_conflict = True
-            else:
-                # 使用交易所持仓状态检查重复和反向冲突
-                duplicate = False
-                opposite_conflict = False
-                for p in exchange_positions:
-                    if p.get("instId", "") != symbol:
-                        continue
-                    pos_qty = abs(float(p.get("pos", 0) or 0))
-                    if pos_qty <= 0:
-                        continue
-                    # 找到该 symbol 的持仓
-                    exchange_pos_side = p.get("posSide", "").lower()
-                    if exchange_pos_side == pos_side:
-                        duplicate = True
-                        break
-                    elif exchange_pos_side in ("long", "short"):
-                        opposite_conflict = True
-
-            if duplicate:
-                logger.info(
-                    f"Duplicate open position blocked: {symbol} {pos_side} already exists on exchange, "
-                    f"skipping new {strategy_name} {signal_type} order"
-                )
-                if order_id:
-                    await self._order_queue.update_order_status(order_id, "failed")
-                return
-            # P0: 反向持仓冲突——已有相反方向持仓时禁止开仓（防止双向对冲浪费保证金）
-            if opposite_conflict:
-                opp_dir = DirectionUnifier.opposite(pos_side)
-                logger.warning(
-                    f"Opposite position conflict blocked: {symbol} already has {opp_dir} position on exchange, "
-                    f"rejecting new {pos_side} {strategy_name} {signal_type} order"
-                )
-                if order_id:
-                    await self._order_queue.update_order_status(order_id, "failed")
-                return
-
-        # 开仓前最大并发持仓数检查：动态调整+优先级驱逐
+        # P2-3: 开仓前预检并行化 — 保证金检查 + 持仓查询并行执行，减少端到端延迟
+        # 两个独立检查：保证金（需 account_info API）和持仓状态（需 positions API）
         if not is_close_signal:
-            current_positions = self._get_positions_checked()
+            # 并行执行：保证金预检 + 持仓状态查询
+            async def check_margin_async():
+                return await asyncio.to_thread(
+                    self._check_margin_sufficient, symbol, quantity, price, leverage
+                )
+
+            async def get_positions_async():
+                return await asyncio.to_thread(self._get_positions_checked)
+
+            margin_ok, exchange_positions = await asyncio.gather(
+                check_margin_async(),
+                get_positions_async(),
+                return_exceptions=True
+            )
+
+            # 处理异常结果
+            if isinstance(margin_ok, Exception):
+                logger.error(f"Margin check exception for {symbol}: {margin_ok}")
+                margin_ok = False  # fail-closed
+            if isinstance(exchange_positions, Exception):
+                logger.error(f"Position query exception for {symbol}: {exchange_positions}")
+                exchange_positions = None
+
+            # 保证金检查
+            if not margin_ok:
+                logger.warning(f"Insufficient margin for {symbol} open order, skipping (pre-check)")
+                self._record_symbol_fail(symbol, "margin_pre_check_failed", strategy_name)
+                if order_id:
+                    await self._order_queue.update_order_status(order_id, "failed")
+                return
+
+            # P2: 开仓前动态波动过滤 - 复用预取 ticker
+            if self._no_trade_volatility_threshold > 0:
+                try:
+                    vol_ticker = prefetched_ticker
+                    if vol_ticker is None:
+                        vol_ticker = await self.okx_client.get_ticker_async(symbol)
+                    if vol_ticker:
+                        high_24h = float(vol_ticker.get("high24h", 0) or 0)
+                        low_24h = float(vol_ticker.get("low24h", 0) or 0)
+                        if low_24h > 0:
+                            volatility = (high_24h - low_24h) / low_24h
+                            if volatility > self._no_trade_volatility_threshold:
+                                logger.info(
+                                    f"Order blocked: {symbol} 24h volatility {volatility:.1%} "
+                                    f"> threshold {self._no_trade_volatility_threshold:.0%}, "
+                                    f"skipping {strategy_name} {signal_type}"
+                                )
+                                if order_id:
+                                    await self._order_queue.update_order_status(order_id, "failed")
+                                return
+                except Exception as e:
+                    logger.debug(f"Volatility check failed for {symbol}, allowing trade: {e}")
+
+            # 开仓前重复持仓检查：使用并行查询结果
+            if "grid" not in strategy_name.lower():
+                if exchange_positions is None:
+                    # 交易所查询失败时降级到 SQLite
+                    logger.warning(
+                        f"Exchange position query failed for {symbol}, falling back to SQLite for duplicate check"
+                    )
+                    existing_open = self.sqlite_storage.get_all_open_records(symbol)
+                    duplicate = False
+                    opposite_conflict = False
+                    for rec in existing_open:
+                        rec_side = str(rec.get("side", "")).lower()
+                        rec_dir = DirectionUnifier.normalize(rec_side) if rec_side in ("long", "short", "buy", "sell") else ""
+                        if rec_dir and rec_dir == pos_side:
+                            duplicate = True
+                            break
+                        if rec_dir and rec_dir != pos_side and rec_dir in ("long", "short"):
+                            opposite_conflict = True
+                else:
+                    # 使用交易所持仓状态检查
+                    duplicate = False
+                    opposite_conflict = False
+                    for p in exchange_positions:
+                        if p.get("instId", "") != symbol:
+                            continue
+                        pos_qty = abs(float(p.get("pos", 0) or 0))
+                        if pos_qty <= 0:
+                            continue
+                        exchange_pos_side = p.get("posSide", "").lower()
+                        if exchange_pos_side == pos_side:
+                            duplicate = True
+                            break
+                        elif exchange_pos_side in ("long", "short"):
+                            opposite_conflict = True
+
+                if duplicate:
+                    logger.info(
+                        f"Duplicate open position blocked: {symbol} {pos_side} already exists on exchange, "
+                        f"skipping new {strategy_name} {signal_type} order"
+                    )
+                    if order_id:
+                        await self._order_queue.update_order_status(order_id, "failed")
+                    return
+                if opposite_conflict:
+                    opp_dir = DirectionUnifier.opposite(pos_side)
+                    logger.warning(
+                        f"Opposite position conflict blocked: {symbol} already has {opp_dir} position on exchange, "
+                        f"rejecting new {pos_side} {strategy_name} {signal_type} order"
+                    )
+                    if order_id:
+                        await self._order_queue.update_order_status(order_id, "failed")
+                    return
+
+            # 开仓前最大并发持仓数检查：复用并行查询结果
+            current_positions = exchange_positions
             if current_positions is None:
                 logger.error(
                     f"Open order rejected: exchange position state unavailable for {symbol}"
@@ -2455,10 +2507,15 @@ class OrderExecutor:
                     "trace_id": order_data.get("trace_id", ""),  # P2: 全链路 traceID 串联
                 }
                 # P2: 优先独立风控裁决器（traceID 贯穿 + 裁决事件溯源），未注入回退 RiskGate
+                # P0-A: 风控校验为同步方法，使用 to_thread 避免阻塞事件循环
                 if self._risk_adjudicator is not None:
-                    risk_result = self._risk_adjudicator.adjudicate(risk_signal, is_close=is_close_signal)
+                    risk_result = await asyncio.to_thread(
+                        self._risk_adjudicator.adjudicate, risk_signal, is_close=is_close_signal
+                    )
                 else:
-                    risk_result = self._risk_gate.validate(risk_signal, is_close=is_close_signal)
+                    risk_result = await asyncio.to_thread(
+                        self._risk_gate.validate, risk_signal, is_close=is_close_signal
+                    )
                 if not risk_result.passed:
                     # 风控拦截：直接丢弃，不下单，记录拦截原因
                     logger.warning(
@@ -2717,7 +2774,8 @@ class OrderExecutor:
 
         # 诊断：下单前打印账户余额
         try:
-            acct = self.okx_client.get_account_info()
+            # P0-C: 使用异步账户查询避免阻塞事件循环
+            acct = await self.okx_client.get_account_info_async()
             if acct:
                 usdt_detail = None
                 for d in acct.get("details", []):
@@ -3008,23 +3066,32 @@ class OrderExecutor:
                     # 避免用下单数量而非实际成交数量挂TP/SL，导致超挂或挂错侧
                     if order_type in ("limit", "post_only") and fill_px <= 0 and fill_sz <= 0:
                         try:
-                            # 延迟1秒等待订单可能成交
-                            await asyncio.sleep(1.0)
-                            order_details = await asyncio.to_thread(
-                                self.okx_client.get_order_details,
-                                symbol, exchange_order_id
-                            )
-                            if order_details:
-                                fill_px = float(order_details.get("avgPx") or order_details.get("fillPx") or 0.0)
-                                fill_sz = float(order_details.get("fillSz") or order_details.get("accFillSz") or 0.0)
-                                order_state = order_details.get("state", "")
-                                if fill_px > 0 or fill_sz > 0:
-                                    logger.info(
-                                        f"Partial fill detected for {symbol}: "
-                                        f"fill_px={fill_px:.4f}, fill_sz={fill_sz}, state={order_state}"
-                                    )
-                                elif order_state == "canceled":
-                                    logger.warning(f"Order {exchange_order_id} for {symbol} was canceled")
+                            # P0: 自适应轮询替代固定1s等待 — 指数退避 50/100/200ms(最长350ms)，成交即退出
+                            _poll_delays = (0.05, 0.1, 0.2)
+                            for _poll_i, _poll_delay in enumerate(_poll_delays):
+                                await asyncio.sleep(_poll_delay)
+                                order_details = await asyncio.to_thread(
+                                    self.okx_client.get_order_details,
+                                    symbol, exchange_order_id
+                                )
+                                if order_details:
+                                    fill_px = float(order_details.get("avgPx") or order_details.get("fillPx") or 0.0)
+                                    fill_sz = float(order_details.get("fillSz") or order_details.get("accFillSz") or 0.0)
+                                    order_state = order_details.get("state", "")
+                                    if fill_px > 0 or fill_sz > 0:
+                                        logger.info(
+                                            f"Partial fill detected for {symbol}: "
+                                            f"fill_px={fill_px:.4f}, fill_sz={fill_sz}, state={order_state} "
+                                            f"(poll={_poll_i+1})"
+                                        )
+                                        break
+                                    elif order_state == "canceled":
+                                        logger.warning(f"Order {exchange_order_id} for {symbol} was canceled")
+                                        break
+                                    elif order_state in ("live", "partially_filled"):
+                                        continue
+                                    else:
+                                        break
                         except Exception as query_err:
                             logger.debug(f"Order details query failed for {symbol}: {query_err}")
 
@@ -3330,44 +3397,18 @@ class OrderExecutor:
         leverage: int,
         fill_px: float,
     ):
-        """P0-后置操作：条件单挂单 + 交易记录落盘（带超时保护）"""
-        # 挂条件单（TP/SL）并验证结果
-        cond_result = await self._place_conditional_orders(order_data, exchange_order_id)
+        """P0-后置操作：条件单挂单（异步） + 交易记录落盘（同步，5s 超时保护）
 
-        # P0-条件单失败告警+后台重试：TP/SL 任一失败时发送 CRITICAL 告警并启动后台重试
-        if cond_result.get("error"):
-            error_msg = f"{symbol} 条件单放置失败: {cond_result['error']} (order={exchange_order_id})"
-            logger.error(error_msg)
-            if self._alert_manager:
-                try:
-                    await self._alert_manager.send_alert(
-                        "conditional_orders_failed",
-                        error_msg,
-                        severity="CRITICAL",
-                        symbol=symbol,
-                        metadata={
-                            "order_id": exchange_order_id,
-                            "sl_placed": cond_result.get("sl_placed", False),
-                            "tp_placed": cond_result.get("tp_placed", False),
-                            "error": cond_result.get("error"),
-                        },
-                    )
-                except Exception:
-                    pass
-
-            # P0-后台重试机制：条件单失败时启动后台任务重试（最多3次，指数退避）
-            # 确保持仓最终有TP/SL保护，避免裸仓暴露
+        P0-1 优化：TP/SL 挂单立即作为后台任务发出，不阻塞 SQLite 落盘。
+        裸仓窗口从 "5s timeout + [5,15,30]s retry" 缩减到 "~200ms API 延迟"。
+        """
+        # P0-1: TP/SL 立即异步发出，不等待结果
+        if not is_close_signal:
             asyncio.create_task(
-                self._retry_conditional_orders_background(
-                    order_data=order_data.copy(),
-                    exchange_order_id=exchange_order_id,
-                    symbol=symbol,
-                    failed_sl=not cond_result.get("sl_placed", True),
-                    failed_tp=not cond_result.get("tp_placed", True),
-                )
+                self._place_conditional_orders_async(order_data, exchange_order_id, symbol)
             )
 
-        # 开仓记录落盘
+        # 开仓记录落盘（同步，受 5s 超时保护）
         if not is_close_signal:
             taker_fee_rate = self.config.get("trading", {}).get("taker_fee_rate", 0.0005)
             est_open_fee = quantity * price * taker_fee_rate
@@ -3391,6 +3432,67 @@ class OrderExecutor:
                 "trace_id": order_data.get("trace_id", "")
             })
 
+    async def _place_conditional_orders_async(
+        self,
+        order_data: Dict[str, Any],
+        exchange_order_id: str,
+        symbol: str,
+    ):
+        """P0-1: 异步 TP/SL 挂单 — 作为后台任务立即发出，不阻塞主流程。
+
+        封装原 _post_order_operations 中的条件单逻辑：调用 → 错误检查 → alert → 后台重试。
+        任何异常均在此方法内消化，不影响主开仓流程。
+        """
+        try:
+            cond_result = await self._place_conditional_orders(order_data, exchange_order_id)
+            failed_sl = order_data.get("stop_loss") and not cond_result.get("sl_placed", False)
+            failed_tp = order_data.get("take_profit") and not cond_result.get("tp_placed", False)
+
+            if cond_result.get("error"):
+                logger.error(
+                    f"Conditional order error for {symbol} (order={exchange_order_id}): "
+                    f"{cond_result['error']}"
+                )
+                if self._alert_manager:
+                    try:
+                        await self._alert_manager.send_alert(
+                            alert_type="tp_sl_error",
+                            message=f"{symbol} 条件单挂单失败: {cond_result['error']}",
+                            severity="WARNING",
+                            symbol=symbol,
+                            metadata={
+                                "exchange_order_id": exchange_order_id,
+                                "failed_sl": failed_sl,
+                                "failed_tp": failed_tp,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            if failed_sl or failed_tp:
+                logger.warning(
+                    f"Conditional orders partially failed for {symbol} "
+                    f"(SL={failed_sl}, TP={failed_tp}), starting background retry"
+                )
+                asyncio.create_task(
+                    self._retry_conditional_orders_background(
+                        order_data, exchange_order_id, symbol, failed_sl, failed_tp
+                    )
+                )
+        except Exception as e:
+            logger.error(f"Unexpected error in _place_conditional_orders_async for {symbol}: {e}", exc_info=True)
+            if self._alert_manager:
+                try:
+                    await self._alert_manager.send_alert(
+                        alert_type="tp_sl_error",
+                        message=f"{symbol} 条件单异步任务异常: {e}",
+                        severity="WARNING",
+                        symbol=symbol,
+                        metadata={"exchange_order_id": exchange_order_id},
+                    )
+                except Exception:
+                    pass
+
     async def _retry_conditional_orders_background(
         self,
         order_data: Dict[str, Any],
@@ -3401,7 +3503,7 @@ class OrderExecutor:
         max_retries: int = 3,
     ):
         """P0-后台重试条件单：指数退避重试失败的TP/SL，确保持仓有保护"""
-        retry_delays = [5, 15, 30]  # 秒
+        retry_delays = [1, 5, 15]  # P0-1: 缩短重试间隔，裸仓窗口从 ~50s 降至 ~20s
         for attempt in range(max_retries):
             try:
                 await asyncio.sleep(retry_delays[attempt])
@@ -4151,6 +4253,9 @@ class OrderExecutor:
                 return
 
         placed = 0
+        # P1-5: 批量下单 — 构建所有档位订单体，一次 API 调用发出
+        is_spot = "-SWAP" not in symbol
+        order_bodies = []  # (index, tier_price, tier_clordid, body_dict)
         for i, tier_price in enumerate(prices):
             # 每档唯一幂等键（clordid + 档位序号）
             tier_clordid = ""
@@ -4170,56 +4275,76 @@ class OrderExecutor:
             except Exception:
                 pass
 
-            try:
-                result = self.okx_client.place_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type="post_only",
-                    quantity=per_tier_qty,
-                    price=tier_price,
-                    leverage=leverage,
-                    pos_side=pos_side,
-                    reduce_only=False,
-                    clOrdId=tier_clordid if self._idempotency_enabled else "",
-                )
-            except Exception as e:
-                logger.error(f"Pending tier {i + 1} place_order error for {symbol}: {e}")
+            # 构建订单体（与 place_order 内部逻辑一致）
+            contracts_qty = self.okx_client.coin_to_contracts(symbol, per_tier_qty)
+            rounded_qty = self.okx_client.round_quantity_to_lot(symbol, contracts_qty, round_up=False)
+            if rounded_qty <= 0:
                 continue
 
-            is_failed = isinstance(result, dict) and result.get("_failed", False)
-            exchange_order_id = result.get("ordId", "") if isinstance(result, dict) and not is_failed else ""
-
-            if is_failed or not exchange_order_id:
-                msg = ""
-                if isinstance(result, dict):
-                    msg = result.get("sMsg", "")
-                logger.warning(f"Pending tier {i + 1} rejected for {symbol}: {msg or result}")
-                continue
-
-            placed += 1
-            self._record_open_accepted(strategy_name)
-            self._active_orders[exchange_order_id] = {
-                **order_data,
-                "status": "pending",
-                "exchange_order_id": exchange_order_id,
-                "filled_price": 0,
-                "create_time": datetime.now(),
-                "slippage_offset_applied": 0.0,
-                "clOrdId": tier_clordid,
-                "price": tier_price,
-                "quantity": per_tier_qty,
-                "pending_tier": True,
-                "pending_price": pending_price,
-                "tier_index": i + 1,
+            body = {
+                "instId": symbol,
+                "side": side,
+                "ordType": "post_only",
+                "sz": str(rounded_qty),
+                "px": str(tier_price),
             }
+            if is_spot:
+                body["tdMode"] = "cash"
+            else:
+                body["tdMode"] = "isolated"
+                body["lever"] = str(leverage)
+                body["posSide"] = pos_side
+            if tier_clordid:
+                body["clOrdId"] = tier_clordid
 
-            # 方案A：活跃订单落盘（pending tier，fill 回执丢失根因修复）
-            self._persist_active_order(exchange_order_id, self._active_orders[exchange_order_id])
+            order_bodies.append((i, tier_price, tier_clordid, body))
 
-            if self._idempotency_enabled and tier_clordid:
-                self._record_idempotency_key(tier_clordid, exchange_order_id)
+        # 批量发送
+        if order_bodies:
+            batch_bodies = [item[3] for item in order_bodies]
+            try:
+                batch_results = self.okx_client.place_batch_orders(batch_bodies)
+            except Exception as e:
+                logger.error(f"Pending tier batch order error for {symbol}: {e}")
+                batch_results = [{"_failed": True, "sMsg": str(e)}] * len(order_bodies)
 
-            await self._lifecycle_manager.set_exchange_order_id(order_id, exchange_order_id)
+            # 处理每档结果
+            for idx, (i, tier_price, tier_clordid, _) in enumerate(order_bodies):
+                result = batch_results[idx] if idx < len(batch_results) else {"_failed": True, "sMsg": "No result"}
+                is_failed = isinstance(result, dict) and result.get("_failed", False)
+                exchange_order_id = result.get("ordId", "") if isinstance(result, dict) and not is_failed else ""
+
+                if is_failed or not exchange_order_id:
+                    msg = ""
+                    if isinstance(result, dict):
+                        msg = result.get("sMsg", "")
+                    logger.warning(f"Pending tier {i + 1} rejected for {symbol}: {msg or result}")
+                    continue
+
+                placed += 1
+                self._record_open_accepted(strategy_name)
+                self._active_orders[exchange_order_id] = {
+                    **order_data,
+                    "status": "pending",
+                    "exchange_order_id": exchange_order_id,
+                    "filled_price": 0,
+                    "create_time": datetime.now(),
+                    "slippage_offset_applied": 0.0,
+                    "clOrdId": tier_clordid,
+                    "price": tier_price,
+                    "quantity": per_tier_qty,
+                    "pending_tier": True,
+                    "pending_price": pending_price,
+                    "tier_index": i + 1,
+                }
+
+                # 方案A：活跃订单落盘（pending tier，fill 回执丢失根因修复）
+                self._persist_active_order(exchange_order_id, self._active_orders[exchange_order_id])
+
+                if self._idempotency_enabled and tier_clordid:
+                    self._record_idempotency_key(tier_clordid, exchange_order_id)
+
+                await self._lifecycle_manager.set_exchange_order_id(order_id, exchange_order_id)
 
             if self._account_manager:
                 self._account_manager.notify_order_placed(strategy_name, per_tier_qty * tier_price / max(leverage, 1))
@@ -4369,11 +4494,26 @@ class OrderExecutor:
                 for warning in validation["warnings"]:
                     logger.warning(f"TP/SL warning for {symbol}: {warning}")
 
-        if stop_loss:
-            result["sl_placed"] = await self._place_stop_loss(order_data, stop_loss)
-        
-        if take_profit:
-            result["tp_placed"] = await self._place_staged_take_profit(order_data, take_profit, entry_price)
+        if stop_loss or take_profit:
+            # P0: TP/SL 并行放置 + ticker 复用，消除子函数内的重复 REST 调用
+            sl_task = self._place_stop_loss(order_data, stop_loss, ticker=ticker) if stop_loss else None
+            tp_task = self._place_staged_take_profit(order_data, take_profit, entry_price, ticker=ticker) if take_profit else None
+            if sl_task and tp_task:
+                sl_result, tp_result = await asyncio.gather(sl_task, tp_task, return_exceptions=True)
+                if isinstance(sl_result, Exception):
+                    logger.error(f"SL placement exception for {symbol}: {sl_result}")
+                    result["sl_placed"] = False
+                else:
+                    result["sl_placed"] = sl_result
+                if isinstance(tp_result, Exception):
+                    logger.error(f"TP placement exception for {symbol}: {tp_result}")
+                    result["tp_placed"] = False
+                else:
+                    result["tp_placed"] = tp_result
+            elif sl_task:
+                result["sl_placed"] = await sl_task
+            elif tp_task:
+                result["tp_placed"] = await tp_task
 
         # P0-条件单放置验证：如果 TP/SL 都失败，记录错误并告警
         if stop_loss and not result["sl_placed"]:
@@ -4472,7 +4612,7 @@ class OrderExecutor:
         
         return round(stop_loss, precision), round(take_profit, precision)
     
-    async def _place_stop_loss(self, order_data: Dict[str, Any], stop_price: float) -> bool:
+    async def _place_stop_loss(self, order_data: Dict[str, Any], stop_price: float, ticker: dict = None) -> bool:
         """放置止损。返回 True 表示成功，False 表示失败。"""
         symbol = order_data["symbol"]
         direction = order_data["direction"]
@@ -4493,9 +4633,10 @@ class OrderExecutor:
         else:
             pos_side = direction
 
-        # P27: 预放置价格检查 - 获取最新市价验证SL方向
+        # P27: 预放置价格检查 - 复用调用方传入的 ticker，避免重复 REST 调用
         try:
-            ticker = await self.okx_client.get_ticker_async(symbol)
+            if ticker is None:
+                ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 current_price = float(ticker.get("last", 0))
                 if current_price > 0:
@@ -4706,7 +4847,7 @@ class OrderExecutor:
                 except Exception:
                     pass
 
-    async def _place_staged_take_profit(self, order_data: Dict[str, Any], base_tp_price: float, entry_price: float) -> bool:
+    async def _place_staged_take_profit(self, order_data: Dict[str, Any], base_tp_price: float, entry_price: float, ticker: dict = None) -> bool:
         """分段止盈：25% 近端 + 50% 中端 + 25% 远端，锁定利润防止回吐。返回 True 表示至少一档成功。"""
         symbol = order_data["symbol"]
         direction = order_data["direction"]
@@ -4720,10 +4861,11 @@ class OrderExecutor:
         else:
             pos_side = direction
 
-        # P0: 获取当前市价，确保TP价格方向正确（long的TP必须>市价，short的TP必须<市价）
+        # P0: 复用调用方传入的 ticker，避免重复 REST 调用
         current_price = entry_price
         try:
-            ticker = await self.okx_client.get_ticker_async(symbol)
+            if ticker is None:
+                ticker = await self.okx_client.get_ticker_async(symbol)
             if ticker:
                 current_price = float(ticker.get("last", entry_price))
         except Exception:
@@ -4862,35 +5004,37 @@ class OrderExecutor:
     
     async def _retry_order(self, order_data: Dict[str, Any], attempt: int = 0,
                          error_type: RetryableError = None):
-        """生产级重试：指数退避 + 随机抖动 + 错误分类"""
+        """生产级重试：指数退避 + 随机抖动 + 错误分类（迭代替代递归，防栈溢出）"""
         order_id = order_data.get("order_id", "")
-        
-        if attempt >= self._max_retry_attempts:
-            logger.error(
-                f"Order failed after {self._max_retry_attempts} attempts "
-                f"(symbol={order_data.get('symbol')}, type={order_data.get('signal_type')})"
-            )
-            if order_id:
-                await self._order_queue.update_order_status(order_id, "failed")
-            return
+        current_attempt = attempt
+        current_error = error_type
 
-        # 计算指数退避延迟
-        delay = self._calculate_backoff_delay(attempt, error_type)
-        # P0-全局限频：叠加滑动窗口限流延迟，防止并发重试集中打爆 API
-        rate_wait = await self._acquire_retry_rate_slot()
-        total_delay = delay + rate_wait
-        logger.info(
-            f"Retrying order in {total_delay:.1f}s (attempt {attempt}/{self._max_retry_attempts}, "
-            f"symbol={order_data.get('symbol')}, error_type={error_type.value if error_type else 'unknown'}"
-            f"{', rate_limited=+' + f'{rate_wait:.1f}s' if rate_wait > 0 else ''})"
+        while current_attempt < self._max_retry_attempts:
+            # 计算指数退避延迟
+            delay = self._calculate_backoff_delay(current_attempt, current_error)
+            # P0-全局限频：叠加滑动窗口限流延迟，防止并发重试集中打爆 API
+            rate_wait = await self._acquire_retry_rate_slot()
+            total_delay = delay + rate_wait
+            logger.info(
+                f"Retrying order in {total_delay:.1f}s (attempt {current_attempt}/{self._max_retry_attempts}, "
+                f"symbol={order_data.get('symbol')}, error_type={current_error.value if current_error else 'unknown'}"
+                f"{', rate_limited=+' + f'{rate_wait:.1f}s' if rate_wait > 0 else ''})"
+            )
+            await asyncio.sleep(total_delay)
+
+            try:
+                await self._execute_order(order_data)
+                return
+            except Exception as e:
+                current_error = self._classify_error("", str(e))
+                current_attempt += 1
+
+        logger.error(
+            f"Order failed after {self._max_retry_attempts} attempts "
+            f"(symbol={order_data.get('symbol')}, type={order_data.get('signal_type')})"
         )
-        await asyncio.sleep(total_delay)
-        
-        try:
-            await self._execute_order(order_data)
-        except Exception as e:
-            err_type = self._classify_error("", str(e))
-            await self._retry_order(order_data, attempt + 1, err_type)
+        if order_id:
+            await self._order_queue.update_order_status(order_id, "failed")
     
     async def _reconciliation_loop(self):
         while True:
@@ -5081,7 +5225,8 @@ class OrderExecutor:
             except Exception as e:
                 logger.debug(f"DB position sync failed: {e}")
 
-            account_info = self.okx_client.get_account_info()
+            # P0-C: 使用异步账户查询避免阻塞事件循环
+            account_info = await self.okx_client.get_account_info_async()
             if account_info:
                 account = self.okx_client._parse_account_info(account_info)
                 self.redis_cache.set_account_info(account)
@@ -5722,6 +5867,8 @@ class OrderExecutor:
                             "exchange_order_id": exchange_order_id,
                             "reduce_only": order_info.get("reduce_only", False),
                         })
+                        # P0-9: 成交后清除持仓缓存，确保下次查询获取最新状态
+                        self._invalidate_positions_cache()
 
                         # 使用 OKX 返回的真实手续费
                         actual_fee = abs(float(order_status.get("fee", "0"))) if order_status.get("fee") else filled_price * quantity * 0.0005

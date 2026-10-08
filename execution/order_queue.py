@@ -69,39 +69,48 @@ class OrderQueue:
             strategy_name = order_data.get("strategy_name", "grid")
             symbol = order_data.get("symbol", "")
             
-            # 止损/平仓订单去重：同一symbol+strategy已有pending止损的，跳过
+            # R31: 止损/平仓订单去重 — 同一symbol+strategy已有pending止损时，替换旧单而非拒绝新单
             is_stop_order = "stop" in signal_type.lower() or "loss" in signal_type.lower()
             if is_stop_order:
-                # 1) 队列中仍排队的止损单（None 防御：跳过非 dict 项）
-                for _, _, oid, cached_data in self._queue:
+                # 1) 队列中仍排队的止损单 — 移除旧单，允许新单替换
+                stale_indices = []
+                for idx, (_, _, oid, cached_data) in enumerate(self._queue):
                     if not isinstance(cached_data, dict):
                         continue
                     cached_sig = (cached_data.get("signal_type") or "")
                     if (cached_data.get("symbol") == symbol and
                         cached_data.get("strategy_name") == strategy_name and
                         ("stop" in cached_sig.lower() or "loss" in cached_sig.lower())):
-                        logger.debug(f"Stop loss dedup: {symbol} {strategy_name} already has pending stop loss")
-                        return oid
-                # 2) 已从队列取出、正在执行的止损单（仅查 queue 会漏掉 cache 中的 executing 单）
+                        stale_indices.append((idx, oid))
+                if stale_indices:
+                    for _, stale_oid in stale_indices:
+                        if stale_oid in self._order_cache:
+                            self._order_cache[stale_oid]["status"] = "replaced"
+                    # 从后往前删除，避免索引偏移
+                    for idx, _ in sorted(stale_indices, reverse=True):
+                        del self._queue[idx]
+                    heapq.heapify(self._queue)
+                    logger.debug(f"Stop loss replace: {symbol} {strategy_name} replaced {len(stale_indices)} pending stop(s)")
+                # 2) 已从队列取出、正在执行的止损单 — 拒绝新单（执行中不可替换）
                 for oid, cached in self._order_cache.items():
                     if not isinstance(cached, dict):
                         continue
-                    if cached.get("status") not in ("queued", "executing"):
+                    if cached.get("status") != "executing":
                         continue
                     cached_sig = (cached.get("signal_type") or "")
                     if (cached.get("symbol") == symbol and
                         cached.get("strategy_name") == strategy_name and
                         ("stop" in cached_sig.lower() or "loss" in cached_sig.lower())):
-                        logger.debug(f"Stop loss dedup: {symbol} {strategy_name} already has active stop loss")
+                        logger.debug(f"Stop loss dedup: {symbol} {strategy_name} stop loss executing, skip")
                         return oid
             
-            # 队列接近满载时，清理超过60秒的旧订单腾出空间
+            # R32: 队列接近满载时，清理超过180秒的旧订单腾出空间（原60秒过短，grid挂单易被误清）
             if len(self._queue) >= self._max_queue_size * 0.9:
-                self._cleanup_stale_orders_locked(max_age_seconds=60)
+                self._cleanup_stale_orders_locked(max_age_seconds=180)
             
             if len(self._queue) >= self._max_queue_size:
-                # 尝试清理更激进的30秒旧订单
-                self._cleanup_stale_orders_locked(max_age_seconds=30)
+                # R32: 激进清理阈值从30秒提升到120秒
+                self._cleanup_stale_orders_locked(max_age_seconds=120)
             
             if len(self._queue) >= self._max_queue_size:
                 logger.error(f"Order queue full ({self._max_queue_size}), rejecting order")

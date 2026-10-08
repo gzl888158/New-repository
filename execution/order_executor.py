@@ -2030,8 +2030,8 @@ class OrderExecutor:
         if self._tasks:
             return
         # P2-1: 多消费者并行执行 — 提升高并发场景吞吐量
-        # 配置项 execution_workers 控制并行度，默认 2
-        num_workers = max(1, int(self.config.get("execution", {}).get("execution_workers", 2)))
+        # R28: execution_workers 与 concurrent_strategies 对齐，避免执行层成为瓶颈
+        num_workers = max(1, int(self.config.get("execution", {}).get("execution_workers", 8)))
         self._tasks = [
             *(asyncio.create_task(self._execution_loop(worker_id=i), name=f"exec_loop_{i}")
               for i in range(num_workers)),
@@ -3843,9 +3843,8 @@ class OrderExecutor:
                 elif equity >= 100:
                     dynamic = max(5, int(base * 0.6))
                 else:
-                    # P4-5: 小账户(<100USDT)提升上限至15，适应微仓位高并发需求
-                    # 每个仓位仅1-2 USDT保证金，需要更多仓位才能达到85%利用率
-                    dynamic = max(15, int(base * 0.55))
+                    # R29: 小账户(<100USDT)适度提升上限，但不超过配置的最大持仓数
+                    dynamic = min(base, max(8, int(base * 0.55)))
                 
                 # P9: 防止死锁 - 动态上限不低于当前实际持仓数
                 position_snapshot = current_positions
@@ -3865,6 +3864,11 @@ class OrderExecutor:
                         f"(active positions > dynamic limit, preventing deadlock)"
                     )
                     dynamic = active_count
+                
+                # R29: 硬上限 — 动态值不得超过配置的最大持仓数（死锁保护除外）
+                configured_max = self._max_concurrent_positions
+                if dynamic > configured_max and active_count <= configured_max:
+                    dynamic = configured_max
                 
                 return dynamic
         except Exception as e:

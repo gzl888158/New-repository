@@ -50,6 +50,7 @@ execution:
   asyncio_workers: 4
   batch_processing_size: 10
   concurrent_strategies: 8
+  execution_workers: 8
   max_parallel_tasks: 16
   order_priority:
   - reduce_order
@@ -1257,7 +1258,7 @@ trading:
   loss_batch_window_sec: 5
   max_daily_trades_per_symbol: 4
   max_drawdown: 0.25
-  max_queue_size: 200
+  max_queue_size: 500
   max_slippage_pct: 0.001
   stop_loss_slippage_buffer: 0.001
   max_total_leverage: 5.0

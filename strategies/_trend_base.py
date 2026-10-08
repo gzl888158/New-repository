@@ -57,6 +57,8 @@ class TrendStrategyBase(StrategyBase):
         self._take_profit_pct = self._safe_float(self._cfg.get("take_profit_pct", 0.04), 0.04)
         self._loop_interval = self._safe_float(self._cfg.get("loop_interval_seconds", 60.0), 60.0)
         self._min_hold_minutes = self._safe_float(config.get("trading", {}).get("min_hold_minutes", 5), 5)
+        # R3: 单币种保证金上限比例（与 grid 对齐），防止趋势策略垄断某币种
+        self._single_symbol_ratio = self._safe_float(self._cfg.get("single_symbol_ratio", 0.25), 0.25)
         self._taker_fee_rate = self._safe_float(config.get("trading", {}).get("taker_fee_rate", 0.0005), 0.0005)
 
         self._symbols: List[str] = self._build_symbols()
@@ -241,6 +243,25 @@ class TrendStrategyBase(StrategyBase):
                 base_position *= 6.0
             else:
                 base_position *= 10.0
+
+        # R3: 单币种保证金上限 — 该币种已有持仓保证金 + 新开仓保证金 ≤ total_capital * ratio
+        if self._position_manager is not None:
+            try:
+                existing_positions = self._position_manager.get_positions_by_symbol(symbol)
+                existing_margin = sum(
+                    getattr(p, "margin", 0.0) or 0.0 for p in existing_positions
+                )
+                symbol_cap = total_capital * self._single_symbol_ratio
+                available = max(0.0, symbol_cap - existing_margin)
+                if base_position > available:
+                    logger.debug(
+                        f"[{self._strategy_name}] R3: {symbol} base_position {base_position:.2f} "
+                        f"clipped to {available:.2f} (existing margin {existing_margin:.2f}, "
+                        f"cap {symbol_cap:.2f})"
+                    )
+                    base_position = available
+            except Exception:
+                pass
 
         leverage = self._get_leverage(symbol)
         quantity_coin = base_position * leverage / price if price > 0 else 0.0

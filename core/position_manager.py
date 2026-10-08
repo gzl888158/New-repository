@@ -174,6 +174,8 @@ class PositionManager:
         self._max_total_positions = pm_cfg.get("max_total_positions", 6)
         self._max_positions_per_symbol = pm_cfg.get("max_positions_per_symbol", 2)
         self._max_positions_per_strategy = pm_cfg.get("max_positions_per_strategy", 3)
+        # R2: 同 symbol+direction 最多允许 N 个策略共同持仓（软阻断）
+        self._max_co_hold_strategies = pm_cfg.get("max_co_hold_strategies", 2)
 
         # 风险联动配置
         rl_cfg = pm_cfg.get("risk_linkage", {})
@@ -1342,10 +1344,12 @@ class PositionManager:
     def would_create_cross_strategy_duplicate(
         self, symbol: str, side: str, strategy_name: str
     ) -> tuple:
-        """检查新开仓是否会造成跨策略同币种同方向重复持仓。
+        """检查新开仓是否会造成跨策略同币种同方向重复持仓超限。
+
+        R2: 软阻断 — 允许最多 max_co_hold_strategies 个策略共同持有同 symbol+direction，
+        超过上限才拒绝。避免先到先得导致其他策略资金完全闲置。
 
         返回 (allowed: bool, reason: str)。
-        allowed=True 表示允许开仓，False 表示存在冲突应拒绝。
         """
         try:
             target_side = PositionSide.LONG if side in ("long", "buy") else PositionSide.SHORT
@@ -1356,7 +1360,7 @@ class PositionManager:
         if not keys:
             return True, ""
 
-        conflicting_strategies = []
+        co_holding_strategies = set()
         for key in keys:
             pos = self._positions.get(key)
             if pos is None:
@@ -1365,12 +1369,13 @@ class PositionManager:
                 continue
             if pos.strategy_name == strategy_name:
                 continue
-            conflicting_strategies.append(pos.strategy_name)
+            co_holding_strategies.add(pos.strategy_name)
 
-        if conflicting_strategies:
-            others = ", ".join(set(conflicting_strategies))
+        if len(co_holding_strategies) >= self._max_co_hold_strategies:
+            others = ", ".join(sorted(co_holding_strategies))
             return False, (
-                f"{symbol} {side} already held by [{others}], "
+                f"{symbol} {side} already held by [{others}] "
+                f"({len(co_holding_strategies)}/{self._max_co_hold_strategies} co-hold limit), "
                 f"cross-strategy duplicate blocked"
             )
 

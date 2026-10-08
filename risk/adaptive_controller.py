@@ -1425,7 +1425,8 @@ class AdaptiveController:
         for strategy in new_allocations:
             old = self._dynamic_allocations.get(strategy, 0.25)
             new = new_allocations[strategy]
-            max_change = old * 0.15
+            # R1: 下限 0.05，防止 old=0 时 max_change=0 导致策略永远无法从零爬升
+            max_change = max(old * 0.15, 0.05)
             if abs(new - old) > max_change:
                 if new > old:
                     new_allocations[strategy] = old + max_change

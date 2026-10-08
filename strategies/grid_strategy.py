@@ -53,14 +53,14 @@ class GridStrategy(PersistentStrategy):
         self._dx_history: Dict[str, List[float]] = {}
         # P33: 退出后冷却追踪 {symbol: exit_timestamp}
         self._last_exit_time: Dict[str, float] = {}
-        self._post_exit_cooldown = grid_cfg.get("post_exit_cooldown", 300)  # 默认5分钟
+        self._post_exit_cooldown = grid_cfg.get("post_exit_cooldown", 120)  # R7: 默认从 300s 降至 120s，加速资金再部署
         # 参数层：post_exit_cooldown 运行时校验
         try:
             self._post_exit_cooldown = float(self._post_exit_cooldown)
         except (TypeError, ValueError):
-            self._post_exit_cooldown = 300.0
+            self._post_exit_cooldown = 120.0
         if not math.isfinite(self._post_exit_cooldown) or self._post_exit_cooldown < 0:
-            self._post_exit_cooldown = 300.0
+            self._post_exit_cooldown = 120.0
         
         self._grid_pending_at: Dict[str, Dict[int, float]] = {}  # {symbol: {grid_index: pending_timestamp}}
 
@@ -1125,8 +1125,8 @@ class GridStrategy(PersistentStrategy):
         MEDIUM_RISK_HOURS = {1, 2, 15, 16, 21}            # 中风险：降仓50%
         
         if utc_hour in HIGH_RISK_HOURS:
-            # 高风险时段：提高信号质量门槛，优质信号仍可开仓，低质信号被过滤
-            self._high_risk_quality_margin = 0.25
+            # R4: 高风险时段门槛从 0.25 降至 0.10，避免叠加后阈值过高过滤掉大量信号
+            self._high_risk_quality_margin = 0.10
             self._medium_risk_reduce = False
         elif utc_hour in MEDIUM_RISK_HOURS:
             self._high_risk_quality_margin = 0.0
@@ -1195,10 +1195,10 @@ class GridStrategy(PersistentStrategy):
                         # P0-4: buy方向阈值接入config min_signal_quality（替代硬编码0.50）
                         # P32: 高风险时段叠加质量门槛，优质信号仍可开仓
                         _buy_threshold = self._min_signal_quality + self._high_risk_quality_margin
-                        # P2: 做多逆势惩罚 — 下跌趋势中做多是逆势，提高门槛（对称于做空的溢价取消）
+                        # R4: 逆势惩罚从 0.05 降至 0.03，减少信号过滤
                         _bias = self._trend_bias_cache.get(symbol)
                         if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
-                            _buy_threshold += 0.05
+                            _buy_threshold += 0.03
                         if quality < _buy_threshold:
                             logger.debug(f"Grid {symbol} buy signal rejected: quality={quality:.2f} < {_buy_threshold:.2f}")
                             continue
@@ -1222,12 +1222,11 @@ class GridStrategy(PersistentStrategy):
                     # 信号质量评分检查
                     try:
                         quality = await self._calculate_grid_signal_quality(symbol, "sell", price, grid)
-                        # P2: 做空溢价方向感知 — 下跌趋势中做空是顺势，降低做空溢价但保留底线
-                        # （_trend_bias_cache.direction: 1=上涨, -1=下跌, 0=震荡）
-                        _short_premium = 0.25
+                        # R4: 做空溢价从 0.25/0.10 降至 0.10/0.05，减少信号过滤
+                        _short_premium = 0.10
                         _bias = self._trend_bias_cache.get(symbol)
                         if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
-                            _short_premium = 0.10
+                            _short_premium = 0.05
                         # P32: 高风险时段叠加质量门槛
                         # P2: 叠加信号质量放松量（资本层意图传导到信号门槛）+ 门槛上限
                         _sell_threshold = self._min_signal_quality + _short_premium + self._high_risk_quality_margin

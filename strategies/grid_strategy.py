@@ -46,7 +46,7 @@ class GridStrategy(PersistentStrategy):
         self._position_side: Dict[str, Optional[str]] = {}
         self._trend_mode: Dict[str, bool] = {}
         self._trend_mode_last_switch: Dict[str, float] = {}
-        self._trend_mode_cooldown = 300.0
+        self._trend_mode_cooldown = grid_cfg.get("trend_mode_cooldown", 120.0)  # R6: 300s→120s，减少趋势模式切换冷却期的资金闲置
         self._atr_cache: Dict[str, float] = {}
         self._volume_profile_cache: Dict[str, Dict[str, float]] = {}
         self._trend_bias_cache: Dict[str, Dict[str, Any]] = {}
@@ -452,6 +452,8 @@ class GridStrategy(PersistentStrategy):
             "max_stop_loss_pct": "_max_stop_loss_pct",
             "long_only": "_long_only",
             "min_signal_quality": "_min_signal_quality",
+            "trend_mode_cooldown": "_trend_mode_cooldown",
+            "post_exit_cooldown": "_post_exit_cooldown",
             # 生产级各币种网格状态管理
             "coin_health_check_interval": "_coin_health_check_interval",
             "coin_health_max_errors": "_coin_health_max_errors",
@@ -1074,8 +1076,7 @@ class GridStrategy(PersistentStrategy):
             ws_used = False
 
             async def _tick_one(sym):
-                if self._trend_mode.get(sym, False):
-                    return False
+                # R6: 趋势模式下不再完全停摆，改为顺势网格（_process_tick 内部做方向过滤）
                 return await self._process_tick(sym)
 
             results = await asyncio.gather(
@@ -1188,19 +1189,22 @@ class GridStrategy(PersistentStrategy):
             
             # P32: 高风险时段不再完全禁止开仓，而是提高信号质量门槛（下方阈值叠加 margin）
             if side == "buy" and last_price > grid_price >= price:
-                if await self._confirm_grid_entry(symbol, "buy", price, tick):
+                _entry_penalty = await self._confirm_grid_entry(symbol, "buy", price, tick)
+                if _entry_penalty >= 0:
                     # 信号质量评分检查
                     try:
                         quality = await self._calculate_grid_signal_quality(symbol, "buy", price, grid)
+                        # R7: 扣分制 — 入场确认的过滤器惩罚从质量分中扣除
+                        effective_quality = quality - _entry_penalty
                         # P0-4: buy方向阈值接入config min_signal_quality（替代硬编码0.50）
-                        # P32: 高风险时段叠加质量门槛，优质信号仍可开仓
+                        # P32: 高风险时段叠加质量门槛
                         _buy_threshold = self._min_signal_quality + self._high_risk_quality_margin
                         # R4: 逆势惩罚从 0.05 降至 0.03，减少信号过滤
                         _bias = self._trend_bias_cache.get(symbol)
                         if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
                             _buy_threshold += 0.03
-                        if quality < _buy_threshold:
-                            logger.debug(f"Grid {symbol} buy signal rejected: quality={quality:.2f} < {_buy_threshold:.2f}")
+                        if effective_quality < _buy_threshold:
+                            logger.debug(f"Grid {symbol} buy signal rejected: quality={quality:.2f} penalty={_entry_penalty:.2f} effective={effective_quality:.2f} < {_buy_threshold:.2f}")
                             continue
                         # 信号验证
                         is_valid, reason = self._validate_grid_signal(symbol, "buy", price, grid)
@@ -1218,10 +1222,13 @@ class GridStrategy(PersistentStrategy):
                     break  # P0: 每tick只触发一个网格，避免同时触发多层
             elif (not self._long_only) and side == "sell" and last_price < grid_price <= price:
                 # P0-1: long_only 模式下禁止 sell 信号（历史 sell 层也不会触发空单）
-                if await self._confirm_grid_entry(symbol, "sell", price, tick):
+                _entry_penalty = await self._confirm_grid_entry(symbol, "sell", price, tick)
+                if _entry_penalty >= 0:
                     # 信号质量评分检查
                     try:
                         quality = await self._calculate_grid_signal_quality(symbol, "sell", price, grid)
+                        # R7: 扣分制 — 入场确认的过滤器惩罚从质量分中扣除
+                        effective_quality = quality - _entry_penalty
                         # R4: 做空溢价从 0.25/0.10 降至 0.10/0.05，减少信号过滤
                         _short_premium = 0.10
                         _bias = self._trend_bias_cache.get(symbol)
@@ -1232,8 +1239,8 @@ class GridStrategy(PersistentStrategy):
                         _sell_threshold = self._min_signal_quality + _short_premium + self._high_risk_quality_margin
                         _sell_threshold -= self._get_signal_relaxation()
                         _sell_threshold = max(self._min_signal_quality, min(_sell_threshold, self._sell_signal_quality_cap))
-                        if quality < _sell_threshold:
-                            logger.debug(f"Grid {symbol} sell signal rejected: quality={quality:.2f} < {_sell_threshold:.2f}")
+                        if effective_quality < _sell_threshold:
+                            logger.debug(f"Grid {symbol} sell signal rejected: quality={quality:.2f} penalty={_entry_penalty:.2f} effective={effective_quality:.2f} < {_sell_threshold:.2f}")
                             continue
                         # 信号验证
                         is_valid, reason = self._validate_grid_signal(symbol, "sell", price, grid)
@@ -1399,9 +1406,11 @@ class GridStrategy(PersistentStrategy):
                 return True
         return False
 
-    async def _confirm_grid_entry(self, symbol: str, side: str, price: float, tick) -> bool:
-        """成交量+订单簿+趋势方向三重确认，减少假突破"""
-        # P34: 单方向连续止损熔断 — 该方向处于冷却期时直接拒绝开仓
+    async def _confirm_grid_entry(self, symbol: str, side: str, price: float, tick) -> float:
+        """R7: 扣分制入场确认 — 返回质量惩罚值（0.0=无惩罚，>0=扣分）。
+        -1.0 表示硬性否决（熔断），调用方应直接拒绝。
+        原一票否决过滤器改为扣分，只有最终质量分低于阈值才拒绝。"""
+        # P34: 单方向连续止损熔断 — 硬性否决（安全底线，不改为扣分）
         if self._is_side_circuit_broken(symbol, side):
             now = time.time()
             key = f"{symbol}_{side}"
@@ -1412,56 +1421,47 @@ class GridStrategy(PersistentStrategy):
                     f"{self._sl_circuit_breaker_threshold} 次)"
                 )
                 self._last_grid_skip_log[key] = now
-            return False
+            return -1.0
 
-        # 趋势方向过滤：强趋势中禁止逆势开仓（grid适合震荡市）
+        penalty = 0.0
+
+        # R8: 趋势方向过滤 — 从一票否决改为扣分（强趋势逆势扣更多）
         bias = self._trend_bias_cache.get(symbol)
-        if bias and bias.get("strength", 0) > 0.05:
+        if bias:
+            strength = bias.get("strength", 0)
             trend_dir = bias.get("direction", 0)
-            if trend_dir == 1 and side == "sell":
-                # 强上涨趋势中禁止开空单（防抖: 每30秒最多记录一次同 symbol+side）
-                now = time.time()
-                key = f"{symbol}_sell"
-                if now - self._last_grid_skip_log.get(key, 0) > 30:
-                    logger.debug(f"Grid skip {symbol} sell: strong uptrend (strength={bias['strength']:.4f})")
-                    self._last_grid_skip_log[key] = now
-                return False
-            elif trend_dir == -1 and side == "buy":
-                # 强下跌趋势中禁止开多单（防抖: 每30秒最多记录一次同 symbol+side）
-                now = time.time()
-                key = f"{symbol}_buy"
-                if now - self._last_grid_skip_log.get(key, 0) > 30:
-                    logger.debug(f"Grid skip {symbol} buy: strong downtrend (strength={bias['strength']:.4f})")
-                    self._last_grid_skip_log[key] = now
-                return False
+            if strength > 0.05:
+                is_counter = (trend_dir == 1 and side == "sell") or (trend_dir == -1 and side == "buy")
+                if is_counter:
+                    # 强趋势逆势：扣分与强度成正比，strength=0.05→0.08, strength=0.2→0.15
+                    penalty += min(0.15, 0.08 + strength * 0.35)
 
-        # P36: 分钟级反转过滤 — 短期急拉(做空)/急杀(做多)超阈值拦截，
-        # 补齐 EMA20-EMA50 滞后指标捕捉不到的分钟级反弹（grid 做空反复被反弹止损的根因）。
+        # P36: 分钟级反转 — 从一票否决改为扣分
         if await self._check_minute_rebound(symbol, side, price):
-            return False
+            penalty += 0.08
 
-        # 成交量确认 - 降低阈值，更容易触发
+        # 成交量确认 — 从一票否决改为扣分
         if tick.volume and tick.volume > 0:
             vol_history = self._trade_history.get(symbol, [])
             if len(vol_history) >= 5:
                 recent_vols = [t.get("volume", 0) for t in vol_history[-5:]]
                 avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
                 if avg_vol > 0 and tick.volume < avg_vol * 0.1:
-                    return False
+                    penalty += 0.05
 
-        # 买卖盘压力确认 - 降低阈值，更容易触发
+        # 买卖盘压力确认 — 从一票否决改为扣分
         if side == "buy":
             bid_vol = tick.bid_volume or 0
             ask_vol = tick.ask_volume or 0
             if ask_vol > 0 and bid_vol / ask_vol < 0.2:
-                return False
+                penalty += 0.05
         else:
             bid_vol = tick.bid_volume or 0
             ask_vol = tick.ask_volume or 0
             if bid_vol > 0 and ask_vol / bid_vol < 0.2:
-                return False
+                penalty += 0.05
 
-        return True
+        return penalty
 
     async def _check_trend_ready_for_entry(self, symbol: str, side: str, price: float) -> bool:
         """P33: 趋势确认门禁，按 trend_confirmation_mode 分流。
@@ -1636,8 +1636,7 @@ class GridStrategy(PersistentStrategy):
         self._signal_fingerprints[fingerprint] = now
         window_q.append(now)  # 记录到滑动窗口
 
-        if self._trend_mode.get(symbol, False):
-            return
+        # R6: 趋势模式下不再完全阻断信号，由 _trigger_grid_order 做顺势过滤
 
         # P0-3: 极端波动暂停期检查
         until = self._extreme_vol_until.get(symbol)
@@ -1678,11 +1677,20 @@ class GridStrategy(PersistentStrategy):
         # 数据层：NaN/Inf 防护
         if not math.isfinite(_last_exit):
             _last_exit = 0
-        _cooldown_remaining = self._post_exit_cooldown - (time.time() - _last_exit)
+        # R12: 按波动率差异化冷却期 — 高波动长冷却（避免反复止损），低波动短冷却（加速再部署）
+        _effective_cooldown = self._post_exit_cooldown
+        atr = self._atr_cache.get(symbol, 0)
+        if atr > 0 and price > 0:
+            atr_ratio = atr / price
+            if atr_ratio > 0.03:
+                _effective_cooldown = self._post_exit_cooldown * 2.0
+            elif atr_ratio < 0.01:
+                _effective_cooldown = self._post_exit_cooldown * 0.5
+        _cooldown_remaining = _effective_cooldown - (time.time() - _last_exit)
         if _cooldown_remaining > 0:
             logger.debug(
                 f"P33: Grid {symbol} {side} rejected — post-exit cooldown "
-                f"{_cooldown_remaining:.0f}s remaining"
+                f"{_cooldown_remaining:.0f}s remaining (base={self._post_exit_cooldown:.0f}s effective={_effective_cooldown:.0f}s)"
             )
             return
 
@@ -1777,11 +1785,16 @@ class GridStrategy(PersistentStrategy):
 
         quantity = base_position * leverage / price
 
-        # 数量校验：取整后必须 >= 最小合约面额，否则跳过（避免幽灵信号）
+        # 数量校验：取整后必须 >= 最小合约面额
         qty_rounded = round(quantity / min_lot_size) * min_lot_size
         if qty_rounded < min_lot_size:
-            logger.debug(f"Grid {symbol}: qty {quantity:.6f} < min_lot {min_lot_size}, skip")
-            return
+            # R13: 计算量不足一手时，尝试用最小手数开仓（利用零散资金而非闲置）
+            qty_rounded = min_lot_size
+            min_lot_margin = min_lot_size * price / leverage
+            if min_lot_margin > base_position * 1.2:
+                logger.debug(f"Grid {symbol}: min lot margin {min_lot_margin:.4f} > budget {base_position:.4f}*1.2, skip")
+                return
+            logger.info(f"Grid {symbol}: qty {quantity:.6f} < min_lot, using min lot {min_lot_size} (R13 fallback)")
         quantity = qty_rounded
 
         # P0: 名义价值上限保护 - 防止小资金时 AdaptiveController boost 导致仓位过大
@@ -1815,10 +1828,17 @@ class GridStrategy(PersistentStrategy):
                 logger.debug(f"Grid {symbol}: capped qty {capped_qty:.4f} < min_lot {min_lot_size}, skip")
                 return
 
-        # 趋势过滤
+        # R6: 趋势模式下只允许顺势网格（顺势方向开仓），逆势方向跳过
         if self._trend_mode.get(symbol, False):
-            logger.debug(f"Grid {symbol}: in trend mode, skip grid entry")
-            return
+            bias = self._trend_bias_cache.get(symbol)
+            trend_dir = bias.get("direction", 0) if bias else 0
+            if trend_dir == 1 and side == "sell":
+                logger.debug(f"Grid {symbol}: trend-up mode, skip counter-trend sell")
+                return
+            elif trend_dir == -1 and side == "buy":
+                logger.debug(f"Grid {symbol}: trend-down mode, skip counter-trend buy")
+                return
+            # 顺势方向：放行（无 bias 信息时也放行，由后续质量门槛兜底）
 
         # 移除马丁格尔：小账户使用马丁格尔必然爆仓
         # 固定仓位：每层同样大小，不放大
@@ -2649,6 +2669,22 @@ class GridStrategy(PersistentStrategy):
 
     
 
+    def _get_effective_martingale_layers(self, symbol: str) -> int:
+        """R11: 按 ATR 自适应马丁格尔层数上限 — 高波动(单边行情)允许多层加仓，低波动用基础值。"""
+        atr = self._atr_cache.get(symbol, 0)
+        if atr <= 0:
+            return self._martingale_layers
+        last_price = self._last_tick_price.get(symbol, 0)
+        if last_price <= 0:
+            return self._martingale_layers
+        atr_ratio = atr / last_price
+        # atr_ratio > 0.03 (高波动): +2 层; > 0.02 (中波动): +1 层; 其余: 基础值
+        if atr_ratio > 0.03:
+            return self._martingale_layers + 2
+        elif atr_ratio > 0.02:
+            return self._martingale_layers + 1
+        return self._martingale_layers
+
     def handle_trade_completion(self, symbol: str, is_profitable: bool):
         if is_profitable:
             self._martingale_state[symbol] = 0
@@ -2658,7 +2694,9 @@ class GridStrategy(PersistentStrategy):
             self._trailing_state.pop(symbol, None)
             self._position_entry_time.pop(symbol, None)
         else:
-            self._martingale_state[symbol] = min(self._martingale_state.get(symbol, 0) + 1, self._martingale_layers)
+            # R11: 动态层数上限 — 高波动行情允许多层加仓
+            effective_max = self._get_effective_martingale_layers(symbol)
+            self._martingale_state[symbol] = min(self._martingale_state.get(symbol, 0) + 1, effective_max)
     
     def on_order_filled(self, fill_payload: Dict[str, Any]):
         """成交回执回调（ghost_close 专项 Phase 4）：匹配网格层 clOrdId 并提前确认成交。

@@ -174,8 +174,8 @@ class PositionManager:
         self._max_total_positions = pm_cfg.get("max_total_positions", 6)
         self._max_positions_per_symbol = pm_cfg.get("max_positions_per_symbol", 2)
         self._max_positions_per_strategy = pm_cfg.get("max_positions_per_strategy", 3)
-        # R2: 同 symbol+direction 最多允许 N 个策略共同持仓（软阻断）
-        self._max_co_hold_strategies = pm_cfg.get("max_co_hold_strategies", 2)
+        # R10: 同 symbol+direction 最多允许 N 个策略共同持仓（软阻断）— 从2提高到3，避免4个启用策略中2个被闲置
+        self._max_co_hold_strategies = pm_cfg.get("max_co_hold_strategies", 3)
 
         # 风险联动配置
         rl_cfg = pm_cfg.get("risk_linkage", {})

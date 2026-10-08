@@ -274,15 +274,26 @@ class PreTradeRiskChecker:
             avg_leverage = max(leverage, 3)  # 至少3x
             total_position_value = existing_margin * avg_leverage + order_value
             total_leverage = safe_div(total_position_value, equity, 0.0) if equity > 0 else 0
-            
-            if total_leverage > self._max_total_leverage:
+
+            # R9: 按账户规模动态调整杠杆上限 — 小账户允许更高杠杆使仓位有意义
+            if equity < 500:
+                effective_max_leverage = self._max_total_leverage * 1.6
+            elif equity < 2000:
+                effective_max_leverage = self._max_total_leverage * 1.2
+            else:
+                effective_max_leverage = self._max_total_leverage
+
+            if total_leverage > effective_max_leverage:
                 return RiskCheckResult(
                     RiskLayer.L1_PRE_TRADE, False, RiskAction.REJECT,
-                    f"全局总杠杆超限: {total_leverage:.2f}x > {self._max_total_leverage}x",
+                    f"全局总杠杆超限: {total_leverage:.2f}x > {effective_max_leverage:.2f}x",
                     {"total_leverage": round(total_leverage, 2),
-                     "max_leverage": self._max_total_leverage}
+                     "max_leverage": round(effective_max_leverage, 2),
+                     "base_max_leverage": self._max_total_leverage,
+                     "equity": round(equity, 2)}
                 )
             details["total_leverage"] = round(total_leverage, 2)
+            details["effective_max_leverage"] = round(effective_max_leverage, 2)
         else:
             total_position_value = sum(self._symbol_positions.values())
             total_leverage = safe_div(total_position_value, equity, 0.0) if equity > 0 else 0

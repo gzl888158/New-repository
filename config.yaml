@@ -133,6 +133,7 @@ position_manager:
   max_total_positions: 12
   max_positions_per_symbol: 2
   max_positions_per_strategy: 5
+  max_co_hold_strategies: 3
   risk_linkage:
     drawdown_trigger: 0.15
     drawdown_reduce_pct: 0.3
@@ -435,6 +436,8 @@ strategies:
     coin_health_degraded_score: 0.6
     coin_auto_pause_on_error: true
     trend_confirmation_mode: regime_aware
+    trend_mode_cooldown: 120
+    post_exit_cooldown: 120
     minute_rebound_window: 15
     minute_rebound_threshold: 0.005
     locked_params:

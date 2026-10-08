@@ -58,10 +58,10 @@ class AdaptiveController:
         self._deployability_max_blacklist_penalty = float(dep_cfg.get("max_blacklist_penalty", 0.7))
         self._idle_cash_min_deployability = float(cm_cfg.get("idle_cash_min_deployability", 0.3))
         # 平滑权重：新分配占比越高，低效→高效策略资金转移越快
-        self._allocation_smoothing_new_weight = float(cm_cfg.get("smoothing_new_weight", 0.5))
+        self._allocation_smoothing_new_weight = float(cm_cfg.get("smoothing_new_weight", 0.7))  # R45: 0.5→0.7 加速收敛
 
         self._health_check_interval = 60
-        self._rebalance_interval = int(cm_cfg.get("rebalance_interval", 1800))
+        self._rebalance_interval = int(cm_cfg.get("rebalance_interval", 600))  # R46: 1800→600s（30min→10min）
         self._optimization_interval = 7200
         self._utilization_check_interval = 120  # 2分钟检查一次资金利用率和idle cash优化
         
@@ -133,8 +133,8 @@ class AdaptiveController:
         self._tasks: list = []
         self._started = False
         self._stopped = False
-        self._warmup_minutes = 30
-        self._warmup_minutes_with_positions = 10  # P28: 已有持仓时缩短预热期
+        self._warmup_minutes = 10  # R40: 30→10min，缩短冷启动资本闲置期
+        self._warmup_minutes_with_positions = 5  # R40: 10→5min
         
         # P28: 初始化时检测已有持仓，自动缩短预热期
         self._detect_existing_positions_for_warmup()

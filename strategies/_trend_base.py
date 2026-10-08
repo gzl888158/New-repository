@@ -66,7 +66,7 @@ class TrendStrategyBase(StrategyBase):
         self._last_signal_time: Dict[str, datetime] = {}
         # P33: 退出后冷却追踪 {symbol: exit_timestamp}
         self._last_exit_time: Dict[str, float] = {}
-        self._post_exit_cooldown = self._safe_float(self._cfg.get("post_exit_cooldown", 300), 300)  # 默认5分钟
+        self._post_exit_cooldown = self._safe_float(self._cfg.get("post_exit_cooldown", 60), 60)  # R43: 300→60s
 
         self._adaptive_controller = None
         self._stop_loss_manager = None

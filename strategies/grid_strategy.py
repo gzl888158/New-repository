@@ -94,8 +94,8 @@ class GridStrategy(PersistentStrategy):
         self._stop_loss_history: Dict[str, List[float]] = {}  # {symbol:buy|sell: [止损unix时间戳]}
         self._sl_circuit_breaker_enabled = grid_cfg.get("sl_circuit_breaker_enabled", True)
         self._sl_circuit_breaker_window = grid_cfg.get("sl_circuit_breaker_window", 7200)      # 观察窗口2h
-        self._sl_circuit_breaker_threshold = grid_cfg.get("sl_circuit_breaker_threshold", 2)   # 连续止损≥2次
-        self._sl_circuit_breaker_cooldown = grid_cfg.get("sl_circuit_breaker_cooldown", 3600)  # 冷却60min
+        self._sl_circuit_breaker_threshold = grid_cfg.get("sl_circuit_breaker_threshold", 3)   # R44: 2→3次
+        self._sl_circuit_breaker_cooldown = grid_cfg.get("sl_circuit_breaker_cooldown", 1200)  # R44: 3600→1200s（60min→20min）
 
         # 信号去重和节流机制
         self._last_signal_time: Dict[str, float] = {}  # {symbol: last_signal_timestamp}

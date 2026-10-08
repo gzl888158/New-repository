@@ -29,7 +29,7 @@ class DecisionConfig:
     risk_per_trade: float = 0.01
     max_position_notional_pct: float = 0.25
     max_leverage: float = 1.0
-    min_bars: int = 27
+    min_bars: int = 10  # R42: 27→10，缩短首次信号等待
 
     def __post_init__(self) -> None:
         if self.fast_period < 2 or self.slow_period <= self.fast_period:

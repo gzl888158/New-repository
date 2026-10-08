@@ -986,9 +986,9 @@ capital_pool:
   risk_isolation_ratio: 0.15
 allocation_agent:
   enabled: true
-  rebalance_interval: 3600
+  rebalance_interval: 900
   min_trade_count: 20
-  max_allocation_change: 0.05
+  max_allocation_change: 0.20
   method: dynamic
 freeze_policy:
   enabled: true
@@ -1284,8 +1284,8 @@ trading:
   trailing_profit_lock: 0.04
   trend_allocation: 0.3
 capital_management:
-  rebalance_interval: 900
-  smoothing_new_weight: 0.5
+  rebalance_interval: 600
+  smoothing_new_weight: 0.7
   deployability:
     enabled: true
     exited_factor: 0.0

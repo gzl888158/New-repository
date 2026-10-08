@@ -281,9 +281,9 @@ class DynamicAllocator:
 
         # ── 分配控制参数 ──
         alloc_cfg = config.get("allocation_agent", {})
-        self._max_weight_change = _safe_float(alloc_cfg.get("max_allocation_change"), 0.10)
+        self._max_weight_change = _safe_float(alloc_cfg.get("max_allocation_change"), 0.20)  # R48: 0.10→0.20
         self._min_trade_count = int(_safe_float(alloc_cfg.get("min_trade_count"), 20))
-        self._rebalance_interval = int(_safe_float(alloc_cfg.get("rebalance_interval"), 3600))
+        self._rebalance_interval = int(_safe_float(alloc_cfg.get("rebalance_interval"), 900))  # R47: 3600→900s（1h→15min）
 
         # ── 风险参数 ──
         self._max_single_weight = _safe_float(config.get("symbol_allocation", {}).get("max_symbol_weight"), 0.15) * 3  # 策略级放宽
@@ -347,7 +347,7 @@ class DynamicAllocator:
         self._probing_strategies: set = set()
 
         # ── 试探→正常渐变恢复（避免权重跳变） ──
-        self._ramp_up_steps = max(1, int(_safe_float(freeze_cfg.get("ramp_up_steps"), 5)))
+        self._ramp_up_steps = max(1, int(_safe_float(freeze_cfg.get("ramp_up_steps"), 3)))  # R49: 5→3 steps
         # {strategy: {exited_probing_at, current_step, target_weight}}
         self._ramp_up_state: Dict[str, Dict[str, Any]] = {}
 

@@ -115,7 +115,7 @@ class PreTradeRiskChecker:
         trading = self.config.get("trading", {})
         risk = self.config.get("risk", {})
         
-        self._max_single_order_usd = risk.get("max_single_order_usd") or trading.get("max_single_order_usd") or 500.0
+        self._max_single_order_usd = risk.get("max_single_order_usd") or trading.get("max_single_order_usd") or 2000.0
         self._max_symbol_position_ratio = risk.get("max_symbol_position_ratio") or 0.25
         self._max_total_leverage = trading.get("max_total_leverage") or 20
         self._daily_max_loss = trading.get("daily_max_loss") or 0.04
@@ -336,10 +336,10 @@ class InTradeRiskChecker:
         self.config = config or {}
         risk = self.config.get("risk", {})
         
-        self._max_api_rps = risk.get("max_api_rps") or 10
+        self._max_api_rps = risk.get("max_api_rps") or 20
         self._max_slippage_pct = risk.get("max_slippage_pct") or 0.003
-        self._max_spread_pct = risk.get("max_spread_pct") or 0.002
-        self._max_latency_ms = risk.get("max_latency_ms") or 3000
+        self._max_spread_pct = risk.get("max_spread_pct") or 0.005
+        self._max_latency_ms = risk.get("max_latency_ms") or 5000
         
         self._api_call_times: deque = deque(maxlen=100)
         self._latency_history: deque = deque(maxlen=20)

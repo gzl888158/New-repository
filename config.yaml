@@ -131,8 +131,8 @@ position_manager:
   sync_failure_threshold: 3
   risk_check_interval_sec: 5
   max_total_positions: 12
-  max_positions_per_symbol: 2
-  max_positions_per_strategy: 5
+  max_positions_per_symbol: 6
+  max_positions_per_strategy: 8
   max_co_hold_strategies: 3
   risk_linkage:
     drawdown_trigger: 0.15
@@ -310,6 +310,10 @@ redis:
   password: ${REDIS_PASSWORD}
   port: 6379
 risk:
+  max_single_order_usd: 2000
+  max_api_rps: 20
+  max_spread_pct: 0.005
+  max_latency_ms: 5000
   black_swan:
     btc_flash_crash_pct: 0.03
     btc_volatility_spike_pct: 0.05
@@ -1247,7 +1251,7 @@ trading:
   weekly_max_loss: 0.06
   idle_cash_allocation: true
   maker_fee_rate: 0.0002
-  max_concurrent_positions: 10
+  max_concurrent_positions: 12
   max_consecutive_losses: 5
   min_pnl_for_loss: 0.005
   loss_batch_window_sec: 5

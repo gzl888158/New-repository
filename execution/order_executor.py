@@ -100,7 +100,7 @@ class OrderExecutor:
         self._stop_pending: set = set()
 
         # 最大并发持仓数
-        self._max_concurrent_positions = config.get("trading", {}).get("max_concurrent_positions", 4)
+        self._max_concurrent_positions = config.get("trading", {}).get("max_concurrent_positions", 12)
         self._max_concurrent_positions_base = self._max_concurrent_positions  # P7: 保存基础值用于动态调整
 
         self._profit_optimizer: Optional[ProfitOptimizer] = None

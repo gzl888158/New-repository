@@ -171,9 +171,9 @@ class PositionManager:
         self._sync_fail_streak = 0
         self._sync_degraded = False
         self._risk_check_interval = pm_cfg.get("risk_check_interval_sec", 5)
-        self._max_total_positions = pm_cfg.get("max_total_positions", 6)
-        self._max_positions_per_symbol = pm_cfg.get("max_positions_per_symbol", 2)
-        self._max_positions_per_strategy = pm_cfg.get("max_positions_per_strategy", 3)
+        self._max_total_positions = pm_cfg.get("max_total_positions", 12)
+        self._max_positions_per_symbol = pm_cfg.get("max_positions_per_symbol", 6)
+        self._max_positions_per_strategy = pm_cfg.get("max_positions_per_strategy", 8)
         # R10: 同 symbol+direction 最多允许 N 个策略共同持仓（软阻断）— 从2提高到3，避免4个启用策略中2个被闲置
         self._max_co_hold_strategies = pm_cfg.get("max_co_hold_strategies", 3)
 

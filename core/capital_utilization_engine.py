@@ -146,7 +146,7 @@ class CapitalUtilizationEngine:
         "overlap_eu_us": 0.85,  # 欧美重叠 (UTC 13-16)：降低15%
         "us": 0.90,          # 美国盘 (UTC 13-20)：降低10%
         "low_liquidity": 0.70,  # 低流动性 (UTC 20-24)：降低30%
-        "weekend": 0.50,     # 周末：降低50%
+        "weekend": 0.75,     # R123: 0.50→0.75 周末降低幅度减小
     }
 
     # ── 波动率调节系数 ──
@@ -176,15 +176,15 @@ class CapitalUtilizationEngine:
 
     # ── 账户层级仓位乘数上限 ──
     TIER_POSITION_BOOST_CAPS = {
-        "nano": 1.5, "micro": 2.0, "small": 3.0,
-        "medium": 4.0, "large": 5.0, "xlarge": 5.0,
+        "nano": 3.0, "micro": 2.5, "small": 2.0,  # R122: 反转，小账户更高boost
+        "medium": 1.8, "large": 1.5, "xlarge": 1.5,
     }
 
     # ── 强制再平衡触发阈值 ──
     # 近期资本效率（总PnL / 总已用保证金）低于此值，且总权益超过最小规模时，
     # 触发 FORCE_REBALANCE：资金未被有效利用，需向高效策略重新分配。
     FORCE_REBALANCE_EFFICIENCY_THRESHOLD = 0.15
-    FORCE_REBALANCE_MIN_EQUITY = 100.0
+    FORCE_REBALANCE_MIN_EQUITY = 5.0  # R100: 100→5 小账户也需要强制再平衡
     # 资金占用低于此值视为「闲置」而非「无效利用」，不触发 FORCE_REBALANCE
     FORCE_REBALANCE_MIN_UTILIZATION = 0.10
     # 已用保证金低于此值（USDT）时效率分母无意义，返回中性值避免被 PnL 放大成异常值

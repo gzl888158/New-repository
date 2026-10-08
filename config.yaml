@@ -160,9 +160,9 @@ equity_monitor:
   tiered_drawdown_guard:
     enabled: true
     levels:
-    - drawdown_pct: 0.03
-      position_multiplier: 0.7
-      risk_budget_ratio: 0.7
+    - drawdown_pct: 0.08  # R104: 0.03→0.08 3%在小账户=正常噪声
+      position_multiplier: 0.85  # R104: 0.7→0.85
+      risk_budget_ratio: 0.85  # R104: 0.7→0.85
       max_positions: 7
     - drawdown_pct: 0.05
       position_multiplier: 0.5
@@ -174,7 +174,7 @@ equity_monitor:
       max_positions: 3
   profit_reserve:
     enabled: true
-    activation_pct: 0.02
+    activation_pct: 0.10  # R105: 0.02→0.10 小账户2%利润就锁定太早
     max_pct: 0.1
     max_position_multiplier_reduction: 0.3
   drawdown_velocity:
@@ -184,8 +184,7 @@ equity_monitor:
     position_multiplier: 0.5
   recovery_ramp:
     enabled: true
-    floor: 0.3
-    ceiling: 1.0
+    floor: 0.6  # R106: 0.3→0.6 恢复下限提高，避免策略长期低仓位
     step_per_bar: 0.05
 hardware:
   cpu_cores: 4
@@ -335,11 +334,11 @@ risk:
     rapid_drawdown_threshold: 0.03
     rapid_drawdown_window: 60
   correlation:
-    check_interval_seconds: 300
+    check_interval_seconds: 180  # R97: 300→180
     kline_bar: 1H
     lookback_bars: 50
-    max_concentration: 0.4
-    reduce_ratio: 0.5
+    max_concentration: 0.50  # R98: 0.4→0.50
+    reduce_ratio: 0.30  # R99: 0.5→0.30 减仓更温和
     threshold: 0.7
   full_close_threshold: 0.2
   margin_call_threshold: 0.3
@@ -402,7 +401,7 @@ strategies:
     martingale_layers: 3
     martingale_coefficient: 1.0
     dynamic_adjust_interval: 120
-    volatility_threshold: 0.015
+    volatility_threshold: 0.04  # R93: 0.015→0.04 对齐代码默认值
     atr_period: 14
     atr_multiplier: 0.8
     volume_profile_period: 30
@@ -414,7 +413,7 @@ strategies:
     breakeven_stop_pct: 0.003
     min_signal_quality: 0.109835
     extreme_volatility_pause_minutes: 5
-    max_stop_loss_pct: 0.02
+    max_stop_loss_pct: 0.035  # R95: 0.02→0.035
     min_signal_interval: 3
     signal_cooldown: 2.0
     take_profit_enabled: true
@@ -432,9 +431,9 @@ strategies:
     time_exit_partial_pct: 0.5
     time_exit_after_hours: 48.0
     volatility_stop_enabled: true
-    vol_spike_threshold: 2.5
+    vol_spike_threshold: 3.5  # R92: 2.5→3.5 对齐代码
     vol_stop_partial_pct: 0.3
-    volatility_lockout_minutes: 30
+    volatility_lockout_minutes: 15  # R62: 30→15
     coin_health_check_interval: 120
     coin_max_lifecycle_events: 100
     coin_health_max_errors: 5
@@ -448,16 +447,16 @@ strategies:
     locked_params:
     - min_signal_quality
     - stop_loss_pct
-    max_grid_spacing: 0.04
-    min_grid_spacing: 0.012
+    max_grid_spacing: 0.08  # R90: 0.04→0.08 对齐代码
+    min_grid_spacing: 0.003  # R94: 0.012→0.003
     volatility_adaptive_spacing: true
     long_only: false
     dynamic_grid_count: true
     multi_symbol_scheduling: true
-    grid_rebuild_cooldown_seconds: 300
+    grid_rebuild_cooldown_seconds: 120  # R91: 300→120 对齐代码
     use_fill_driven_position: true
-    max_daily_loss_usdt: 0.5
-    leverage: 1.0
+    max_daily_loss_usdt: 1.0  # R96: 0.5→1.0
+    leverage: 3.0  # R125: 1.0→3.0 小账户零杠杆无意义
   scalping:
     enabled: false
     run_hours_start: 0
@@ -721,7 +720,7 @@ strategies:
     adx_threshold: 20.0
     adx_period: 14
     breakout_lookback: 20
-    volume_multiplier: 1.5
+    volume_multiplier: 1.2  # R121: 1.5→1.2 放宽量能确认
     rsi_period: 14
     rsi_oversold: 30.0
     rsi_overbought: 70.0
@@ -770,10 +769,9 @@ strategies:
     rsi_oversold: 30.0
     rsi_overbought: 70.0
     atr_sl_mult: 1.5
-    min_regime_confidence: 0.4
+    min_regime_confidence: 0.25  # R120: 0.4→0.25
     symbol_cooldown_seconds: 300
-    min_signal_quality: 0.35
-    confirm_bar: 4H
+    min_signal_quality: 0.25  # R119: 0.35→0.25
     confirm_trend_threshold: 0.02
     min_band_touch_count: 2
     touch_proximity_pct: 0.0015
@@ -893,8 +891,8 @@ anti_targeting:
     enabled: true
     mode: standard
     delay_enabled: true
-    delay_min_ms: 50
-    delay_max_ms: 500
+    delay_min_ms: 0  # R113: 50→0 减少信号延迟
+    delay_max_ms: 50  # R113: 500→50 大幅缩减混淆延迟
     delay_distribution: exponential
     weight_jitter_enabled: true
     weight_jitter_pct: 0.05
@@ -981,9 +979,9 @@ telegram:
   bot_token: ${TELEGRAM_BOT_TOKEN}
   chat_id: ${TELEGRAM_CHAT_ID}
 capital_pool:
-  base_ratio: 0.6
+  base_ratio: 0.70  # R103: 0.6→0.70 更多资金投入交易
   add_reserve_ratio: 0.25
-  risk_isolation_ratio: 0.15
+  risk_isolation_ratio: 0.05  # R102: 0.15→0.05 小账户不需要15%隔离
 allocation_agent:
   enabled: true
   rebalance_interval: 900
@@ -1056,8 +1054,8 @@ capital_efficiency:
   opportunity_cost_daily: 0.0005
   positive_return_protection: true
 grid_adaptive_utilization:
-  min_trades_for_activation: 20
-  min_trades_for_confidence: 50
+  min_trades_for_activation: 5  # R116: 20→5 小账户更快激活自适应
+  min_trades_for_confidence: 15  # R116: 50→15
   confidence_lookback_trades: 30
   max_position_multiplier: 2.5
   min_position_multiplier: 0.5
@@ -1084,7 +1082,7 @@ enterprise_sync:
   alert_on_drift: true
   alert_on_disconnect: true
   health:
-    max_data_age_healthy_sec: 10.0
+    max_data_age_healthy_sec: 15.0  # R60: 10→15 对齐代码
     max_data_age_degraded_sec: 30.0
     max_data_age_stale_sec: 60.0
     max_consecutive_errors: 5
@@ -1154,7 +1152,7 @@ risk_budget:
   enabled: true
   daily_risk_budget_pct: 0.03
   hourly_max_loss_pct: 0.015
-  max_per_trade_risk_pct: 0.008
+  max_per_trade_risk_pct: 0.02  # R117: 0.008→0.02 放宽单笔风险
   max_position_boost: 2.0
   strategy_budgets:
     scalping: 0.4
@@ -1193,7 +1191,7 @@ reversal_take_profit:
   partial_exit_ratio: 0.5
   full_exit_score: 0.85
   min_profit_lock_pct: 0.002
-  cooldown_seconds: 300
+  cooldown_seconds: 60  # R127: 300→60 反转止盈冷却缩短
   price_precision: 4
 trailing_take_profit:
   enabled: true
@@ -1204,7 +1202,7 @@ trailing_take_profit:
   min_notional_usd: 1.0
 profit_lock:
   enabled: true
-  breakeven_pct: 0.0015
+  breakeven_pct: 0.005  # R124: 0.0015→0.005 太早锁定利润
   breakeven_exit_pct: 0.0
   partial_pct: 0.004
   partial_ratio: 0.5
@@ -1214,11 +1212,11 @@ profit_lock:
   breakeven_retrace_partial_ratio: 0.4
 adaptive_tp_sl:
   enabled: true
-  base_sl_pct: 0.02
+  base_sl_pct: 0.035  # R126: 0.02→0.035 给止损更多空间
   base_tp_pct: 0.06
   atr_sl_multiplier: 1.5
   atr_tp_ratio: 3.0
-  min_sl_pct: 0.005
+  min_sl_pct: 0.01  # R126: 0.005→0.01
   max_sl_pct: 0.08
   min_tp_pct: 0.01
   max_tp_pct: 0.3
@@ -2039,7 +2037,7 @@ anti_debounce:
   signal_dedup_window_seconds: 10.0
   strategy_cooldown_seconds: 5.0
   global_cooldown_seconds: 2.0
-  loss_cooldown_seconds: 120.0
+  loss_cooldown_seconds: 30.0  # R114: 120→30 亏损冷却缩短
   churn_window_seconds: 60.0
   churn_max_flips: 3
   churn_block_seconds: 300.0

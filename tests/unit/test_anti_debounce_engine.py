@@ -480,8 +480,8 @@ class TestAdaptiveCoolown:
         engine = _make_engine()
         engine.set_market_state(volatility=0.05, drawdown=0.15, account_tier="nano")
         mult = engine._compute_adaptive_multiplier()
-        # 1.5 * 2.0 * 1.3 = 3.9
-        assert mult >= 3.8
+        # R115: ADAPTIVE_DRAWDOWN_MULTIPLIER 2.0→1.3, combined result ~2.5
+        assert mult >= 2.5
 
     def test_adaptive_multiplier_extends_cooldown(self):
         engine = _make_engine(symbol_cooldown_seconds=10,

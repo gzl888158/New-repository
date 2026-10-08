@@ -133,7 +133,7 @@ class StrategyEngine:
         # 模式对应的信号权重乘数
         self._mode_signal_multipliers = {
             RunMode.NORMAL: 1.0,
-            RunMode.CONSERVATIVE: 0.7,
+            RunMode.CONSERVATIVE: 0.85,  # R118: 0.7→0.85 保守模式信号衰减减小
             RunMode.AGGRESSIVE: 1.2,
             RunMode.EMERGENCY: 0.0,  # 紧急模式不产生开仓信号
         }

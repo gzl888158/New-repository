@@ -128,8 +128,8 @@ class CapitalPoolController:
             "risk_isolation_max_usage_pct", 0.5
         )  # 单次最多使用池总额的50%
         self._risk_isolation_cooldown_seconds = pool_config.get(
-            "risk_isolation_cooldown_seconds", 86400
-        )  # 使用后24小时冷却
+            "risk_isolation_cooldown_seconds", 7200
+        )  # R101: 86400→7200 24h冷却对小账户太长
         self._risk_isolation_max_concurrent = pool_config.get(
             "risk_isolation_max_concurrent", 2
         )  # 最多同时2笔未偿还

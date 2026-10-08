@@ -49,10 +49,10 @@ class TrendStrategyBase(StrategyBase):
 
         self._enabled = bool(self._cfg.get("enabled", False))
         self._bar = str(self._cfg.get("timeframe", self.DEFAULT_BAR))
-        self._min_signal_quality = max(0.35, self._safe_float(self._cfg.get("min_signal_quality", 0.35), 0.35))
+        self._min_signal_quality = max(0.20, self._safe_float(self._cfg.get("min_signal_quality", 0.20), 0.20))  # R111: 0.35→0.20
         self._leverage = self._safe_int(self._cfg.get("leverage", 5), 5)
-        self._max_concurrent_positions = self._safe_int(self._cfg.get("max_concurrent_positions", 2), 2)
-        self._capital_allocation = self._safe_float(self._cfg.get("capital_allocation", 0.10), 0.10)
+        self._max_concurrent_positions = self._safe_int(self._cfg.get("max_concurrent_positions", 5), 5)  # R109: 2→5
+        self._capital_allocation = self._safe_float(self._cfg.get("capital_allocation", 0.25), 0.25)  # R108: 0.10→0.25
         self._max_stop_loss_pct = self._safe_float(self._cfg.get("max_stop_loss_pct", 0.02), 0.02)
         self._take_profit_pct = self._safe_float(self._cfg.get("take_profit_pct", 0.04), 0.04)
         self._loop_interval = self._safe_float(self._cfg.get("loop_interval_seconds", 15.0), 15.0)  # R34: 60s→15s
@@ -155,8 +155,8 @@ class TrendStrategyBase(StrategyBase):
                     setattr(self, attr, self._safe_float(updates[cfg_key], getattr(self, attr)))
                 logger.info(f"[{self._strategy_name}] config hot-updated: {attr}={updates[cfg_key]}")
 
-        # 阈值硬下限：min_signal_quality 不得低于 0.35（A/B/E 趋势类信号质量门槛）
-        self._min_signal_quality = max(0.35, self._safe_float(self._min_signal_quality, 0.35))
+        # 阈值硬下限：min_signal_quality 不得低于 0.20（R111: 0.35→0.20）
+        self._min_signal_quality = max(0.20, self._safe_float(self._min_signal_quality, 0.20))
 
     # ------------------------------------------------------------------
     # 标的池
@@ -219,7 +219,7 @@ class TrendStrategyBase(StrategyBase):
             leverage = self._safe_int(tier_settings.get("leverage_max", self._leverage), self._leverage)
         except Exception:
             leverage = self._leverage
-        abs_max = self._safe_int(self.config.get("leverage_tiers", {}).get("absolute_max", 5), 5)
+        abs_max = self._safe_int(self.config.get("leverage_tiers", {}).get("absolute_max", 10), 10)  # R110: 5→10
         return min(max(leverage, 1), abs_max)
 
     def _calculate_quantity(self, symbol: str, price: float) -> Tuple[float, float]:

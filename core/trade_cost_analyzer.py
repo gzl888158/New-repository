@@ -115,7 +115,7 @@ class TradeCostAnalyzer:
     DEFAULT_SPREAD_PCT = 0.0003   # 预估点差 0.03%
 
     # 最小盈利要求：盈利必须 >= 总成本 * 3
-    MIN_PROFIT_MULTIPLIER = 3.0
+    MIN_PROFIT_MULTIPLIER = 1.5  # R112: 3.0→1.5 盈利要求过严阻碍交易
 
     def __init__(self, config: Optional[Dict] = None):
         self._config = config or {}

@@ -210,7 +210,7 @@ class GridStrategy(PersistentStrategy):
         self._daily_pnl_date = None
         self._symbol_activity: Dict[str, Dict[str, Any]] = {}
         self._last_rebalance_time: Optional[datetime] = None
-        self._rebalance_interval = 3600  # 1小时重新平衡一次
+        self._rebalance_interval = 600  # R107: 3600→600 10分钟重新平衡
 
         # ===================== 生产级各币种网格状态管理 =====================
         # 逐币健康状态: {symbol: {status, last_check, error_count, warnings, grid_integrity_score}}

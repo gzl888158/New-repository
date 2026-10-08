@@ -248,8 +248,8 @@ class TestDynamicTarget:
         eng._volatility_regime = "normal"
         eng._current_session = "weekend"
         target = eng._compute_dynamic_target(0.5, 1.0, 0.0)
-        # 0.85 * 1.0 * 0.50 * 1.0 * 1.0 = 0.425
-        assert target == pytest.approx(0.425)
+        # R123: weekend 0.50→0.75; 0.85 * 1.0 * 0.75 * 1.0 * 1.0 = 0.6375
+        assert target == pytest.approx(0.6375)
 
     def test_drawdown_reduces(self):
         eng = _make_engine("small")
@@ -755,15 +755,15 @@ class TestPositionBoost:
         eng = _make_engine("nano")
         eng._dynamic_target = 0.75
         boost = eng._compute_position_boost(0.05, UtilizationTier.CRITICAL_LOW, UtilizationAction.BOOST_AGGRESSIVE)
-        # nano cap = 1.5 * 1.2 = 1.8
-        assert boost <= 1.8
+        # R122: nano cap = 3.0 * 1.2 = 3.6
+        assert boost <= 3.6
 
     def test_boost_conservative_caps_lower(self):
         eng = _make_engine("small")
         eng._dynamic_target = 0.75
         boost = eng._compute_position_boost(0.10, UtilizationTier.LOW, UtilizationAction.BOOST_CONSERVATIVE)
-        # small cap = 3.0 * 0.7 = 2.1
-        assert boost <= 2.1
+        # R122: small cap = 2.0 * 0.7 = 1.4
+        assert boost <= 1.4
 
     def test_boost_floor(self):
         eng = _make_engine()
@@ -872,9 +872,11 @@ class TestAllocationShift:
 class TestAnalyze:
     def test_low_utilization_boosts(self):
         eng = _make_engine("nano")
+        # R100: FORCE_REBALANCE_MIN_EQUITY 100→5, need efficiency >= 0.15 to avoid force_rebalance
+        # efficiency = pnl / used_margin = 3.0/15.0 = 0.2 >= 0.15
         rep = eng.analyze(
             total_equity=100.0, used_margin=15.0, available=85.0,
-            strategy_usage={"grid": 15.0}, recent_pnl={"grid": 0.5},
+            strategy_usage={"grid": 15.0}, recent_pnl={"grid": 3.0},
             atr_ratio=1.0, total_drawdown_pct=0.0, session="european",
         )
         assert rep.current_utilization == pytest.approx(0.15)
@@ -1256,7 +1258,8 @@ class TestTierConstants:
         caps = [CapitalUtilizationEngine.TIER_CAPS[t] for t in tiers]
         boost_caps = [CapitalUtilizationEngine.TIER_POSITION_BOOST_CAPS[t] for t in tiers]
         assert caps == sorted(caps)
-        assert boost_caps == sorted(boost_caps)
+        # R122: boost_caps descending — small accounts get higher boost
+        assert boost_caps == sorted(boost_caps, reverse=True)
 
     def test_session_adjustments_all_present(self):
         expected = {"asian", "european", "overlap_eu_us", "us", "low_liquidity", "weekend"}
@@ -1333,9 +1336,10 @@ class TestForceRebalance:
         assert action == UtilizationAction.HOLD
 
     def test_no_trigger_small_equity(self):
+        # R100: FORCE_REBALANCE_MIN_EQUITY 100→5, equity must be <= 5 to avoid trigger
         eng = _make_engine("small")
         eng._equity_mode = "normal"
-        action = eng._determine_action(0.5, UtilizationTier.OPTIMAL, 0.0, 0.10, 90.0)
+        action = eng._determine_action(0.5, UtilizationTier.OPTIMAL, 0.0, 0.10, 4.0)
         assert action == UtilizationAction.HOLD
 
     def test_no_trigger_missing_equity(self):

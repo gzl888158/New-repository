@@ -29,8 +29,8 @@ def test_config_loading():
     
     # 验证关键值
     cp = config.get('capital_pool', {})
-    assert cp.get('base_ratio') == 0.60, f"base_ratio mismatch: {cp.get('base_ratio')}"
-    assert cp.get('risk_isolation_ratio') == 0.15, f"risk_isolation_ratio mismatch"
+    assert cp.get('base_ratio') == 0.70, f"base_ratio mismatch: {cp.get('base_ratio')}"  # R103: 0.60→0.70
+    assert cp.get('risk_isolation_ratio') == 0.05, f"risk_isolation_ratio mismatch"  # R102: 0.15→0.05
     
     aa = config.get('allocation_agent', {})
     assert aa.get('method') == 'dynamic', f"method mismatch: {aa.get('method')}"

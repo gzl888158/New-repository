@@ -43,7 +43,7 @@ class DecisionValidator:
             "min_confidence": 0.15,
             "max_daily_loss": 0.05,
             "kelly_fraction_cap": 0.25,       # Kelly仓位上限（资本占比）
-            "max_streak_count": 4,            # 连续同向信号最大次数
+            "max_streak_count": 8,            # R129: 4→8 连续同向信号限制放宽
             "max_churn_per_hour": 30,         # P7: 每小时最大换手次数（10→30，网格策略19个币种10次太低）
         }
         # 硬编码合约规格作为回退（当OKX API不可用时使用）

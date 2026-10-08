@@ -16,8 +16,8 @@ class RiskLimits:
             "single_strategy_max_margin": config["risk"].get("single_strategy_max_margin", 0.30),
             "max_leverage": config["trading"].get("max_leverage", 20),
             "max_open_positions": config["trading"].get("max_concurrent_positions", 4),
-            "daily_max_trades": config["risk"].get("daily_max_trades", 100),
-            "hourly_max_trades": config["risk"].get("hourly_max_trades", 20),
+            "daily_max_trades": config["risk"].get("daily_max_trades", 200),  # R130: 100→200
+            "hourly_max_trades": config["risk"].get("hourly_max_trades", 40),  # R131: 20→40
         }
         
         self._daily_trade_count = 0

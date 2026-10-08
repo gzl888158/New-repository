@@ -91,6 +91,10 @@ class OrderExecutor:
         self._leverage_cache: Dict[str, Tuple[int, float]] = {}  # {symbol_pos_side: (leverage, timestamp)}
         self._leverage_cache_ttl = 300.0  # 5分钟有效期
 
+        # P0-5: 账户权益缓存 — 避免每笔订单都调用 REST API 获取账户信息
+        self._account_equity_cache: Optional[Tuple[float, float]] = None  # (total_eq, timestamp)
+        self._account_equity_cache_ttl = 2.0  # 2秒有效期
+
         # 框架外持仓白名单（手动开单显式归属）：key = f"{symbol}:{side}"
         # 对账发现手动开单（strategy=unknown/sync）且 orphan_position_auto_close=False 时登记到此处，
         # 后续对账跳过重复告警/平仓，避免手动单被反复误判为失控仓位。
@@ -453,10 +457,18 @@ class OrderExecutor:
             safe_profit_needed = round_trip_fee * 3
             min_notional = safe_profit_needed / min_target_profit_pct
             
-            # 根据账户资金动态调整下限
-            account_info = self.okx_client.get_account_info()
-            if account_info:
-                total_eq = float(account_info.get("totalEq", 0))
+            # 根据账户资金动态调整下限（P0-5: 缓存2秒，避免每笔订单REST调用）
+            now = time.time()
+            total_eq = 0.0
+            if self._account_equity_cache and (now - self._account_equity_cache[1]) < self._account_equity_cache_ttl:
+                total_eq = self._account_equity_cache[0]
+            else:
+                account_info = self.okx_client.get_account_info()
+                if account_info:
+                    total_eq = float(account_info.get("totalEq", 0))
+                    self._account_equity_cache = (total_eq, now)
+
+            if total_eq > 0:
                 if total_eq > 0:
                     # 每笔交易占用不超过总资金的 25%（小资金场景放宽）
                     max_per_trade = total_eq * 0.25
@@ -1029,7 +1041,7 @@ class OrderExecutor:
             logger.debug(f"reconcile_locked_capital: exchange query failed: {e}")
             return {}
 
-        return self._capital_manager.reconcile_locked_capital(actual_by_pool)
+        return await asyncio.to_thread(self._capital_manager.reconcile_locked_capital, actual_by_pool)
 
     def _invalidate_positions_cache(self):
         """P0-9: 持仓变更后清除缓存，确保下次查询获取最新数据。"""

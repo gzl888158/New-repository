@@ -78,7 +78,7 @@ class StrategyEngine:
         
         self._market_data: Dict[str, Dict[str, Any]] = {}
         self._positions: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.RLock()
+        self._lock = asyncio.Lock()
         
         self._trade_callback: Optional[Callable] = None
         self._signal_callback: Optional[Callable] = None
@@ -610,14 +610,14 @@ class StrategyEngine:
         if symbol not in self._market_data:
             self._market_data[symbol] = {}
     
-    def update_market_data(self, symbol: str, data: Dict[str, Any]) -> None:
+    async def update_market_data(self, symbol: str, data: Dict[str, Any]) -> None:
         """更新市场数据（带异常保护）"""
         if not symbol or not data:
             return
         try:
-            with self._lock:
+            async with self._lock:
                 self._market_data[symbol] = data
-            
+
             self._indicator_engine.update_market_data(
                 symbol=symbol,
                 open_price=data.get("open", data.get("o", 0)),
@@ -657,7 +657,7 @@ class StrategyEngine:
 
             # P0: 将tick数据推入IndicatorEngine，确保指标计算使用最新数据
             try:
-                self.update_market_data(symbol, tick)
+                await self.update_market_data(symbol, tick)
             except Exception as e:
                 logger.error(f"StrategyEngine process_tick: update_market_data failed for {symbol}: {e}")
 
@@ -749,12 +749,12 @@ class StrategyEngine:
                     except Exception as e:
                         logger.error(f"Error in signal callback: {e}")
 
-            # 发送重要信号通知
-            for signal in signals:
-                try:
-                    await self._send_signal_notification(symbol, signal)
-                except Exception:
-                    pass
+            # 发送重要信号通知（P1-2: 并行发送）
+            if signals:
+                await asyncio.gather(
+                    *(self._send_signal_notification(symbol, signal) for signal in signals),
+                    return_exceptions=True
+                )
 
             # 记录处理延迟
             latency_ms = (time.time() - t_start) * 1000
@@ -797,7 +797,7 @@ class StrategyEngine:
                 return []
 
             try:
-                self.update_market_data(symbol, bar)
+                await self.update_market_data(symbol, bar)
             except Exception as e:
                 logger.error(f"StrategyEngine process_bar: update_market_data failed for {symbol}: {e}")
 
@@ -896,12 +896,12 @@ class StrategyEngine:
                     except Exception as e:
                         logger.error(f"Error in signal callback: {e}")
 
-            # 发送重要信号通知
-            for signal in signals:
-                try:
-                    await self._send_signal_notification(symbol, signal)
-                except Exception:
-                    pass
+            # 发送重要信号通知（P1-2: 并行发送）
+            if signals:
+                await asyncio.gather(
+                    *(self._send_signal_notification(symbol, signal) for signal in signals),
+                    return_exceptions=True
+                )
 
             # 记录处理延迟
             latency_ms = (time.time() - t_start) * 1000
@@ -917,11 +917,11 @@ class StrategyEngine:
             logger.error(f"StrategyEngine process_bar: unhandled error for {symbol}: {e}", exc_info=True)
             return []
     
-    def update_position(self, symbol: str, position: Dict[str, Any]) -> None:
+    async def update_position(self, symbol: str, position: Dict[str, Any]) -> None:
         """更新仓位信息"""
-        with self._lock:
+        async with self._lock:
             self._positions[symbol] = position
-        
+
         self._strategy_container.update_position(symbol, position)
     
     def _build_signal_context(self, symbol: str, price: float, 

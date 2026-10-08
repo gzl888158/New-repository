@@ -316,9 +316,9 @@ class PositionManager:
         self._running = True
         logger.info("PositionManager starting...")
 
-        # 恢复持久化状态
+        # 恢复持久化状态（P1-7: 文件I/O隔离到线程池）
         if self._persistence_enabled:
-            self._restore_state()
+            await asyncio.to_thread(self._restore_state)
 
         # 初始同步
         await self._sync_positions()
@@ -426,11 +426,10 @@ class PositionManager:
 
         try:
             checked_query = getattr(self._okx_client, "get_positions_checked", None)
-            positions = (
-                checked_query()
-                if callable(checked_query)
-                else self._okx_client.get_positions()
-            )
+            if callable(checked_query):
+                positions = await asyncio.to_thread(checked_query)
+            else:
+                positions = await asyncio.to_thread(self._okx_client.get_positions)
             if positions is None:
                 error = "exchange position query failed; keeping local snapshot"
                 logger.error(f"Position sync aborted: {error}")
@@ -654,12 +653,15 @@ class PositionManager:
     # ═══════════════════════════════════════════════════════════════
 
     async def _risk_check_loop(self):
-        """风险检查循环"""
+        """风险检查循环（P1-3: 并行执行独立风险检查）"""
         while self._running:
             try:
-                await self._check_account_risk()
-                await self._check_position_risks()
-                await self._check_risk_linkage()
+                await asyncio.gather(
+                    self._check_account_risk(),
+                    self._check_position_risks(),
+                    self._check_risk_linkage(),
+                    return_exceptions=True
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -672,7 +674,7 @@ class PositionManager:
             return
 
         try:
-            account_info = self._okx_client.get_account_info()
+            account_info = await asyncio.to_thread(self._okx_client.get_account_info)
             if not account_info:
                 return
 
@@ -903,41 +905,58 @@ class PositionManager:
             key=lambda x: x[1].unrealized_pnl,
         )
 
-        # 减仓亏损最大的持仓
+        # 减仓亏损最大的持仓（P1-4: 并行下单）
         reduce_count = max(1, int(len(self._positions) * self._drawdown_reduce_pct))
-        closed = 0
+        orders_to_place = []
+
         for key, pos in sorted_positions[:reduce_count]:
             close_side = "sell" if pos.side == PositionSide.LONG else "buy"
             reduce_qty = abs(pos.quantity) * self._drawdown_reduce_pct
             if reduce_qty <= 0 or not self._okx_client:
                 continue
+            orders_to_place.append((pos, close_side, reduce_qty))
+
+        if not orders_to_place:
+            logger.error("Drawdown reduce FAILED: no positions to reduce")
+            self._emergency_reduce = False
+            return
+
+        # 并行执行所有减仓订单
+        async def place_reduce_order(pos, close_side, reduce_qty):
             try:
-                self._okx_client.place_order(
+                await asyncio.to_thread(
+                    self._okx_client.place_order,
                     symbol=pos.symbol,
                     side=close_side,
                     order_type="market",
                     quantity=reduce_qty,
                     leverage=pos.leverage,
-                    reduce_only=True,
+                    reduce_only=True
                 )
-                closed += 1
                 logger.warning(
                     f"Drawdown reduce: closed {pos.symbol} {close_side} "
                     f"qty={reduce_qty:.4f} (loss={pos.unrealized_pnl:.4f})"
                 )
+                event = RiskEvent(
+                    event_type="drawdown_reduce",
+                    severity=RiskLevel.HIGH,
+                    symbol=pos.symbol,
+                    strategy_name=pos.strategy_name,
+                    message=f"Drawdown reduce: closed {pos.symbol} {close_side} qty={reduce_qty:.4f}",
+                    action_taken="close_position",
+                )
+                self._notify_risk_event(event)
+                return True
             except Exception as e:
                 logger.error(f"Drawdown reduce order failed for {pos.symbol}: {e}")
+                return False
 
-            event = RiskEvent(
-                event_type="drawdown_reduce",
-                severity=RiskLevel.HIGH,
-                symbol=pos.symbol,
-                strategy_name=pos.strategy_name,
-                message=f"Drawdown reduce: closed {pos.symbol} {close_side} qty={reduce_qty:.4f}",
-                action_taken="close_position",
-            )
-            self._notify_risk_event(event)
+        results = await asyncio.gather(
+            *(place_reduce_order(pos, side, qty) for pos, side, qty in orders_to_place),
+            return_exceptions=True
+        )
 
+        closed = sum(1 for r in results if r is True)
         if closed > 0:
             logger.warning(f"Drawdown reduce completed: {closed}/{reduce_count} positions reduced")
         else:
@@ -989,12 +1008,12 @@ class PositionManager:
     # ═══════════════════════════════════════════════════════════════
 
     async def _persist_loop(self):
-        """持久化循环"""
+        """持久化循环（P1-7: 文件I/O隔离到线程池）"""
         while self._running:
             try:
                 await asyncio.sleep(self._save_interval)
                 if time.time() - self._last_save_time > self._save_interval:
-                    self._save_state()
+                    await asyncio.to_thread(self._save_state)
                     self._last_save_time = time.time()
             except asyncio.CancelledError:
                 break

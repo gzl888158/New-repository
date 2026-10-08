@@ -2281,7 +2281,7 @@ class TradingScheduler:
 
                 # ============ 2.1 同步总敞口到 PortfolioRebalancer（P1: 总敞口硬限制）============
                 try:
-                    positions = self.okx_client.get_positions() or []
+                    positions = await asyncio.to_thread(self.okx_client.get_positions) or []
                     gross_notional = 0.0
                     for pos_data in positions:
                         pos = self.okx_client._parse_position(pos_data)
@@ -3832,7 +3832,8 @@ class TradingScheduler:
                                     try:
                                         vol_value = regime.get("volatility", 0.02)
                                         momentum = regime.get("momentum", 0.0)
-                                        self.capital_manager.update_symbol_metrics(
+                                        await asyncio.to_thread(
+                                            self.capital_manager.update_symbol_metrics,
                                             symbol, float(vol_value), float(momentum), 0.5
                                         )
                                     except Exception:

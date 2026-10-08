@@ -127,7 +127,7 @@ class PreTradeRiskChecker:
         self._current_equity: float = 0.0
         self._available_margin: float = 0.0
         self._position_manager = None
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
     def update_account(self, equity: float, available_margin: float,
                        daily_pnl: float, daily_start_equity: float) -> None:
@@ -343,7 +343,7 @@ class InTradeRiskChecker:
         
         self._api_call_times: deque = deque(maxlen=100)
         self._latency_history: deque = deque(maxlen=20)
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
     def record_api_call(self) -> None:
         """记录API调用时间"""
@@ -463,7 +463,7 @@ class PositionRiskChecker:
         self._max_funding_loss_pct = risk.get("max_funding_loss_pct") or 0.005
         
         self._position_states: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         # 手动开单白名单（symbol 集合）：这些持仓由用户手动管理，L3 不自动减仓/平仓
         self._manual_override_symbols: set = set()
 
@@ -649,7 +649,7 @@ class DailyRiskChecker:
         self._pause_reason = ""
         self._pause_started_at = 0.0  # P5: 暂停开始时间戳，用于自动恢复
         
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
     def record_trade(self) -> None:
         """记录一笔交易"""
@@ -983,7 +983,7 @@ class EmergencyCircuitBreaker:
 
         self._price_history: Dict[str, deque] = {}
         self._last_data_time: Optional[float] = None
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
 
         self._close_all_callback: Optional[Callable] = None
         self._stop_strategies_callback: Optional[Callable] = None
@@ -1383,7 +1383,7 @@ class RiskGate:
         self._okx_client = okx_client
         self._position_manager = None
         
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         
         self._total_checks = 0
         self._total_rejections = 0

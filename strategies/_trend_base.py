@@ -55,7 +55,7 @@ class TrendStrategyBase(StrategyBase):
         self._capital_allocation = self._safe_float(self._cfg.get("capital_allocation", 0.10), 0.10)
         self._max_stop_loss_pct = self._safe_float(self._cfg.get("max_stop_loss_pct", 0.02), 0.02)
         self._take_profit_pct = self._safe_float(self._cfg.get("take_profit_pct", 0.04), 0.04)
-        self._loop_interval = self._safe_float(self._cfg.get("loop_interval_seconds", 60.0), 60.0)
+        self._loop_interval = self._safe_float(self._cfg.get("loop_interval_seconds", 15.0), 15.0)  # R34: 60s→15s
         self._min_hold_minutes = self._safe_float(config.get("trading", {}).get("min_hold_minutes", 5), 5)
         # R3: 单币种保证金上限比例（与 grid 对齐），防止趋势策略垄断某币种
         self._single_symbol_ratio = self._safe_float(self._cfg.get("single_symbol_ratio", 0.25), 0.25)

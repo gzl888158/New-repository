@@ -87,6 +87,10 @@ class OrderExecutor:
         self._position_entry_time: Dict[str, datetime] = {}  # symbol -> entry_time
         self._min_hold_minutes = config.get("trading", {}).get("min_hold_minutes", 5)
 
+        # R38: 杠杆设置缓存 — 同一 symbol+pos_side 已设置相同杠杆值时跳过 REST 调用
+        self._leverage_cache: Dict[str, Tuple[int, float]] = {}  # {symbol_pos_side: (leverage, timestamp)}
+        self._leverage_cache_ttl = 300.0  # 5分钟有效期
+
         # 框架外持仓白名单（手动开单显式归属）：key = f"{symbol}:{side}"
         # 对账发现手动开单（strategy=unknown/sync）且 orphan_position_auto_close=False 时登记到此处，
         # 后续对账跳过重复告警/平仓，避免手动单被反复误判为失控仓位。
@@ -4216,6 +4220,12 @@ class OrderExecutor:
 
     async def _set_leverage(self, symbol: str, leverage: int, pos_side: str = None) -> bool:
         """P0-设置杠杆并验证结果。返回 True 表示成功，False 表示失败。"""
+        # R38: 缓存命中则跳过 REST 调用
+        cache_key = f"{symbol}_{pos_side or 'any'}"
+        cached = self._leverage_cache.get(cache_key)
+        if cached and cached[0] == leverage and (time.time() - cached[1]) < self._leverage_cache_ttl:
+            logger.debug(f"Leverage cache hit for {symbol}: {leverage}x (posSide={pos_side})")
+            return True
         try:
             result = await asyncio.to_thread(
                 self.okx_client.set_leverage, symbol, leverage, pos_side=pos_side
@@ -4229,7 +4239,8 @@ class OrderExecutor:
                 logger.warning(
                     f"Leverage mismatch for {symbol}: requested={leverage}, actual={actual_lever}"
                 )
-                # 交易所可能限制了最大杠杆，但订单仍可继续（保守策略：警告但不阻止）
+            # R38: 写入缓存
+            self._leverage_cache[cache_key] = (leverage, time.time())
             logger.debug(f"Leverage verified for {symbol}: {leverage}x (posSide={pos_side})")
             return True
         except Exception as e:

@@ -298,7 +298,7 @@ class DynamicAllocator:
         # ── 企业级：资金效率强化参数 ──
         eff_cfg = config.get("capital_efficiency", {})
         self._idle_sweep_threshold = _safe_float(eff_cfg.get("idle_sweep_threshold"), 0.20)     # 闲置>20%触发归集
-        self._idle_sweep_min_duration = _safe_float(eff_cfg.get("idle_sweep_min_duration"), 30) # 闲置持续30分钟才归集
+        self._idle_sweep_min_duration = _safe_float(eff_cfg.get("idle_sweep_min_duration"), 5) # R35: 闲置持续5分钟即归集（原30分钟过慢）
         self._utilization_reclaim_threshold = _safe_float(eff_cfg.get("utilization_reclaim_threshold"), 0.50)  # 利用率<50%回收
         self._min_capital_efficiency = _safe_float(eff_cfg.get("min_capital_efficiency"), 0.15)  # 最低资金效率
         self._emergency_reserve_threshold = _safe_float(eff_cfg.get("emergency_reserve_threshold"), 0.10)  # 风控池<10%触发补充

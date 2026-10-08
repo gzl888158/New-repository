@@ -53,14 +53,14 @@ class GridStrategy(PersistentStrategy):
         self._dx_history: Dict[str, List[float]] = {}
         # P33: 退出后冷却追踪 {symbol: exit_timestamp}
         self._last_exit_time: Dict[str, float] = {}
-        self._post_exit_cooldown = grid_cfg.get("post_exit_cooldown", 120)  # R7: 默认从 300s 降至 120s，加速资金再部署
+        self._post_exit_cooldown = grid_cfg.get("post_exit_cooldown", 30)  # R36: 120s→30s，grid高频策略快速再入场
         # 参数层：post_exit_cooldown 运行时校验
         try:
             self._post_exit_cooldown = float(self._post_exit_cooldown)
         except (TypeError, ValueError):
-            self._post_exit_cooldown = 120.0
+            self._post_exit_cooldown = 30.0
         if not math.isfinite(self._post_exit_cooldown) or self._post_exit_cooldown < 0:
-            self._post_exit_cooldown = 120.0
+            self._post_exit_cooldown = 30.0
         
         self._grid_pending_at: Dict[str, Dict[int, float]] = {}  # {symbol: {grid_index: pending_timestamp}}
 
@@ -103,11 +103,10 @@ class GridStrategy(PersistentStrategy):
 
         # grid skip 日志防抖: 同一 symbol+side 30 秒内不重复打印
         self._last_grid_skip_log: Dict[str, float] = {}  # {symbol_side: timestamp}
-        self._symbol_signal_timestamps: Dict[str, deque] = {}  # {symbol: deque of timestamps} 滑动窗口计数
-        self._min_signal_interval = config["strategies"]["grid"].get("min_signal_interval", 5.0)  # 最小信号间隔5秒
-        self._signal_cooldown = config["strategies"]["grid"].get("signal_cooldown", 5.0)  # R18: 同层信号冷却5秒
-        self._max_signals_per_window = config["strategies"]["grid"].get("max_signals_per_window", 2)  # 每窗口最多2个信号
-        self._signal_window_seconds = config["strategies"]["grid"].get("signal_window_seconds", 10.0)  # 滑动窗口10秒
+        # R37: 移除滑动窗口频率限制（与min_signal_interval重叠，3s间隔已足够限频）
+        # 保留 fingerprint 去重（同层同方向精确去重）和 min_signal_interval（跨层全局间隔）
+        self._min_signal_interval = config["strategies"]["grid"].get("min_signal_interval", 3.0)  # R37: 15s→3s
+        self._signal_cooldown = config["strategies"]["grid"].get("signal_cooldown", 2.0)  # R37: 5s→2s
         # P0-4: 信号质量阈值接入config（buy方向）；sell方向保持 +0.25 风险溢价
         self._min_signal_quality = config["strategies"]["grid"].get("min_signal_quality", 0.50)
         # P2: sell 门槛上限，防止高风时段 + 做空溢价叠加形成过高的绝对门槛
@@ -1620,20 +1619,7 @@ class GridStrategy(PersistentStrategy):
             logger.debug(f"Grid {symbol}: signal throttled (interval={now-last_signal:.2f}s < {self._min_signal_interval}s)")
             return
 
-        # P0: 滑动窗口频率限制 - 防止快速tick场景下多个网格层被连续触发
-        if symbol not in self._symbol_signal_timestamps:
-            self._symbol_signal_timestamps[symbol] = deque()
-        window_q = self._symbol_signal_timestamps[symbol]
-        # 清理窗口外的旧时间戳
-        cutoff = now - self._signal_window_seconds
-        while window_q and window_q[0] < cutoff:
-            window_q.popleft()
-        if len(window_q) >= self._max_signals_per_window:
-            logger.debug(
-                f"Grid {symbol}: window throttle ({len(window_q)} signals in "
-                f"{self._signal_window_seconds}s >= {self._max_signals_per_window}), skipping"
-            )
-            return
+        # R37: 滑动窗口频率限制已移除（与min_signal_interval重叠，3s间隔已足够限频）
 
         # 同层同方向信号去重（基于指纹）
         fingerprint = f"{symbol}:{side}:{layer}:{round(price, 4)}"
@@ -1645,7 +1631,6 @@ class GridStrategy(PersistentStrategy):
         # 更新时间戳
         self._last_signal_time[symbol] = now
         self._signal_fingerprints[fingerprint] = now
-        window_q.append(now)  # 记录到滑动窗口
 
         # R6: 趋势模式下不再完全阻断信号，由 _trigger_grid_order 做顺势过滤
 

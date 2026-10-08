@@ -86,6 +86,9 @@ class AdaptiveController:
         # 动态构建基础分配：优先 trading.{name}_allocation，兜底 strategies.{name}.capital_allocation
         self._base_allocations: Dict[str, float] = {}
         for sname in strategies_cfg.keys():
+            # R33: 跳过禁用策略，将其分配比例重分配给启用策略
+            if not strategies_cfg.get(sname, {}).get("enabled", False):
+                continue
             base = trading_cfg.get(f"{sname}_allocation")
             if base is None:
                 base = strategies_cfg.get(sname, {}).get("capital_allocation", 0.1)
@@ -99,6 +102,11 @@ class AdaptiveController:
                 "grid": 0.12, "trend": 0.25, "scalping": 0.28, "arbitrage": 0.13,
                 "spot_grid": 0.12, "spot_martingale": 0.10,
             }
+        # R33: 归一化 — 禁用策略的分配比例按比例分配给启用策略，总和=1.0
+        total_alloc = sum(self._base_allocations.values())
+        if total_alloc > 0:
+            for sname in self._base_allocations:
+                self._base_allocations[sname] /= total_alloc
         self._dynamic_allocations = dict(self._base_allocations)
         
         self._pnl_verification_log: List[Dict[str, Any]] = []
@@ -204,7 +212,7 @@ class AdaptiveController:
         self._streak_reduce_pct = streak_cfg.get("loss_streak_reduce_pct", 0.50)
         self._streak_recovery_wins = streak_cfg.get("recovery_consecutive_wins", 3)
         self._streak_probe_after_seconds = max(
-            0.0, float(streak_cfg.get("probe_after_seconds", 7200.0))
+            0.0, float(streak_cfg.get("probe_after_seconds", 1800.0))  # R39: 7200s→1800s（2h→30min）
         )
         self._streak_probe_risk_pct = max(
             0.0, min(0.01, float(streak_cfg.get("probe_max_risk_pct", 0.001)))

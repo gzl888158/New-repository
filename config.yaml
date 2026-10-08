@@ -415,8 +415,8 @@ strategies:
     min_signal_quality: 0.109835
     extreme_volatility_pause_minutes: 5
     max_stop_loss_pct: 0.02
-    min_signal_interval: 15
-    signal_cooldown: 5.0
+    min_signal_interval: 3
+    signal_cooldown: 2.0
     take_profit_enabled: true
     take_profit_pct: 0.03
     tp1_ratio: 0.4
@@ -442,7 +442,7 @@ strategies:
     coin_auto_pause_on_error: true
     trend_confirmation_mode: regime_aware
     trend_mode_cooldown: 120
-    post_exit_cooldown: 120
+    post_exit_cooldown: 30
     minute_rebound_window: 15
     minute_rebound_threshold: 0.005
     locked_params:
@@ -700,7 +700,7 @@ strategies:
     capital_allocation: 0.25
     max_stop_loss_pct: 0.02
     take_profit_pct: 0.04
-    loop_interval_seconds: 60
+    loop_interval_seconds: 15
     adaptive_enabled: true
     risk_lock_quality_boost: 0.1
     adx_max_filter_enabled: true
@@ -717,7 +717,7 @@ strategies:
     capital_allocation: 0.25
     max_stop_loss_pct: 0.02
     take_profit_pct: 0.04
-    loop_interval_seconds: 30
+    loop_interval_seconds: 15
     adx_threshold: 20.0
     adx_period: 14
     breakout_lookback: 20
@@ -758,7 +758,7 @@ strategies:
     capital_allocation: 0.05
     max_stop_loss_pct: 0.02
     take_profit_pct: 0.02
-    loop_interval_seconds: 60
+    loop_interval_seconds: 15
   oscillation_harvest:
     enabled: true
     timeframe: 1H
@@ -1047,7 +1047,7 @@ capital_efficiency:
   trend_window: 5
   deployment_min: 0.3
   idle_sweep_threshold: 0.2
-  idle_sweep_min_duration: 30
+  idle_sweep_min_duration: 5
   utilization_reclaim_threshold: 0.5
   min_capital_efficiency: 0.15
   emergency_reserve_threshold: 0.1
@@ -1174,6 +1174,7 @@ risk_budget:
     max_consecutive_losses: 5
     loss_streak_reduce_pct: 0.5
     recovery_consecutive_wins: 3
+    probe_after_seconds: 1800
   high_correlation_threshold: 0.7
   extreme_correlation_threshold: 0.85
   data_dir: ./data

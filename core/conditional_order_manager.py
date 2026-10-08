@@ -656,10 +656,14 @@ class ConditionalOrderManager:
             if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing SL for {symbol}")
                 return None
-            # P2-7: 限流检查
+            # P2-7: 限流检查 — 超限时短暂等待而非静默丢弃
             if not self._check_rate_limit(symbol):
-                logger.warning(f"Rate limit exceeded for {symbol}, skip placing SL")
-                return None
+                wait_sec = min(self._rate_limit_window_sec, 5.0)
+                logger.info(f"Rate limit hit for {symbol} SL, waiting {wait_sec:.1f}s before retry")
+                await asyncio.sleep(wait_sec)
+                if not self._check_rate_limit(symbol):
+                    logger.warning(f"Rate limit still exceeded for {symbol} after wait, skip placing SL")
+                    return None
             if self._has_active_order(symbol, side, "stop_loss"):
                 logger.info(f"Skip placing SL for {symbol}: active stop_loss already exists")
                 return None
@@ -796,10 +800,14 @@ class ConditionalOrderManager:
             if not self._circuit_breaker_allows(symbol):
                 logger.warning(f"Circuit breaker open, skip placing TP for {symbol}")
                 return None
-            # P2-7: 限流检查
+            # P2-7: 限流检查 — 超限时短暂等待而非静默丢弃
             if not self._check_rate_limit(symbol):
-                logger.warning(f"Rate limit exceeded for {symbol}, skip placing TP")
-                return None
+                wait_sec = min(self._rate_limit_window_sec, 5.0)
+                logger.info(f"Rate limit hit for {symbol} TP, waiting {wait_sec:.1f}s before retry")
+                await asyncio.sleep(wait_sec)
+                if not self._check_rate_limit(symbol):
+                    logger.warning(f"Rate limit still exceeded for {symbol} after wait, skip placing TP")
+                    return None
             if self._has_active_order(symbol, side, "take_profit", trigger_price):
                 logger.info(f"Skip placing TP for {symbol}: active take_profit at {trigger_price} already exists")
                 return None
@@ -1145,11 +1153,10 @@ class ConditionalOrderManager:
             return None
 
     async def update_take_profit(self, symbol: str, new_tp_price: float) -> Optional[str]:
-        """S5: 动态止盈收紧闭环 — 取消现有 TP 条件单并按新价重挂（cancel+replace）。
+        """S5: 动态止盈收紧闭环 — fail-closed 替换现有 TP 条件单。
 
-        当反转评分上升、ReversalTakeProfitEngine 收紧止盈价时，交易所侧的 TP 条件单
-        仍是旧价，需要实际替换为新价才能让收紧生效。取消全部既有 TP 分段单后，
-        按合并数量重挂一张新价 TP；仅在存在活跃 TP 单时才动作。
+        先挂新价 TP，成功后再取消旧 TP 分段单；新单失败时保留旧单不取消，
+        避免取消后新挂失败导致持仓上方无止盈保护。
         """
         try:
             tp_orders = self.get_tp_orders_for_symbol(symbol)
@@ -1169,18 +1176,24 @@ class ConditionalOrderManager:
                 logger.warning(f"Skip TP tighten for {symbol}: invalid side={side} or qty={total_qty}")
                 return None
 
-            # 取消旧 TP 分段单
-            for oid, _ in tp_orders:
-                self.cancel_conditional_order(symbol, oid)
-
-            # 重挂新价 TP（合并数量）
-            return await self.place_take_profit(
+            # fail-closed: 先挂新价 TP
+            new_order_id = await self.place_take_profit(
                 symbol=symbol,
                 side=side,
                 quantity=total_qty,
                 trigger_price=round(float(new_tp_price), 4),
                 leverage=leverage,
             )
+
+            if new_order_id:
+                # 新 TP 挂出成功，安全取消旧 TP 分段单
+                for oid, _ in tp_orders:
+                    self.cancel_conditional_order(symbol, oid)
+                logger.info(f"TP tightened for {symbol}: new_tp={new_tp_price:.4f} (old TP cancelled after new confirmed)")
+            else:
+                # 新 TP 挂失败，保留旧 TP 不取消（fail-closed）
+                logger.error(f"TP tighten FAILED for {symbol}, keeping old TP (fail-closed)")
+            return new_order_id
         except Exception as e:
             logger.error(f"Failed to update take profit for {symbol}: {e}")
             return None
@@ -1769,34 +1782,36 @@ class ConditionalOrderManager:
                     if not has_tp:
                         avg_px = float(pos_data.get("avgPx", 0))
                         if avg_px > 0:
-                            # P1-5: 优先使用自适应TP水平，降级到静态计算
-                            tp_prices = None
+                            # P1-1: 优先使用分段止盈（_calculate_tp_prices），保持与原始挂单一致的梯度平仓粒度
+                            tp_prices = self._calculate_tp_prices(pos_side, avg_px)
+
+                            # 尝试用自适应引擎优化TP距离（仅调整价格水平，不改变分段结构）
                             if hasattr(self, "_adaptive_tp_sl_engine") and self._adaptive_tp_sl_engine:
                                 try:
-                                    # 从自适应引擎获取当前TP水平
-                                    # 注意：这里需要知道direction和当前市场状态，从pos_data推断
                                     direction = pos_side
-                                    current_price = float(pos_data.get("last", avg_px))
-                                    
-                                    # 调用自适应引擎计算TP（需要传入必要的状态）
-                                    # 这里简化处理：使用基础TP百分比
-                                    base_tp_pct = getattr(self._adaptive_tp_sl_engine, "_base_tp_pct", 0.06)
-                                    if direction == "long":
-                                        tp_price = avg_px * (1 + base_tp_pct)
-                                    else:
-                                        tp_price = avg_px * (1 - base_tp_pct)
-                                    
-                                    # 单级TP，100%仓位
-                                    tp_prices = [(tp_price, 1.0)]
-                                    logger.debug(f"P1-5: Using adaptive TP for {inst_id}: {tp_price:.4f}")
+                                    adaptive_tp = None
+                                    ctx = self._adaptive_tp_sl_engine.build_context(inst_id)
+                                    result = self._adaptive_tp_sl_engine.compute(
+                                        symbol=inst_id,
+                                        entry_price=avg_px,
+                                        direction=direction,
+                                        current_price=float(pos_data.get("last", avg_px)),
+                                        apply_smoothing=False,
+                                        **{k: v for k, v in ctx.items() if k != "symbol"},
+                                    )
+                                    if result.get("take_profit"):
+                                        adaptive_tp = result["take_profit"]
+                                    if adaptive_tp and adaptive_tp > 0 and tp_prices:
+                                        # 用自适应TP距离替换第一级价格，保持分段比例
+                                        if direction == "long":
+                                            tp_prices = [(adaptive_tp, tp_prices[0][1])]
+                                        else:
+                                            tp_prices = [(adaptive_tp, tp_prices[0][1])]
+                                        logger.debug(f"P1-1: Adaptive TP override for {inst_id}: {adaptive_tp:.4f}")
                                 except Exception as e:
-                                    logger.warning(f"P1-5: Failed to get adaptive TP for {inst_id}, falling back: {e}")
-                                    self._adaptive_fallback_count += 1  # P2-8: 记录降级事件
-                                    tp_prices = None
-                            
-                            # 降级：使用静态TP计算
-                            if tp_prices is None:
-                                tp_prices = self._calculate_tp_prices(pos_side, avg_px)
+                                    logger.debug(f"P1-1: Adaptive TP failed for {inst_id}, using staged fallback: {e}")
+                                    if hasattr(self, "_adaptive_fallback_count"):
+                                        self._adaptive_fallback_count += 1
                             
                             for tp_price, tp_ratio in tp_prices:
                                 stage_qty = pos_qty * tp_ratio

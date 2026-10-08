@@ -73,6 +73,9 @@ class OrderExecutor:
         self._tasks: List[asyncio.Task] = []
         # P0-2: 追踪 TP/SL 后台任务，防止任务引用丢失导致异常静默
         self._tp_sl_background_tasks: Set[asyncio.Task] = set()
+        # P0-2: 平仓信号去重 — 防止多引擎（ProfitLock/Reversal/分级止盈）同一周期重复平仓
+        self._close_signal_guard: Dict[str, float] = {}
+        self._close_signal_guard_ttl: float = 3.0
 
         # 强化止损管理器：按策略名分别管理
         self._stop_managers: Dict[str, EnhancedStopLoss] = {
@@ -82,6 +85,7 @@ class OrderExecutor:
             "arbitrage": EnhancedStopLoss(config, "arbitrage"),
             "spot_grid": EnhancedStopLoss(config, "spot_grid"),
             "spot_martingale": EnhancedStopLoss(config, "spot_martingale"),
+            "default": EnhancedStopLoss(config, "trend"),  # P1-8: 通用默认止损（使用 trend 参数）
         }
         self._position_strategy_map: Dict[str, str] = {}  # symbol -> strategy_name
         self._position_entry_time: Dict[str, datetime] = {}  # symbol -> entry_time
@@ -1215,6 +1219,7 @@ class OrderExecutor:
                     return False
             self._partial_fill_tracker.pop(clordid, None)
             self._execution_stats["partial_fill_resolved"] += 1
+            await self._adjust_tp_sl_after_partial_fill(symbol, filled_qty, order_info)
             return True
 
         elif action == PartialFillAction.RESUBMIT_REMAINING:
@@ -1303,6 +1308,99 @@ class OrderExecutor:
             return True
 
         return True
+
+    async def _adjust_tp_sl_after_partial_fill(
+        self, symbol: str, filled_qty: float, order_info: Dict[str, Any]
+    ) -> None:
+        """P1-5: 部分成交后联动调整 TP/SL 条件单数量。
+
+        部分成交后，交易所侧的 TP/SL 条件单仍按原数量挂单，但实际持仓已减少。
+        取消旧条件单并按实际成交量（filled_qty）重挂，避免条件单数量与实际仓位不匹配。
+        """
+        try:
+            if not hasattr(self, "_conditional_manager") or not self._conditional_manager:
+                logger.debug(f"P1-5: conditional_manager not available, skip TP/SL adjustment for {symbol}")
+                return
+
+            # 获取现有 TP/SL 订单
+            tp_orders = self._conditional_manager.get_tp_orders_for_symbol(symbol)
+            sl_orders = self._conditional_manager.get_sl_orders_for_symbol(symbol)
+
+            if not tp_orders and not sl_orders:
+                return
+
+            # 从 order_info 提取公共参数
+            side = order_info.get("pos_side", "")
+            if not side:
+                direction = order_info.get("direction", "")
+                side = "long" if direction in ("long", "buy") else "short"
+
+            leverage = int(order_info.get("leverage", 1) or 1)
+            new_qty = self.okx_client.contracts_to_coins(symbol, filled_qty)
+
+            if new_qty <= 0:
+                logger.warning(f"P1-5: Invalid qty after conversion for {symbol}, skip adjustment")
+                return
+
+            # 调整 TP 订单
+            for oid, info in tp_orders:
+                try:
+                    trigger_price = float(info.get("trigger_price", 0) or info.get("price", 0))
+                    if trigger_price <= 0:
+                        continue
+
+                    # 取消旧单
+                    self._conditional_manager.cancel_conditional_order(symbol, oid)
+
+                    # 重挂新数量
+                    new_oid = await self._conditional_manager.place_take_profit(
+                        symbol=symbol,
+                        side=side,
+                        quantity=new_qty,
+                        trigger_price=trigger_price,
+                        leverage=leverage,
+                    )
+                    if new_oid:
+                        logger.info(
+                            f"P1-5: TP adjusted for {symbol}: {trigger_price} qty={new_qty:.6f} "
+                            f"(was {info.get('quantity', 0):.6f})"
+                        )
+                    else:
+                        logger.warning(f"P1-5: Failed to re-place TP for {symbol} at {trigger_price}")
+                except Exception as e:
+                    logger.error(f"P1-5: Error adjusting TP order {oid} for {symbol}: {e}")
+
+            # 调整 SL 订单
+            for oid, info in sl_orders:
+                try:
+                    trigger_price = float(info.get("trigger_price", 0) or info.get("price", 0))
+                    if trigger_price <= 0:
+                        continue
+
+                    # 取消旧单
+                    self._conditional_manager.cancel_conditional_order(symbol, oid)
+
+                    # 重挂新数量
+                    new_oid = await self._conditional_manager.place_stop_loss(
+                        symbol=symbol,
+                        side=side,
+                        quantity=new_qty,
+                        trigger_price=trigger_price,
+                        leverage=leverage,
+                        is_new_position=False,
+                    )
+                    if new_oid:
+                        logger.info(
+                            f"P1-5: SL adjusted for {symbol}: {trigger_price} qty={new_qty:.6f} "
+                            f"(was {info.get('quantity', 0):.6f})"
+                        )
+                    else:
+                        logger.warning(f"P1-5: Failed to re-place SL for {symbol} at {trigger_price}")
+                except Exception as e:
+                    logger.error(f"P1-5: Error adjusting SL order {oid} for {symbol}: {e}")
+
+        except Exception as e:
+            logger.error(f"P1-5: TP/SL adjustment failed for {symbol}: {e}")
 
     async def _fallback_market_close_after_cancel_failure(
         self,
@@ -3634,6 +3732,8 @@ class OrderExecutor:
                     f"Conditional orders partially failed for {symbol} "
                     f"(SL={failed_sl}, TP={failed_tp}), starting background retry"
                 )
+                if failed_sl:
+                    await self._place_emergency_stop_loss(order_data, symbol)
                 task = asyncio.create_task(
                     self._retry_conditional_orders_background(
                         order_data, exchange_order_id, symbol, failed_sl, failed_tp
@@ -3675,7 +3775,7 @@ class OrderExecutor:
         max_retries: int = 3,
     ):
         """P0-后台重试条件单：指数退避重试失败的TP/SL，确保持仓有保护"""
-        retry_delays = [1, 5, 15]  # P0-1: 缩短重试间隔，裸仓窗口从 ~50s 降至 ~20s
+        retry_delays = [0.5, 1.5, 4]
         for attempt in range(max_retries):
             try:
                 await asyncio.sleep(retry_delays[attempt])
@@ -3757,6 +3857,34 @@ class OrderExecutor:
                 )
             except Exception:
                 pass
+
+    async def _place_emergency_stop_loss(self, order_data: Dict[str, Any], symbol: str):
+        """P0-1: SL 挂单失败后立即挂一个宽幅紧急止损作为临时安全网。
+
+        使用入场价 ±10% 作为紧急止损价（远宽于正常止损），
+        仅在重试窗口内保护持仓免受灾难性损失。正常 SL 重试成功后
+        由心跳检查清理多余的紧急止损单。
+        """
+        try:
+            entry_price = float(order_data.get("entry_price") or order_data.get("price") or 0)
+            direction = order_data.get("direction", "")
+            if entry_price <= 0 or not direction:
+                return
+
+            emergency_pct = 0.10
+            if direction in ("long", "buy"):
+                emergency_price = round(entry_price * (1 - emergency_pct), 6)
+            else:
+                emergency_price = round(entry_price * (1 + emergency_pct), 6)
+
+            placed = await self._place_stop_loss(order_data, emergency_price)
+            if placed:
+                logger.warning(
+                    f"Emergency SL placed for {symbol}: {emergency_price:.6f} "
+                    f"(entry={entry_price:.6f}, -{emergency_pct:.0%})"
+                )
+        except Exception as e:
+            logger.debug(f"Emergency SL placement skipped for {symbol}: {e}")
 
     async def _get_current_price(self, symbol: str, ticker: Dict[str, Any] = None) -> float:
         """获取当前价格。若提供预取 ticker 则直接复用，避免重复 API 调用。"""
@@ -4631,19 +4759,24 @@ class OrderExecutor:
                 # P18-3: 传入current_price，确保调整后的TP/SL不低于/高于当前市价
                 stop_loss, take_profit = self._adjust_tp_sl(symbol, entry_price, verified_direction, stop_loss, take_profit, current_price)
                 if stop_loss is None or take_profit is None:
-                    logger.error(f"TP/SL recalculation failed for {symbol} (invalid direction), skipping TP/SL placement")
+                    logger.error(f"TP/SL recalculation failed for {symbol} (invalid direction), using fallback SL")
                     if self._alert_manager:
                         try:
                             await self._alert_manager.send_alert(
                                 alert_type="tp_sl_error",
-                                message=f"{symbol} TP/SL重算失败（方向非法），止盈止损挂单已跳过",
+                                message=f"{symbol} TP/SL重算失败，降级到固定止损",
                                 severity="WARNING",
                                 symbol=symbol,
                                 metadata={"direction": verified_direction, "entry_price": entry_price},
                             )
                         except Exception:
                             pass
-                    stop_loss = None
+                    fallback_sl_pct = 0.15
+                    precision = get_price_precision(symbol)
+                    if verified_direction == "long":
+                        stop_loss = round(ref_price * (1 - fallback_sl_pct), precision)
+                    else:
+                        stop_loss = round(ref_price * (1 + fallback_sl_pct), precision)
                     take_profit = None
                 else:
                     logger.info(f"Adjusted TP/SL: SL={stop_loss:.4f}, TP={take_profit:.4f}")
@@ -4667,9 +4800,19 @@ class OrderExecutor:
                                 )
                             except Exception:
                                 pass
-                        # 跳过无效的TP/SL下单，避免发送必然失败的订单到交易所
-                        stop_loss = None
+                        # P0-3: 降级方案 — TP 跳过，但用固定宽幅止损保护持仓
+                        fallback_sl_pct = 0.15
+                        precision = get_price_precision(symbol)
+                        if verified_direction == "long":
+                            fallback_sl = round(ref_price * (1 - fallback_sl_pct), precision)
+                        else:
+                            fallback_sl = round(ref_price * (1 + fallback_sl_pct), precision)
+                        stop_loss = fallback_sl
                         take_profit = None
+                        logger.warning(
+                            f"P0-3: TP/SL degradation for {symbol}: using fallback SL={fallback_sl:.6f} "
+                            f"(ref={ref_price:.6f}, -{fallback_sl_pct:.0%}), TP skipped"
+                        )
                     else:
                         for warning in re_validation["warnings"]:
                             logger.warning(f"TP/SL warning for {symbol}: {warning}")
@@ -5576,7 +5719,7 @@ class OrderExecutor:
                 pass
 
             # 注册到止损管理器
-            sm = self._stop_managers.get(strategy_name) or self._stop_managers.get("grid")
+            sm = self._stop_managers.get(strategy_name) or self._stop_managers.get("default")
             if sm and symbol:
                 pos_side = position.side  # 'long' or 'short'
                 entry_price = float(position.avg_cost) if position.avg_cost > 0 else float(position.mark_price)
@@ -6413,12 +6556,32 @@ class OrderExecutor:
                                 is_partial_close = open_qty > 0 and remaining_qty > 1e-8
 
                                 if is_partial_close:
-                                    # 部分平仓：保持 open，仅回写剩余数量，不标记 closed
+                                    # P2-1: 部分平仓：保持 open，回写剩余数量并累加已实现盈亏
+                                    # 累加 PnL 到 open 记录的 pnl 字段，全平时最终 PnL 包含所有部分平仓盈亏
+                                    existing_pnl = 0.0
+                                    try:
+                                        existing_pnl = float(open_rec.get("pnl", 0) or 0)
+                                    except Exception:
+                                        existing_pnl = 0.0
+                                    accumulated_pnl = existing_pnl + float(pnl)
+
+                                    # 计算累计手续费
+                                    existing_fees = 0.0
+                                    try:
+                                        existing_fees = float(open_rec.get("fees", 0) or 0)
+                                    except Exception:
+                                        existing_fees = 0.0
+                                    accumulated_fees = existing_fees + float(actual_fee)
+
                                     self.sqlite_storage.update_trade_record(
                                         open_trade_id,
-                                        {"quantity": remaining_qty}
+                                        {
+                                            "quantity": remaining_qty,
+                                            "pnl": accumulated_pnl,
+                                            "fees": accumulated_fees,
+                                        }
                                     )
-                                    logger.info(f"Position partially closed: {symbol_order} closed {close_qty:.4f}, remaining {remaining_qty:.4f}, PnL: {pnl:.4f} (open record kept)")
+                                    logger.info(f"Position partially closed: {symbol_order} closed {close_qty:.4f}, remaining {remaining_qty:.4f}, PnL: {pnl:.4f} (accumulated: {accumulated_pnl:.4f})")
                                 else:
                                     # 全平：更新开仓记录为 closed 状态（保留entry_price在price字段）
                                     self.sqlite_storage.update_trade_record(
@@ -6590,7 +6753,7 @@ class OrderExecutor:
                             # 初始化强化止损状态
                             direction_norm = self._resolve_track_direction(order_info)
                             dir_norm = direction_norm  # 已是 'long' 或 'short'
-                            sm = self._stop_managers.get(strategy_name) or self._stop_managers.get("grid")
+                            sm = self._stop_managers.get(strategy_name) or self._stop_managers.get("default")
                             if sm and symbol_order:
                                 actual_entry = order_info.get("entry_price", filled_price)
                                 # actual_pos_qty 是 OKX API 返回的合约张数，需转为币数存入止损管理器
@@ -6693,6 +6856,22 @@ class OrderExecutor:
             is_close_signal = any(kw in signal_type.lower() for kw in [
                 "close", "stop_loss", "stop", "exit", "hedge", "reduce", "liquidation", "margin_call", "trailing", "tp", "take_profit"
             ])
+
+        if is_close_signal:
+            pos_side = signal_data.get("pos_side", "")
+            guard_key = f"{symbol}:{pos_side}" if pos_side else symbol
+            now = time.time()
+            last_ts = self._close_signal_guard.get(guard_key, 0)
+            if now - last_ts < self._close_signal_guard_ttl:
+                logger.info(
+                    f"Close signal dedup: {symbol} {strategy_name} skipped "
+                    f"(already closing within {self._close_signal_guard_ttl}s, source={signal_type})"
+                )
+                return False
+            self._close_signal_guard[guard_key] = now
+            stale_cutoff = now - self._close_signal_guard_ttl * 3
+            for k in [k for k, v in self._close_signal_guard.items() if v < stale_cutoff]:
+                self._close_signal_guard.pop(k, None)
 
         if not is_close_signal:
             # 信号质量阈值

@@ -84,7 +84,7 @@ execution:
   partial_fill_tracker_ttl_sec: 300.0
   persist_active_orders: true
   fill_reconcile_interval_sec: 30
-  price_freshness_max_age_sec: 5.0
+  price_freshness_max_age_sec: 10.0  # R59: 5→10s
   post_only_timeout_sec: 60.0
   backtest_slippage_rate: 0.0005
   taker_fee: 0.0005
@@ -987,7 +987,7 @@ capital_pool:
 allocation_agent:
   enabled: true
   rebalance_interval: 900
-  min_trade_count: 20
+  min_trade_count: 10  # R57: 20→10
   max_allocation_change: 0.20
   method: dynamic
 freeze_policy:
@@ -1123,9 +1123,9 @@ volatility_targeting:
   forecast_horizon: 21
   confidence_z: 1.96
 adaptive_kelly:
-  max_kelly_fraction: 0.25
-  default_kelly_fraction: 0.5
-  min_trade_count_kelly: 20
+  max_kelly_fraction: 0.35  # R53: 0.25→0.35
+  default_kelly_fraction: 0.7  # R52: 0.5→0.7
+  min_trade_count_kelly: 10  # R54: 20→10
   kelly_trending_up: 1.1
   kelly_trending_down: 0.6
   kelly_ranging: 0.9

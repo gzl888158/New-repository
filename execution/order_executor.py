@@ -3765,7 +3765,7 @@ class OrderExecutor:
         返回 False 表示价格过期，应拒绝下单；异常时 fail-closed 返回 False。
         若提供预取 ticker 则直接复用，避免重复 API 调用。
         """
-        max_age = float(self.config.get("execution", {}).get("price_freshness_max_age_sec", 5.0))
+        max_age = float(self.config.get("execution", {}).get("price_freshness_max_age_sec", 10.0))  # R59: 5→10s（高波动时网络延迟可达3-8s，5s fail-closed阻塞交易）
         try:
             if ticker is None:
                 ticker = await self.okx_client.get_ticker_async(symbol)

@@ -282,7 +282,7 @@ class DynamicAllocator:
         # ── 分配控制参数 ──
         alloc_cfg = config.get("allocation_agent", {})
         self._max_weight_change = _safe_float(alloc_cfg.get("max_allocation_change"), 0.20)  # R48: 0.10→0.20
-        self._min_trade_count = int(_safe_float(alloc_cfg.get("min_trade_count"), 20))
+        self._min_trade_count = int(_safe_float(alloc_cfg.get("min_trade_count"), 10))  # R57: 20→10
         self._rebalance_interval = int(_safe_float(alloc_cfg.get("rebalance_interval"), 900))  # R47: 3600→900s（1h→15min）
 
         # ── 风险参数 ──
@@ -292,7 +292,7 @@ class DynamicAllocator:
 
         # ── Kelly 参数 ──
         self._kelly_enabled = True
-        self._kelly_max_fraction = 0.25       # Kelly 仓位上限
+        self._kelly_max_fraction = 0.35      # R55: 0.25→0.35（与AdaptiveKelly _max_kelly对齐）
         self._use_half_kelly = True           # 默认使用半Kelly
 
         # ── 企业级：资金效率强化参数 ──
@@ -1818,9 +1818,9 @@ class AdaptiveKelly:
     def __init__(self, config: Dict[str, Any]):
         self._config = config
         self._lock = asyncio.Lock()
-        self._max_kelly = _safe_float(config.get("max_kelly_fraction"), 0.25)
-        self._default_fraction = _safe_float(config.get("default_kelly_fraction"), 0.5)
-        self._min_trade_count = int(_safe_float(config.get("min_trade_count_kelly"), 20))
+        self._max_kelly = _safe_float(config.get("max_kelly_fraction"), 0.35)  # R53: 0.25→0.35
+        self._default_fraction = _safe_float(config.get("default_kelly_fraction"), 0.7)  # R52: 0.5→0.7（贝叶斯收缩已提供保守性，不再叠加半Kelly）
+        self._min_trade_count = int(_safe_float(config.get("min_trade_count_kelly"), 10))  # R54: 20→10
 
         # 不同市场状态下的 Kelly 乘数
         self._regime_multipliers: Dict[str, float] = {
@@ -1846,8 +1846,8 @@ class AdaptiveKelly:
         # 点估计会导致过度下注，企业级实现用贝叶斯收缩 + 赔率收缩替代点估计）
         self._use_wilson_lcb = config.get("kelly_use_wilson_lcb", False)      # 可选：Wilson置信下界（更保守）
         self._wilson_z = _safe_float(config.get("kelly_wilson_z"), 1.645)                  # Wilson置信度 z 值
-        self._win_prior_strength = _safe_float(config.get("kelly_win_rate_prior_strength"), 40.0)  # 胜率先验强度（等效α+β样本量，先验50%）
-        self._b_shrinkage = _safe_float(config.get("kelly_b_shrinkage_strength"), 20.0)    # 赔率收缩强度（等效先验样本量）
+        self._win_prior_strength = _safe_float(config.get("kelly_win_rate_prior_strength"), 15.0)  # R50: 40→15（先验仍正则化，但真实数据15笔即可主导）
+        self._b_shrinkage = _safe_float(config.get("kelly_b_shrinkage_strength"), 10.0)    # R51: 20→10（赔率收缩减弱，避免利润因子被过度压缩）
         self._use_semivariance = config.get("kelly_use_semivariance", True)   # 连续Kelly使用下行半方差
         self._skew_penalty = _safe_float(config.get("kelly_skew_penalty_strength"), 0.5)   # 负偏度惩罚强度
 
@@ -1921,7 +1921,7 @@ class AdaptiveKelly:
         # ── 样本量折扣 ──
         if trade_count < self._min_trade_count and trade_count > 0:
             sample_discount = trade_count / self._min_trade_count
-            sample_discount = max(0.25, sample_discount)
+            sample_discount = max(0.40, sample_discount)  # R54: 0.25→0.40（贝叶斯先验已惩罚小样本，线性折扣不再叠加至0.25）
         else:
             sample_discount = 1.0
         kelly_final = kelly_streak * sample_discount

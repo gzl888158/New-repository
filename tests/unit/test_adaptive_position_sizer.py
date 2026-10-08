@@ -132,8 +132,8 @@ class TestKellyFusion:
         )
         assert r.allowed
         assert r.kelly_fraction > 0
-        # Kelly 上限 = max_kelly_fraction(0.25) * default_fraction(0.5) = 0.125
-        assert r.kelly_fraction <= 0.125 + 1e-6
+        # Kelly 上限 = max_kelly_fraction(0.35) * default_fraction(0.7) = 0.245  (R50-R54)
+        assert r.kelly_fraction <= 0.245 + 1e-6
 
     def test_no_data_falls_back_to_default(self):
         eng = _make_engine(aps={"min_notional_usd": 0.0})

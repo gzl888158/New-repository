@@ -43,7 +43,7 @@ def test_config_loading():
     assert vt.get('target_volatility') == 0.20, f"target_volatility mismatch"
     
     ak = config.get('adaptive_kelly', {})
-    assert ak.get('max_kelly_fraction') == 0.25, f"max_kelly_fraction mismatch"
+    assert ak.get('max_kelly_fraction') == 0.35, f"max_kelly_fraction mismatch"  # R53: 0.25→0.35
     
     ce = config.get('capital_efficiency', {})
     assert ce.get('idle_cash_threshold') == 0.15, f"idle_cash_threshold mismatch"

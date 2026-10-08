@@ -63,7 +63,7 @@ class AdaptiveController:
         self._health_check_interval = 60
         self._rebalance_interval = int(cm_cfg.get("rebalance_interval", 600))  # R46: 1800→600s（30min→10min）
         self._optimization_interval = 7200
-        self._utilization_check_interval = 120  # 2分钟检查一次资金利用率和idle cash优化
+        self._utilization_check_interval = 30  # R58: 120→30s（快速检测闲置资金并重新分配）
         
         self._health_status: Dict[str, Any] = {
             "account": "unknown",
@@ -3522,7 +3522,7 @@ class AdaptiveController:
             kelly_fraction = max(0.0, min(1.0, kelly_fraction))
 
             # 分数凯利：使用25%以降低波动
-            fractional_kelly = kelly_fraction * 0.25
+            fractional_kelly = kelly_fraction * 0.50  # R56: 0.25→0.50（贝叶斯调整已提供保守性，不再叠加25%分数Kelly）
 
             # 波动率惩罚：回撤越大，仓位越小
             vol_penalty = max(0.3, 1.0 - max_dd * 3)

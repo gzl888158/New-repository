@@ -411,7 +411,7 @@ strategies:
     extreme_volatility_pause_minutes: 5
     max_stop_loss_pct: 0.02
     min_signal_interval: 15
-    signal_cooldown: 30.0
+    signal_cooldown: 5.0
     take_profit_enabled: true
     take_profit_pct: 0.03
     tp1_ratio: 0.4

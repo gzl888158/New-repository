@@ -132,7 +132,7 @@ class AdaptiveController:
         self._detect_existing_positions_for_warmup()
         
         self._idle_cash_allocation_enabled = config.get("trading", {}).get("idle_cash_allocation", True)
-        self._idle_cash_strategy_priority = ["scalping", "arbitrage", "grid", "trend"]
+        self._idle_cash_strategy_priority = ["grid", "oscillation_harvest", "donchian", "sniper"]
         self._idle_cash_position_boost = 1.0
         self._strategy_optimizer = None
         self._strategy_manager = None  # 由 Scheduler 注入，作为策略名称单一事实来源

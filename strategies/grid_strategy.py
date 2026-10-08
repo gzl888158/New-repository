@@ -74,6 +74,7 @@ class GridStrategy(PersistentStrategy):
         
         # P0: 网格回滚追踪 - 防止同一层反复触发
         self._grid_retry_count: Dict[str, Dict[int, int]] = {}  # {symbol: {grid_index: retry_count}}
+        self._grid_retry_first_ts: Dict[str, Dict[int, float]] = {}  # R15: {symbol: {grid_index: first_retry_timestamp}}
         self._grid_rollback_cooldown: Dict[str, Dict[int, float]] = {}  # {symbol: {grid_index: cooldown_until_timestamp}}
         self._grid_stale_count: Dict[str, int] = {}  # P10: {symbol: 连续"too far"拒绝次数}
 
@@ -104,7 +105,7 @@ class GridStrategy(PersistentStrategy):
         self._last_grid_skip_log: Dict[str, float] = {}  # {symbol_side: timestamp}
         self._symbol_signal_timestamps: Dict[str, deque] = {}  # {symbol: deque of timestamps} 滑动窗口计数
         self._min_signal_interval = config["strategies"]["grid"].get("min_signal_interval", 5.0)  # 最小信号间隔5秒
-        self._signal_cooldown = config["strategies"]["grid"].get("signal_cooldown", 10.0)  # 同层信号冷却10秒
+        self._signal_cooldown = config["strategies"]["grid"].get("signal_cooldown", 5.0)  # R18: 同层信号冷却5秒
         self._max_signals_per_window = config["strategies"]["grid"].get("max_signals_per_window", 2)  # 每窗口最多2个信号
         self._signal_window_seconds = config["strategies"]["grid"].get("signal_window_seconds", 10.0)  # 滑动窗口10秒
         # P0-4: 信号质量阈值接入config（buy方向）；sell方向保持 +0.25 风险溢价
@@ -505,6 +506,7 @@ class GridStrategy(PersistentStrategy):
             "_trend_mode": self._trend_mode,
             "_extreme_vol_until": self._extreme_vol_until,
             "_grid_retry_count": self._grid_retry_count,
+            "_grid_retry_first_ts": self._grid_retry_first_ts,
             "_grid_rollback_cooldown": self._grid_rollback_cooldown,
             "_trailing_state": self._trailing_state,
             "_position_entry_time": self._position_entry_time,
@@ -548,6 +550,7 @@ class GridStrategy(PersistentStrategy):
         self._trend_mode = state.get("_trend_mode", {}) or {}
         self._extreme_vol_until = state.get("_extreme_vol_until", {}) or {}
         self._grid_retry_count = self._restore_int_keyed_dict(state.get("_grid_retry_count", {}))
+        self._grid_retry_first_ts = self._restore_int_keyed_dict(state.get("_grid_retry_first_ts", {}))
         self._grid_rollback_cooldown = self._restore_int_keyed_dict(state.get("_grid_rollback_cooldown", {}))
         self._trailing_state = state.get("_trailing_state", {}) or {}
         self._position_entry_time = state.get("_position_entry_time", {}) or {}
@@ -951,6 +954,8 @@ class GridStrategy(PersistentStrategy):
                 del self._grid_pending_at[symbol]
             if symbol in self._grid_retry_count:
                 del self._grid_retry_count[symbol]
+            if symbol in self._grid_retry_first_ts:
+                del self._grid_retry_first_ts[symbol]
             if symbol in self._grid_rollback_cooldown:
                 del self._grid_rollback_cooldown[symbol]
             if symbol in self._grid_stale_count:
@@ -1163,7 +1168,8 @@ class GridStrategy(PersistentStrategy):
 
         # P0: 最大同时pending层数限制 —— 防止快速行情下多个网格同时触发
         pending_count = len(self._grid_pending_at.get(symbol, {}))
-        max_pending_grids = max(1, len(grids) // 6)  # 最多同时pending层数 = 总层数/6，至少1层
+        # R14: 从 //6 放宽到 //3，释放主策略闲置资金（原限制导致 70-85% 网格层闲置）
+        max_pending_grids = max(1, len(grids) // 3)
         if pending_count >= max_pending_grids:
             return  # 等待pending确认/回滚后再触发新层
         
@@ -1178,9 +1184,14 @@ class GridStrategy(PersistentStrategy):
             if cooldown_until and time.time() < cooldown_until:
                 continue
             
-            # P0: 最大重试次数检查 —— 超过重试上限的网格不再触发
+            # R15: 最大重试次数 3→6，超过1小时自动重置计数
             retry_count = self._grid_retry_count.get(symbol, {}).get(i, 0)
-            max_retries = 3
+            first_ts = self._grid_retry_first_ts.get(symbol, {}).get(i, 0)
+            if first_ts > 0 and time.time() - first_ts > 3600:
+                self._grid_retry_count.get(symbol, {}).pop(i, None)
+                self._grid_retry_first_ts.get(symbol, {}).pop(i, None)
+                retry_count = 0
+            max_retries = 6
             if retry_count >= max_retries:
                 continue
             
@@ -1754,6 +1765,20 @@ class GridStrategy(PersistentStrategy):
         margin_needed_for_min_lot = price * min_lot_size / leverage
 
         strategy_cap = trading_capital * allocation
+
+        # R16: 跨策略资金协调 — 扣除本策略已在其他币种占用的保证金
+        if self._position_manager is not None:
+            try:
+                used_margin = self._position_manager.get_strategy_used_margin("grid")
+                remaining_cap = max(0.0, strategy_cap - used_margin)
+                if remaining_cap < strategy_cap * 0.1:
+                    logger.debug(f"Grid {symbol}: cross-strategy coord — used {used_margin:.2f}/{strategy_cap:.2f}, skip")
+                    return
+                if base_position > remaining_cap:
+                    logger.info(f"Grid {symbol}: cross-strategy coord — clip margin {base_position:.2f} -> {remaining_cap:.2f} (used {used_margin:.2f})")
+                    base_position = remaining_cap
+            except Exception as e:
+                logger.debug(f"Grid {symbol}: cross-strategy margin check failed: {e}")
         if base_position < margin_needed_for_min_lot:
             adjusted = min(margin_needed_for_min_lot, strategy_cap)
             if adjusted >= margin_needed_for_min_lot:
@@ -2729,6 +2754,7 @@ class GridStrategy(PersistentStrategy):
                     self._grid_pending_at.pop(symbol, None)
                 # 成交成功，清除该层重试/冷却记录
                 self._grid_retry_count.get(symbol, {}).pop(idx, None)
+                self._grid_retry_first_ts.get(symbol, {}).pop(idx, None)
                 self._grid_rollback_cooldown.get(symbol, {}).pop(idx, None)
                 self._fill_callback_hits += 1
                 logger.info(
@@ -2826,6 +2852,8 @@ class GridStrategy(PersistentStrategy):
                 # 清除该层的重试计数（成功成交）
                 if symbol in self._grid_retry_count:
                     self._grid_retry_count[symbol].pop(grid_idx, None)
+                if symbol in self._grid_retry_first_ts:
+                    self._grid_retry_first_ts[symbol].pop(grid_idx, None)
                 if symbol in self._grid_rollback_cooldown:
                     self._grid_rollback_cooldown[symbol].pop(grid_idx, None)
                 logger.info(f"Grid {symbol}[{grid_idx}] layer={grid_layer} confirmed filled via actual position check")
@@ -2855,6 +2883,8 @@ class GridStrategy(PersistentStrategy):
                 resolved_indices.append(grid_idx)
                 if symbol in self._grid_retry_count:
                     self._grid_retry_count[symbol].pop(grid_idx, None)
+                if symbol in self._grid_retry_first_ts:
+                    self._grid_retry_first_ts[symbol].pop(grid_idx, None)
                 if symbol in self._grid_rollback_cooldown:
                     self._grid_rollback_cooldown[symbol].pop(grid_idx, None)
                 logger.info(f"Grid {symbol}[{grid_idx}] layer={grid_layer} confirmed filled via trade journal")
@@ -2870,12 +2900,16 @@ class GridStrategy(PersistentStrategy):
                 # 记录重试次数
                 if symbol not in self._grid_retry_count:
                     self._grid_retry_count[symbol] = {}
+                if symbol not in self._grid_retry_first_ts:
+                    self._grid_retry_first_ts[symbol] = {}
                 retry_count = self._grid_retry_count[symbol].get(grid_idx, 0) + 1
                 self._grid_retry_count[symbol][grid_idx] = retry_count
+                if retry_count == 1:
+                    self._grid_retry_first_ts[symbol][grid_idx] = now
 
-                # P18-4: 递增冷却时间：60s -> 120s -> 300s（网络不稳时减少回滚频率）
-                cooldown_map = {1: 60, 2: 120, 3: 300}
-                cooldown = cooldown_map.get(retry_count, 900)  # 超过3次后15分钟冷却
+                # R15: 递增冷却时间：60s → 120s → 300s → 600s → 900s，上限6次
+                cooldown_map = {1: 60, 2: 120, 3: 300, 4: 600, 5: 900}
+                cooldown = cooldown_map.get(retry_count, 1200)
 
                 if symbol not in self._grid_rollback_cooldown:
                     self._grid_rollback_cooldown[symbol] = {}
@@ -2952,15 +2986,17 @@ class GridStrategy(PersistentStrategy):
             # 清理冷却已过期且超过1小时的retry计数
             stale = []
             for idx, count in retries.items():
-                if count >= 3 and symbol in self._grid_rollback_cooldown:
-                    # 高重试次数的如果冷却也过期了，清理掉
+                if count >= 6 and symbol in self._grid_rollback_cooldown:
+                    # R15: 高重试次数的如果冷却也过期了，清理掉
                     continue
-                if count >= 5:
+                if count >= 8:
                     stale.append(idx)
             for idx in stale:
                 retries.pop(idx, None)
+                self._grid_retry_first_ts.get(symbol, {}).pop(idx, None)
             if not retries:
                 self._grid_retry_count.pop(symbol, None)
+                self._grid_retry_first_ts.pop(symbol, None)
 
     async def _check_pending_orders(self, symbol: str):
         pending = self._pending_orders.get(symbol, [])
@@ -3915,6 +3951,9 @@ class GridStrategy(PersistentStrategy):
         if symbol in self._grid_retry_count:
             del self._grid_retry_count[symbol]
             cleared.append("grid_retry_count")
+        if symbol in self._grid_retry_first_ts:
+            del self._grid_retry_first_ts[symbol]
+            cleared.append("grid_retry_first_ts")
         
         # 清理回滚冷却
         if symbol in self._grid_rollback_cooldown:
@@ -4343,7 +4382,7 @@ class GridStrategy(PersistentStrategy):
                         return False, f"grid layer {grid_index} in rollback cooldown"
                     # 检查重试次数
                     retry_count = self._grid_retry_count.get(symbol, {}).get(grid_index, 0)
-                    if retry_count >= 3:
+                    if retry_count >= 6:
                         return False, f"grid layer {grid_index} exceeded max retries ({retry_count})"
 
             # 3. 网格方向与市场趋势兼容

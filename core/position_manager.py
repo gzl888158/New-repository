@@ -1151,6 +1151,10 @@ class PositionManager:
         keys = self._positions_by_strategy.get(strategy_name, [])
         return [self._positions[k] for k in keys if k in self._positions]
 
+    def get_strategy_used_margin(self, strategy_name: str) -> float:
+        """R16: 获取指定策略已使用的保证金总额"""
+        return sum(p.used_margin for p in self.get_positions_by_strategy(strategy_name))
+
     def get_account_risk(self) -> AccountRiskSnapshot:
         """获取账户风险快照"""
         return self._account_risk

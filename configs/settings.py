@@ -527,11 +527,11 @@ class RiskConfig(BaseModel):
     # 五层风控拦截层 L1/L2/L3 配置（必须显式声明，否则 model_dump() 会丢弃）
     # max_symbol_position_ratio 限制的是"名义价值/equity"，杠杆交易可达 2x-5x，故上限放宽到 10
     max_symbol_position_ratio: float = Field(ge=0, le=10, default=0.25)
-    max_single_order_usd: float = Field(gt=0, default=500.0)
-    max_api_rps: int = Field(ge=1, default=10)
-    max_slippage_pct: float = Field(ge=0, default=0.003)
-    max_spread_pct: float = Field(ge=0, default=0.002)
-    max_latency_ms: int = Field(gt=0, default=3000)
+    max_single_order_usd: float = Field(gt=0, default=2000.0)  # R72: 500→2000
+    max_api_rps: int = Field(ge=1, default=20)  # R75: 10→20
+    max_slippage_pct: float = Field(ge=0, default=0.005)  # R74: 0.003→0.005
+    max_spread_pct: float = Field(ge=0, default=0.005)  # R68: 0.002→0.005
+    max_latency_ms: int = Field(gt=0, default=5000)  # R69: 3000→5000
     liquidation_warning_pct: float = Field(ge=0, le=1, default=0.10)
     liquidation_critical_pct: float = Field(ge=0, le=1, default=0.05)
     position_loss_tier1_pct: float = Field(ge=0, le=1, default=0.05)

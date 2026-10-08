@@ -90,7 +90,7 @@ class SlippageOptimizer:
         self._default_strategy = SlippageTolerance(slippage_config.get("default_strategy", "balanced"))
         
         # 基础偏移配置（相对价格的比例）
-        self._base_offset = slippage_config.get("base_offset", 0.0005)     # 基础偏移 0.05%
+        self._base_offset = slippage_config.get("base_offset", 0.0002)     # R70: 0.0005→0.0002
         self._max_offset = slippage_config.get("max_offset", 0.005)         # 最大偏移 0.5%
         self._min_offset = slippage_config.get("min_offset", 0.0001)        # 最小偏移 0.01%
         

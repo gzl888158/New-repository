@@ -49,11 +49,11 @@ class TestRoundQuantityToLot:
         result = client.round_quantity_to_lot("BTC-USDT-SWAP", 1.2345, round_up=True)
         assert result == pytest.approx(1.235)
 
-    def test_round_down_below_min_returns_zero(self):
-        """开仓数量不足最小单位：向下取整返回 0（阻止无效下单）"""
+    def test_round_down_below_min_returns_lot(self):
+        """R71: 开仓数量不足最小单位：保底返回 1 lot（小账户 Kelly 量 > 0 时不静默丢弃）"""
         client = _make_client(BTC_SPEC)
         result = client.round_quantity_to_lot("BTC-USDT-SWAP", 0.0005, round_up=False)
-        assert result == 0.0
+        assert result == pytest.approx(0.001)
 
     def test_round_up_below_min_returns_lot(self):
         """减仓数量不足最小单位：向上取整至少返回 lot_sz（避免残留仓位）"""

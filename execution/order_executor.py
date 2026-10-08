@@ -461,11 +461,11 @@ class OrderExecutor:
                     # 每笔交易占用不超过总资金的 25%（小资金场景放宽）
                     max_per_trade = total_eq * 0.25
                     # 但不低于 2 USDT（适配6U小资金场景，OKX最低名义价值约2-3U）
-                    return max(min(min_notional, max_per_trade), 2.0)
+                    return max(min(min_notional, max_per_trade), 1.0)  # R67: 2.0→1.0
             
-            return max(min_notional, 2.0)
+            return max(min_notional, 1.0)  # R67: 2.0→1.0
         except Exception:
-            return 2.0  # 异常时使用宽松下限
+            return 1.0  # R67: 2.0→1.0
 
     def set_profit_optimizer(self, profit_optimizer: ProfitOptimizer):
         self._profit_optimizer = profit_optimizer

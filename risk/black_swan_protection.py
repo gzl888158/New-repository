@@ -280,7 +280,7 @@ class BlackSwanProtection:
             return
 
         self._is_circuit_broken = True
-        self._circuit_breaker_end_time = datetime.now() + timedelta(minutes=30)
+        self._circuit_breaker_end_time = datetime.now() + timedelta(minutes=15)  # R65: 30→15
         self._circuit_breaker_reason = event.description
 
         event.action_taken = "circuit_breaker_triggered"

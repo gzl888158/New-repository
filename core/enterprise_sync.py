@@ -242,7 +242,7 @@ class SyncHealthMonitor:
     """
 
     DEFAULTS = {
-        "max_data_age_healthy_sec": 10.0,    # 数据新鲜度健康阈值
+        "max_data_age_healthy_sec": 15.0,    # R60: 10→15s
         "max_data_age_degraded_sec": 30.0,   # 降级阈值
         "max_data_age_stale_sec": 60.0,      # 过期阈值
         "max_consecutive_errors": 5,         # 连续错误熔断

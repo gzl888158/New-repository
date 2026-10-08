@@ -22,7 +22,7 @@ class SpotGridStrategy(PersistentStrategy):
         self._enabled = config["strategies"].get("spot_grid", {}).get("enabled", False)
         self._grid_count_min = config["strategies"].get("spot_grid", {}).get("grid_count_min", 5)
         self._grid_count_max = config["strategies"].get("spot_grid", {}).get("grid_count_max", 10)
-        self._dynamic_adjust_interval = config["strategies"].get("spot_grid", {}).get("dynamic_adjust_interval", 300)
+        self._dynamic_adjust_interval = config["strategies"].get("spot_grid", {}).get("dynamic_adjust_interval", 120)  # R79: 300→120
         self._volatility_threshold = config["strategies"].get("spot_grid", {}).get("volatility_threshold", 0.003)
         self._atr_period = config["strategies"].get("spot_grid", {}).get("atr_period", 14)
         self._atr_multiplier = config["strategies"].get("spot_grid", {}).get("atr_multiplier", 0.3)
@@ -37,7 +37,7 @@ class SpotGridStrategy(PersistentStrategy):
         self._tick_rest_cache: Dict[str, tuple] = {}
         self._tick_rest_interval = 1.0
 
-        self._order_check_interval = 60
+        self._order_check_interval = 15  # R80: 60→15
 
         self._adaptive_controller = None
 
@@ -45,12 +45,12 @@ class SpotGridStrategy(PersistentStrategy):
         self._volatility_adaptive_spacing = config["strategies"].get("spot_grid", {}).get("volatility_adaptive_spacing", True)
         self._multi_symbol_scheduling = config["strategies"].get("spot_grid", {}).get("multi_symbol_scheduling", True)
         self._min_grid_spacing = config["strategies"].get("spot_grid", {}).get("min_grid_spacing", 0.002)
-        self._max_grid_spacing = config["strategies"].get("spot_grid", {}).get("max_grid_spacing", 0.03)
+        self._max_grid_spacing = config["strategies"].get("spot_grid", {}).get("max_grid_spacing", 0.05)  # R88: 0.03→0.05
 
         self._grid_performance: Dict[str, Dict[str, Any]] = {}
         self._symbol_activity: Dict[str, Dict[str, Any]] = {}
         self._last_rebalance_time: Optional[datetime] = None
-        self._rebalance_interval = 3600
+        self._rebalance_interval = 900  # R81: 3600→900
 
         self._all_symbols = []
         for tier in ["tier1", "tier2", "tier3"]:
@@ -81,7 +81,7 @@ class SpotGridStrategy(PersistentStrategy):
 
         # === 优化：成交量过滤 ===
         self._volume_filter_enabled = config["strategies"].get("spot_grid", {}).get("volume_filter_enabled", True)
-        self._volume_threshold_ratio = config["strategies"].get("spot_grid", {}).get("volume_threshold_ratio", 0.3)  # 成交量低于均值的30%则过滤
+        self._volume_threshold_ratio = config["strategies"].get("spot_grid", {}).get("volume_threshold_ratio", 0.15)  # R86: 0.3→0.15
 
         # === P0-1: 入场价对账跟踪 ===
         self._reconciled_symbols: set = set()  # 已对账过入场价的 symbol，避免每轮都调 fills API

@@ -500,7 +500,7 @@ class StrategyRiskDetector:
         )
         # 过拟合检测
         self._overfit_winrate_gap = cfg.get("overfit_winrate_gap", 0.15)   # 回测-实盘胜率差>15%
-        self._overfit_min_trades = cfg.get("overfit_min_trades", 20)        # 最少20笔交易才评估
+        self._overfit_min_trades = cfg.get("overfit_min_trades", 10)        # R89: 20→10
         # 高杠杆重仓
         self._high_leverage_threshold = cfg.get("high_leverage_threshold", 10)
         self._concentration_limit_pct = cfg.get("concentration_limit_pct", 0.4)  # 单币种不超过40%

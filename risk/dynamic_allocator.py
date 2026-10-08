@@ -286,7 +286,7 @@ class DynamicAllocator:
         self._rebalance_interval = int(_safe_float(alloc_cfg.get("rebalance_interval"), 900))  # R47: 3600→900s（1h→15min）
 
         # ── 风险参数 ──
-        self._max_single_weight = _safe_float(config.get("symbol_allocation", {}).get("max_symbol_weight"), 0.15) * 3  # 策略级放宽
+        self._max_single_weight = _safe_float(config.get("symbol_allocation", {}).get("max_symbol_weight"), 0.15) * 4  # R73: *3→*4 (0.60)
         self._min_single_weight = _safe_float(config.get("symbol_allocation", {}).get("min_symbol_weight"), 0.02)
         self._max_total_leverage = _safe_float(config.get("leverage_tiers", {}).get("absolute_max"), 10)
 

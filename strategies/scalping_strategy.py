@@ -106,7 +106,7 @@ class ScalpingStrategy(PersistentStrategy):
         self._volatility_lockout_until: Dict[str, datetime] = {}
         
         self._adaptive_enabled = config["strategies"]["scalping"].get("adaptive_enabled", True)
-        self._min_signal_quality = config["strategies"]["scalping"].get("min_signal_quality", 0.50)
+        self._min_signal_quality = config["strategies"]["scalping"].get("min_signal_quality", 0.35)  # R84: 0.50→0.35
         self._market_state_lookback = config["strategies"]["scalping"].get("market_state_lookback", 20)
 
         # 措施5: 高滑点币降权/禁用 — 滑点成本翻转治理（DOGE 实测滑点 0.32% vs tp1 0.5%）
@@ -444,7 +444,7 @@ class ScalpingStrategy(PersistentStrategy):
                     else:
                         logger.info("force_close_outside_hours=false: positions left to natural exit (SL/TP)")
 
-                await asyncio.sleep(3600)
+                await asyncio.sleep(300)  # R82: 3600→300
         except asyncio.CancelledError:
             logger.info("Scalping _schedule_loop cancelled")
             self._is_active = False

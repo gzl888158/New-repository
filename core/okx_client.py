@@ -1714,6 +1714,9 @@ class OKXClient:
             else:
                 # 向下取整到 lot_sz 倍数（开仓用，避免下单量超过预期导致资金不足）
                 rounded = (d_qty / d_lot).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_lot
+                # R71: 小账户 Kelly 计算量 < 1 lot 时，保底 1 lot（否则静默丢弃交易）
+                if rounded == 0 and quantity > 0:
+                    rounded = d_lot
 
             return float(rounded)
         except Exception as e:

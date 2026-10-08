@@ -31,8 +31,8 @@ class GridStrategy(PersistentStrategy):
         self._martingale_layers = grid_cfg.get("martingale_layers", 4)
         self._martingale_coefficient = grid_cfg.get("martingale_coefficient", 1.5)
         self._dynamic_adjust_interval = grid_cfg.get("dynamic_adjust_interval", 60)
-        self._volatility_threshold = grid_cfg.get("volatility_threshold", 0.02)
-        self._vol_adjust_cooldown = grid_cfg.get("vol_adjust_cooldown", 300)  # P23: 波动调整冷却时间(秒)，默认5分钟
+        self._volatility_threshold = grid_cfg.get("volatility_threshold", 0.04)  # R61: 0.02→0.04 山寨币日常波动>2%
+        self._vol_adjust_cooldown = grid_cfg.get("vol_adjust_cooldown", 120)  # R77: 300→120s
         self._last_vol_adjust_ts: Dict[str, float] = {}  # P23: 每个币种上次波动调整时间戳
         self._atr_period = grid_cfg.get("atr_period", 14)
         self._atr_multiplier = grid_cfg.get("atr_multiplier", 0.5)
@@ -87,7 +87,7 @@ class GridStrategy(PersistentStrategy):
         
         self._pending_orders: Dict[str, List[Dict[str, Any]]] = {}
         self._stop_loss_orders: Dict[str, Dict[str, Any]] = {}
-        self._order_check_interval = 60
+        self._order_check_interval = 15  # R76: 60→15s
 
         # P34: 单方向连续止损熔断 — 同 symbol+side 在观察窗口内连续止损达阈值后，冷却该方向开仓
         # 目标：阻断「同方向分层加仓→趋势反向→多层同时止损」的密集爆损（如 XRP 三连止损 -6.2）
@@ -108,9 +108,9 @@ class GridStrategy(PersistentStrategy):
         self._min_signal_interval = config["strategies"]["grid"].get("min_signal_interval", 3.0)  # R37: 15s→3s
         self._signal_cooldown = config["strategies"]["grid"].get("signal_cooldown", 2.0)  # R37: 5s→2s
         # P0-4: 信号质量阈值接入config（buy方向）；sell方向保持 +0.25 风险溢价
-        self._min_signal_quality = config["strategies"]["grid"].get("min_signal_quality", 0.50)
+        self._min_signal_quality = config["strategies"]["grid"].get("min_signal_quality", 0.35)  # R83: 0.50→0.35
         # P2: sell 门槛上限，防止高风时段 + 做空溢价叠加形成过高的绝对门槛
-        self._sell_signal_quality_cap = config["strategies"]["grid"].get("sell_signal_quality_cap", 0.75)
+        self._sell_signal_quality_cap = config["strategies"]["grid"].get("sell_signal_quality_cap", 0.85)  # R85: 0.75→0.85
         # P33: 趋势确认门禁模式 — strict（ADX<20 拒绝，旧行为）/ regime_aware（震荡市 ADX<20 放行）
         self._trend_confirmation_mode = config["strategies"]["grid"].get("trend_confirmation_mode", "regime_aware")
 
@@ -138,11 +138,11 @@ class GridStrategy(PersistentStrategy):
         self._volatility_adaptive_spacing = config["strategies"]["grid"].get("volatility_adaptive_spacing", True)
         self._multi_symbol_scheduling = config["strategies"]["grid"].get("multi_symbol_scheduling", True)
         self._min_grid_spacing = config["strategies"]["grid"].get("min_grid_spacing", 0.002)
-        self._max_grid_spacing = config["strategies"]["grid"].get("max_grid_spacing", 0.05)
+        self._max_grid_spacing = config["strategies"]["grid"].get("max_grid_spacing", 0.08)  # R87: 0.05→0.08
 
         # ── 参数层：min/max grid_spacing 运行时类型/范围/合法性校验 ──
         # Pydantic 已做 min <= max 校验，此处兜底 dict.get 返回的 None/非数字/NaN/Inf
-        _default = (0.002, 0.05)
+        _default = (0.002, 0.08)  # R87: 0.05→0.08
         try:
             self._min_grid_spacing = float(self._min_grid_spacing)
             self._max_grid_spacing = float(self._max_grid_spacing)
@@ -177,13 +177,13 @@ class GridStrategy(PersistentStrategy):
 
         # 波动率止盈 {symbol: last_volatility_check_timestamp}
         self._volatility_stop_enabled = config["strategies"]["grid"].get("volatility_stop_enabled", True)
-        self._vol_spike_threshold = config["strategies"]["grid"].get("vol_spike_threshold", 2.5)
+        self._vol_spike_threshold = config["strategies"]["grid"].get("vol_spike_threshold", 3.5)  # R62: 2.5→3.5
         self._vol_stop_partial_pct = config["strategies"]["grid"].get("vol_stop_partial_pct", 0.3)
-        self._volatility_lockout_minutes = config["strategies"]["grid"].get("volatility_lockout_minutes", 30)
+        self._volatility_lockout_minutes = config["strategies"]["grid"].get("volatility_lockout_minutes", 15)  # R62: 30→15
 
         # P13: 网格重建冷却 {symbol: last_rebuild_timestamp}
         self._grid_rebuild_cooldown: Dict[str, float] = {}
-        self._grid_rebuild_cooldown_seconds = config["strategies"]["grid"].get("grid_rebuild_cooldown_seconds", 300)
+        self._grid_rebuild_cooldown_seconds = config["strategies"]["grid"].get("grid_rebuild_cooldown_seconds", 120)  # R78: 300→120
 
         # 多级止盈配置
         self._tp1_ratio = config["strategies"]["grid"].get("tp1_ratio", 0.4)
@@ -2412,7 +2412,7 @@ class GridStrategy(PersistentStrategy):
         # 原逻辑会在极端波动时主动开仓追多/追空，小账户极易爆仓
         # 新逻辑：仅记录警告，暂停该 symbol 网格交易 30 分钟
         # 已有网格持仓保持不变，由 _check_stop_loss_orders 与止损单保护
-        pause_seconds = 600  # 10 分钟
+        pause_seconds = 300  # R63: 600→300s (5分钟)
         self._extreme_vol_until[symbol] = time.time() + pause_seconds
         logger.warning(
             f"Extreme volatility detected for {symbol}: {volatility:.2%}. "

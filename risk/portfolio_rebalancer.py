@@ -802,7 +802,7 @@ class ExecutionScheduler:
         self._max_chunk_size_pct = config.get("max_chunk_size_pct", 0.05)
         self._execution_priority = config.get("execution_priority", "drift_descending")
         self._max_parallel = config.get("max_parallel_trades", 3)
-        self._volatility_threshold = config.get("execution_volatility_threshold", 0.05)
+        self._volatility_threshold = config.get("execution_volatility_threshold", 0.10)  # R64: 0.05→0.10
         self._chunk_delay_seconds = config.get("chunk_delay_seconds", 1.0)
 
         # 追踪状态

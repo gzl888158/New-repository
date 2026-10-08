@@ -48,18 +48,18 @@ class DecisionValidator:
         }
         # 硬编码合约规格作为回退（当OKX API不可用时使用）
         self._contract_specs = {
-            "BTC": {"min_qty": 0.001, "tick_size": 0.1, "lot_size": 0.001, "min_notional": 10.0},
-            "ETH": {"min_qty": 0.01, "tick_size": 0.01, "lot_size": 0.01, "min_notional": 10.0},
-            "SOL": {"min_qty": 0.1, "tick_size": 0.01, "lot_size": 0.1, "min_notional": 5.0},
-            "BNB": {"min_qty": 0.01, "tick_size": 0.1, "lot_size": 0.01, "min_notional": 10.0},
+            "BTC": {"min_qty": 0.001, "tick_size": 0.1, "lot_size": 0.001, "min_notional": 5.0},  # R66: 10→5
+            "ETH": {"min_qty": 0.01, "tick_size": 0.01, "lot_size": 0.01, "min_notional": 5.0},  # R66: 10→5
+            "SOL": {"min_qty": 0.1, "tick_size": 0.01, "lot_size": 0.1, "min_notional": 2.0},  # R66: 5→2
+            "BNB": {"min_qty": 0.01, "tick_size": 0.1, "lot_size": 0.01, "min_notional": 5.0},  # R66: 10→5
             "XRP": {"min_qty": 1.0, "tick_size": 0.0001, "lot_size": 1.0, "min_notional": 2.0},
             "ADA": {"min_qty": 1.0, "tick_size": 0.0001, "lot_size": 1.0, "min_notional": 2.0},
             "DOGE": {"min_qty": 10.0, "tick_size": 0.00001, "lot_size": 10.0, "min_notional": 2.0},
-            "LTC": {"min_qty": 0.1, "tick_size": 0.01, "lot_size": 0.1, "min_notional": 5.0},
-            "DOT": {"min_qty": 0.1, "tick_size": 0.001, "lot_size": 0.1, "min_notional": 5.0},
-            "LINK": {"min_qty": 0.1, "tick_size": 0.001, "lot_size": 0.1, "min_notional": 5.0},
-            "UNI": {"min_qty": 0.1, "tick_size": 0.001, "lot_size": 0.1, "min_notional": 5.0},
-            "AVAX": {"min_qty": 0.1, "tick_size": 0.01, "lot_size": 0.1, "min_notional": 5.0},
+            "LTC": {"min_qty": 0.1, "tick_size": 0.01, "lot_size": 0.1, "min_notional": 2.0},  # R66: 5→2
+            "DOT": {"min_qty": 0.1, "tick_size": 0.001, "lot_size": 0.1, "min_notional": 2.0},  # R66: 5→2
+            "LINK": {"min_qty": 0.1, "tick_size": 0.001, "lot_size": 0.1, "min_notional": 2.0},  # R66: 5→2
+            "UNI": {"min_qty": 0.1, "tick_size": 0.001, "lot_size": 0.1, "min_notional": 2.0},  # R66: 5→2
+            "AVAX": {"min_qty": 0.1, "tick_size": 0.01, "lot_size": 0.1, "min_notional": 2.0},  # R66: 5→2
             "ARB": {"min_qty": 1.0, "tick_size": 0.0001, "lot_size": 1.0, "min_notional": 2.0},
         }
         # 动态合约规格缓存（从OKX API获取，优先于硬编码值）

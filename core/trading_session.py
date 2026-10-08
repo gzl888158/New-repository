@@ -293,6 +293,8 @@ class TradingSessionManager:
                 set_position_manager(position_manager)
         self._circuit_breaker = circuit_breaker
         self._order_executor = order_executor
+        if order_executor is not None and position_manager is not None:
+            order_executor._position_manager = position_manager
         self._capital_manager = capital_manager
         logger.info("TradingSessionManager dependencies injected")
 

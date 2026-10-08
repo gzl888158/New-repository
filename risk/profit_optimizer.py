@@ -425,10 +425,11 @@ class EnhancedStopLoss:
         # TP1: 40%仓位在60%目标处，触发后止损移到保本
         # TP2: 50%仓位在100%目标处，触发后止损移到TP1
         # TP3: 10%仓位用移动止损追踪远端
+        # 注：tp1_fraction/tp2_fraction 是占目标距离的比例，与策略的 tp1_pct（绝对百分比）分开
         self._tp1_ratio = strategy_cfg.get("tp1_ratio", 0.4)
-        self._tp1_pct = strategy_cfg.get("tp1_pct", 0.6)   # 60% of target
+        self._tp1_pct = strategy_cfg.get("tp1_fraction", strategy_cfg.get("tp1_pct", 0.6))   # fraction of target distance
         self._tp2_ratio = strategy_cfg.get("tp2_ratio", 0.5)
-        self._tp2_pct = strategy_cfg.get("tp2_pct", 1.0)   # 100% of target
+        self._tp2_pct = strategy_cfg.get("tp2_fraction", strategy_cfg.get("tp2_pct", 1.0))   # fraction of target distance
         self._tp3_ratio = strategy_cfg.get("tp3_ratio", 0.1)
         self._tp_trailing_pct = strategy_cfg.get("tp3_trailing_pct", 0.02)
 
@@ -451,12 +452,42 @@ class EnhancedStopLoss:
         # 每个持仓的止损状态
         self._position_stops: Dict[str, Dict[str, Any]] = {}
 
+        # ── 市场状态感知 trailing stop ──
+        self._regime_engine = None
+
+        # regime -> trailing multiplier（与 ATR 因子相乘）
+        self._regime_trail_factors: Dict[str, float] = {
+            "trending_up": 1.3,
+            "trending_down": 1.3,
+            "ranging": 0.8,
+            "high_vol": 1.5,
+            "low_vol": 0.85,
+            "breakout": 1.0,
+            "reversal": 0.7,
+            "unknown": 1.0,
+        }
+
         # ── 企业级：止损状态跨重启持久化（watchdog 拉起后恢复保本/移动/分级止盈进度）──
         self._db_path = config.get("sqlite", {}).get("db_path", "")
         self._persistence_enabled = bool(self._db_path)
         if self._persistence_enabled:
             self._init_state_table()
             self._load_state()
+
+    def set_regime_engine(self, engine) -> None:
+        """注入市场状态引擎，用于 regime-aware trailing stop。"""
+        self._regime_engine = engine
+
+    def _get_regime_trail_factor(self, symbol: str) -> float:
+        """查询当前 regime 对应的 trailing multiplier，查询失败返回 1.0。"""
+        if self._regime_engine is None:
+            return 1.0
+        try:
+            regime = self._regime_engine.get_market_regime(symbol)
+            regime_str = regime.value if hasattr(regime, "value") else str(regime)
+            return self._regime_trail_factors.get(regime_str, 1.0)
+        except Exception:
+            return 1.0
 
     def init_position_stop(self, symbol: str, entry_price: float, direction: str,
                            quantity: float, entry_time: datetime = None):
@@ -629,7 +660,7 @@ class EnhancedStopLoss:
                 state["breakeven_activated"] = True
                 stop_type = "breakeven"
 
-        # 4. 移动止损：盈利后跟踪价格移动止损（ATR 动态调整）
+        # 4. 移动止损：盈利后跟踪价格移动止损（ATR + regime 动态调整）
         if self._trailing_enabled and profit_pct > 0:
             if atr > 0 and current_price > 0:
                 atr_ratio = atr / current_price
@@ -643,8 +674,9 @@ class EnhancedStopLoss:
                     trail_mult = 1.0
             else:
                 trail_mult = 1.0
-            
-            adjusted_trail = self._trailing_pct * trail_mult
+
+            regime_factor = self._get_regime_trail_factor(symbol)
+            adjusted_trail = self._trailing_pct * trail_mult * regime_factor
             
             if direction == "long":
                 trailing_stop = current_price * (1 - adjusted_trail)

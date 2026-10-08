@@ -181,6 +181,8 @@ class AdaptiveController:
         for sname, budget_ratio in strategy_budgets.items():
             self._strategy_risk_limits[sname] = float(budget_ratio)
             self._risk_budget[sname] = float(budget_ratio)
+        for sname in self._base_allocations:
+            self._risk_budget.setdefault(sname, 0.2)
         # 风险预算转移配置
         realloc_cfg = risk_budget_cfg.get("reallocation", {})
         self._rb_realloc_enabled = realloc_cfg.get("enabled", True)
@@ -554,7 +556,7 @@ class AdaptiveController:
 
         # OKX API
         try:
-            ticker = self.okx_client.get_ticker("BTC-USDT-SWAP")
+            ticker = await self.okx_client.get_ticker_async("BTC-USDT-SWAP")
             checks["okx_api"] = ticker is not None
         except Exception:
             checks["okx_api"] = False
@@ -878,7 +880,7 @@ class AdaptiveController:
                     )
                     return
 
-            ticker = self.okx_client.get_ticker(pos.symbol)
+            ticker = await self.okx_client.get_ticker_async(pos.symbol)
             last = float(ticker.get("last") or 0) if ticker else 0.0
             if last <= 0:
                 logger.warning(f"orphan stop loss skipped: no last price for {pos.symbol}")
@@ -1902,8 +1904,8 @@ class AdaptiveController:
             if shift < 0.01:
                 continue
 
-            self._risk_budget[donor_name] -= shift
-            self._risk_budget[best_receiver] += shift
+            self._risk_budget[donor_name] = donor_budget - shift
+            self._risk_budget[best_receiver] = self._risk_budget.get(best_receiver, 0) + shift
             transfers.append({
                 "from": donor_name,
                 "to": best_receiver,

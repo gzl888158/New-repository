@@ -70,10 +70,22 @@ class OscillationHarvestStrategy(TrendStrategyBase):
         self._min_band_touch_count = self._safe_int(self._cfg.get("min_band_touch_count", 2), 2)
         self._touch_proximity_pct = self._safe_float(self._cfg.get("touch_proximity_pct", 0.0015), 0.0015)
 
+        # 成交量分布(VP)确认：支撑/阻力位需有高成交量节点(HVN)佐证，过滤低量假区间
+        self._vp_confirm_enabled = bool(self._cfg.get("vp_confirm_enabled", True))
+        self._vp_bins = self._safe_int(self._cfg.get("vp_bins", 20), 20)
+        self._vp_hvn_ratio = self._safe_float(self._cfg.get("vp_hvn_ratio", 1.2), 1.2)
+
         # 布林带辅助确认：RSI + 布林带 %B 双确认，自适应波动边界
         self._use_bollinger_confirm = bool(self._cfg.get("use_bollinger_confirm", True))
         self._boll_period = self._safe_int(self._cfg.get("boll_period", 20), 20)
         self._boll_std_mult = self._safe_float(self._cfg.get("boll_std_mult", 2.0), 2.0)
+
+        # 分级止盈：TP1 半程减仓 + TP2 中轨减仓，剩余仓位跟随原有中轨回归逻辑
+        self._staged_tp_enabled = bool(self._cfg.get("staged_tp_enabled", True))
+        self._tp1_mid_ratio = self._safe_float(self._cfg.get("tp1_mid_ratio", 0.5), 0.5)
+        self._tp1_close_ratio = self._safe_float(self._cfg.get("tp1_close_ratio", 0.4), 0.4)
+        self._tp2_mid_ratio = self._safe_float(self._cfg.get("tp2_mid_ratio", 1.0), 1.0)
+        self._tp2_close_ratio = self._safe_float(self._cfg.get("tp2_close_ratio", 0.3), 0.3)
 
         # 自适应调参：接入 AdaptiveController（空闲资金仓位 boost + 风险预算动态阈值）
         self._adaptive_enabled = bool(self._cfg.get("adaptive_enabled", True))
@@ -206,7 +218,7 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             return False
         return abs(ema_fast - ema_slow) / ema_slow > self._confirm_trend_threshold
 
-    def _compute_support_resistance(self, highs, lows) -> Optional[Dict[str, float]]:
+    def _compute_support_resistance(self, highs, lows, volumes=None) -> Optional[Dict[str, float]]:
         """基于滚动高低点识别支撑/阻力（排除当前未完成 bar 以避免未来函数）。"""
         highs = np.asarray(highs, dtype=float)
         lows = np.asarray(lows, dtype=float)
@@ -229,17 +241,62 @@ class OscillationHarvestStrategy(TrendStrategyBase):
         resistance_touches = int(np.sum(window_highs >= resistance - prox))
         touch_count = min(support_touches, resistance_touches)
 
+        # 成交量分布(VP)确认：支撑/阻力位是否处于高成交量节点(HVN)
+        vp_confirmed = True
+        if self._vp_confirm_enabled and volumes is not None:
+            volumes = np.asarray(volumes, dtype=float)
+            vol_window = volumes[-self._lookback_bars:-1]
+            price_window_lows = lows[-self._lookback_bars:-1]
+            price_window_highs = highs[-self._lookback_bars:-1]
+            vp_confirmed = self._check_vp_confirmation(
+                price_window_lows, price_window_highs, vol_window,
+                support, resistance
+            )
+
         return {"support": support, "resistance": resistance, "mid": mid,
-                "range_pct": range_pct, "touch_count": touch_count}
+                "range_pct": range_pct, "touch_count": touch_count,
+                "vp_confirmed": vp_confirmed}
+
+    def _check_vp_confirmation(self, bar_lows, bar_highs, volumes,
+                               support: float, resistance: float) -> bool:
+        """检查支撑/阻力位是否有高成交量节点(HVN)佐证。
+
+        将价格区间分为 vp_bins 个 bin，统计每个 bin 的成交量。
+        若支撑和阻力附近的 bin 成交量 >= 平均成交量 * hvn_ratio，则确认。
+        """
+        if resistance <= support or len(volumes) == 0:
+            return False
+        n_bins = self._vp_bins
+        bin_size = (resistance - support) / n_bins
+        if bin_size <= 0:
+            return False
+
+        vol_profile = np.zeros(n_bins)
+        for i in range(len(volumes)):
+            price_mid = (bar_lows[i] + bar_highs[i]) / 2.0
+            bin_idx = int((price_mid - support) / bin_size)
+            bin_idx = max(0, min(n_bins - 1, bin_idx))
+            vol_profile[bin_idx] += volumes[i]
+
+        avg_vol = np.mean(vol_profile) if np.sum(vol_profile) > 0 else 0.0
+        if avg_vol <= 0:
+            return False
+
+        threshold = avg_vol * self._vp_hvn_ratio
+        support_bin = 0
+        resistance_bin = n_bins - 1
+        support_vol = vol_profile[support_bin]
+        resistance_vol = vol_profile[resistance_bin]
+        return support_vol >= threshold and resistance_vol >= threshold
 
     # ------------------------------------------------------------------
     # 信号评估
     # ------------------------------------------------------------------
-    def _evaluate(self, symbol: str, closes, highs, lows) -> Optional[Dict[str, Any]]:
+    def _evaluate(self, symbol: str, closes, highs, lows, volumes=None) -> Optional[Dict[str, Any]]:
         if not self._is_range_bound(symbol):
             return {"signal": None, "reason": "not_range_bound"}
 
-        s_r = self._compute_support_resistance(highs, lows)
+        s_r = self._compute_support_resistance(highs, lows, volumes)
         if not s_r:
             return None
 
@@ -248,6 +305,7 @@ class OscillationHarvestStrategy(TrendStrategyBase):
         mid = s_r["mid"]
         range_pct = s_r["range_pct"]
         touch_count = int(s_r.get("touch_count", 0))
+        vp_confirmed = bool(s_r.get("vp_confirmed", True))
 
         # 区间过窄（磨损型）直接放弃
         if range_pct < self._min_band_width_pct:
@@ -282,14 +340,20 @@ class OscillationHarvestStrategy(TrendStrategyBase):
                 direction = "long"
                 band_depth = (support - price) / support if support > 0 else 0.0
                 sl_offset = atr * self._atr_sl_mult if atr > 0 else support * self._support_band_pct
-                stop_loss = support - sl_offset
-                take_profit = support + (mid - support) * self._mid_tp_ratio
+                max_sl = price * self._max_stop_loss_pct
+                sl_offset = min(sl_offset, max_sl) if max_sl > 0 else sl_offset
+                stop_loss = price - sl_offset
+                tp_dist = max(sl_offset * 1.5, (mid - price) * self._mid_tp_ratio)
+                take_profit = price + tp_dist
             elif (near_resistance or bb_high) and overbought:
                 direction = "short"
                 band_depth = (price - resistance) / resistance if resistance > 0 else 0.0
                 sl_offset = atr * self._atr_sl_mult if atr > 0 else resistance * self._support_band_pct
-                stop_loss = resistance + sl_offset
-                take_profit = resistance - (resistance - mid) * self._mid_tp_ratio
+                max_sl = price * self._max_stop_loss_pct
+                sl_offset = min(sl_offset, max_sl) if max_sl > 0 else sl_offset
+                stop_loss = price + sl_offset
+                tp_dist = max(sl_offset * 1.5, (price - mid) * self._mid_tp_ratio)
+                take_profit = price - tp_dist
         elif bb is not None:
             # 区间未验证：降级为布林带震荡兜底（弱震荡市用动态波动边界替代固定支撑/阻力）。
             # 仅当布林带极值 + RSI 极端双共振时才开仓，且止损置于布林带外侧，止盈回归中轨。
@@ -298,15 +362,21 @@ class OscillationHarvestStrategy(TrendStrategyBase):
                 boll_only = True
                 band_depth = (bb["lower"] - price) / bb["lower"] if bb["lower"] > 0 else 0.0
                 sl_offset = atr * self._atr_sl_mult if atr > 0 else bb["lower"] * 0.01
-                stop_loss = bb["lower"] - sl_offset
-                take_profit = bb["mid"]
+                max_sl = price * self._max_stop_loss_pct
+                sl_offset = min(sl_offset, max_sl) if max_sl > 0 else sl_offset
+                stop_loss = price - sl_offset
+                tp_dist = max(sl_offset * 1.5, bb["mid"] - price)
+                take_profit = price + tp_dist
             elif bb_high and overbought:
                 direction = "short"
                 boll_only = True
                 band_depth = (price - bb["upper"]) / bb["upper"] if bb["upper"] > 0 else 0.0
                 sl_offset = atr * self._atr_sl_mult if atr > 0 else bb["upper"] * 0.01
-                stop_loss = bb["upper"] + sl_offset
-                take_profit = bb["mid"]
+                max_sl = price * self._max_stop_loss_pct
+                sl_offset = min(sl_offset, max_sl) if max_sl > 0 else sl_offset
+                stop_loss = price + sl_offset
+                tp_dist = max(sl_offset * 1.5, price - bb["mid"])
+                take_profit = price - tp_dist
 
         if direction is None:
             reason = "range_untested(touches={})".format(touch_count) if not range_verified else "no_entry"
@@ -328,8 +398,9 @@ class OscillationHarvestStrategy(TrendStrategyBase):
                 boll_score = min(1.0, max(0.0, (bb["pct_b"] - 0.8) * 5.0))
         confidence = 0.40 + depth_score * 0.18 + range_score * 0.12 + regime_conf * 0.15 + boll_score * 0.10
         if boll_only:
-            # 区间未验证：不确定性更高，置信度折减
             confidence -= 0.05
+        if not vp_confirmed:
+            confidence -= 0.06
         confidence = min(0.85, confidence)
 
         return {
@@ -376,9 +447,9 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             if len(klines) < self._lookback_bars + 1:
                 self._record_filter(symbol, "insufficient_klines")
                 continue
-            _, highs, lows, closes, _ = self._klines_to_arrays(klines)
+            _, highs, lows, closes, volumes = self._klines_to_arrays(klines)
 
-            result = self._evaluate(symbol, closes, highs, lows)
+            result = self._evaluate(symbol, closes, highs, lows, volumes)
             if not result:
                 self._record_filter(symbol, "no_support_resistance")
                 continue
@@ -427,13 +498,17 @@ class OscillationHarvestStrategy(TrendStrategyBase):
                 self._record_filter(symbol, "fees_not_covered")
                 continue
 
+            if self._check_cross_strategy_conflict(symbol, direction):
+                self._record_filter(symbol, "cross_strategy_conflict")
+                continue
+
             self._record_metric("oscillation_harvest_signal_confidence", confidence,
                                 {"symbol": symbol, "direction": direction})
             self._publish_entry_signal(symbol, direction, price, quantity,
                                        stop_loss, take_profit, confidence)
 
     async def _manage_positions(self):
-        """回归中轨止盈 / 状态退出 / 区间反向出场。"""
+        """分级止盈 + 回归中轨止盈 / 状态退出 / 区间反向出场。"""
         for symbol, pos in list(self._position_state.items()):
             if pos.get("status") != "open":
                 continue
@@ -441,10 +516,9 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             klines = await self._fetch_klines(symbol, limit=self._lookback_bars + 50)
             if len(klines) < self._lookback_bars + 1:
                 continue
-            _, highs, lows, closes, _ = self._klines_to_arrays(klines)
-            result = self._evaluate(symbol, closes, highs, lows)
+            _, highs, lows, closes, volumes = self._klines_to_arrays(klines)
+            result = self._evaluate(symbol, closes, highs, lows, volumes)
             if not result:
-                # 无法评估（如 regime 数据缺失）时保持持仓，避免误平
                 continue
 
             price = float(np.asarray(closes, dtype=float)[-1])
@@ -452,6 +526,8 @@ class OscillationHarvestStrategy(TrendStrategyBase):
             signal = result.get("signal")
             quantity = self._safe_float(pos.get("current_quantity"), 0.0)
             entry_price = self._safe_float(pos.get("entry_price"), 0.0)
+            if quantity <= 0 or entry_price <= 0:
+                continue
 
             # 离开震荡区间 → 风控平仓
             if result.get("reason") == "not_range_bound":
@@ -461,13 +537,59 @@ class OscillationHarvestStrategy(TrendStrategyBase):
 
             reverse = (direction == "long" and signal == "short") or \
                       (direction == "short" and signal == "long")
+
+            # ── 分级止盈 ──
+            if self._staged_tp_enabled and mid > 0 and not reverse:
+                dist_to_mid = abs(mid - entry_price)
+                if direction == "long":
+                    tp1_price = entry_price + dist_to_mid * self._tp1_mid_ratio
+                    tp2_price = entry_price + dist_to_mid * self._tp2_mid_ratio
+                else:
+                    tp1_price = entry_price - dist_to_mid * self._tp1_mid_ratio
+                    tp2_price = entry_price - dist_to_mid * self._tp2_mid_ratio
+
+                tp1_hit = (direction == "long" and price >= tp1_price) or \
+                          (direction == "short" and price <= tp1_price)
+                tp2_hit = (direction == "long" and price >= tp2_price) or \
+                          (direction == "short" and price <= tp2_price)
+
+                if tp1_hit and not pos.get("tp1_done"):
+                    close_qty = self.okx_client.round_quantity_to_lot(
+                        symbol, quantity * self._tp1_close_ratio, round_up=False)
+                    if close_qty > 0:
+                        self._publish_exit_signal(symbol, direction, price, close_qty,
+                                                  reason="take_profit_1")
+                        pos["current_quantity"] = quantity - close_qty
+                        quantity = quantity - close_qty
+                    pos["tp1_done"] = True
+
+                if tp2_hit and not pos.get("tp2_done") and pos.get("tp1_done"):
+                    remaining = self._safe_float(pos.get("current_quantity"), 0.0)
+                    close_qty = self.okx_client.round_quantity_to_lot(
+                        symbol, remaining * self._tp2_close_ratio, round_up=False)
+                    if close_qty > 0:
+                        self._publish_exit_signal(symbol, direction, price, close_qty,
+                                                  reason="take_profit_2")
+                        pos["current_quantity"] = remaining - close_qty
+                        quantity = remaining - close_qty
+                    pos["tp2_done"] = True
+
+            if reverse:
+                reason = "exit"
+                quantity = self._safe_float(pos.get("current_quantity"), 0.0)
+                if quantity > 0:
+                    self._record_exit_metrics(symbol, direction, entry_price, price, quantity, reason)
+                    self._publish_exit_signal(symbol, direction, price, quantity, reason=reason)
+                continue
+
             reverted = (direction == "long" and mid > 0 and price >= mid) or \
                        (direction == "short" and mid > 0 and price <= mid)
 
-            if reverse or reverted:
-                reason = "exit" if reverse else "take_profit"
-                self._record_exit_metrics(symbol, direction, entry_price, price, quantity, reason)
-                self._publish_exit_signal(symbol, direction, price, quantity, reason=reason)
+            if reverted:
+                quantity = self._safe_float(pos.get("current_quantity"), 0.0)
+                if quantity > 0:
+                    self._record_exit_metrics(symbol, direction, entry_price, price, quantity, "take_profit")
+                    self._publish_exit_signal(symbol, direction, price, quantity, reason="take_profit")
 
     # ------------------------------------------------------------------
     # 冷却与校验辅助

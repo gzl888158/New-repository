@@ -70,6 +70,7 @@ class TrendStrategyBase(StrategyBase):
         self._stop_loss_manager = None
         self._coordinator = None
         self._regime_engine = None
+        self._position_manager = None
         self._funding_enhancer = FundingRateEnhancer(config, okx_client)
         self._vol_breakout_filter = VolatilityBreakoutFilter(config)
 
@@ -100,6 +101,30 @@ class TrendStrategyBase(StrategyBase):
     def set_regime_engine(self, engine):
         """注入 MarketRegimeEngine（供震荡/趋势类策略做状态过滤）。"""
         self._regime_engine = engine
+
+    def set_position_manager(self, manager):
+        """注入 PositionManager（供跨策略持仓相关性检查）。"""
+        self._position_manager = manager
+
+    def _check_cross_strategy_conflict(self, symbol: str, side: str) -> bool:
+        """检查是否与已有跨策略持仓冲突（同 symbol 同 side）。
+
+        返回 True 表示存在冲突，应跳过该信号。
+        """
+        if self._position_manager is None:
+            return False
+        try:
+            allowed, reason = self._position_manager.would_create_cross_strategy_duplicate(
+                symbol, side, self._strategy_name
+            )
+            if not allowed:
+                logger.debug(
+                    f"[{self._strategy_name}] 跨策略持仓冲突: {symbol} {side} — {reason}"
+                )
+                return True
+        except Exception:
+            pass
+        return False
 
     # ------------------------------------------------------------------
     # 配置热更新

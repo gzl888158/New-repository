@@ -22,11 +22,15 @@ def _make_target():
     s._rsi_oversold = 30.0
     s._rsi_overbought = 70.0
     s._atr_sl_mult = 1.5
+    s._max_stop_loss_pct = 0.02
     s._use_bollinger_confirm = True
     s._boll_period = 20
     s._boll_std_mult = 2.0
     s._lookback_bars = 96
     s._touch_proximity_pct = 0.0015
+    s._vp_confirm_enabled = False
+    s._vp_bins = 20
+    s._vp_hvn_ratio = 1.2
     s._safe_float = lambda v, d=0.0: float(v) if v is not None else d
     s._is_range_bound = lambda symbol: True
     s._get_symbol_regime = lambda symbol: {"confidence": 0.5}
@@ -35,7 +39,7 @@ def _make_target():
 
 def _untested_sr(touch_count=0):
     """返回一个区间未验证的支撑/阻力结果（可复用）。"""
-    return lambda highs, lows: {
+    return lambda highs, lows, volumes=None: {
         "support": 85.0, "resistance": 100.0, "mid": 92.5,
         "range_pct": 0.16, "touch_count": touch_count,
     }

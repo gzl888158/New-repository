@@ -1093,6 +1093,22 @@ class IntelligentTradingAgent:
 
         return state
 
+    def is_signal_blocked(self, symbol: str, strategy_name: str) -> tuple:
+        """快速检查信号是否被黑名单或策略暂停阻断（O(1) 字典查找，不经过过滤链）。
+
+        Returns:
+            (blocked: bool, reason: str)
+        """
+        bl_hit, bl_reason, _bl_until, bl_strategy = self._resolve_blacklist_hit(symbol, strategy_name)
+        if bl_hit:
+            return True, f"Symbol {symbol}（策略 {bl_strategy}）在黑名单中: {bl_reason}"
+
+        paused, pause_reason = self._resolve_strategy_pause_hit(strategy_name)
+        if paused:
+            return True, f"策略 {strategy_name} 已暂停: {pause_reason}"
+
+        return False, ""
+
     def _resolve_blacklist_hit(self, symbol, strategy_name):
         """查询黑名单（复合键优先，回退全局键），过期自动清理。"""
         for key in (self._make_blacklist_key(symbol, strategy_name), symbol):

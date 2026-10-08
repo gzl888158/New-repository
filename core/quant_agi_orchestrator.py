@@ -286,7 +286,60 @@ class QuantAGIOrchestrator:
         # 不污染调用方：config 先 copy
         self.config = dict(config or {})
         agi_cfg = self.config.get("agi_orchestrator") or {}
+        self._init_core_config(agi_cfg)
 
+        self._init_guard_configs(agi_cfg)
+
+        self._init_strategy_trend_guard_configs(agi_cfg)
+
+        self.regime_engine = regime_engine
+        # RegimeArbiter：融合主引擎+检测器输出，None 时 _perceive 透明回退 regime_engine
+        self.regime_arbiter = regime_arbiter
+        self.contribution_analyzer = contribution_analyzer
+        self.capital_allocator = capital_allocator
+        self.dynamic_allocator = dynamic_allocator
+        self.account_manager = account_manager
+        self.equity_monitor = equity_monitor
+        self.strategy_correlation = strategy_correlation
+        self.rl_agent = rl_agent
+
+        self._init_runtime_state()
+
+        logger.info(
+            f"QuantAGIOrchestrator initialized: cooldown={self.cooldown_seconds:.0f}s, "
+            f"regime_engine={'on' if self.regime_engine else 'off'}, "
+            f"contribution_analyzer={'on' if self.contribution_analyzer else 'off'}, "
+            f"capital_allocator={'on' if self.capital_allocator else 'off'}, "
+            f"dynamic_allocator={'on' if self.dynamic_allocator else 'off'}, "
+            f"profit_take={'on' if self._profit_take_enabled else 'off'}"
+            f"(act={self._profit_take_activation_pct:.1%},max={self._profit_take_max_pct:.1%},"
+            f"close<= {self._profit_take_max_close_ratio:.0%}), "
+            f"risk_response={'on' if self._risk_response_enabled else 'off'}"
+            f"(reduce_to={self._risk_response_reduce_target:.0%}), "
+            f"regime_adaptive={'on' if self._regime_adaptive_enabled else 'off'}"
+            f"(trend={self._trend_profit_take_mult:.1f}x,range={self._range_profit_take_mult:.1f}x), "
+            f"learning={'on' if self._learning_enabled else 'off'}"
+            f"(mem={self._learning_memory_size},max_adj={self._learning_max_adjust_pct:.0%}), "
+            f"goal_planning={'on' if self._goal_planning_enabled else 'off'}"
+            f"(target={self._goal_daily_target_pct:.1%},max_dd={self._goal_max_drawdown_pct:.1%}), "
+            f"param_adaptation={'on' if self._param_adaptation_enabled else 'off'}"
+        )
+
+        # 跨周期学习记忆：从 state 文件恢复历史决策（跨重启续用）
+        self._load_learning_memory()
+
+        # 已暂停策略集合：从 state 文件恢复（跨重启续用，供健康度改善后自主恢复）
+        self._load_paused_strategies()
+
+        # 决策溯源历史：从 lineage 文件恢复（跨重启续用）
+        self._load_decision_lineage()
+
+        # 学习型状态（进攻归因基线/利润峰值/健康度时序/突变冷却）：从 state 文件恢复（跨重启续用）
+        self._load_learning_state()
+
+
+    def _init_core_config(self, agi_cfg: dict) -> None:
+        """核心配置：冷却、阈值、仿真安全、循环熔断。"""
         self.cooldown_seconds = safe_float(agi_cfg.get("cooldown_seconds"), 300.0)
         if self.cooldown_seconds < 0:
             self.cooldown_seconds = 300.0
@@ -343,6 +396,8 @@ class QuantAGIOrchestrator:
         self._cycle_halted = False
         self._cycle_halt_reason = ""
 
+    def _init_guard_configs(self, agi_cfg: dict) -> None:
+        """账户级与策略级阈值型守卫配置（profit_take 至 cost_guard）。"""
         # ── 账户级收益检测自动平仓（profit_take）──
         # AGI 综合账户整体浮盈，达到阈值后生成 profit_take_close 动作，
         # 由 RestrictedExecutionChannel 低风险自动执行（平仓降风险），
@@ -978,6 +1033,8 @@ class QuantAGIOrchestrator:
         self._cost_guard_min_delta = safe_float(cg_cfg.get("min_delta"), 0.02)
         self._cost_guard_min_delta = max(0.0, min(1.0, self._cost_guard_min_delta))
 
+    def _init_strategy_trend_guard_configs(self, agi_cfg: dict) -> None:
+        """策略级趋势型守卫与高级守卫配置（health_trend 至 equity_mode_guard）。"""
         # ── 策略健康度趋势外推（health_trend_guard）──
         # 从「反应式」升级到「预测式」：追踪各策略 health_score 跨周期时序，
         # 检测到连续 window 个周期健康度下降时（即使当前仍在 B/C 级），提前降杠杆，
@@ -1829,17 +1886,8 @@ class QuantAGIOrchestrator:
         self._equity_mode_decline_reduce_target = safe_float(emg_cfg.get("decline_reduce_target"), 0.1)
         self._equity_mode_decline_reduce_target = max(0.0, min(1.0, self._equity_mode_decline_reduce_target))
 
-        self.regime_engine = regime_engine
-        # RegimeArbiter：融合主引擎+检测器输出，None 时 _perceive 透明回退 regime_engine
-        self.regime_arbiter = regime_arbiter
-        self.contribution_analyzer = contribution_analyzer
-        self.capital_allocator = capital_allocator
-        self.dynamic_allocator = dynamic_allocator
-        self.account_manager = account_manager
-        self.equity_monitor = equity_monitor
-        self.strategy_correlation = strategy_correlation
-        self.rl_agent = rl_agent
-
+    def _init_runtime_state(self) -> None:
+        """运行时状态初始化：计数器、时序队列、归因字典。"""
         # 状态
         self._cycle_count = 0
         self._last_run_ts: Optional[float] = None
@@ -2006,38 +2054,6 @@ class QuantAGIOrchestrator:
         # regime → correction；缺失/过期 regime 时回退到全局 _correction_factor
         self._correction_factor_by_regime: Dict[str, float] = {}
         self._correction_factor_by_regime_updated_cycle: Dict[str, int] = {}
-
-        logger.info(
-            f"QuantAGIOrchestrator initialized: cooldown={self.cooldown_seconds:.0f}s, "
-            f"regime_engine={'on' if self.regime_engine else 'off'}, "
-            f"contribution_analyzer={'on' if self.contribution_analyzer else 'off'}, "
-            f"capital_allocator={'on' if self.capital_allocator else 'off'}, "
-            f"dynamic_allocator={'on' if self.dynamic_allocator else 'off'}, "
-            f"profit_take={'on' if self._profit_take_enabled else 'off'}"
-            f"(act={self._profit_take_activation_pct:.1%},max={self._profit_take_max_pct:.1%},"
-            f"close<= {self._profit_take_max_close_ratio:.0%}), "
-            f"risk_response={'on' if self._risk_response_enabled else 'off'}"
-            f"(reduce_to={self._risk_response_reduce_target:.0%}), "
-            f"regime_adaptive={'on' if self._regime_adaptive_enabled else 'off'}"
-            f"(trend={self._trend_profit_take_mult:.1f}x,range={self._range_profit_take_mult:.1f}x), "
-            f"learning={'on' if self._learning_enabled else 'off'}"
-            f"(mem={self._learning_memory_size},max_adj={self._learning_max_adjust_pct:.0%}), "
-            f"goal_planning={'on' if self._goal_planning_enabled else 'off'}"
-            f"(target={self._goal_daily_target_pct:.1%},max_dd={self._goal_max_drawdown_pct:.1%}), "
-            f"param_adaptation={'on' if self._param_adaptation_enabled else 'off'}"
-        )
-
-        # 跨周期学习记忆：从 state 文件恢复历史决策（跨重启续用）
-        self._load_learning_memory()
-
-        # 已暂停策略集合：从 state 文件恢复（跨重启续用，供健康度改善后自主恢复）
-        self._load_paused_strategies()
-
-        # 决策溯源历史：从 lineage 文件恢复（跨重启续用）
-        self._load_decision_lineage()
-
-        # 学习型状态（进攻归因基线/利润峰值/健康度时序/突变冷却）：从 state 文件恢复（跨重启续用）
-        self._load_learning_state()
 
     def _load_learning_state(self) -> None:
         """从 state 文件恢复学习型状态（进攻归因基线 / 观察期冷却 / 止损止盈冷却 /
@@ -3279,7 +3295,35 @@ class QuantAGIOrchestrator:
         alerts: List[Dict[str, Any]] = []
 
         equity = perception.get("equity")
+        equity_status = perception.get("equity_status") or {}
+        mode = equity_status.get("mode")
 
+        # 策略级贡献度数据（跨子方法共享）
+        contrib = _coerce_dict(perception.get("contribution"))
+        # 成本预算自适应阈值（权益状态联动：健康放宽、恶化收紧）
+        adaptive_funding_threshold = self._adaptive_cost_threshold(self._funding_cost_ratio_threshold)
+        adaptive_exec_cost_threshold = self._adaptive_cost_threshold(self._execution_cost_ratio_threshold)
+
+        self._diagnose_account_health(perception, equity, equity_status, mode, alerts)
+        self._diagnose_strategy_metrics(
+            perception, equity, contrib,
+            adaptive_funding_threshold, adaptive_exec_cost_threshold, alerts,
+        )
+        self._diagnose_portfolio_level(perception, contrib, alerts)
+        self._diagnose_account_signals(perception, equity, equity_status, mode, alerts)
+
+        logger.info(f"[AGI-Diagnose] {len(alerts)} alerts")
+        return alerts
+
+    def _diagnose_account_health(
+        self,
+        perception: Dict[str, Any],
+        equity: Any,
+        equity_status: Dict[str, Any],
+        mode: Any,
+        alerts: List[Dict[str, Any]],
+    ) -> None:
+        """账户级健康诊断：权益状态、回撤加速、追涨抑制、资金利用率、杠杆、挂单保证金。"""
         # 权益非正 → 最高优先级告警
         if equity is not None and safe_float(equity, 0.0) <= 0:
             alerts.append({
@@ -3289,8 +3333,6 @@ class QuantAGIOrchestrator:
             })
 
         # 账户状态机（EquityMonitor 的 mode）：按状态分层收敛/进攻
-        equity_status = perception.get("equity_status") or {}
-        mode = equity_status.get("mode")
         if mode == "emergency":
             alerts.append({
                 "level": "critical",
@@ -3459,11 +3501,18 @@ class QuantAGIOrchestrator:
                         ),
                     })
 
+    def _diagnose_strategy_metrics(
+        self,
+        perception: Dict[str, Any],
+        equity: Any,
+        contrib: Dict[str, Any],
+        adaptive_funding_threshold: float,
+        adaptive_exec_cost_threshold: float,
+        alerts: List[Dict[str, Any]],
+    ) -> None:
+        """策略级诊断：浮亏/已实现亏损、费用侵蚀、健康趋势、胜率/夏普/回撤等 30+ 守卫。"""
         # 策略衰退 / 休眠 / 健康度恶化 / 疑似连续亏损
-        contrib = _coerce_dict(perception.get("contribution"))
         # 成本预算自适应阈值（权益状态联动：健康放宽、恶化收紧）
-        adaptive_funding_threshold = self._adaptive_cost_threshold(self._funding_cost_ratio_threshold)
-        adaptive_exec_cost_threshold = self._adaptive_cost_threshold(self._execution_cost_ratio_threshold)
         for name, c in _coerce_dict(contrib.get("strategies")).items():
             lifecycle = c.get("lifecycle")
             trend = c.get("trend")
@@ -4578,6 +4627,13 @@ class QuantAGIOrchestrator:
                         ),
                     })
 
+    def _diagnose_portfolio_level(
+        self,
+        perception: Dict[str, Any],
+        contrib: Dict[str, Any],
+        alerts: List[Dict[str, Any]],
+    ) -> None:
+        """组合级诊断：盈利集中度、尾部风险、协同效应、相关性、HHI 集中度等。"""
         # 组合级盈利集中度：盈利来源是否过度依赖单一策略（单一支柱风险）。
         # 与 correlation（策略间收益相关性）和 diversification（资金配置 HHI）区分：
         # 本维度看「盈利来源的集中度」——即使资金分散（HHI 低）、策略不相关，
@@ -5026,6 +5082,15 @@ class QuantAGIOrchestrator:
                     ),
                 })
 
+    def _diagnose_account_signals(
+        self,
+        perception: Dict[str, Any],
+        equity: Any,
+        equity_status: Dict[str, Any],
+        mode: Any,
+        alerts: List[Dict[str, Any]],
+    ) -> None:
+        """账户信号诊断：市场突变、落袋、目标规划、进攻机会、压力测试等。"""
         # 市场状态突变（结合置信度过滤：低置信度只作「疑似变化」提示，不触发突变告警）
         market_regime = perception.get("market_regime") or {}
         regime = market_regime.get("regime")
@@ -5433,9 +5498,6 @@ class QuantAGIOrchestrator:
                             f"预算 {self._stress_severe_loss_budget:.0%}，紧急收敛敞口"
                         ),
                     })
-
-        logger.info(f"[AGI-Diagnose] {len(alerts)} alerts")
-        return alerts
 
     def _effective_profit_take_activation(self, regime: Optional[str]) -> float:
         """计算经过市场状态自适应 + 学习记忆调整后的 profit_take 激活阈值。
@@ -6397,6 +6459,38 @@ class QuantAGIOrchestrator:
             )
         return kept
 
+    def _simple_reduce_actions(
+        self,
+        enabled: bool,
+        alerts: List[Dict[str, Any]],
+        alert_type: str,
+        target_allocation: float,
+        reason_prefix: str,
+    ) -> List[Dict[str, Any]]:
+        """通用策略降仓动作生成器：过滤指定类型告警，按策略去重，生成 reallocate decrease。
+
+        用于 40+ 同构守卫动作方法（浮亏/已实现亏损/费用侵蚀/趋势外推等），消除重复代码。
+        """
+        if not enabled:
+            return []
+        actions: List[Dict[str, Any]] = []
+        seen: set = set()
+        for alert in alerts or []:
+            if alert.get("type") != alert_type:
+                continue
+            strategy = alert.get("strategy")
+            if not strategy or strategy in seen:
+                continue
+            seen.add(strategy)
+            actions.append({
+                "type": "reallocate",
+                "strategy": strategy,
+                "action": "decrease",
+                "target_allocation": target_allocation,
+                "reason": f"{reason_prefix}: {alert.get('message', '')}",
+            })
+        return actions
+
     def _risk_reduce_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """主动风控响应：诊断到风险策略时，生成 reallocate 减配动作。
 
@@ -6498,252 +6592,90 @@ class QuantAGIOrchestrator:
         return actions
 
     def _unrealized_loss_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级浮亏止损动作：strategy_floating_loss → reallocate decrease 止损。
-
-        - 亏损侧闭环：单策略当前浮亏占账户权益比例超阈值时，主动止损减仓，
-          限制单策略亏损扩散，对应用户「稳定资金增长」诉求。
-        - 与收益侧闭环（profit_take 账户浮盈 / give_back 策略回吐 / ProfitLock 持仓锁微利）
-          形成对称：收益侧保住利润，亏损侧限制亏损。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条止损动作。
-        """
-        if not self._unrealized_loss_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "strategy_floating_loss":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._unrealized_loss_reduce_target,
-                "reason": f"unrealized_loss_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级浮亏止损动作：strategy_floating_loss → reallocate decrease 止损。"""
+        return self._simple_reduce_actions(
+            self._unrealized_loss_enabled,
+            alerts,
+            "strategy_floating_loss",
+            self._unrealized_loss_reduce_target,
+            "unrealized_loss_guard",
+        )
 
     def _realized_loss_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级已实现亏损动作：realized_loss → reallocate decrease 收敛资金权重。
-
-        - 已平仓交易累计为负（永久损失）占权益比例超阈值时，降低该策略资金权重，
-          收敛「频繁交易累积永久损失」的策略，对应「消除频繁交易消耗资金」诉求。
-        - 与 unrealized_loss_actions（浮亏止损，看浮亏）区分：本方法看「已实现亏损」（不可逆）。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条收敛动作。
-        """
-        if not self._realized_loss_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "realized_loss":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._realized_loss_reduce_target,
-                "reason": f"realized_loss_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级已实现亏损动作：realized_loss → reallocate decrease 收敛资金权重。"""
+        return self._simple_reduce_actions(
+            self._realized_loss_enabled,
+            alerts,
+            "realized_loss",
+            self._realized_loss_reduce_target,
+            "realized_loss_guard",
+        )
 
     def _unrealized_loss_trend_actions(self, decision: Dict[str, Any],
                                        alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级浮亏加深趋势动作：unrealized_loss_deteriorating → reallocate decrease 提前止损。
-
-        - unrealized_loss_guard（阈值型：浮亏占权益超 loss_threshold 才清仓）的「事前」补充：
-          浮亏连续 window 周期加深时提前收敛敞口到 reduce_target（默认0.1，比清仓更温和），
-          在浮亏触及硬阈值之前止损，避免单策略亏损扩散。
-        - 与 give_back（浮盈从峰值回吐，收益侧趋势）形成对称：give_back 看收益侧回吐，
-          本方法看亏损侧加深，共同对应用户「稳定资金增长」诉求。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条止损动作。
-        """
-        if not self._unrealized_loss_trend_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "unrealized_loss_deteriorating":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._unrealized_loss_trend_reduce_target,
-                "reason": f"unrealized_loss_trend_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级浮亏加深趋势动作：unrealized_loss_deteriorating → reallocate decrease 提前止损。"""
+        return self._simple_reduce_actions(
+            self._unrealized_loss_trend_enabled,
+            alerts,
+            "unrealized_loss_deteriorating",
+            self._unrealized_loss_trend_reduce_target,
+            "unrealized_loss_trend_guard",
+        )
 
     def _strategy_fee_ratio_actions(self, decision: Dict[str, Any],
                                     alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级手续费率动作：high_strategy_fee → reallocate decrease 降低过度交易策略权重。
-
-        - 单策略手续费占毛利比例过高（交易过频、换手过度）时，主动降低该策略权重到
-          reduce_target，抑制频繁交易消耗资金（直接对应「消除频繁交易消耗资金」诉求）。
-        - 与 cost_awareness（账户级：抑制进攻性加仓）区分：本方法针对单策略收敛敞口。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条降权动作。
-        """
-        if not self._strategy_fee_ratio_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "high_strategy_fee":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._strategy_fee_ratio_reduce_target,
-                "reason": f"strategy_fee_ratio_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级手续费率动作：high_strategy_fee → reallocate decrease 降低过度交易策略权重。"""
+        return self._simple_reduce_actions(
+            self._strategy_fee_ratio_enabled,
+            alerts,
+            "high_strategy_fee",
+            self._strategy_fee_ratio_reduce_target,
+            "strategy_fee_ratio_guard",
+        )
 
     def _funding_cost_actions(self, decision: Dict[str, Any],
                               alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级资金费率动作：high_funding_cost → reallocate decrease 收敛持仓过久策略。
-
-        - 单策略资金费占毛利比例过高（持仓过久被 funding 持续侵蚀）时，主动降低该策略权重
-          到 reduce_target，收敛持仓敞口、缩短持仓时间（直接对应「稳定资金增长」诉求）。
-        - 与 strategy_fee_ratio_guard（手续费 = 交易频率成本，看换手/交易过频）区分：本方法
-          针对「持仓时间成本」（funding），即使不交易也亏钱。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条降权动作。
-        """
-        if not self._funding_cost_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "high_funding_cost":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._funding_cost_reduce_target,
-                "reason": f"funding_cost_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级资金费率动作：high_funding_cost → reallocate decrease 收敛持仓过久策略。"""
+        return self._simple_reduce_actions(
+            self._funding_cost_enabled,
+            alerts,
+            "high_funding_cost",
+            self._funding_cost_reduce_target,
+            "funding_cost_guard",
+        )
 
     def _funding_cost_trend_actions(self, decision: Dict[str, Any],
                                     alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级资金费率趋势动作：funding_cost_rising → reallocate decrease 提前收敛持仓。
-
-        - funding_cost_guard（阈值型：funding_ratio 超 threshold 才降权）的「事前」补充：
-          资金费率连续 window 周期上升时提前收敛敞口到 reduce_target（默认0.1），在持仓时间
-          成本进一步侵蚀之前收敛持仓、缩短持仓时间（直接对应「稳定资金增长」诉求）。
-        - 与 strategy_fee_ratio_trend_actions（手续费率趋势，看换手频率）区分：本方法针对
-          持仓时间成本趋势（funding），即使不交易持仓过久也持续侵蚀。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条降权动作。
-        """
-        if not self._funding_cost_trend_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "funding_cost_rising":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._funding_cost_trend_reduce_target,
-                "reason": f"funding_cost_trend_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级资金费率趋势动作：funding_cost_rising → reallocate decrease 提前收敛持仓。"""
+        return self._simple_reduce_actions(
+            self._funding_cost_trend_enabled,
+            alerts,
+            "funding_cost_rising",
+            self._funding_cost_trend_reduce_target,
+            "funding_cost_trend_guard",
+        )
 
     def _execution_cost_trend_actions(self, decision: Dict[str, Any],
                                       alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级执行成本趋势动作：execution_cost_rising → reallocate decrease 提前收敛敞口。
-
-        - execution_cost_guard（阈值型：exec_ratio 超 threshold 才降权）的「事前」补充：
-          执行成本率连续 window 周期上升时提前收敛敞口到 reduce_target（默认0.1），在执行
-          质量进一步恶化之前收敛、减少市价单追单（直接对应「消除追涨杀跌」诉求）。
-        - 与 strategy_fee_ratio_trend_actions（手续费率趋势，看换手频率）、
-          _funding_cost_trend_actions（资金费率趋势，看持仓时间）区分：本方法针对执行质量
-          成本趋势（滑点/点差），反映流动性、下单时机、市价 vs 限价的执行质量恶化。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条降权动作。
-        """
-        if not self._execution_cost_trend_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "execution_cost_rising":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._execution_cost_trend_reduce_target,
-                "reason": f"execution_cost_trend_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级执行成本趋势动作：execution_cost_rising → reallocate decrease 提前收敛敞口。"""
+        return self._simple_reduce_actions(
+            self._execution_cost_trend_enabled,
+            alerts,
+            "execution_cost_rising",
+            self._execution_cost_trend_reduce_target,
+            "execution_cost_trend_guard",
+        )
 
     def _execution_cost_actions(self, decision: Dict[str, Any],
                                 alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级执行质量成本动作：high_execution_cost → reallocate decrease 收敛执行质量差策略。
-
-        - 单策略滑点 + 点差成本占毛利比例过高（下单执行时点差/滑点损失大）时，主动降低该策略
-          权重到 reduce_target，收敛敞口、倒逼改善下单执行质量（限价替代市价、避免追单）。
-        - 与 strategy_fee_ratio_guard（手续费 = 交易频率成本）、funding_cost_guard（资金费 =
-          持仓时间成本）区分：本方法针对「执行质量成本」（滑点/点差），直接对应「消除追涨杀跌」。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条降权动作。
-        """
-        if not self._execution_cost_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "high_execution_cost":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._execution_cost_reduce_target,
-                "reason": f"execution_cost_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级执行质量成本动作：high_execution_cost → reallocate decrease 收敛执行质量差策略。"""
+        return self._simple_reduce_actions(
+            self._execution_cost_enabled,
+            alerts,
+            "high_execution_cost",
+            self._execution_cost_reduce_target,
+            "execution_cost_guard",
+        )
 
     def _long_short_imbalance_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """策略级多空方向失衡动作：long_side_losing / short_side_losing → param_adjust 降杠杆。
@@ -6803,97 +6735,36 @@ class QuantAGIOrchestrator:
 
     def _strategy_fee_ratio_trend_actions(self, decision: Dict[str, Any],
                                           alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略级手续费率趋势动作：strategy_fee_ratio_rising → reallocate decrease 提前降频收敛。
-
-        - strategy_fee_ratio_guard（阈值型：fee_ratio 超 threshold 才降权）的「事前」补充：
-          手续费率连续 window 周期上升时提前收敛敞口到 reduce_target（默认0.1），在交易成本
-          进一步侵蚀之前降频收敛。
-        - 与 cost_awareness（账户级，阈值型抑制进攻）区分：本方法针对单策略收敛敞口（事前趋势）。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条降权动作。
-        """
-        if not self._strategy_fee_ratio_trend_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "strategy_fee_ratio_rising":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._strategy_fee_ratio_trend_reduce_target,
-                "reason": f"strategy_fee_ratio_trend_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略级手续费率趋势动作：strategy_fee_ratio_rising → reallocate decrease 提前降频收敛。"""
+        return self._simple_reduce_actions(
+            self._strategy_fee_ratio_trend_enabled,
+            alerts,
+            "strategy_fee_ratio_rising",
+            self._strategy_fee_ratio_trend_reduce_target,
+            "strategy_fee_ratio_trend_guard",
+        )
 
     def _unrealized_profit_ratio_actions(self, decision: Dict[str, Any],
                                          alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """浮盈占比过高动作：unrealized_profit_concentration → reallocate decrease 锁定浮盈。
-
-        - 收益侧闭环的「盈利质量」维度：单策略账面盈利主要靠未兑现浮盈支撑时，主动减仓
-          锁定浮盈，把脆弱的账面利润部分落袋（对应用户「稳定资金增长」诉求）。
-        - 与 give_back（浮盈已回吐，事后减仓锁利）区分：本方法在回吐发生之前减仓（事前），
-          与 profit_take（账户级浮盈落袋）区分：本方法是策略级（单策略浮盈占比过高）。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条减仓动作。
-        """
-        if not self._unrealized_profit_ratio_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "unrealized_profit_concentration":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._unrealized_profit_ratio_reduce_target,
-                "reason": f"unrealized_profit_ratio_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """浮盈占比过高动作：unrealized_profit_concentration → reallocate decrease 锁定浮盈。"""
+        return self._simple_reduce_actions(
+            self._unrealized_profit_ratio_enabled,
+            alerts,
+            "unrealized_profit_concentration",
+            self._unrealized_profit_ratio_reduce_target,
+            "unrealized_profit_ratio_guard",
+        )
 
     def _unrealized_profit_ratio_trend_actions(self, decision: Dict[str, Any],
                                                alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """浮盈占比趋势动作：unrealized_profit_ratio_rising → reallocate decrease 锁定浮盈。
-
-        - unrealized_profit_ratio_guard（阈值型：浮盈占比超 ratio_threshold 才减仓）的「事前」
-          补充：浮盈占比连续 window 周期上升时提前收敛敞口到 reduce_target（默认0.1），在盈利
-          质量进一步劣化之前锁定浮盈。
-        - 与 unrealized_loss_trend_actions（浮亏连续加深，亏损侧趋势）形成对称：浮亏侧提前止损，
-          本方法看「盈利变虚」提前锁定浮盈，共同对应用户「稳定资金增长」诉求。
-        - 复用 reallocate 高风险动作：autonomous 模式受 Kill Switch 约束，非自主排队。
-        - 同一策略去重，只生成一条减仓动作。
-        """
-        if not self._unrealized_profit_ratio_trend_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        seen: set = set()
-        for alert in alerts or []:
-            if alert.get("type") != "unrealized_profit_ratio_rising":
-                continue
-            strategy = alert.get("strategy")
-            if not strategy or strategy in seen:
-                continue
-            seen.add(strategy)
-            actions.append({
-                "type": "reallocate",
-                "strategy": strategy,
-                "action": "decrease",
-                "target_allocation": self._unrealized_profit_ratio_trend_reduce_target,
-                "reason": f"unrealized_profit_ratio_trend_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """浮盈占比趋势动作：unrealized_profit_ratio_rising → reallocate decrease 锁定浮盈。"""
+        return self._simple_reduce_actions(
+            self._unrealized_profit_ratio_trend_enabled,
+            alerts,
+            "unrealized_profit_ratio_rising",
+            self._unrealized_profit_ratio_trend_reduce_target,
+            "unrealized_profit_ratio_trend_guard",
+        )
 
     def _downside_momentum_actions(self, decision: Dict[str, Any],
                                    alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -8137,54 +8008,24 @@ class QuantAGIOrchestrator:
         return actions
 
     def _hourly_pnl_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """每小时盈利效率守卫动作：hourly_pnl_negative → reallocate decrease 收敛资金权重。
-
-        - 活跃时长足够、交易量足够但每小时仍在持续失血的策略，说明其长时间占用资金
-          却负期望（时间价值流失），降低其资金权重到 reduce_target，消除低效策略。
-        - 复用 reallocate 高风险通道，autonomous 模式受 Kill Switch 约束。
-        """
-        if not self._hourly_pnl_guard_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        for alert in alerts or []:
-            if alert.get("type") != "hourly_pnl_negative":
-                continue
-            name = alert.get("strategy")
-            if not name:
-                continue
-            actions.append({
-                "type": "reallocate",
-                "strategy": name,
-                "action": "decrease",
-                "target_allocation": self._hourly_reduce_target,
-                "reason": f"hourly_pnl_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """每小时盈利效率守卫动作：hourly_pnl_negative → reallocate decrease 收敛资金权重。"""
+        return self._simple_reduce_actions(
+            self._hourly_pnl_guard_enabled,
+            alerts,
+            "hourly_pnl_negative",
+            self._hourly_reduce_target,
+            "hourly_pnl_guard",
+        )
 
     def _trade_frequency_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """交易频率守卫动作：high_trade_frequency → reallocate decrease 收敛资金权重。
-
-        - 每小时交易笔数过高（高频刷单）的策略，即使盈利，单笔滑点/手续费/冲击成本叠加
-          也持续侵蚀利润，降低其资金权重到 reduce_target，消除「频繁交易消耗资金」。
-        - 复用 reallocate 高风险通道，autonomous 模式受 Kill Switch 约束。
-        """
-        if not self._trade_frequency_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        for alert in alerts or []:
-            if alert.get("type") != "high_trade_frequency":
-                continue
-            name = alert.get("strategy")
-            if not name:
-                continue
-            actions.append({
-                "type": "reallocate",
-                "strategy": name,
-                "action": "decrease",
-                "target_allocation": self._trade_frequency_reduce_target,
-                "reason": f"trade_frequency_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """交易频率守卫动作：high_trade_frequency → reallocate decrease 收敛资金权重。"""
+        return self._simple_reduce_actions(
+            self._trade_frequency_enabled,
+            alerts,
+            "high_trade_frequency",
+            self._trade_frequency_reduce_target,
+            "trade_frequency_guard",
+        )
 
     def _health_trend_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """健康度趋势外推动作：连续下降 → param_adjust 提前降杠杆（事前风控）。
@@ -8499,30 +8340,14 @@ class QuantAGIOrchestrator:
         return actions
 
     def _strategy_staleness_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """策略休眠资金回收动作：strategy_stale → reallocate decrease 回收闲置资金。
-
-        - 与 strategy_lifecycle（strategy_dormant → strategy_pause 停开新仓）区分：本方法在更早的
-          reclaim_idle_hours 回收资金（reallocate decrease 到 reclaim_target），事前释放闲置资金；
-          strategy_pause 是事后停开新仓。二者互补：先回收资金、再停开新仓。
-        - 复用 reallocate 高风险通道，autonomous 模式受 Kill Switch 约束。
-        """
-        if not self._strategy_staleness_enabled:
-            return []
-        actions: List[Dict[str, Any]] = []
-        for alert in alerts or []:
-            if alert.get("type") != "strategy_stale":
-                continue
-            name = alert.get("strategy")
-            if not name:
-                continue
-            actions.append({
-                "type": "reallocate",
-                "strategy": name,
-                "action": "decrease",
-                "target_allocation": self._strategy_staleness_reclaim_target,
-                "reason": f"strategy_staleness_guard: {alert.get('message', '')}",
-            })
-        return actions
+        """策略休眠资金回收动作：strategy_stale → reallocate decrease 回收闲置资金。"""
+        return self._simple_reduce_actions(
+            self._strategy_staleness_enabled,
+            alerts,
+            "strategy_stale",
+            self._strategy_staleness_reclaim_target,
+            "strategy_staleness_guard",
+        )
 
     def _health_crash_actions(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """健康度骤降动作：health_crash → param_adjust 提前降杠杆（急信号）。

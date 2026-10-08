@@ -34,6 +34,9 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
         # 趋势判定：ATR% 低于阈值视为震荡，暂停开仓
         self._atr_pct_threshold = self._safe_float(self._cfg.get("atr_pct_threshold", 0.002), 0.002)
 
+        # 方向模式：breakout=原始突破逻辑, reversal=反转(低多高空对齐), long_only, short_only
+        self._direction_mode = str(self._cfg.get("direction_mode", "reversal")).lower()
+
         # ADX 入场上限过滤（回测验证：ADX>=25 追高是 2025 亏损主因）
         # 默认关闭，避免改变现有策略行为；启用后仅允许 ADX < 阈值的突破入场。
         self._adx_max_filter_enabled = bool(self._cfg.get("adx_max_filter_enabled", False))
@@ -52,6 +55,13 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
         self._risk_lock_quality_boost = self._safe_float(self._cfg.get("risk_lock_quality_boost", 0.10), 0.10)
         # 企业级增强：过滤理由本地计数（get_health 暴露 + MetricsPipeline 埋点）
         self._filter_stats: Dict[str, int] = {}
+
+        # R3: 分批止盈（ATR 倍数档位，与 sniper 同模式）
+        self._staged_tp_enabled = bool(self._cfg.get("staged_tp_enabled", True))
+        self._tp1_atr_mult = self._safe_float(self._cfg.get("tp1_atr_mult", 1.5), 1.5)
+        self._tp1_close_ratio = self._safe_float(self._cfg.get("tp1_close_ratio", 0.4), 0.4)
+        self._tp2_atr_mult = self._safe_float(self._cfg.get("tp2_atr_mult", 2.5), 2.5)
+        self._tp2_close_ratio = self._safe_float(self._cfg.get("tp2_close_ratio", 0.3), 0.3)
 
     def _dynamic_min_quality(self) -> float:
         """自适应信号质量阈值：连续亏损/风险熔断时上浮，收紧开仓。"""
@@ -170,6 +180,19 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
             return True
         return (self._symbol_pnl.get(symbol, 0.0) / self._total_pnl) < self._symbol_pnl_cap_ratio
 
+    def _apply_direction_mode(self, direction: str) -> str | None:
+        """按方向模式过滤或反转突破信号。返回 None 表示该方向被过滤。"""
+        mode = self._direction_mode
+        if mode == "breakout":
+            return direction
+        if mode == "reversal":
+            return "short" if direction == "long" else "long"
+        if mode == "long_only":
+            return direction if direction == "long" else None
+        if mode == "short_only":
+            return direction if direction == "short" else None
+        return direction
+
     def _record_realized_pnl(self, symbol: str, direction: str,
                              entry_price: float, exit_price: float):
         """以价格收益率作为收益贡献度量，累加到币种与总账户。"""
@@ -207,6 +230,25 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
             if direction not in ("long", "short"):
                 self._record_filter(symbol, "no_signal")
                 continue
+
+            # 方向模式过滤/反转：对齐低多高空等全局偏向
+            original_direction = direction
+            direction = self._apply_direction_mode(direction)
+            if direction is None:
+                self._record_filter(symbol, "direction_mode_filtered")
+                continue
+
+            # 方向反转时需重算 SL/TP（evaluate_donchian 按原始方向计算）
+            if direction != original_direction:
+                price_cur = float(closes[-1])
+                atr_val = self._safe_float(result.get("atr"), 0.0)
+                if atr_val > 0:
+                    if direction == "long":
+                        result["stop_loss"] = price_cur - atr_val * self._atr_sl_mult
+                        result["take_profit"] = price_cur + atr_val * self._atr_tp_mult
+                    else:
+                        result["stop_loss"] = price_cur + atr_val * self._atr_sl_mult
+                        result["take_profit"] = price_cur - atr_val * self._atr_tp_mult
 
             # ADX 入场上限过滤：仅在 ADX < 阈值时允许突破入场（默认关闭）
             if not self._adx_allows_entry(highs, lows, closes):
@@ -268,6 +310,10 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
                 self._record_filter(symbol, "symbol_pnl_cap")
                 continue
 
+            if self._check_cross_strategy_conflict(symbol, direction):
+                self._record_filter(symbol, "cross_strategy_conflict")
+                continue
+
             self._publish_entry_signal(symbol, direction, price, quantity,
                                        stop_loss, take_profit, confidence)
 
@@ -296,6 +342,43 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
                 self._record_exit_metrics(symbol, direction, entry_price, price, quantity, "exit")
                 self._publish_exit_signal(symbol, direction, price, quantity, reason="exit")
                 continue
+
+            # R3: 分批止盈 — TP1/TP2 按 ATR 倍数分档减仓
+            if self._staged_tp_enabled and atr > 0:
+                if direction == "long":
+                    tp1_price = entry_price + atr * self._tp1_atr_mult
+                    tp2_price = entry_price + atr * self._tp2_atr_mult
+                else:
+                    tp1_price = entry_price - atr * self._tp1_atr_mult
+                    tp2_price = entry_price - atr * self._tp2_atr_mult
+
+                tp1_hit = (direction == "long" and price >= tp1_price) or \
+                          (direction == "short" and price <= tp1_price)
+                tp2_hit = (direction == "long" and price >= tp2_price) or \
+                          (direction == "short" and price <= tp2_price)
+
+                if tp1_hit and not pos.get("tp1_done"):
+                    close_qty = self.okx_client.round_quantity_to_lot(
+                        symbol, quantity * self._tp1_close_ratio, round_up=False)
+                    if close_qty > 0:
+                        self._publish_exit_signal(symbol, direction, price, close_qty,
+                                                  reason="take_profit_1")
+                        pos["current_quantity"] = quantity - close_qty
+                        quantity = quantity - close_qty
+                    pos["tp1_done"] = True
+                    # TP1 后移动止损到成本价（锁利）
+                    pos["stop_loss"] = entry_price
+
+                if tp2_hit and not pos.get("tp2_done") and pos.get("tp1_done"):
+                    remaining = self._safe_float(pos.get("current_quantity"), 0.0)
+                    close_qty = self.okx_client.round_quantity_to_lot(
+                        symbol, remaining * self._tp2_close_ratio, round_up=False)
+                    if close_qty > 0:
+                        self._publish_exit_signal(symbol, direction, price, close_qty,
+                                                  reason="take_profit_2")
+                        pos["current_quantity"] = remaining - close_qty
+                        quantity = remaining - close_qty
+                    pos["tp2_done"] = True
 
             # ATR 尾随止损
             if atr <= 0:
@@ -364,6 +447,7 @@ class DonchianBreakoutStrategy(TrendStrategyBase):
             "adx_max_filter_enabled": self._adx_max_filter_enabled,
             "adx_max_threshold": self._adx_max_threshold,
             "symbol_pnl_cap_enabled": self._symbol_pnl_cap_enabled,
+            "direction_mode": self._direction_mode,
         })
         return base
 

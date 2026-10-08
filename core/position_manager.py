@@ -1339,6 +1339,43 @@ class PositionManager:
         
         return conflicts
 
+    def would_create_cross_strategy_duplicate(
+        self, symbol: str, side: str, strategy_name: str
+    ) -> tuple:
+        """检查新开仓是否会造成跨策略同币种同方向重复持仓。
+
+        返回 (allowed: bool, reason: str)。
+        allowed=True 表示允许开仓，False 表示存在冲突应拒绝。
+        """
+        try:
+            target_side = PositionSide.LONG if side in ("long", "buy") else PositionSide.SHORT
+        except (ValueError, TypeError):
+            return True, ""
+
+        keys = self._positions_by_symbol.get(symbol, [])
+        if not keys:
+            return True, ""
+
+        conflicting_strategies = []
+        for key in keys:
+            pos = self._positions.get(key)
+            if pos is None:
+                continue
+            if pos.side != target_side:
+                continue
+            if pos.strategy_name == strategy_name:
+                continue
+            conflicting_strategies.append(pos.strategy_name)
+
+        if conflicting_strategies:
+            others = ", ".join(set(conflicting_strategies))
+            return False, (
+                f"{symbol} {side} already held by [{others}], "
+                f"cross-strategy duplicate blocked"
+            )
+
+        return True, ""
+
     def get_position_concentration(self) -> Dict[str, Any]:
         """获取持仓集中度分析
         

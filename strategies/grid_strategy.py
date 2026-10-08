@@ -45,6 +45,8 @@ class GridStrategy(PersistentStrategy):
         self._trade_history: Dict[str, List[Dict[str, Any]]] = {}
         self._position_side: Dict[str, Optional[str]] = {}
         self._trend_mode: Dict[str, bool] = {}
+        self._trend_mode_last_switch: Dict[str, float] = {}
+        self._trend_mode_cooldown = 300.0
         self._atr_cache: Dict[str, float] = {}
         self._volume_profile_cache: Dict[str, Dict[str, float]] = {}
         self._trend_bias_cache: Dict[str, Dict[str, Any]] = {}
@@ -74,6 +76,9 @@ class GridStrategy(PersistentStrategy):
         self._grid_retry_count: Dict[str, Dict[int, int]] = {}  # {symbol: {grid_index: retry_count}}
         self._grid_rollback_cooldown: Dict[str, Dict[int, float]] = {}  # {symbol: {grid_index: cooldown_until_timestamp}}
         self._grid_stale_count: Dict[str, int] = {}  # P10: {symbol: 连续"too far"拒绝次数}
+
+        # R1: 跨策略持仓冲突检查（GridStrategy 不继承 TrendStrategyBase，需自行支持注入）
+        self._position_manager = None
 
         # REST API降级缓存：避免频繁调用REST接口
         self._tick_rest_cache: Dict[str, tuple] = {}  # {symbol: (timestamp, TickData)}
@@ -251,6 +256,28 @@ class GridStrategy(PersistentStrategy):
     def set_regime_engine(self, engine):
         """注入MarketRegimeEngine，供内部评分复用统一 ADX/DI 趋势明细（消除口径漂移）。"""
         self._regime_engine = engine
+
+    def set_position_manager(self, manager):
+        """注入 PositionManager，用于跨策略持仓冲突检查（R1）。"""
+        self._position_manager = manager
+
+    def _check_cross_strategy_conflict(self, symbol: str, side: str) -> bool:
+        """检查跨策略持仓冲突：同 symbol 同方向是否已被其他策略持有。
+
+        返回 True 表示存在冲突，应拒绝开仓。
+        """
+        if self._position_manager is None:
+            return False
+        try:
+            allowed, reason = self._position_manager.would_create_cross_strategy_duplicate(
+                symbol, side, "grid"
+            )
+            if not allowed:
+                logger.debug(f"[grid] 跨策略持仓冲突: {symbol} {side} — {reason}")
+                return True
+        except Exception:
+            pass
+        return False
 
     def _get_unified_trend_detail(self, symbol: str) -> Optional[Dict[str, Any]]:
         """读取 MarketRegimeEngine 的统一 ADX/DI 趋势明细（get_symbol_trend_detail）。
@@ -798,18 +825,18 @@ class GridStrategy(PersistentStrategy):
         # P32: 方向感知网格 - 根据EMA趋势非对称分配buy/sell层
         trend_direction, trend_strength = await self._detect_grid_trend(symbol)
         if trend_direction == "up" and trend_strength >= 0.15:
-            # 上升趋势：buy层更多，sell层更少 (60/40 ~ 70/30)
-            # 趋势越强，buy层越多
-            buy_ratio = 0.5 + trend_strength * 0.2  # 0.5~0.7
+            # 上升趋势：buy层更多，sell层更少 (60/40)
+            # 趋势越强，buy层越多；上限0.6防止极端非对称
+            buy_ratio = min(0.6, 0.5 + trend_strength * 0.2)
             split_point = int(grid_count * buy_ratio)
             logger.info(
                 f"P32: Grid {symbol} asymmetric UP - buy_ratio={buy_ratio:.0%} "
                 f"split={split_point}/{grid_count} strength={trend_strength:.2f}"
             )
         elif trend_direction == "down" and trend_strength >= 0.15:
-            # 下降趋势：sell层更多，buy层更少 (30/40 ~ 40/60)
-            # 趋势越强，sell层越多
-            sell_ratio = 0.5 + trend_strength * 0.2  # 0.5~0.7
+            # 下降趋势：sell层更多，buy层更少 (40/60)
+            # 趋势越强，sell层越多；上限0.6防止极端非对称
+            sell_ratio = min(0.6, 0.5 + trend_strength * 0.2)
             split_point = int(grid_count * (1 - sell_ratio))  # buy层更少
             logger.info(
                 f"P32: Grid {symbol} asymmetric DOWN - sell_ratio={sell_ratio:.0%} "
@@ -1171,7 +1198,7 @@ class GridStrategy(PersistentStrategy):
                         # P2: 做多逆势惩罚 — 下跌趋势中做多是逆势，提高门槛（对称于做空的溢价取消）
                         _bias = self._trend_bias_cache.get(symbol)
                         if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
-                            _buy_threshold += 0.10
+                            _buy_threshold += 0.05
                         if quality < _buy_threshold:
                             logger.debug(f"Grid {symbol} buy signal rejected: quality={quality:.2f} < {_buy_threshold:.2f}")
                             continue
@@ -1195,12 +1222,12 @@ class GridStrategy(PersistentStrategy):
                     # 信号质量评分检查
                     try:
                         quality = await self._calculate_grid_signal_quality(symbol, "sell", price, grid)
-                        # P2: 做空溢价方向感知 — 下跌趋势中做空是顺势，取消 +0.25 做空溢价
+                        # P2: 做空溢价方向感知 — 下跌趋势中做空是顺势，降低做空溢价但保留底线
                         # （_trend_bias_cache.direction: 1=上涨, -1=下跌, 0=震荡）
                         _short_premium = 0.25
                         _bias = self._trend_bias_cache.get(symbol)
                         if _bias and _bias.get("direction") == -1 and _bias.get("strength", 0) > 0.015:
-                            _short_premium = 0.0
+                            _short_premium = 0.10
                         # P32: 高风险时段叠加质量门槛
                         # P2: 叠加信号质量放松量（资本层意图传导到信号门槛）+ 门槛上限
                         _sell_threshold = self._min_signal_quality + _short_premium + self._high_risk_quality_margin
@@ -1539,6 +1566,12 @@ class GridStrategy(PersistentStrategy):
                 f"symbol={symbol!r} side={side!r} price={price!r}"
             )
             self._increment_metric("grid_signal_rejected_total", 1.0, {"reason": "invalid_params", "symbol": symbol})
+            return
+
+        # R1: 跨策略持仓冲突检查 — 同 symbol 同方向已被其他策略持有时拒绝开仓
+        if self._check_cross_strategy_conflict(symbol, side):
+            logger.info(f"R1: Grid {symbol} {side} rejected - cross-strategy position conflict")
+            self._increment_metric("grid_signal_rejected_total", 1.0, {"reason": "cross_strategy_conflict", "symbol": symbol})
             return
 
         # P32: 网格最小间距保护 - 前置检查，避免无效信号消耗资源
@@ -1935,10 +1968,21 @@ class GridStrategy(PersistentStrategy):
         tp1_pct = min(raw_tp1, tp1_vol_cap) if tp1_vol_cap > 0 else raw_tp1
         tp2_pct = min(raw_tp2, tp2_vol_cap) if tp2_vol_cap > 0 else raw_tp2
 
+        # 最小盈亏比保底：波动率上限可能将 TP 压缩到远低于止损距离，
+        # 导致风险/收益倒挂（如 TP=0.75% vs SL=2%，R:R 仅 0.375:1）。
+        # 确保 TP 至少维持 min_rr_ratio * SL 距离，否则交易期望值为负。
+        grid_cfg = self.config.get("strategies", {}).get("grid", {})
+        sl_pct = grid_cfg.get("stop_loss_pct", 0.02)
+        min_rr_ratio = grid_cfg.get("min_rr_ratio", 0.75)
+        tp1_floor = sl_pct * min_rr_ratio
+        tp2_floor = sl_pct * min_rr_ratio * 2
+        tp1_pct = max(tp1_pct, tp1_floor)
+        tp2_pct = max(tp2_pct, tp2_floor)
+
         if tp1_pct != raw_tp1:
             logger.debug(
-                f"[grid] {symbol} TP1 capped by volatility: {raw_tp1:.4%} -> {tp1_pct:.4%} "
-                f"(grid_spacing={grid_spacing:.4%})"
+                f"[grid] {symbol} TP1 adjusted: {raw_tp1:.4%} -> {tp1_pct:.4%} "
+                f"(grid_spacing={grid_spacing:.4%}, sl={sl_pct:.2%}, min_rr={min_rr_ratio})"
             )
         
         if layer == 0:
@@ -2002,7 +2046,13 @@ class GridStrategy(PersistentStrategy):
             self._trade_history[symbol] = self._trade_history[symbol][-50:]
 
     async def _switch_to_trend_mode(self, symbol: str):
+        now = time.time()
+        last_switch = self._trend_mode_last_switch.get(symbol, 0)
+        if now - last_switch < self._trend_mode_cooldown:
+            logger.debug(f"Grid {symbol}: trend mode switch blocked by cooldown ({now - last_switch:.0f}s < {self._trend_mode_cooldown:.0f}s)")
+            return
         self._trend_mode[symbol] = True
+        self._trend_mode_last_switch[symbol] = now
         
         ticker = await self.okx_client.get_ticker_async(symbol)
         if not ticker:
@@ -2274,7 +2324,13 @@ class GridStrategy(PersistentStrategy):
         return max(0, min(100, adx)), max(0, min(100, plus_di)), max(0, min(100, minus_di))
 
     async def _exit_trend_mode(self, symbol: str):
+        now = time.time()
+        last_switch = self._trend_mode_last_switch.get(symbol, 0)
+        if now - last_switch < self._trend_mode_cooldown:
+            logger.debug(f"Grid {symbol}: trend mode exit blocked by cooldown ({now - last_switch:.0f}s < {self._trend_mode_cooldown:.0f}s)")
+            return
         self._trend_mode[symbol] = False
+        self._trend_mode_last_switch[symbol] = now
         self._martingale_state[symbol] = 0
         self._trailing_state.pop(symbol, None)
         self._position_entry_time.pop(symbol, None)
@@ -3126,7 +3182,6 @@ class GridStrategy(PersistentStrategy):
         self._record_grid_stop_loss_audit(symbol, sl_order)
         
         try:
-            self._trend_mode[symbol] = True
             await self._switch_to_trend_mode(symbol)
         except Exception as e:
             logger.error(f"Failed to switch to trend mode after stop loss: {e}")
@@ -4069,6 +4124,13 @@ class GridStrategy(PersistentStrategy):
         try:
             score = 0.0
 
+            # 预取 ticker（成交量 + 价差共用，避免重复 REST 调用）
+            ticker = None
+            try:
+                ticker = await self.okx_client.get_ticker_async(symbol)
+            except Exception:
+                pass
+
             # 1. 成交量确认 (0-0.25)
             if hasattr(self, '_trade_history') and symbol in self._trade_history:
                 vol_history = self._trade_history.get(symbol, [])
@@ -4076,16 +4138,13 @@ class GridStrategy(PersistentStrategy):
                     recent_vols = [t.get("volume", 0) for t in vol_history[-5:]]
                     avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
                     if avg_vol > 0:
-                        # 获取当前tick的24h成交量
-                        try:
-                            ticker = await self.okx_client.get_ticker_async(symbol)
-                            if ticker:
-                                vol_24h = float(ticker.get("vol24h", 0))
-                                if vol_24h > avg_vol * 0.5:
-                                    vol_ratio = min(1.0, vol_24h / (avg_vol * 2))
-                                    score += 0.25 * vol_ratio
-                        except Exception:
-                            score += 0.125  # 无法获取时给中等分数
+                        if ticker:
+                            vol_24h = float(ticker.get("vol24h", 0))
+                            if vol_24h > avg_vol * 0.5:
+                                vol_ratio = min(1.0, vol_24h / (avg_vol * 2))
+                                score += 0.25 * vol_ratio
+                        else:
+                            score += 0.125
                     else:
                         score += 0.125
                 else:
@@ -4112,27 +4171,23 @@ class GridStrategy(PersistentStrategy):
             else:
                 score += 0.125
 
-            # 3. 价差检查 (0-0.25)
-            try:
-                ticker = await self.okx_client.get_ticker_async(symbol)
-                if ticker:
-                    bid = float(ticker.get("bidPx", 0))
-                    ask = float(ticker.get("askPx", 0))
-                    if bid > 0 and ask > 0 and price > 0:
-                        spread = (ask - bid) / price
-                        if spread < 0.001:  # < 0.1%
-                            score += 0.25
-                        elif spread < 0.002:  # < 0.2%
-                            score += 0.15
-                        elif spread < 0.005:  # < 0.5%
-                            score += 0.08
-                        else:
-                            score += 0.02
+            # 3. 价差检查 (0-0.25) — 复用预取 ticker
+            if ticker:
+                bid = float(ticker.get("bidPx", 0))
+                ask = float(ticker.get("askPx", 0))
+                if bid > 0 and ask > 0 and price > 0:
+                    spread = (ask - bid) / price
+                    if spread < 0.001:  # < 0.1%
+                        score += 0.25
+                    elif spread < 0.002:  # < 0.2%
+                        score += 0.15
+                    elif spread < 0.005:  # < 0.5%
+                        score += 0.08
                     else:
-                        score += 0.125
+                        score += 0.02
                 else:
                     score += 0.125
-            except Exception:
+            else:
                 score += 0.125
 
             # 4. 市场状态兼容 (0-0.15)

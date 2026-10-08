@@ -48,6 +48,17 @@ class SniperStrategy(TrendStrategyBase):
         self._atr_period = self._safe_int(self._cfg.get("atr_period", 14), 14)
         self._atr_sl_mult = self._safe_float(self._cfg.get("atr_sl_multiplier", 2.0), 2.0)
         self._atr_tp_mult = self._safe_float(self._cfg.get("atr_tp_multiplier", 3.0), 3.0)
+        self._trailing_stop_enabled = bool(self._cfg.get("trailing_stop_enabled", True))
+        self._trailing_atr_mult = self._safe_float(
+            self._cfg.get("trailing_atr_multiplier", self._atr_sl_mult), self._atr_sl_mult
+        )
+
+        # ── 分级止盈 ──
+        self._staged_tp_enabled = bool(self._cfg.get("staged_tp_enabled", True))
+        self._tp1_atr_mult = self._safe_float(self._cfg.get("tp1_atr_mult", 1.5), 1.5)
+        self._tp1_close_ratio = self._safe_float(self._cfg.get("tp1_close_ratio", 0.4), 0.4)
+        self._tp2_atr_mult = self._safe_float(self._cfg.get("tp2_atr_mult", 2.5), 2.5)
+        self._tp2_close_ratio = self._safe_float(self._cfg.get("tp2_close_ratio", 0.3), 0.3)
 
         self._filter_stats: Dict[str, int] = {}
 
@@ -227,6 +238,10 @@ class SniperStrategy(TrendStrategyBase):
                 self._record_filter(symbol, "profit_covers_fees_failed")
                 continue
 
+            if self._check_cross_strategy_conflict(symbol, direction):
+                self._record_filter(symbol, "cross_strategy_conflict")
+                continue
+
             self._publish_entry_signal(symbol, direction, price, quantity,
                                        stop_loss, take_profit, confidence)
 
@@ -289,16 +304,28 @@ class SniperStrategy(TrendStrategyBase):
         # 做多：触及支撑 + RSI 超卖 + 阳线
         if float(lows[-1]) <= support * 1.002 and rsi < self._rsi_oversold and bullish_candle:
             atr = self._atr(highs, lows, closes, self._atr_period)
-            stop = self._round_price(symbol, support - atr * self._atr_sl_mult) if atr > 0 else self._round_price(symbol, support * 0.99)
-            take = self._round_price(symbol, resist) if resist > price else self._round_price(symbol, price + atr * self._atr_tp_mult)
+            sl_dist = atr * self._atr_sl_mult if atr > 0 else support * 0.01
+            stop = self._round_price(symbol, support - sl_dist) if atr > 0 else self._round_price(symbol, support * 0.99)
+            sr_tp = self._round_price(symbol, resist) if resist > price else self._round_price(symbol, price + atr * self._atr_tp_mult)
+            atr_tp = self._round_price(symbol, price + atr * self._atr_tp_mult)
+            sr_reward = abs(float(sr_tp) - price)
+            atr_reward = abs(float(atr_tp) - price)
+            min_reward = sl_dist * 1.5
+            take = sr_tp if sr_reward >= min_reward else (atr_tp if atr_reward >= min_reward else self._round_price(symbol, price + min_reward))
             confidence = round(min(0.9, 0.6 + (30.0 - rsi) * 0.01), 3)
             return "long", price, stop, take, confidence
 
         # 做空：触及阻力 + RSI 超买 + 阴线
         if float(highs[-1]) >= resist * 0.998 and rsi > self._rsi_overbought and bearish_candle:
             atr = self._atr(highs, lows, closes, self._atr_period)
-            stop = self._round_price(symbol, resist + atr * self._atr_sl_mult) if atr > 0 else self._round_price(symbol, resist * 1.01)
-            take = self._round_price(symbol, support) if support < price else self._round_price(symbol, price - atr * self._atr_tp_mult)
+            sl_dist = atr * self._atr_sl_mult if atr > 0 else resist * 0.01
+            stop = self._round_price(symbol, resist + sl_dist) if atr > 0 else self._round_price(symbol, resist * 1.01)
+            sr_tp = self._round_price(symbol, support) if support < price else self._round_price(symbol, price - atr * self._atr_tp_mult)
+            atr_tp = self._round_price(symbol, price - atr * self._atr_tp_mult)
+            sr_reward = abs(price - float(sr_tp))
+            atr_reward = abs(price - float(atr_tp))
+            min_reward = sl_dist * 1.5
+            take = sr_tp if sr_reward >= min_reward else (atr_tp if atr_reward >= min_reward else self._round_price(symbol, price - min_reward))
             confidence = round(min(0.9, 0.6 + (rsi - 70.0) * 0.01), 3)
             return "short", price, stop, take, confidence
 
@@ -318,6 +345,73 @@ class SniperStrategy(TrendStrategyBase):
             stop_loss = self._safe_float(pos.get("stop_loss"), 0.0)
             take_profit = self._safe_float(pos.get("take_profit"), 0.0)
             quantity = self._safe_float(pos.get("current_quantity"), 0.0)
+            entry_price = self._safe_float(pos.get("entry_price"), 0.0)
+            if quantity <= 0 or entry_price <= 0:
+                continue
+
+            klines = await self._fetch_klines(symbol, limit=self._atr_period + 10)
+            atr = 0.0
+            if len(klines) >= self._atr_period + 2:
+                _, highs, lows, closes, _ = self._klines_to_arrays(klines)
+                atr = self._atr(highs, lows, closes, self._atr_period)
+
+            # ── 分级止盈 ──
+            if self._staged_tp_enabled and atr > 0:
+                if direction == "long":
+                    tp1_price = entry_price + atr * self._tp1_atr_mult
+                    tp2_price = entry_price + atr * self._tp2_atr_mult
+                else:
+                    tp1_price = entry_price - atr * self._tp1_atr_mult
+                    tp2_price = entry_price - atr * self._tp2_atr_mult
+
+                tp1_hit = (direction == "long" and price >= tp1_price) or \
+                          (direction == "short" and price <= tp1_price)
+                tp2_hit = (direction == "long" and price >= tp2_price) or \
+                          (direction == "short" and price <= tp2_price)
+
+                if tp1_hit and not pos.get("tp1_done"):
+                    close_qty = self.okx_client.round_quantity_to_lot(
+                        symbol, quantity * self._tp1_close_ratio, round_up=False)
+                    if close_qty > 0:
+                        self._publish_exit_signal(symbol, direction, price, close_qty,
+                                                  reason="take_profit_1")
+                        pos["current_quantity"] = quantity - close_qty
+                        quantity = quantity - close_qty
+                    pos["tp1_done"] = True
+                    if direction == "long":
+                        pos["stop_loss"] = entry_price
+                        stop_loss = entry_price
+                    else:
+                        pos["stop_loss"] = entry_price
+                        stop_loss = entry_price
+
+                if tp2_hit and not pos.get("tp2_done") and pos.get("tp1_done"):
+                    remaining = self._safe_float(pos.get("current_quantity"), 0.0)
+                    close_qty = self.okx_client.round_quantity_to_lot(
+                        symbol, remaining * self._tp2_close_ratio, round_up=False)
+                    if close_qty > 0:
+                        self._publish_exit_signal(symbol, direction, price, close_qty,
+                                                  reason="take_profit_2")
+                        pos["current_quantity"] = remaining - close_qty
+                        quantity = remaining - close_qty
+                    pos["tp2_done"] = True
+
+            # ── ATR 尾随止损 ──
+            if self._trailing_stop_enabled and atr > 0:
+                if direction == "long":
+                    new_stop = price - atr * self._trailing_atr_mult
+                    if stop_loss <= 0 or new_stop > stop_loss:
+                        pos["stop_loss"] = new_stop
+                        stop_loss = new_stop
+                else:
+                    new_stop = price + atr * self._trailing_atr_mult
+                    if stop_loss <= 0 or new_stop < stop_loss:
+                        pos["stop_loss"] = new_stop
+                        stop_loss = new_stop
+
+            quantity = self._safe_float(pos.get("current_quantity"), 0.0)
+            if quantity <= 0:
+                continue
 
             hit_sl = (direction == "long" and stop_loss > 0 and price <= stop_loss) or \
                      (direction == "short" and stop_loss > 0 and price >= stop_loss)

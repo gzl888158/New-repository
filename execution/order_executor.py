@@ -144,6 +144,9 @@ class OrderExecutor:
         # 条件单管理器（由scheduler注入，可选）
         self._conditional_manager = None
 
+        # PositionManager（由scheduler注入，可选；对账用）
+        self._position_manager = None
+
         # 统一自适应止损止盈引擎（由scheduler注入，可选；下单兜底重算时优先使用）
         self._adaptive_tp_sl_engine = None
         # S3: AdaptiveTpSlEngine 升级为开仓 TP/SL 主计算路径的开关（默认关闭）。
@@ -582,6 +585,8 @@ class OrderExecutor:
     def set_intelligent_agent(self, agent):
         """注入智能交易体 - 自适应判断 + 成长性学习"""
         self._intelligent_agent = agent
+        for sm in self._stop_managers.values():
+            sm.set_regime_engine(agent)
 
     def set_rl_agent(self, rl_agent):
         """注入强化学习 Agent，用于交易反馈闭环（reward 计算 + MAB 策略评分更新）"""
@@ -1031,12 +1036,36 @@ class OrderExecutor:
         """只有交易所确认订单已撤销后，生命周期管理器才可终结超时订单。"""
         symbol = str(order.get("symbol", ""))
         exchange_order_id = str(order.get("exchange_order_id") or "")
-        if not symbol or not exchange_order_id:
-            logger.error(
-                f"Cannot resolve timed-out order at exchange: "
-                f"symbol={symbol!r}, exchange_order_id={exchange_order_id!r}"
-            )
+        clordid = str(order.get("clOrdId") or "")
+
+        if not symbol:
+            logger.error(f"Cannot resolve timed-out order: symbol is empty")
             return False
+
+        # exchange_order_id 为空：下单请求可能尚未到达交易所或未被响应。
+        # 先尝试用 clOrdId 在挂单中查找；找不到说明交易所侧无此单，直接放行终结。
+        if not exchange_order_id:
+            if clordid:
+                found_id = await self._find_pending_order_by_clordid(symbol, clordid)
+                if found_id:
+                    logger.info(
+                        f"Timeout order had no exchange_order_id but found in pending "
+                        f"via clOrdId={clordid}: exchange_id={found_id}"
+                    )
+                    order["exchange_order_id"] = found_id
+                    exchange_order_id = found_id
+                else:
+                    logger.warning(
+                        f"Timeout order not found at exchange (no exchange_order_id, "
+                        f"clOrdId={clordid} not in pending). Allowing clean terminal."
+                    )
+                    return True
+            else:
+                logger.warning(
+                    f"Timeout order has no exchange_order_id and no clOrdId. "
+                    f"Allowing clean terminal for symbol={symbol}."
+                )
+                return True
 
         try:
             status = await asyncio.to_thread(
@@ -1082,6 +1111,17 @@ class OrderExecutor:
                 f"{exchange_order_id}: {e}"
             )
             return False
+
+    async def _find_pending_order_by_clordid(self, symbol: str, clordid: str) -> str:
+        """在交易所挂单列表中按 clOrdId 查找，返回 exchange_order_id；未找到返回空串。"""
+        try:
+            pending = await asyncio.to_thread(self.okx_client.get_orders, "SWAP")
+            for ord_item in pending:
+                if str(ord_item.get("clOrdId", "")) == clordid:
+                    return str(ord_item.get("ordId", ""))
+        except Exception as e:
+            logger.warning(f"Failed to search pending orders by clOrdId={clordid}: {e}")
+        return ""
 
     # ═══════════════════════════════════════════════════════════════
     # 生产级部分成交处理
@@ -2673,6 +2713,30 @@ class OrderExecutor:
 
         # P0: 开仓前智能体审核 - 多维度判断
         if not is_close_signal and hasattr(self, '_intelligent_agent') and self._intelligent_agent:
+            # P0-fast: 黑名单/策略暂停快速阻断（O(1) 字典查找，避免完整审核链超时）
+            try:
+                blocked, block_reason = self._intelligent_agent.is_signal_blocked(symbol, strategy_name)
+                if blocked:
+                    logger.warning(f"IntelligentAgent FAST-BLOCK {symbol}: {block_reason}")
+                    self._publish_event(EventType.ORDER_REJECTED, {
+                        "trace_id": order_data.get("trace_id", ""),
+                        "symbol": symbol,
+                        "strategy": strategy_name,
+                        "signal_type": signal_type,
+                        "direction": direction,
+                        "layer": "intelligent_agent_fast_path",
+                        "reason_code": "agent_blacklist_or_pause",
+                        "reason": block_reason,
+                        "is_close": is_close_signal,
+                    })
+                    if order_id:
+                        await self._order_queue.update_order_status(order_id, "rejected_by_agent")
+                    self._persist_order_rejected(order_data)
+                    await self._lifecycle_manager.update_status(order_id, OrderStatus.FAILED)
+                    return
+            except Exception as e:
+                logger.warning(f"Fast-path blacklist check failed, falling through to full audit: {e}")
+
             try:
                 # P2a: 超时保护 - 智能体审核限制在 2 秒内，避免阻塞下单链路
                 agent_decision = await asyncio.wait_for(
@@ -6777,6 +6841,66 @@ class OrderExecutor:
             self._record_open_rejection(strategy_name, "execution_queue", "order_queue_rejected")
         return bool(order_id)
 
+    async def _manage_orphan_risk(self, symbol: str, position):
+        """为无策略归属的持仓（orphan/sync）提供基本止损和止盈管理。
+
+        历史问题：orphan_stop_loss_pct 配置从未被读取，sync 持仓无止损止盈，
+        7 天内 24 笔交易亏损 16.31 USDT，0 笔止盈，平均亏损是平均盈利的 3 倍。
+        """
+        exec_cfg = self.config.get("execution", {})
+        if not exec_cfg.get("orphan_stop_loss_enabled", False):
+            return
+
+        sl_pct = float(exec_cfg.get("orphan_stop_loss_pct", 0.015))
+        tp_pct = float(exec_cfg.get("orphan_take_profit_pct", sl_pct * 1.5))
+
+        if not hasattr(self, '_orphan_entry_prices'):
+            self._orphan_entry_prices = {}
+
+        avg_cost = float(position.avg_cost) if position.avg_cost > 0 else 0
+        if avg_cost <= 0:
+            return
+
+        if symbol not in self._orphan_entry_prices:
+            self._orphan_entry_prices[symbol] = avg_cost
+            logger.info(f"Orphan position tracked: {symbol} entry={avg_cost:.6f} side={position.side}")
+
+        entry = self._orphan_entry_prices[symbol]
+        current_price = float(position.mark_price) if position.mark_price > 0 else 0
+        if current_price <= 0:
+            return
+
+        is_long = position.side == "long" or (position.side not in ("long", "short") and float(position.quantity) > 0)
+
+        if is_long:
+            pnl_pct = (current_price - entry) / entry
+        else:
+            pnl_pct = (entry - current_price) / entry
+
+        if pnl_pct <= -sl_pct:
+            logger.warning(f"Orphan SL triggered: {symbol} {position.side} entry={entry:.6f} price={current_price:.6f} pnl={pnl_pct:.2%}")
+            try:
+                result = await asyncio.to_thread(self.okx_client.close_position, symbol, position.side)
+                if result and result.get("success"):
+                    logger.info(f"Orphan SL closed: {symbol} {position.side}")
+                    self._orphan_entry_prices.pop(symbol, None)
+                else:
+                    logger.error(f"Orphan SL close failed: {symbol}: {(result or {}).get('error', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Orphan SL close error: {symbol}: {e}")
+
+        elif pnl_pct >= tp_pct:
+            logger.info(f"Orphan TP triggered: {symbol} {position.side} entry={entry:.6f} price={current_price:.6f} pnl={pnl_pct:.2%}")
+            try:
+                result = await asyncio.to_thread(self.okx_client.close_position, symbol, position.side)
+                if result and result.get("success"):
+                    logger.info(f"Orphan TP closed: {symbol} {position.side}")
+                    self._orphan_entry_prices.pop(symbol, None)
+                else:
+                    logger.error(f"Orphan TP close failed: {symbol}: {(result or {}).get('error', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Orphan TP close error: {symbol}: {e}")
+
     async def _dynamic_stop_loss_loop(self):
         """动态止损循环：移动止损 + 保本止损 + 最小持仓周期检查"""
         while True:
@@ -6823,6 +6947,7 @@ class OrderExecutor:
                 symbol = position.symbol
                 strategy_name = self._position_strategy_map.get(symbol)
                 if not strategy_name:
+                    await self._manage_orphan_risk(symbol, position)
                     continue
 
                 sm = self._stop_managers.get(strategy_name)
@@ -6968,18 +7093,25 @@ class OrderExecutor:
             logger.error(f"Error handling take-profit action for {symbol}: {e}")
 
     async def _get_cached_atr(self, symbol: str) -> float:
-        """获取 ATR 值，带 5 分钟缓存"""
+        """获取 ATR 值，自适应缓存（高波动 60s，低波动 300s）"""
         now = time.time()
         if not hasattr(self, '_atr_cache'):
             self._atr_cache = {}
         
         cache_entry = self._atr_cache.get(symbol)
-        if cache_entry and (now - cache_entry["ts"]) < 300:
-            return cache_entry["value"]
+        if cache_entry:
+            age = now - cache_entry["ts"]
+            cached_val = cache_entry["value"]
+            ttl = 60.0 if (cached_val > 0 and cache_entry.get("price", 0) > 0
+                           and cached_val / cache_entry["price"] > 0.01) else 300.0
+            if age < ttl:
+                return cached_val
         
         try:
             atr = await asyncio.to_thread(self.okx_client.get_atr, symbol)
-            self._atr_cache[symbol] = {"value": atr, "ts": now}
+            ticker = await self.okx_client.get_ticker_async(symbol)
+            price = float(ticker.get("last") or 0) if ticker else 0.0
+            self._atr_cache[symbol] = {"value": atr, "ts": now, "price": price}
             return atr
         except Exception as e:
             logger.debug(f"Failed to get ATR for {symbol}: {e}")

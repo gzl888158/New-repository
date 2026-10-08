@@ -126,6 +126,7 @@ class PreTradeRiskChecker:
         self._daily_start_equity: float = 0.0
         self._current_equity: float = 0.0
         self._available_margin: float = 0.0
+        self._position_manager = None
         self._lock = threading.RLock()
 
     def update_account(self, equity: float, available_margin: float,
@@ -136,6 +137,9 @@ class PreTradeRiskChecker:
             self._available_margin = available_margin
             self._daily_pnl = daily_pnl
             self._daily_start_equity = daily_start_equity
+
+    def set_position_manager(self, position_manager) -> None:
+        self._position_manager = position_manager
 
     def update_symbol_position(self, symbol: str, position_value: float) -> None:
         """更新币种持仓价值"""
@@ -242,6 +246,25 @@ class PreTradeRiskChecker:
             details["symbol_position"] = round(new_total, 2)
         else:
             details["symbol_position"] = round(current_pos, 2)
+
+        # 4b. 跨策略同币种同方向重复持仓检查
+        if not is_close_signal and self._position_manager is not None:
+            sig_side = str(signal.get("side", "") or signal.get("direction", "") or "").lower()
+            sig_strategy = str(signal.get("strategy_name", "") or signal.get("strategy", "") or "")
+            if sig_side and sig_strategy:
+                try:
+                    cs_allowed, cs_reason = self._position_manager.would_create_cross_strategy_duplicate(
+                        symbol, sig_side, sig_strategy
+                    )
+                    if not cs_allowed:
+                        return RiskCheckResult(
+                            RiskLayer.L1_PRE_TRADE, False, RiskAction.REJECT,
+                            f"跨策略重复持仓: {cs_reason}",
+                            {"symbol": symbol, "side": sig_side,
+                             "strategy": sig_strategy, "reason": cs_reason}
+                        )
+                except Exception:
+                    pass
 
         # 5. 全局总杠杆上限（仅对开仓信号检查，平仓信号跳过）
         if not is_close_signal:
@@ -1388,6 +1411,7 @@ class RiskGate:
     def set_position_manager(self, position_manager) -> None:
         """注入仓位管理器，以便同步持续失败时冻结新开仓。"""
         self._position_manager = position_manager
+        self._l1.set_position_manager(position_manager)
 
     def shutdown(self):
         """关闭复用线程池，在系统停机时调用。"""

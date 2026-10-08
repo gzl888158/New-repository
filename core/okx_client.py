@@ -1291,6 +1291,12 @@ class OKXClient:
             server_ts /= 1000.0
         return abs(time.time() - server_ts) <= self._ticker_max_server_age_seconds
 
+    def update_ticker_from_ws(self, symbol: str, data: Dict[str, Any]) -> None:
+        """R4: WS tick 数据写入 ticker 缓存，供 get_ticker(_async) 命中缓存跳过 REST。"""
+        if not data or not symbol:
+            return
+        self._ticker_cache[symbol] = {"data": data, "ts": time.time()}
+
     def get_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         # P28: Ticker缓存 - 减少网络不稳定时的重复API调用
         ttl = self._ticker_cache_ttl_degraded if not self._network_healthy else self._ticker_cache_ttl_normal

@@ -691,6 +691,16 @@ class TradingScheduler:
         self.order_state_synchronizer.set_position_manager(self.position_manager)
         logger.info("PositionManager initialized and connected to RiskGate + OrderExecutor removal callback + position_ws")
 
+        # S1: 注入 PositionManager 到所有 TrendStrategyBase 子类，激活跨策略持仓相关性检查
+        try:
+            container = self.strategy_engine._strategy_container
+            for strategy in container._strategies.values():
+                if hasattr(strategy, "set_position_manager"):
+                    strategy.set_position_manager(self.position_manager)
+            logger.info("PositionManager injected into all TrendStrategyBase strategies (cross-strategy conflict check)")
+        except Exception as e:
+            logger.warning(f"Failed to inject PositionManager into strategies: {e}")
+
         # P1: 注入SQLite存储，持久化风控拦截事件到 risk_events 表（修复审计缺口）
         self.risk_gate.set_sqlite_storage(self.sqlite_storage)
         logger.info("RiskGate SQLite storage injected for risk event persistence")
@@ -4572,6 +4582,13 @@ class TradingScheduler:
 
         async def tick_handler(tick):
             self.redis_cache.set_tick(tick)
+            # R4: WS tick 同步写入 okx_client 缓存，策略 get_ticker_async 可命中跳过 REST
+            try:
+                symbol = tick.get("instId")
+                if symbol and self.okx_client:
+                    self.okx_client.update_ticker_from_ws(symbol, tick)
+            except Exception:
+                pass
 
         self.market_data_service.register_tick_callback(tick_handler)
 

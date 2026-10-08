@@ -75,7 +75,7 @@ async def test_existing_sync_position_rechecks_protective_stop():
     ]
     controller.okx_client._parse_position.return_value = position
     controller.okx_client.get_algo_orders.return_value = []
-    controller.okx_client.get_ticker.return_value = {"last": "101"}
+    controller.okx_client.get_ticker_async = AsyncMock(return_value={"last": "101"})
     controller.okx_client.contracts_to_coins.return_value = 1.0
     controller.okx_client.place_order.return_value = {
         "algoId": "algo-1",
